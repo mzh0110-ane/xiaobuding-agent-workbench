@@ -1,0 +1,202 @@
+"use client";
+
+import { useCallback, useEffect, useRef } from "react";
+import { useAppStore } from "@/components/state-provider";
+import { useContextFilesStore } from "@/lib/state/context-files-store";
+import type { ActiveDocument } from "@/lib/state/slices/ui/types";
+import type { BuiltInPreset } from "@/lib/state/layout-manager/presets";
+
+const PLAN_CONTEXT_PATH = "plan:context";
+
+export function useAutoDisableUnsupportedPlanMode({
+  planModeEnabled,
+  hasAgentProfile,
+  planModeAvailable,
+  resolvedSessionId,
+}: {
+  planModeEnabled: boolean;
+  hasAgentProfile: boolean;
+  planModeAvailable: boolean;
+  resolvedSessionId: string | null;
+}) {
+  const setPlanMode = useAppStore((state) => state.setPlanMode);
+  const removeContextFile = useContextFilesStore((state) => state.removeFile);
+  const hasAutoDisabled = useRef(false);
+
+  useEffect(() => {
+    if (
+      planModeEnabled &&
+      hasAgentProfile &&
+      !planModeAvailable &&
+      resolvedSessionId &&
+      !hasAutoDisabled.current
+    ) {
+      hasAutoDisabled.current = true;
+      setPlanMode(resolvedSessionId, false);
+      removeContextFile(resolvedSessionId, PLAN_CONTEXT_PATH);
+    }
+    if (!planModeEnabled) hasAutoDisabled.current = false;
+  }, [
+    planModeEnabled,
+    hasAgentProfile,
+    planModeAvailable,
+    resolvedSessionId,
+    setPlanMode,
+    removeContextFile,
+  ]);
+}
+
+// --- Auto-disable plan mode ---
+
+type AutoDisablePlanOpts = {
+  enabled?: boolean;
+  resolvedSessionId: string | null;
+  taskId: string | null;
+  sessionMetaPlanMode: boolean;
+  planModeFromStore: boolean;
+  applyBuiltInPreset: (preset: BuiltInPreset) => void;
+  closeDocument: (sid: string) => void;
+  setActiveDocument: (sid: string, doc: ActiveDocument | null) => void;
+  setPlanMode: (sid: string, enabled: boolean) => void;
+  removeContextFile: (sid: string, path: string) => void;
+};
+
+/**
+ * Auto-disable plan mode when the backend clears plan_mode from session metadata.
+ *
+ * Triggers when `sessionMetaPlanMode` transitions from true to false — the backend explicitly
+ * cleared plan_mode (e.g., on_exit: disable_plan_mode, or entering a non-plan-mode step).
+ *
+ * User-initiated step moves (proceed button, stepper) disable plan mode directly in their
+ * click handlers rather than relying on this effect.
+ */
+export function useAutoDisablePlanMode(opts: AutoDisablePlanOpts) {
+  const {
+    enabled = true,
+    resolvedSessionId,
+    taskId,
+    sessionMetaPlanMode,
+    planModeFromStore,
+    applyBuiltInPreset,
+    closeDocument,
+    setActiveDocument,
+    setPlanMode,
+    removeContextFile,
+  } = opts;
+
+  const prevSessionMetaPlanRef = useRef(sessionMetaPlanMode);
+
+  useEffect(() => {
+    const wasPlanMode = prevSessionMetaPlanRef.current;
+    prevSessionMetaPlanRef.current = sessionMetaPlanMode;
+
+    if (!enabled || !resolvedSessionId || !taskId) return;
+
+    if (wasPlanMode && !sessionMetaPlanMode && planModeFromStore) {
+      applyBuiltInPreset("default");
+      closeDocument(resolvedSessionId);
+      setActiveDocument(resolvedSessionId, null);
+      setPlanMode(resolvedSessionId, false);
+      removeContextFile(resolvedSessionId, PLAN_CONTEXT_PATH);
+    }
+  }, [
+    resolvedSessionId,
+    taskId,
+    enabled,
+    sessionMetaPlanMode,
+    planModeFromStore,
+    applyBuiltInPreset,
+    closeDocument,
+    setActiveDocument,
+    setPlanMode,
+    removeContextFile,
+  ]);
+}
+
+// --- Plan layout handlers ---
+
+type PlanLayoutHandlersOpts = {
+  enabled?: boolean;
+  resolvedSessionId: string | null;
+  taskId: string | null;
+  setActiveDocument: (sid: string, doc: ActiveDocument | null) => void;
+  applyBuiltInPreset: (preset: BuiltInPreset) => void;
+  closeDocument: (sid: string) => void;
+  setPlanMode: (sid: string, enabled: boolean) => void;
+  addContextFile: (sid: string, file: { path: string; name: string }) => void;
+  removeContextFile: (sid: string, path: string) => void;
+  refocusChatAfterLayout: () => void;
+};
+
+/** Returns togglePlanLayout and handlePlanModeChange callbacks. */
+export function usePlanLayoutHandlers(opts: PlanLayoutHandlersOpts) {
+  const {
+    enabled: layoutEnabled = true,
+    resolvedSessionId,
+    taskId,
+    setActiveDocument,
+    applyBuiltInPreset,
+    closeDocument,
+    setPlanMode,
+    addContextFile,
+    removeContextFile,
+    refocusChatAfterLayout,
+  } = opts;
+
+  const togglePlanLayout = useCallback(
+    (show: boolean) => {
+      if (!layoutEnabled || !resolvedSessionId || !taskId) return;
+      if (show) {
+        setActiveDocument(resolvedSessionId, { type: "plan", taskId });
+        applyBuiltInPreset("plan");
+      } else {
+        applyBuiltInPreset("default");
+        closeDocument(resolvedSessionId);
+        setActiveDocument(resolvedSessionId, null);
+      }
+      refocusChatAfterLayout();
+    },
+    [
+      resolvedSessionId,
+      taskId,
+      layoutEnabled,
+      setActiveDocument,
+      applyBuiltInPreset,
+      closeDocument,
+      refocusChatAfterLayout,
+    ],
+  );
+
+  const handlePlanModeChange = useCallback(
+    (enabled: boolean) => {
+      if (!layoutEnabled || !resolvedSessionId || !taskId) return;
+      if (enabled) {
+        setActiveDocument(resolvedSessionId, { type: "plan", taskId });
+        applyBuiltInPreset("plan");
+        setPlanMode(resolvedSessionId, true);
+        addContextFile(resolvedSessionId, { path: PLAN_CONTEXT_PATH, name: "Plan" });
+      } else {
+        applyBuiltInPreset("default");
+        closeDocument(resolvedSessionId);
+        setActiveDocument(resolvedSessionId, null);
+        setPlanMode(resolvedSessionId, false);
+        removeContextFile(resolvedSessionId, PLAN_CONTEXT_PATH);
+      }
+      refocusChatAfterLayout();
+    },
+    [
+      resolvedSessionId,
+      taskId,
+      layoutEnabled,
+      setActiveDocument,
+      applyBuiltInPreset,
+      closeDocument,
+      setPlanMode,
+      addContextFile,
+      removeContextFile,
+      refocusChatAfterLayout,
+    ],
+  );
+
+  return { togglePlanLayout, handlePlanModeChange };
+}

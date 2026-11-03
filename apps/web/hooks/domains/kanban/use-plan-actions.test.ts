@@ -1,0 +1,637 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import type { ContextFile } from "@/lib/state/context-files-store";
+
+const mockGetState = vi.fn();
+const mockMoveTask = vi.hoisted(() => vi.fn());
+const mockToast = vi.hoisted(() => vi.fn());
+const mockAppState = vi.hoisted(() => ({
+  value: {
+    kanban: { workflowId: "workflow-1", steps: [], tasks: [] },
+    kanbanMulti: { snapshots: {} },
+    tasks: { activeSessionId: "session-1" },
+    taskSessions: { items: {} },
+    setActiveSession: vi.fn(),
+    setPlanMode: vi.fn(),
+    setActiveDocument: vi.fn(),
+    setTaskPlan: vi.fn(),
+  } as Record<string, unknown>,
+}));
+const WORKFLOW_ID = "workflow-1";
+const FEATURE_WORKFLOW_ID = "workflow-feature";
+const SESSION_ID = "session-1";
+const TASK_ID = "task-1";
+const mockContextFilesStore = vi.hoisted(() => ({
+  value: {
+    removeFile: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/state/context-files-store", () => ({
+  useContextFilesStore: Object.assign(
+    (selector: (state: typeof mockContextFilesStore.value) => unknown) =>
+      selector(mockContextFilesStore.value),
+    { getState: () => mockGetState() },
+  ),
+}));
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (state: typeof mockAppState.value) => unknown) =>
+    selector(mockAppState.value),
+}));
+
+vi.mock("@/components/toast-provider", () => ({
+  useToast: () => ({ toast: mockToast }),
+}));
+
+vi.mock("@/lib/ws/connection", () => ({
+  getWebSocketClient: () => ({ request: vi.fn() }),
+}));
+
+vi.mock("@/lib/local-storage", () => ({
+  setChatDraftContent: vi.fn(),
+}));
+
+vi.mock("@/lib/api/domains/kanban-api", () => ({
+  moveTask: mockMoveTask,
+}));
+
+vi.mock("@/lib/api/domains/plan-api", () => ({
+  markPlanImplementationStarted: vi.fn(),
+}));
+
+vi.mock("@/lib/state/layout-store", () => ({
+  useLayoutStore: (selector: (state: { closeDocument: () => void }) => unknown) =>
+    selector({ closeDocument: vi.fn() }),
+}));
+
+vi.mock("@/lib/state/dockview-store", () => ({
+  useDockviewStore: (selector: (state: { applyBuiltInPreset: () => void }) => unknown) =>
+    selector({ applyBuiltInPreset: vi.fn() }),
+}));
+
+vi.mock("./use-implement-fresh", () => ({
+  useImplementFresh: () => vi.fn(),
+}));
+
+import {
+  buildImplementPlanContent,
+  collectImplementPlanInput,
+  readContextFilesMeta,
+  useNextWorkflowStep,
+  usePlanActions,
+} from "./use-plan-actions";
+
+describe("buildImplementPlanContent", () => {
+  it("appends the kandev-system block to user text", () => {
+    const out = buildImplementPlanContent("ship it");
+    expect(out.startsWith("ship it\n\n")).toBe(true);
+    expect(out).toContain("<kandev-system>");
+    expect(out).toContain("get_task_plan_kandev");
+    expect(out).toContain("</kandev-system>");
+  });
+
+  it("trims whitespace from user text", () => {
+    const out = buildImplementPlanContent("   hello  \n");
+    expect(out.startsWith("hello\n\n")).toBe(true);
+  });
+
+  it("uses default visible text when input is empty", () => {
+    expect(buildImplementPlanContent("")).toMatch(/^Implement the plan\n\n/);
+    expect(buildImplementPlanContent("   ")).toMatch(/^Implement the plan\n\n/);
+  });
+});
+
+function file(path: string, name: string, pinned?: boolean): ContextFile {
+  return { path, name, pinned };
+}
+
+describe("readContextFilesMeta", () => {
+  const sessionId = "sess-1";
+  const appFilePath = "src/app.ts";
+  const appFileName = "app.ts";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns an empty array when the session has no context files", () => {
+    mockGetState.mockReturnValue({ filesBySessionId: {} });
+    expect(readContextFilesMeta(sessionId)).toEqual([]);
+  });
+
+  it("maps real files to {path, name} pairs", () => {
+    mockGetState.mockReturnValue({
+      filesBySessionId: {
+        [sessionId]: [file(appFilePath, appFileName), file("README.md", "README.md")],
+      },
+    });
+    expect(readContextFilesMeta(sessionId)).toEqual([
+      { path: appFilePath, name: appFileName },
+      { path: "README.md", name: "README.md" },
+    ]);
+  });
+
+  it("filters out the special plan:context path", () => {
+    mockGetState.mockReturnValue({
+      filesBySessionId: {
+        [sessionId]: [file("plan:context", "Plan"), file(appFilePath, appFileName)],
+      },
+    });
+    expect(readContextFilesMeta(sessionId)).toEqual([{ path: appFilePath, name: appFileName }]);
+  });
+
+  it("filters out prompt: prefixed paths", () => {
+    mockGetState.mockReturnValue({
+      filesBySessionId: {
+        [sessionId]: [file("prompt:my-prompt", "My Prompt"), file(appFilePath, appFileName)],
+      },
+    });
+    expect(readContextFilesMeta(sessionId)).toEqual([{ path: appFilePath, name: appFileName }]);
+  });
+});
+
+describe("collectImplementPlanInput", () => {
+  it("uses default empty input when no chat input handle exists", () => {
+    mockGetState.mockReturnValue({ filesBySessionId: {} });
+    expect(collectImplementPlanInput(null, "sess-1")).toEqual({
+      userText: "",
+      attachments: [],
+      contextFilesMeta: [],
+    });
+  });
+});
+
+/** Plan step followed by an auto-start work step, with task-1 sitting on Plan. */
+function setUpPlanActionsState() {
+  vi.clearAllMocks();
+  mockMoveTask.mockResolvedValue(undefined);
+  mockAppState.value = {
+    ...mockAppState.value,
+    kanban: {
+      workflowId: WORKFLOW_ID,
+      steps: [
+        {
+          id: "plan-step",
+          title: "Plan",
+          position: 1,
+          events: { on_enter: [{ type: "enable_plan_mode" }] },
+        },
+        {
+          id: "work-step",
+          title: "Work",
+          position: 2,
+          events: { on_enter: [{ type: "auto_start_agent" }] },
+        },
+      ],
+      tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+    },
+  };
+}
+
+describe("useNextWorkflowStep visibility", () => {
+  beforeEach(setUpPlanActionsState);
+
+  it("exposes the next step for an idle signal-gated turn-complete move", () => {
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: [
+          {
+            id: "plan-step",
+            title: "Plan",
+            position: 1,
+            auto_advance_requires_signal: true,
+            events: { on_turn_complete: [{ type: "move_to_next" }] },
+          },
+          {
+            id: "work-step",
+            title: "Work",
+            position: 2,
+            events: { on_enter: [{ type: "auto_start_agent" }] },
+          },
+        ],
+        tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBe("Work");
+    expect(result.current.proceedPreviewTarget).toEqual({
+      taskId: TASK_ID,
+      workflowId: WORKFLOW_ID,
+      workflowStepId: "work-step",
+    });
+  });
+
+  it("suppresses the next step for an ungated turn-complete move", () => {
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: [
+          {
+            id: "plan-step",
+            title: "Plan",
+            position: 1,
+            auto_advance_requires_signal: false,
+            events: { on_turn_complete: [{ type: "move_to_next" }] },
+          },
+          {
+            id: "work-step",
+            title: "Work",
+            position: 2,
+            events: { on_enter: [{ type: "auto_start_agent" }] },
+          },
+        ],
+        tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBeNull();
+  });
+});
+
+describe("useNextWorkflowStep task workflow resolution", () => {
+  beforeEach(setUpPlanActionsState);
+
+  it("uses the task workflow when a different board is selected", async () => {
+    const featureSteps = [
+      {
+        id: "analysis",
+        title: "Analysis",
+        position: 0,
+        auto_advance_requires_signal: true,
+        events: { on_turn_complete: [{ type: "move_to_next" }] },
+      },
+      {
+        id: "implement",
+        title: "Implement",
+        position: 1,
+        events: { on_enter: [{ type: "auto_start_agent" }] },
+      },
+    ];
+    const kanbanSteps = [
+      { id: "kanban-analysis", title: "Analysis", position: 0 },
+      { id: "kanban-next", title: "Wrong next step", position: 1 },
+    ];
+
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: kanbanSteps,
+        tasks: [],
+      },
+      kanbanMulti: {
+        snapshots: {
+          [FEATURE_WORKFLOW_ID]: {
+            workflowId: FEATURE_WORKFLOW_ID,
+            workflowName: "Feature",
+            steps: featureSteps,
+            tasks: [
+              {
+                id: TASK_ID,
+                workflowId: FEATURE_WORKFLOW_ID,
+                workflowStepId: "analysis",
+              },
+            ],
+          },
+        },
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBe("Implement");
+    expect(result.current.proceedPreviewTarget).toEqual({
+      taskId: TASK_ID,
+      workflowId: FEATURE_WORKFLOW_ID,
+      workflowStepId: "implement",
+    });
+    await act(async () => {
+      await result.current.proceed();
+    });
+    expect(mockMoveTask).toHaveBeenCalledWith(TASK_ID, {
+      workflow_id: FEATURE_WORKFLOW_ID,
+      workflow_step_id: "implement",
+      position: 0,
+      entry_options: undefined,
+    });
+  });
+});
+
+describe("useNextWorkflowStep snapshot readiness", () => {
+  beforeEach(setUpPlanActionsState);
+
+  // @covers AC-TASKS-WORKFLOW-EXPLICIT-COMPLETION-SIGNAL-002.6
+  it("waits for the task workflow snapshot instead of borrowing selected-board steps", () => {
+    const featureTask = {
+      id: TASK_ID,
+      workflowId: FEATURE_WORKFLOW_ID,
+      workflowStepId: "analysis",
+    };
+    const kanbanSteps = [
+      { id: "analysis", title: "Analysis", position: 0 },
+      { id: "kanban-next", title: "Wrong next step", position: 1 },
+    ];
+
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: kanbanSteps,
+        tasks: [featureTask],
+      },
+      kanbanMulti: { snapshots: {} },
+    };
+
+    const { result, rerender } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBeNull();
+    expect(result.current.proceedPreviewTarget).toBeUndefined();
+
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanbanMulti: {
+        snapshots: {
+          [FEATURE_WORKFLOW_ID]: {
+            workflowId: FEATURE_WORKFLOW_ID,
+            workflowName: "Feature",
+            isPlaceholder: true,
+            steps: [],
+            tasks: [featureTask],
+          },
+        },
+      },
+    };
+    rerender();
+
+    expect(result.current.proceedStepName).toBeNull();
+    expect(result.current.proceedPreviewTarget).toBeUndefined();
+
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanbanMulti: {
+        snapshots: {
+          [FEATURE_WORKFLOW_ID]: {
+            workflowId: FEATURE_WORKFLOW_ID,
+            workflowName: "Feature",
+            isPlaceholder: false,
+            steps: [
+              { id: "analysis", title: "Analysis", position: 0 },
+              { id: "implement", title: "Implement", position: 1 },
+            ],
+            tasks: [featureTask],
+          },
+        },
+      },
+    };
+    rerender();
+
+    expect(result.current.proceedStepName).toBe("Implement");
+    expect(result.current.proceedPreviewTarget).toEqual({
+      taskId: TASK_ID,
+      workflowId: FEATURE_WORKFLOW_ID,
+      workflowStepId: "implement",
+    });
+  });
+});
+
+describe("useNextWorkflowStep gated move destinations", () => {
+  beforeEach(setUpPlanActionsState);
+
+  it("suppresses the next step for a gated move to a previous step", () => {
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: [
+          {
+            id: "plan-step",
+            title: "Plan",
+            position: 1,
+            auto_advance_requires_signal: true,
+            events: { on_turn_complete: [{ type: "move_to_previous" }] },
+          },
+          {
+            id: "work-step",
+            title: "Work",
+            position: 2,
+            events: { on_enter: [{ type: "auto_start_agent" }] },
+          },
+        ],
+        tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBeNull();
+  });
+
+  it("suppresses the next step for a gated move to a configured step", () => {
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: [
+          {
+            id: "plan-step",
+            title: "Plan",
+            position: 1,
+            auto_advance_requires_signal: true,
+            events: {
+              on_turn_complete: [{ type: "move_to_step", config: { step_id: "other-step" } }],
+            },
+          },
+          {
+            id: "work-step",
+            title: "Work",
+            position: 2,
+            events: { on_enter: [{ type: "auto_start_agent" }] },
+          },
+        ],
+        tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBeNull();
+  });
+
+  it("treats an absent signal-gated flag as ungated", () => {
+    mockAppState.value = {
+      ...mockAppState.value,
+      kanban: {
+        workflowId: WORKFLOW_ID,
+        steps: [
+          {
+            id: "plan-step",
+            title: "Plan",
+            position: 1,
+            events: { on_turn_complete: [{ type: "move_to_next" }] },
+          },
+          {
+            id: "work-step",
+            title: "Work",
+            position: 2,
+            events: { on_enter: [{ type: "auto_start_agent" }] },
+          },
+        ],
+        tasks: [{ id: TASK_ID, workflowId: WORKFLOW_ID, workflowStepId: "plan-step" }],
+      },
+    };
+
+    const { result } = renderHook(() => useNextWorkflowStep(TASK_ID));
+
+    expect(result.current.proceedStepName).toBeNull();
+  });
+});
+
+describe("usePlanActions", () => {
+  beforeEach(setUpPlanActionsState);
+
+  it("keeps the implement handler available in plan mode before an auto-start work step", () => {
+    const chatInputRef = {
+      current: {
+        getValue: () => "",
+        getAttachments: () => [],
+        clear: vi.fn(),
+      },
+    };
+
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: true,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: chatInputRef as never,
+      }),
+    );
+
+    expect(result.current.implementPlanHandler).toEqual(expect.any(Function));
+  });
+
+  it("routes implement through the next auto-start work step", async () => {
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: true,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: { current: null },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.implementPlanHandler?.(false);
+    });
+
+    expect(mockMoveTask).toHaveBeenCalledWith(TASK_ID, {
+      workflow_id: WORKFLOW_ID,
+      workflow_step_id: "work-step",
+      position: 0,
+    });
+    expect(mockAppState.value.setPlanMode).toHaveBeenCalledWith(SESSION_ID, false);
+  });
+
+  // @covers AC-TASKS-PROMPT-ATTACHMENTS-001.17
+  it("does not advance from plan mode while a file lacks its uploaded descriptor", async () => {
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: true,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: {
+          current: {
+            getValue: () => "",
+            getAttachments: () => [
+              { type: "resource", data: "cGVuZGluZw==", mime_type: "text/plain" },
+            ],
+            clear: vi.fn(),
+          },
+        } as never,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.implementPlanHandler?.(false);
+    });
+
+    expect(mockMoveTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps plan mode enabled when moving to the work step fails", async () => {
+    mockMoveTask.mockRejectedValueOnce(new Error("move failed"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: true,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: { current: null },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.implementPlanHandler?.(false);
+    });
+
+    expect(mockMoveTask).toHaveBeenCalledTimes(1);
+    expect(mockAppState.value.setPlanMode).not.toHaveBeenCalled();
+  });
+
+  it("does not expose the implement handler outside plan mode", () => {
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: false,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: { current: null },
+      }),
+    );
+
+    expect(result.current.implementPlanHandler).toBeUndefined();
+  });
+});
+
+describe("usePlanActions proceed failures", () => {
+  beforeEach(setUpPlanActionsState);
+
+  it("puts the backend's refusal reason in the proceed toast", async () => {
+    // A phone has no console to fall back on: if the toast drops the reason the
+    // user is told the step failed and nothing about why.
+    mockMoveTask.mockRejectedValueOnce(new Error("task has an active session (RUNNING)"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { result } = renderHook(() =>
+      usePlanActions({
+        resolvedSessionId: SESSION_ID,
+        taskId: TASK_ID,
+        planModeEnabled: true,
+        handlePlanModeChange: vi.fn(),
+        chatInputRef: { current: null },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.proceed();
+    });
+
+    expect(mockToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: "task has an active session (RUNNING)",
+        variant: "error",
+      }),
+    );
+  });
+});

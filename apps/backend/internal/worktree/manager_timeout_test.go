@@ -1,0 +1,439 @@
+package worktree
+
+import (
+	"context"
+	"errors"
+	"expvar"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/common/subproc"
+)
+
+// hangOnRevParseScript is the shared fake-git script body used by the timeout
+// regression tests. It sleeps indefinitely on `git rev-parse` and no-ops on
+// everything else (including `fetch`), so branchExists, currentBranch, and
+// the pullBaseBranch path that calls them all exercise the hang scenario.
+const hangOnRevParseScript = `
+case "${1:-}" in
+  rev-parse)
+    sleep 30
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+
+const hangOnUpdateRefScript = `
+case "${1:-}" in
+  update-ref)
+    sleep 30
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+
+type boundedBranchMetadataStore struct{ mockStore }
+
+func (s *boundedBranchMetadataStore) CountWorktreeBranchOwners(context.Context, string, string) (int, error) {
+	return 1, nil
+}
+
+func (s *boundedBranchMetadataStore) PersistBranchRecoveryHead(context.Context, string, string, string) (bool, error) {
+	return true, nil
+}
+
+func (s *boundedBranchMetadataStore) PersistBranchCompactionComplete(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+// TestBranchExists_RespectsContextDeadline verifies that branchExists cancels
+// the underlying git subprocess when its caller-provided context expires.
+func TestBranchExists_RespectsContextDeadline(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	exists, err := mgr.branchExists(ctx, t.TempDir(), "main")
+	elapsed := time.Since(start)
+
+	if exists {
+		t.Fatalf("branchExists() = true, want false on hanging git")
+	}
+	if err == nil {
+		t.Fatalf("branchExists() err = nil, want non-nil on ctx cancellation")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("branchExists() took %v, want <2s (ctx not propagated to subprocess)", elapsed)
+	}
+}
+
+// TestCurrentBranch_RespectsContextDeadline verifies that currentBranch
+// cancels the git subprocess when its caller-provided context expires.
+func TestCurrentBranch_RespectsContextDeadline(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	branch := mgr.currentBranch(ctx, t.TempDir())
+	elapsed := time.Since(start)
+
+	if branch != "" {
+		t.Fatalf("currentBranch() = %q, want empty on hanging git", branch)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("currentBranch() took %v, want <2s (ctx not propagated to subprocess)", elapsed)
+	}
+}
+
+// TestBranchExists_BoundedWhenCallerHasNoDeadline pins the behaviour of the
+// Manager's internal inspectTimeout. With a background (never-cancelled)
+// caller ctx, branchExists must still return within m.inspectTimeout so a
+// future refactor that drops the wrapping timeout cannot silently regress
+// the fix. We shrink inspectTimeout for the test to keep it fast.
+func TestBranchExists_BoundedWhenCallerHasNoDeadline(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.inspectTimeout = 300 * time.Millisecond
+
+	start := time.Now()
+	exists, err := mgr.branchExists(context.Background(), t.TempDir(), "main")
+	elapsed := time.Since(start)
+
+	if exists {
+		t.Fatalf("branchExists() = true, want false on hanging git")
+	}
+	if err == nil {
+		t.Fatalf("branchExists() err = nil, want non-nil on inspectTimeout firing")
+	}
+	// Budget = inspectTimeout + WaitDelay for subprocess pipe cleanup + slack.
+	if elapsed > 2*time.Second {
+		t.Fatalf("branchExists() took %v, want <2s (inspectTimeout not applied)", elapsed)
+	}
+}
+
+// TestResolveCommit_BoundedWhenCallerHasNoDeadline verifies that commit
+// probes used by locked cleanup cannot leave a repository lock held by a
+// stalled Git process.
+func TestResolveCommit_BoundedWhenCallerHasNoDeadline(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr, err := NewManager(newTestConfig(t), newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.inspectTimeout = 300 * time.Millisecond
+
+	start := time.Now()
+	commit, err := mgr.resolveCommit(context.Background(), t.TempDir(), "refs/heads/main")
+	elapsed := time.Since(start)
+
+	if commit != "" {
+		t.Fatalf("resolveCommit() = %q, want empty on hanging git", commit)
+	}
+	if err == nil {
+		t.Fatal("resolveCommit() err = nil, want timeout error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("resolveCommit() took %v, want <2s (inspect timeout not applied)", elapsed)
+	}
+}
+
+func TestDeleteExpectedBranchRef_BoundedWhenUpdateRefHangs(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnUpdateRefScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	store := &boundedBranchMetadataStore{mockStore: *newMockStore()}
+	mgr, err := NewManager(newTestConfig(t), store, newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.inspectTimeout = 300 * time.Millisecond
+
+	wt := &Worktree{ID: "wt-timeout", RepositoryPath: t.TempDir(), Branch: "feature/timeout"}
+	start := time.Now()
+	reason := mgr.deleteExpectedBranchRef(context.Background(), store, wt, strings.Repeat("a", 40))
+	elapsed := time.Since(start)
+
+	if reason != RetainedSafeDeleteRefused {
+		t.Fatalf("deleteExpectedBranchRef() reason = %q, want %q", reason, RetainedSafeDeleteRefused)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("deleteExpectedBranchRef() took %v, want <2s", elapsed)
+	}
+}
+
+func TestRestoreManagedBranchFromRecoveryHead_BoundsUpdateRefAdmissionAndReleasesRepoLock(t *testing.T) {
+	restoreCap := setGitThrottleCapForTest(2)
+	t.Cleanup(restoreCap)
+
+	recoverySHA := strings.Repeat("a", 40)
+	barrierDir := t.TempDir()
+	revParseStarted := filepath.Join(barrierDir, "rev-parse-started")
+	allowRevParse := filepath.Join(barrierDir, "allow-rev-parse")
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  rev-parse)
+    : > "`+revParseStarted+`"
+    while [ ! -f "`+allowRevParse+`" ]; do sleep 0.01; done
+    printf '%s\n' "`+recoverySHA+`"
+    ;;
+  update-ref)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr, err := NewManager(newTestConfig(t), newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.inspectTimeout = 300 * time.Millisecond
+	repoPath := t.TempDir()
+	repoLock := mgr.getRepoLock(repoPath)
+	firstHold, err := subproc.AcquireGit(context.Background(), subproc.GitLifecycle)
+	if err != nil {
+		t.Fatalf("hold first lifecycle slot: %v", err)
+	}
+	t.Cleanup(firstHold)
+
+	resultCh := make(chan error, 1)
+	go func() {
+		repoLock.Lock()
+		err := mgr.restoreManagedBranchFromRecoveryHeadLocked(context.Background(), &Worktree{
+			RepositoryPath:  repoPath,
+			Branch:          "feature/recovery-timeout",
+			BranchOwner:     BranchOwnerManaged,
+			RecoveryHeadSHA: recoverySHA,
+		})
+		repoLock.Unlock()
+		resultCh <- err
+	}()
+	waitForFile(t, revParseStarted)
+
+	secondHoldCh := make(chan func(), 1)
+	secondHoldErrCh := make(chan error, 1)
+	go func() {
+		release, acquireErr := subproc.AcquireGit(context.Background(), subproc.GitLifecycle)
+		if acquireErr != nil {
+			secondHoldErrCh <- acquireErr
+			return
+		}
+		secondHoldCh <- release
+	}()
+	waitForGitLifecycleWaiters(t, 1)
+	if err := os.WriteFile(allowRevParse, []byte("go"), 0o600); err != nil {
+		t.Fatalf("release rev-parse barrier: %v", err)
+	}
+	var secondHold func()
+	select {
+	case err := <-secondHoldErrCh:
+		t.Fatalf("hold second lifecycle slot: %v", err)
+	case secondHold = <-secondHoldCh:
+	case <-time.After(time.Second):
+		t.Fatal("second lifecycle slot was not acquired")
+	}
+	t.Cleanup(secondHold)
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("restore error = %v, want bounded update-ref admission deadline", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore remained blocked on saturated update-ref admission")
+	}
+	if !repoLock.TryLock() {
+		t.Fatal("repository lock remained held after bounded recovery restore")
+	}
+	repoLock.Unlock()
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("file %s was not created", path)
+}
+
+func waitForGitLifecycleWaiters(t *testing.T, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := gitLifecycleWaiters(); got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("git lifecycle waiters did not reach %d (got %d)", want, gitLifecycleWaiters())
+}
+
+func gitLifecycleWaiters() int64 {
+	vars, ok := expvar.Get("subproc_class_waiters").(*expvar.Map)
+	if !ok {
+		return 0
+	}
+	value := vars.Get("pool=git;class=lifecycle")
+	if value == nil {
+		return 0
+	}
+	got, _ := strconv.ParseInt(value.String(), 10, 64)
+	return got
+}
+
+// TestCreate_HangingRevParseReleasesRepoLock is the core regression test for
+// the reported symptom: a hung git rev-parse during Create must not keep the
+// per-repo mutex locked indefinitely. Before the fix, branchExists and
+// currentBranch ignored ctx, so a backend restart was the only way to clear
+// the lock. After the fix, ctx cancellation propagates to the git subprocess
+// and Create returns, releasing the lock for subsequent callers.
+func TestCreate_HangingRevParseReleasesRepoLock(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.fetchTimeout = 100 * time.Millisecond
+	mgr.pullTimeout = 100 * time.Millisecond
+
+	repoPath := t.TempDir()
+	if err := os.MkdirAll(repoPath+"/.git", 0755); err != nil {
+		t.Fatalf("failed to create .git dir: %v", err)
+	}
+
+	req := CreateRequest{
+		TaskID:             "task-a",
+		SessionID:          "sess-a",
+		TaskTitle:          "hang repro",
+		RepositoryPath:     repoPath,
+		BaseBranch:         "main",
+		PullBeforeWorktree: true,
+		TaskDirName:        "task-a",
+		RepoName:           "repo-a",
+	}
+
+	// Short caller deadline exercises ctx propagation through branchExists
+	// and currentBranch. Before the fix these ignored ctx and slept the full
+	// 30s in the fake git script, holding repoLock the entire time.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = mgr.Create(ctx, req)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("Create() err = nil, want error on hanging git")
+	}
+	// Budget: inspect timeout + WaitDelay per subprocess kill, bounded by a
+	// few subprocess kills and any lock bookkeeping. Pre-fix this was ~30s.
+	if elapsed > 10*time.Second {
+		t.Fatalf("Create() took %v, want <10s (lock held during hung git)", elapsed)
+	}
+
+	// Confirm the repo lock was released: a second Create call must be able
+	// to acquire it without waiting. We use a fresh context so the call can
+	// run briefly, then cancel; all we care about is that Lock() didn't
+	// block us out.
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer lockCancel()
+
+	lockStart := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = mgr.Create(lockCtx, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("second Create() stuck on repo lock (elapsed %v)", time.Since(lockStart))
+	}
+}
+
+// TestCreate_InspectTimeoutDoesNotSurfaceAsInvalidBaseBranch pins the bug
+// where a hung `git rev-parse --verify <base>` (e.g. a stalled NFS / SMB
+// mount) caused branchExists to return false and Create to surface
+// ErrInvalidBaseBranch — falsely claiming the base branch did not exist when
+// in fact the check timed out. Callers must see the underlying timeout, not
+// a misleading "branch not found" error that triggers task FAILED states.
+func TestCreate_InspectTimeoutDoesNotSurfaceAsInvalidBaseBranch(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, hangOnRevParseScript)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	// Tight inspect timeout so the test completes quickly.
+	mgr.inspectTimeout = 200 * time.Millisecond
+
+	repoPath := t.TempDir()
+	if err := os.MkdirAll(repoPath+"/.git", 0755); err != nil {
+		t.Fatalf("failed to create .git dir: %v", err)
+	}
+
+	req := CreateRequest{
+		TaskID:         "task-a",
+		SessionID:      "sess-a",
+		TaskTitle:      "inspect timeout repro",
+		RepositoryPath: repoPath,
+		BaseBranch:     "master",
+		TaskDirName:    "task-a",
+		RepoName:       "repo-a",
+	}
+
+	_, err = mgr.Create(context.Background(), req)
+	if err == nil {
+		t.Fatalf("Create() err = nil, want timeout error on hanging git rev-parse")
+	}
+	if errors.Is(err, ErrInvalidBaseBranch) {
+		t.Fatalf("Create() err = %v, must NOT be ErrInvalidBaseBranch on inspect timeout (regression: misleading 'base branch does not exist' surfaced to users)", err)
+	}
+}

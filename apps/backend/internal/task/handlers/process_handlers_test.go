@@ -1,0 +1,1217 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/kandev/kandev/internal/task/repository"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/gin-gonic/gin"
+	agentdto "github.com/kandev/kandev/internal/agent/dto"
+	"github.com/kandev/kandev/internal/agent/registry"
+	agentctlclient "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/models"
+	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/task/service"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+type mockRepository struct {
+	// Membership is not exercised by this fake; the embedded default
+	// reports no membership, which is the narrower answer.
+	repository.UnsupportedWorkspaceMembers
+	scriptsByRepo map[string][]*models.RepositoryScript
+	sessions      map[string]*models.TaskSession
+	executors     map[string]*models.Executor
+}
+
+func (m *mockRepository) UpdateTaskFieldsWithParentAdmission(context.Context, string, models.TaskFieldUpdate, repository.TaskParentValidator) (*models.TaskFieldUpdateResult, error) {
+	return nil, fmt.Errorf("field updates are not supported by this test repository")
+}
+
+func (m *mockRepository) CommitWorkspaceRecoveryErrorIfCurrent(
+	ctx context.Context,
+	observation models.WorkspaceRecoveryErrorObservation,
+	errorValue models.LastAgentError,
+) (bool, string, error) {
+	return false, "", nil
+}
+
+func (m *mockRepository) HasUserPromptHistory(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (m *mockRepository) ClaimInitialPromptFallback(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockRepository) DeleteTurnIfUnreferenced(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (m *mockRepository) ReconcileUnpublishedPromptTurns(context.Context) (int, error) {
+	return 0, nil
+}
+func (m *mockRepository) ListTurnsPendingStartEvent(context.Context) ([]*models.Turn, error) {
+	return nil, nil
+}
+
+func (m *mockRepository) CreateWorkspace(ctx context.Context, workspace *models.Workspace) error {
+	return nil
+}
+func (m *mockRepository) GetWorkspace(ctx context.Context, id string) (*models.Workspace, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateWorkspace(ctx context.Context, workspace *models.Workspace) error {
+	return nil
+}
+func (m *mockRepository) DeleteWorkspace(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) DeleteWorkspaceCascade(ctx context.Context, id string) ([]*models.Task, []*models.Workflow, error) {
+	return nil, nil, m.DeleteWorkspace(ctx, id)
+}
+func (m *mockRepository) DeleteWorkspaceCascadeWithName(ctx context.Context, id, name string) ([]*models.Task, []*models.Workflow, error) {
+	return nil, nil, m.DeleteWorkspace(ctx, id)
+}
+func (m *mockRepository) ListWorkspaces(ctx context.Context) ([]*models.Workspace, error) {
+	return nil, nil
+}
+func (m *mockRepository) CreateTask(ctx context.Context, task *models.Task) error {
+	return nil
+}
+func (m *mockRepository) GetTask(ctx context.Context, id string) (*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetTasksByIDs(ctx context.Context, ids []string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateTask(ctx context.Context, task *models.Task) error {
+	return nil
+}
+func (m *mockRepository) UpdateTaskWithExplicitPosition(ctx context.Context, task *models.Task) error {
+	return nil
+}
+func (m *mockRepository) UpdateTaskPreservingDeferredLaunch(ctx context.Context, task *models.Task) error {
+	return nil
+}
+func (m *mockRepository) GetTaskDeferredLaunch(ctx context.Context, taskID string) (map[string]interface{}, interface{}, error) {
+	return nil, nil, nil
+}
+func (m *mockRepository) SetTaskDeferredLaunchIfUnchanged(
+	ctx context.Context, taskID string, prior interface{}, value map[string]interface{},
+) (bool, bool, error) {
+	return false, false, nil
+}
+func (m *mockRepository) DeleteTask(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListTasks(ctx context.Context, workflowID string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListTasksByWorkspace(ctx context.Context, workspaceID, workflowID, repositoryID, query string, page, pageSize int, sort string, includeArchived, includeEphemeral, onlyEphemeral, excludeConfig bool) ([]*models.Task, int, error) {
+	return nil, 0, nil
+}
+func (m *mockRepository) ListTasksByWorkflowStep(ctx context.Context, workflowStepID string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ArchiveTask(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListTasksForAutoArchive(ctx context.Context) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListArchivedTasksWithActiveSessions(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListUnarchivedTasksWithActiveSessions(ctx context.Context) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetLastMessageTimeBySessionIDs(ctx context.Context, sessionIDs []string) (map[string]time.Time, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListExpiredQuickChatTasks(ctx context.Context, cutoff time.Time) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) DeleteExpiredQuickChatTask(ctx context.Context, id string, cutoff time.Time) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) CountOpenWatcherCreatedTasks(_ context.Context, _, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepository) UpdateTaskState(ctx context.Context, id string, state v1.TaskState) error {
+	return nil
+}
+func (m *mockRepository) SetTaskMetadataKeyIfPresent(context.Context, string, string, interface{}) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) UpdateTaskStateIfSessionState(
+	_ context.Context, _, _ string, _ models.TaskSessionState, _ v1.TaskState,
+) (v1.TaskState, bool, error) {
+	return "", false, nil
+}
+func (m *mockRepository) UpdateTaskStateIfCurrentIn(_ context.Context, _ string, _ v1.TaskState, _ []v1.TaskState) (v1.TaskState, bool, error) {
+	return "", false, nil
+}
+func (m *mockRepository) UpdateTaskStateIfNotArchived(_ context.Context, _ string, _ v1.TaskState) (v1.TaskState, bool, error) {
+	return "", false, nil
+}
+func (m *mockRepository) AddTaskToWorkflow(ctx context.Context, taskID, workflowID, columnID string, position int) error {
+	return nil
+}
+func (m *mockRepository) RemoveTaskFromWorkflow(ctx context.Context, taskID, workflowID string) error {
+	return nil
+}
+func (m *mockRepository) ListTasksByProject(_ context.Context, _ string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListTasksByAssignee(_ context.Context, _ string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListTaskTree(_ context.Context, _ string, _ models.TaskTreeFilters) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListChildren(_ context.Context, _ string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListChildrenIncludingArchived(_ context.Context, _ string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ReparentDirectChildren(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *mockRepository) ListSiblings(_ context.Context, _ string) ([]*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) ArchiveTaskIfActive(_ context.Context, _, _ string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) UnarchiveTaskByCascade(_ context.Context, _, _ string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) UnarchiveTask(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) IncrementTaskSequence(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepository) GetWorkspaceTaskPrefix(_ context.Context, _ string) (string, string, error) {
+	return "KAN", "", nil
+}
+func (m *mockRepository) GetTaskByExternalID(_ context.Context, _, _ string) (*models.Task, error) {
+	return nil, taskrepo.ErrTaskNotFound
+}
+func (m *mockRepository) SettleTaskExternalID(_ context.Context, _, _ string, _ time.Time) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) ReleaseTaskExternalID(_ context.Context, _, _ string) (*models.Task, error) {
+	return nil, nil
+}
+func (m *mockRepository) SwitchTaskRunner(context.Context, models.RunnerSwitchRequest) (*models.RunnerSwitchResult, error) {
+	return nil, nil
+}
+func (m *mockRepository) ReplaceTaskRepositories(context.Context, string, func(models.TaskRepositoryReplacementSnapshot) ([]*models.TaskRepository, error)) ([]*models.TaskRepository, error) {
+	return nil, fmt.Errorf("complete repository replacement is unsupported by this handler fixture")
+}
+
+func (m *mockRepository) CreateTaskRepository(ctx context.Context, taskRepo *models.TaskRepository) error {
+	return nil
+}
+func (m *mockRepository) GetTaskRepository(ctx context.Context, id string) (*models.TaskRepository, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListTaskRepositories(ctx context.Context, taskID string) ([]*models.TaskRepository, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListTaskRepositoriesByTaskIDs(_ context.Context, _ []string) (map[string][]*models.TaskRepository, error) {
+	return make(map[string][]*models.TaskRepository), nil
+}
+func (m *mockRepository) UpdateTaskRepository(ctx context.Context, taskRepo *models.TaskRepository) error {
+	return nil
+}
+func (m *mockRepository) UpdateTaskRepositoryComparisonTarget(
+	context.Context,
+	string,
+	*models.ComparisonTarget,
+	*models.ComparisonTarget,
+	bool,
+) (*models.TaskRepository, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) UpdateTaskRepositoryBaseBranchAndClearComparisonTarget(
+	context.Context,
+	string,
+	string,
+	bool,
+) (*models.TaskRepository, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) DeleteTaskRepository(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskRepositoriesByTask(ctx context.Context, taskID string) error {
+	return nil
+}
+func (m *mockRepository) GetPrimaryTaskRepository(ctx context.Context, taskID string) (*models.TaskRepository, error) {
+	return nil, nil
+}
+func (m *mockRepository) CreateWorkflow(ctx context.Context, workflow *models.Workflow) error {
+	return nil
+}
+func (m *mockRepository) GetWorkflow(ctx context.Context, id string) (*models.Workflow, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateWorkflow(ctx context.Context, workflow *models.Workflow) error {
+	return nil
+}
+func (m *mockRepository) DeleteWorkflow(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListWorkflows(ctx context.Context, workspaceID string, includeHidden bool) ([]*models.Workflow, error) {
+	return nil, nil
+}
+func (m *mockRepository) ReorderWorkflows(ctx context.Context, workspaceID string, workflowIDs []string) error {
+	return nil
+}
+func (m *mockRepository) CreateMessage(ctx context.Context, message *models.Message) error {
+	return nil
+}
+func (m *mockRepository) GetMessage(ctx context.Context, id string) (*models.Message, error) {
+	return nil, nil
+}
+
+// RehydrateMessagePayload is a no-op for the mock repository: none of its
+// callers construct messages with an externalized PayloadDigest.
+func (m *mockRepository) RehydrateMessagePayload(ctx context.Context, message *models.Message) error {
+	return nil
+}
+
+// GetMessageWithPromptIndex returns the message for id with its derived prompt index, mirroring the repository contract.
+func (m *mockRepository) GetMessageWithPromptIndex(ctx context.Context, id string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetMessageByToolCallID(ctx context.Context, sessionID, toolCallID string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetMessageByPendingID(ctx context.Context, sessionID, pendingID string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) FindMessageByPendingID(ctx context.Context, pendingID string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) FindMessagesByPendingID(ctx context.Context, pendingID string) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) FindMessageByPendingIDAndQuestion(ctx context.Context, sessionID, pendingID, questionID string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) FindActiveClarificationMessagesBySessionID(ctx context.Context, sessionID string) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetPendingActionsBySessionIDs(ctx context.Context, sessionIDs []string) (map[string]models.TaskPendingAction, error) {
+	return make(map[string]models.TaskPendingAction), nil
+}
+func (m *mockRepository) ListPendingInteractions(context.Context, models.PendingInteractionFilter) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) CompleteActiveClarificationBundle(
+	context.Context,
+	string,
+	string,
+	map[string]interface{},
+) ([]*models.Message, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) FinalizeClarificationResponseDelivery(
+	context.Context,
+	string,
+	string,
+	[]*models.Message,
+) ([]*models.Message, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) RestoreActiveClarificationBundle(
+	context.Context,
+	string,
+	string,
+	[]*models.Message,
+) ([]*models.Message, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) UpdateMessage(ctx context.Context, message *models.Message) error {
+	return nil
+}
+func (m *mockRepository) ClaimPermissionResolution(context.Context, models.PermissionResolutionClaimRequest) (*models.PermissionResolutionClaimResult, error) {
+	return &models.PermissionResolutionClaimResult{Outcome: models.PermissionClaimNotFound}, nil
+}
+func (m *mockRepository) FinalizePermissionResolution(context.Context, models.PermissionResolutionFinalizeRequest) (*models.PermissionResolutionFinalizeResult, error) {
+	return &models.PermissionResolutionFinalizeResult{Outcome: models.PermissionFinalizeNotFound}, nil
+}
+func (m *mockRepository) GetPermissionResolutionAudit(context.Context, string, string, string, string) (*models.PermissionResolutionAudit, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetPermissionMessageByIdentity(context.Context, string, string, string, string) (*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListMessages(ctx context.Context, sessionID string) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListMessagesByTurnID(ctx context.Context, turnID string) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListMessagesPaginated(ctx context.Context, sessionID string, opts models.ListMessagesOptions) ([]*models.Message, bool, error) {
+	return nil, false, nil
+}
+func (m *mockRepository) ListMessagesForPlugin(ctx context.Context, filter models.PluginMessageFilter) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) SearchMessages(ctx context.Context, sessionID string, opts models.SearchMessagesOptions) ([]*models.Message, error) {
+	return nil, nil
+}
+func (m *mockRepository) DeleteMessage(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) CreateTurn(ctx context.Context, turn *models.Turn) error {
+	return nil
+}
+func (m *mockRepository) CreateTurnWithStepStamp(ctx context.Context, turn *models.Turn) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) GetTurn(ctx context.Context, id string) (*models.Turn, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetActiveTurnBySessionID(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateTurn(ctx context.Context, turn *models.Turn) error {
+	return nil
+}
+func (m *mockRepository) PatchTurnMetadata(
+	context.Context,
+	string,
+	string,
+	map[string]interface{},
+) (bool, time.Time, error) {
+	return false, time.Time{}, nil
+}
+func (m *mockRepository) UpdateActiveTurnMetadata(
+	context.Context,
+	string,
+	string,
+	map[string]interface{},
+	[]string,
+) (bool, map[string]interface{}, time.Time, error) {
+	return false, nil, time.Time{}, nil
+}
+func (m *mockRepository) ClearTurnPromptDispatchMetadata(
+	context.Context,
+	string,
+	string,
+) (bool, map[string]interface{}, time.Time, error) {
+	return false, nil, time.Time{}, nil
+}
+func (m *mockRepository) CompleteTurn(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) AbandonTurn(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) CompletePendingToolCallsForTurn(ctx context.Context, turnID string) (int64, error) {
+	return 0, nil
+}
+func (m *mockRepository) ListTurnsBySession(ctx context.Context, sessionID string) ([]*models.Turn, error) {
+	return nil, nil
+}
+func (m *mockRepository) CreateTaskSession(ctx context.Context, session *models.TaskSession) error {
+	return nil
+}
+func (m *mockRepository) GetTaskSession(ctx context.Context, id string) (*models.TaskSession, error) {
+	if m.sessions != nil {
+		if session, ok := m.sessions[id]; ok {
+			return session, nil
+		}
+	}
+	return nil, fmt.Errorf("task session not found: %s", id)
+}
+func (m *mockRepository) GetTaskSessionByTaskID(ctx context.Context, taskID string) (*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetActiveTaskSessionByTaskID(ctx context.Context, taskID string) (*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateTaskSession(ctx context.Context, session *models.TaskSession) error {
+	return nil
+}
+func (m *mockRepository) UpdateTaskSessionState(ctx context.Context, id string, state models.TaskSessionState, errorMessage string) error {
+	return nil
+}
+func (m *mockRepository) ClaimPromptableTaskSessionIfActive(_ context.Context, id string) (models.PromptableTaskSessionClaim, error) {
+	return claimPromptableTaskSession(m.sessions, id)
+}
+
+func claimPromptableTaskSession(sessions map[string]*models.TaskSession, id string) (models.PromptableTaskSessionClaim, error) {
+	session, ok := sessions[id]
+	if !ok {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	if !isPromptableTaskSessionState(session.State) {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionBusy}, nil
+	}
+	previousState := session.State
+	session.State = models.TaskSessionStateRunning
+	return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionClaimed, PreviousState: previousState}, nil
+}
+
+func isPromptableTaskSessionState(state models.TaskSessionState) bool {
+	return state == models.TaskSessionStateWaitingForInput ||
+		state == models.TaskSessionStateIdle ||
+		state == models.TaskSessionStateCompleted
+}
+func (m *mockRepository) ResetTaskSessionBasesForRepository(ctx context.Context, taskID, repositoryID, baseBranch string) (int64, error) {
+	return 0, nil
+}
+func (m *mockRepository) ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListActiveTaskSessions(ctx context.Context) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListActiveTaskSessionsByTaskID(ctx context.Context, taskID string) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListLiveWorkspaceSessions(ctx context.Context) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) CancelActiveTaskSessionsByIDs(ctx context.Context, taskID string, sessionIDs []string, reason string) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) CancelActiveTaskSessionsByCandidates(ctx context.Context, taskID string, candidates []models.ActiveSessionCancellationCandidate, reason string) ([]*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) HasActiveTaskSessionsByAgentProfile(ctx context.Context, agentProfileID string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) GetActiveTaskInfoByAgentProfile(ctx context.Context, agentProfileID string) ([]agentdto.ActiveTaskInfo, error) {
+	return nil, nil
+}
+func (m *mockRepository) HasActiveTaskSessionsByExecutor(ctx context.Context, executorID string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) HasActiveTaskSessionsByEnvironment(ctx context.Context, environmentID string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) HasActiveTaskSessionsByRepository(ctx context.Context, repositoryID string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) CountActiveTaskSessionsByRepository(ctx context.Context, repositoryID string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepository) DeleteEphemeralTasksByAgentProfile(ctx context.Context, agentProfileID string) (int64, error) {
+	return 0, nil
+}
+func (m *mockRepository) DeleteTaskSession(ctx context.Context, session *models.TaskSession) error {
+	return nil
+}
+func (m *mockRepository) ListTaskSessionWorktrees(ctx context.Context, sessionID string) ([]*models.TaskEnvironmentRepo, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListWorktreesBySessionIDs(_ context.Context, _ []string) (map[string][]*models.TaskEnvironmentRepo, error) {
+	return make(map[string][]*models.TaskEnvironmentRepo), nil
+}
+func (m *mockRepository) DeleteTaskSessionWorktree(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskSessionWorktreesBySession(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockRepository) CreateRepository(ctx context.Context, repository *models.Repository) error {
+	return nil
+}
+func (m *mockRepository) GetRepository(ctx context.Context, id string) (*models.Repository, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateRepository(ctx context.Context, repository *models.Repository) error {
+	return nil
+}
+func (m *mockRepository) DeleteRepository(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListRepositories(ctx context.Context, workspaceID string) ([]*models.Repository, error) {
+	return nil, nil
+}
+func (m *mockRepository) CreateRepositoryScript(ctx context.Context, script *models.RepositoryScript) error {
+	return nil
+}
+func (m *mockRepository) GetRepositoryScript(ctx context.Context, id string) (*models.RepositoryScript, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateRepositoryScript(ctx context.Context, script *models.RepositoryScript) error {
+	return nil
+}
+func (m *mockRepository) DeleteRepositoryScript(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListRepositoryScripts(ctx context.Context, repositoryID string) ([]*models.RepositoryScript, error) {
+	if m.scriptsByRepo == nil {
+		return nil, nil
+	}
+	return m.scriptsByRepo[repositoryID], nil
+}
+func (m *mockRepository) ListScriptsByRepositoryIDs(_ context.Context, _ []string) (map[string][]*models.RepositoryScript, error) {
+	return make(map[string][]*models.RepositoryScript), nil
+}
+func (m *mockRepository) GetRepositoryByProviderIdentity(_ context.Context, _ models.ProviderRepositoryIdentity) (*models.Repository, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetRepositoryByLocalPath(_ context.Context, _, _ string) (*models.Repository, error) {
+	return nil, nil
+}
+func (m *mockRepository) CreateExecutor(ctx context.Context, executor *models.Executor) error {
+	return nil
+}
+func (m *mockRepository) GetExecutor(ctx context.Context, id string) (*models.Executor, error) {
+	if m.executors != nil {
+		if executor, ok := m.executors[id]; ok {
+			return executor, nil
+		}
+	}
+	return nil, fmt.Errorf("executor not found: %s", id)
+}
+func (m *mockRepository) UpdateExecutor(ctx context.Context, executor *models.Executor) error {
+	return nil
+}
+func (m *mockRepository) DeleteExecutor(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListExecutors(ctx context.Context) ([]*models.Executor, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListExecutorsRunning(ctx context.Context) ([]*models.ExecutorRunning, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListExecutorsRunningByTaskID(ctx context.Context, taskID string) ([]*models.ExecutorRunning, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetExecutorRunningExistenceByTaskIDs(ctx context.Context, taskIDs []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (m *mockRepository) UpsertExecutorRunning(ctx context.Context, running *models.ExecutorRunning) error {
+	return nil
+}
+func (m *mockRepository) GetExecutorRunningBySessionID(ctx context.Context, sessionID string) (*models.ExecutorRunning, error) {
+	return nil, nil
+}
+func (m *mockRepository) DeleteExecutorRunningBySessionID(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockRepository) HasExecutorRunningRow(ctx context.Context, sessionID string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) UpdateResumeToken(ctx context.Context, sessionID, expectedExecID, resumeToken, lastMessageUUID string) error {
+	return nil
+}
+func (m *mockRepository) UpdateExecutorRunningStatus(ctx context.Context, sessionID, status string) error {
+	return nil
+}
+func (m *mockRepository) RepairExecutorRunningDead(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockRepository) ListSSHExecutorsForReachability(ctx context.Context) ([]*models.Executor, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetExecutorReachability(ctx context.Context, executorID string) (*models.ExecutorReachability, error) {
+	return nil, models.ErrExecutorReachabilityNotFound
+}
+func (m *mockRepository) ListExecutorReachability(ctx context.Context) ([]*models.ExecutorReachability, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpsertExecutorReachability(ctx context.Context, obs models.ExecutorReachabilityObservation) error {
+	return nil
+}
+func (m *mockRepository) ResetExecutorReachability(ctx context.Context, executorID, host string, seenUpdatedAt time.Time) error {
+	return nil
+}
+func (m *mockRepository) DeleteExecutorReachability(ctx context.Context, executorID string) error {
+	return nil
+}
+func (m *mockRepository) CreateEnvironment(ctx context.Context, environment *models.Environment) error {
+	return nil
+}
+func (m *mockRepository) GetEnvironment(ctx context.Context, id string) (*models.Environment, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateEnvironment(ctx context.Context, environment *models.Environment) error {
+	return nil
+}
+func (m *mockRepository) DeleteEnvironment(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) ListEnvironments(ctx context.Context) ([]*models.Environment, error) {
+	return nil, nil
+}
+func (m *mockRepository) Close() error {
+	return nil
+}
+
+// Task environment operations
+func (m *mockRepository) CreateTaskEnvironment(ctx context.Context, env *models.TaskEnvironment) error {
+	return nil
+}
+func (m *mockRepository) GetTaskEnvironment(ctx context.Context, id string) (*models.TaskEnvironment, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetTaskEnvironmentByTaskID(ctx context.Context, taskID string) (*models.TaskEnvironment, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetTaskEnvironmentExistenceByTaskIDs(ctx context.Context, taskIDs []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (m *mockRepository) UpdateTaskEnvironment(ctx context.Context, env *models.TaskEnvironment) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskEnvironment(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskEnvironmentsByTask(ctx context.Context, taskID string) error {
+	return nil
+}
+func (m *mockRepository) CreateTaskEnvironmentRepo(ctx context.Context, repo *models.TaskEnvironmentRepo) error {
+	return nil
+}
+func (m *mockRepository) ListTaskEnvironmentRepos(ctx context.Context, envID string) ([]*models.TaskEnvironmentRepo, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateTaskEnvironmentRepo(ctx context.Context, repo *models.TaskEnvironmentRepo) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskEnvironmentRepo(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskEnvironmentReposByEnv(ctx context.Context, envID string) error {
+	return nil
+}
+
+// Git Snapshot operations
+func (m *mockRepository) CreateGitSnapshot(ctx context.Context, snapshot *models.GitSnapshot) error {
+	return nil
+}
+func (m *mockRepository) GetLatestGitSnapshot(ctx context.Context, sessionID string) (*models.GitSnapshot, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetLatestGitSnapshotsBySessionIDs(ctx context.Context, sessionIDs []string) (map[string]*models.GitSnapshot, error) {
+	return make(map[string]*models.GitSnapshot), nil
+}
+func (m *mockRepository) GetLatestGitSnapshotByTaskEnvironmentID(ctx context.Context, taskEnvironmentID string) (*models.GitSnapshot, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetLatestGitSnapshotsByTaskEnvironmentIDs(ctx context.Context, taskEnvironmentIDs []string) (map[string]*models.GitSnapshot, error) {
+	return make(map[string]*models.GitSnapshot), nil
+}
+func (m *mockRepository) GetLatestGitStatusSnapshotsByTaskEnvironmentIDs(ctx context.Context, taskEnvironmentIDs []string) ([]*models.GitSnapshot, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetFirstGitSnapshot(ctx context.Context, sessionID string) (*models.GitSnapshot, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetGitSnapshotsBySession(ctx context.Context, sessionID string, limit int) ([]*models.GitSnapshot, error) {
+	return nil, nil
+}
+
+// Session Commit operations
+func (m *mockRepository) CreateSessionCommit(ctx context.Context, commit *models.SessionCommit) (bool, error) {
+	return true, nil
+}
+func (m *mockRepository) GetSessionCommits(ctx context.Context, sessionID string) ([]*models.SessionCommit, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetLatestSessionCommit(ctx context.Context, sessionID string) (*models.SessionCommit, error) {
+	return nil, nil
+}
+func (m *mockRepository) DeleteSessionCommit(ctx context.Context, id string) error {
+	return nil
+}
+func (m *mockRepository) GetPrimarySessionByTaskID(ctx context.Context, taskID string) (*models.TaskSession, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetPrimarySessionIDsByTaskIDs(ctx context.Context, taskIDs []string) (map[string]string, error) {
+	return make(map[string]string), nil
+}
+func (m *mockRepository) GetSessionCountsByTaskIDs(ctx context.Context, taskIDs []string) (map[string]int, error) {
+	return make(map[string]int), nil
+}
+func (m *mockRepository) GetPrimarySessionInfoByTaskIDs(ctx context.Context, taskIDs []string) (map[string]*models.TaskSession, error) {
+	return make(map[string]*models.TaskSession), nil
+}
+func (m *mockRepository) BatchGetSessionsByTaskIDs(ctx context.Context, taskIDs []string) (map[string][]*models.TaskSession, error) {
+	result := make(map[string][]*models.TaskSession)
+	wanted := make(map[string]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		wanted[taskID] = struct{}{}
+	}
+	for _, session := range m.sessions {
+		if _, ok := wanted[session.TaskID]; ok {
+			result[session.TaskID] = append(result[session.TaskID], session)
+		}
+	}
+	return result, nil
+}
+func (m *mockRepository) SetSessionPrimary(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockRepository) UpdateSessionWorkflowStep(ctx context.Context, sessionID string, stepID string) error {
+	return nil
+}
+func (m *mockRepository) UpdateSessionReviewStatus(ctx context.Context, sessionID string, status string) error {
+	return nil
+}
+func (m *mockRepository) UpdateSessionMetadata(ctx context.Context, sessionID string, metadata map[string]interface{}) error {
+	return nil
+}
+func (m *mockRepository) SetSessionMetadataKey(ctx context.Context, sessionID, key string, value interface{}) error {
+	if session := m.sessions[sessionID]; session != nil {
+		if session.Metadata == nil {
+			session.Metadata = make(map[string]interface{})
+		}
+		if value == nil {
+			delete(session.Metadata, key)
+		} else {
+			session.Metadata[key] = value
+		}
+	}
+	return nil
+}
+func (m *mockRepository) SetSessionACPSessionID(_ context.Context, _ string, _ string) (bool, error) {
+	return false, nil
+}
+func (m *mockRepository) DismissLastAgentError(_ context.Context, _ string, _ models.LastAgentError, _ time.Time) (bool, error) {
+	return true, nil
+}
+func (m *mockRepository) GetLastAgentMessage(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (m *mockRepository) UpdateTaskSessionLastReadMessageID(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
+// Task Plan operations
+func (m *mockRepository) CreateTaskPlan(ctx context.Context, plan *models.TaskPlan) error {
+	return nil
+}
+func (m *mockRepository) GetTaskPlan(ctx context.Context, taskID string) (*models.TaskPlan, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateTaskPlan(ctx context.Context, plan *models.TaskPlan) error {
+	return nil
+}
+func (m *mockRepository) DeleteTaskPlan(ctx context.Context, taskID string) error {
+	return nil
+}
+func (m *mockRepository) UpsertSessionFileReview(ctx context.Context, review *models.SessionFileReview) error {
+	return nil
+}
+func (m *mockRepository) GetSessionFileReviews(ctx context.Context, sessionID string) ([]*models.SessionFileReview, error) {
+	return nil, nil
+}
+func (m *mockRepository) DeleteSessionFileReviews(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (m *mockRepository) CountTasksByWorkflow(ctx context.Context, workflowID string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepository) CountTasksByWorkflowStep(ctx context.Context, stepID string) (int, error) {
+	return 0, nil
+}
+
+// Executor profile operations
+func (m *mockRepository) CreateExecutorProfile(ctx context.Context, profile *models.ExecutorProfile) error {
+	return nil
+}
+func (m *mockRepository) GetExecutorProfile(ctx context.Context, id string) (*models.ExecutorProfile, error) {
+	return nil, nil
+}
+func (m *mockRepository) UpdateExecutorProfile(ctx context.Context, profile *models.ExecutorProfile) error {
+	return nil
+}
+func (m *mockRepository) UpdateExecutorProfileIfUnmodified(ctx context.Context, profile *models.ExecutorProfile, expectedUpdatedAt time.Time) error {
+	return nil
+}
+func (m *mockRepository) DeleteExecutorProfile(ctx context.Context, id string) error { return nil }
+func (m *mockRepository) ListExecutorProfiles(ctx context.Context, executorID string) ([]*models.ExecutorProfile, error) {
+	return nil, nil
+}
+func (m *mockRepository) ListAllExecutorProfiles(ctx context.Context) ([]*models.ExecutorProfile, error) {
+	return nil, nil
+}
+
+func newTestService(t *testing.T, scripts map[string][]*models.RepositoryScript) *service.Service {
+	log, err := logger.NewLogger(logger.LoggingConfig{
+		Level:  "error",
+		Format: "json",
+	})
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	repo := &mockRepository{scriptsByRepo: scripts}
+	return service.NewService(service.Repos{
+		Workspaces: repo, Tasks: repo, TaskRepos: repo,
+		Workflows: repo, Messages: repo, Turns: repo,
+		Sessions: repo, GitSnapshots: repo, RepoEntities: repo,
+		Executors: repo, Environments: repo, TaskEnvironments: repo,
+		Reviews: repo,
+	}, nil, log, service.RepositoryDiscoveryConfig{})
+}
+
+func addExecution(t *testing.T, mgr *lifecycle.Manager, exec *lifecycle.AgentExecution) {
+	t.Helper()
+	store := getExecutionStore(t, mgr)
+	store.Add(exec)
+}
+
+func getExecutionStore(t *testing.T, mgr *lifecycle.Manager) *lifecycle.ExecutionStore {
+	t.Helper()
+	value := reflect.ValueOf(mgr).Elem().FieldByName("executionStore")
+	if !value.IsValid() {
+		t.Fatal("executionStore field not found on lifecycle manager")
+	}
+	value = reflect.NewAt(value.Type(), unsafe.Pointer(value.UnsafeAddr())).Elem()
+	store, ok := value.Interface().(*lifecycle.ExecutionStore)
+	if !ok {
+		t.Fatal("executionStore is not *lifecycle.ExecutionStore")
+	}
+	return store
+}
+
+func newLifecycleManager(t *testing.T, log *logger.Logger) *lifecycle.Manager {
+	t.Helper()
+	reg := registry.NewRegistry(log)
+	return lifecycle.NewManager(reg, nil, nil, nil, nil, nil, lifecycle.ExecutorFallbackWarn, "", log)
+}
+
+func newAgentctlClient(t *testing.T, serverURL string, log *logger.Logger) *agentctlclient.Client {
+	t.Helper()
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatalf("failed to parse server url: %v", err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatalf("failed to parse server port: %v", err)
+	}
+	return agentctlclient.NewClient(parsed.Hostname(), port, log)
+}
+
+func newProcessStopRouter(
+	t *testing.T,
+	svc *service.Service,
+	lifecycleMgr *lifecycle.Manager,
+	log *logger.Logger,
+) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	RegisterProcessRoutes(router, svc, lifecycleMgr, log)
+	return router
+}
+
+func TestResolveScriptCommandBuiltins(t *testing.T) {
+	svc := newTestService(t, nil)
+	repo := &models.Repository{ID: "repo-1", SetupScript: "echo setup", CleanupScript: "echo cleanup", DevScript: "echo dev"}
+
+	cmd, kind, scriptName, err := resolveScriptCommand(context.Background(), svc, repo, "setup", "")
+	if err != nil || cmd != "echo setup" || kind != "setup" || scriptName != "" {
+		t.Fatalf("unexpected setup result: cmd=%q kind=%q script=%q err=%v", cmd, kind, scriptName, err)
+	}
+
+	cmd, kind, scriptName, err = resolveScriptCommand(context.Background(), svc, repo, "cleanup", "")
+	if err != nil || cmd != "echo cleanup" || kind != "cleanup" || scriptName != "" {
+		t.Fatalf("unexpected cleanup result: cmd=%q kind=%q script=%q err=%v", cmd, kind, scriptName, err)
+	}
+
+	cmd, kind, scriptName, err = resolveScriptCommand(context.Background(), svc, repo, "dev", "")
+	if err != nil || cmd != "echo dev" || kind != "dev" || scriptName != "" {
+		t.Fatalf("unexpected dev result: cmd=%q kind=%q script=%q err=%v", cmd, kind, scriptName, err)
+	}
+}
+
+func TestResolveScriptCommandCustom(t *testing.T) {
+	scripts := map[string][]*models.RepositoryScript{
+		"repo-1": {
+			{ID: "s1", RepositoryID: "repo-1", Name: "build", Command: "make build"},
+		},
+	}
+	svc := newTestService(t, scripts)
+	repo := &models.Repository{ID: "repo-1"}
+
+	cmd, kind, scriptName, err := resolveScriptCommand(context.Background(), svc, repo, "custom", "build")
+	if err != nil || cmd != "make build" || kind != "custom" || scriptName != "build" {
+		t.Fatalf("unexpected custom result: cmd=%q kind=%q script=%q err=%v", cmd, kind, scriptName, err)
+	}
+}
+
+func TestResolveScriptCommandErrors(t *testing.T) {
+	svc := newTestService(t, nil)
+	repo := &models.Repository{ID: "repo-1"}
+
+	if _, _, _, err := resolveScriptCommand(context.Background(), svc, repo, "setup", ""); err == nil {
+		t.Fatal("expected error for missing setup script")
+	}
+	if _, _, _, err := resolveScriptCommand(context.Background(), svc, repo, "cleanup", ""); err == nil {
+		t.Fatal("expected error for missing cleanup script")
+	}
+	if _, _, _, err := resolveScriptCommand(context.Background(), svc, repo, "dev", ""); err == nil {
+		t.Fatal("expected error for missing dev script")
+	}
+	if _, _, _, err := resolveScriptCommand(context.Background(), svc, repo, "custom", ""); err == nil {
+		t.Fatal("expected error for missing custom script name")
+	}
+	if _, _, _, err := resolveScriptCommand(context.Background(), svc, repo, "custom", "unknown"); err == nil {
+		t.Fatal("expected error for unknown custom script")
+	}
+}
+
+func TestSetSessionRuntimeConfigOverridesPersistWithoutRunningAgent(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		assertions func(*testing.T, models.SessionRuntimeConfig, map[string]interface{})
+	}{
+		{
+			name: "model",
+			path: "/api/v1/task-sessions/session-idle/set-model",
+			body: `{"model_id":"claude-opus-4-8"}`,
+			assertions: func(t *testing.T, cfg models.SessionRuntimeConfig, _ map[string]interface{}) {
+				t.Helper()
+				if cfg.Model != "claude-opus-4-8" {
+					t.Fatalf("expected persisted model, got %q", cfg.Model)
+				}
+			},
+		},
+		{
+			name: "dynamic model option",
+			path: "/api/v1/task-sessions/session-idle/set-config-option",
+			body: `{"config_id":"model","value":"claude-opus-4-8"}`,
+			assertions: func(t *testing.T, cfg models.SessionRuntimeConfig, _ map[string]interface{}) {
+				t.Helper()
+				if cfg.Model != "claude-opus-4-8" || cfg.ConfigOptions["model"] != "claude-opus-4-8" {
+					t.Fatalf("expected persisted dynamic model option, got %+v", cfg)
+				}
+			},
+		},
+		{
+			name: "mode",
+			path: "/api/v1/task-sessions/session-idle/set-mode",
+			body: `{"mode_id":"acceptEdits"}`,
+			assertions: func(t *testing.T, cfg models.SessionRuntimeConfig, metadata map[string]interface{}) {
+				t.Helper()
+				if cfg.Mode != "acceptEdits" || metadata[models.SessionMetaKeySessionMode] != "acceptEdits" {
+					t.Fatalf("expected persisted mode, got config=%+v metadata=%+v", cfg, metadata)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+			if err != nil {
+				t.Fatalf("failed to create logger: %v", err)
+			}
+			session := &models.TaskSession{
+				ID:       "session-idle",
+				TaskID:   "task-1",
+				State:    models.TaskSessionStateIdle,
+				Metadata: make(map[string]interface{}),
+			}
+			repo := &mockRepository{sessions: map[string]*models.TaskSession{session.ID: session}}
+			svc := service.NewService(service.Repos{
+				Workspaces: repo, Tasks: repo, TaskRepos: repo,
+				Workflows: repo, Messages: repo, Turns: repo,
+				Sessions: repo, GitSnapshots: repo, RepoEntities: repo,
+				Executors: repo, Environments: repo, TaskEnvironments: repo,
+				Reviews: repo,
+			}, nil, log, service.RepositoryDiscoveryConfig{})
+
+			lifecycleMgr := newLifecycleManager(t, log)
+			workspaceOnlyExecution := (&lifecycle.ExecutorInstance{
+				InstanceID: "execution-workspace-only",
+				TaskID:     session.TaskID,
+				SessionID:  session.ID,
+			}).ToAgentExecution(&lifecycle.ExecutorCreateRequest{
+				InstanceID:     "execution-workspace-only",
+				TaskID:         session.TaskID,
+				SessionID:      session.ID,
+				AgentProfileID: "profile-1",
+				WorkspacePath:  "/tmp",
+			})
+			addExecution(t, lifecycleMgr, workspaceOnlyExecution)
+
+			router := newProcessStopRouter(t, svc, lifecycleMgr, log)
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusOK {
+				t.Fatalf("expected idle session update to succeed, got %d: %s", resp.Code, resp.Body.String())
+			}
+			cfg, ok := models.LoadSessionRuntimeConfigOverrides(session.Metadata)
+			if !ok {
+				t.Fatalf("expected persisted runtime config overrides, got %+v", session.Metadata)
+			}
+			tt.assertions(t, cfg, session.Metadata)
+		})
+	}
+}
+
+func TestStopProcessRejectsDifferentSession(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	stopCalled := atomic.Bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/processes/stop":
+			stopCalled.Store(true)
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/processes/"):
+			resp := agentctlclient.ProcessInfo{
+				ID:        "proc-1",
+				SessionID: "session-other",
+				Kind:      agentctlclient.ProcessKind("dev"),
+				Status:    agentctlclient.ProcessStatus("running"),
+			}
+			data, _ := json.Marshal(resp)
+			_, _ = w.Write(data)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	repo := &mockRepository{
+		sessions: map[string]*models.TaskSession{
+			"session-a": {ID: "session-a", TaskID: "task-1", ExecutorID: "exec-1"},
+		},
+		executors: map[string]*models.Executor{
+			"exec-1": {ID: "exec-1", Type: models.ExecutorTypeLocal},
+		},
+	}
+	svc := service.NewService(service.Repos{
+		Workspaces: repo, Tasks: repo, TaskRepos: repo,
+		Workflows: repo, Messages: repo, Turns: repo,
+		Sessions: repo, GitSnapshots: repo, RepoEntities: repo,
+		Executors: repo, Environments: repo, TaskEnvironments: repo,
+		Reviews: repo,
+	}, nil, log, service.RepositoryDiscoveryConfig{})
+	lifecycleMgr := newLifecycleManager(t, log)
+	client := newAgentctlClient(t, server.URL, log)
+	exec := (&lifecycle.ExecutorInstance{
+		InstanceID: "exec-1",
+		TaskID:     "task-1",
+		SessionID:  "session-a",
+		Client:     client,
+	}).ToAgentExecution(&lifecycle.ExecutorCreateRequest{
+		InstanceID:     "exec-1",
+		TaskID:         "task-1",
+		SessionID:      "session-a",
+		AgentProfileID: "profile-1",
+		WorkspacePath:  "/tmp",
+	})
+	addExecution(t, lifecycleMgr, exec)
+
+	router := newProcessStopRouter(t, svc, lifecycleMgr, log)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/task-sessions/session-a/processes/proc-1/stop", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for mismatched session, got %d", resp.Code)
+	}
+	if stopCalled.Load() {
+		t.Fatal("expected stop endpoint not to be called on session mismatch")
+	}
+}
+
+func TestStopProcessAgentctlUnavailable(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	stopCalled := atomic.Bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/processes/stop":
+			stopCalled.Store(true)
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/processes/"):
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	repo := &mockRepository{
+		sessions: map[string]*models.TaskSession{
+			"session-a": {ID: "session-a", TaskID: "task-1", ExecutorID: "exec-1"},
+		},
+		executors: map[string]*models.Executor{
+			"exec-1": {ID: "exec-1", Type: models.ExecutorTypeLocal},
+		},
+	}
+	svc := service.NewService(service.Repos{
+		Workspaces: repo, Tasks: repo, TaskRepos: repo,
+		Workflows: repo, Messages: repo, Turns: repo,
+		Sessions: repo, GitSnapshots: repo, RepoEntities: repo,
+		Executors: repo, Environments: repo, TaskEnvironments: repo,
+		Reviews: repo,
+	}, nil, log, service.RepositoryDiscoveryConfig{})
+	lifecycleMgr := newLifecycleManager(t, log)
+	client := newAgentctlClient(t, server.URL, log)
+	exec := (&lifecycle.ExecutorInstance{
+		InstanceID: "exec-1",
+		TaskID:     "task-1",
+		SessionID:  "session-a",
+		Client:     client,
+	}).ToAgentExecution(&lifecycle.ExecutorCreateRequest{
+		InstanceID:     "exec-1",
+		TaskID:         "task-1",
+		SessionID:      "session-a",
+		AgentProfileID: "profile-1",
+		WorkspacePath:  "/tmp",
+	})
+	addExecution(t, lifecycleMgr, exec)
+
+	router := newProcessStopRouter(t, svc, lifecycleMgr, log)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/task-sessions/session-a/processes/proc-1/stop", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when agentctl is unavailable, got %d", resp.Code)
+	}
+	if stopCalled.Load() {
+		t.Fatal("expected stop endpoint not to be called when get process fails")
+	}
+}

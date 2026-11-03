@@ -1,0 +1,1563 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/office/shared"
+	runsservice "github.com/kandev/kandev/internal/runs/service"
+)
+
+func TestCapabilitiesMarshalProjectCapabilityKeys(t *testing.T) {
+	raw, err := MarshalCapabilities(Capabilities{})
+	if err != nil {
+		t.Fatalf("marshal capabilities: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	for _, key := range []string{"list_projects", "create_project"} {
+		if _, ok := payload[key]; !ok {
+			t.Errorf("capability JSON missing %q: %s", key, raw)
+		}
+	}
+}
+
+func TestRunContextAllowsCurrentAndScopedTaskMutations(t *testing.T) {
+	ctx := RunContext{
+		TaskID: "task-current",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+			AllowedTaskIDs:      []string{"task-extra"},
+		},
+	}
+
+	for _, taskID := range []string{"task-current", "task-extra"} {
+		if !ctx.CanMutateTask(taskID) {
+			t.Fatalf("expected task %q to be mutable", taskID)
+		}
+	}
+
+	if ctx.CanMutateTask("task-other") {
+		t.Fatal("expected unrelated task to be denied")
+	}
+}
+
+func TestRunContextWildcardAllowsAnyTaskMutation(t *testing.T) {
+	ctx := RunContext{
+		TaskID: "task-current",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+			AllowedTaskIDs:      []string{WildcardTaskScope},
+		},
+	}
+
+	if !ctx.CanMutateTask("task-other") {
+		t.Fatal("expected wildcard task scope to allow unrelated task")
+	}
+}
+
+func TestActionsPostCommentDeniesMissingCapability(t *testing.T) {
+	writer := &recordingCommentWriter{}
+	actions := NewActions(ActionDependencies{Comments: writer})
+	runCtx := RunContext{AgentID: "agent-1", TaskID: "task-1"}
+
+	err := actions.PostComment(context.Background(), runCtx, "task-1", "hello")
+	if !errors.Is(err, ErrCapabilityDenied) || !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if len(writer.comments) != 0 {
+		t.Fatal("comment writer should not be called when capability is missing")
+	}
+}
+
+func TestActionsPostCommentWritesAgentComment(t *testing.T) {
+	writer := &recordingCommentWriter{}
+	actions := NewActions(ActionDependencies{Comments: writer})
+	runCtx := RunContext{
+		AgentID:   "agent-1",
+		TaskID:    "task-1",
+		RunID:     "run-1",
+		SessionID: "session-1",
+		Capabilities: Capabilities{
+			CanPostComments: true,
+		},
+	}
+
+	if err := actions.PostComment(context.Background(), runCtx, "task-1", "hello"); err != nil {
+		t.Fatalf("post comment: %v", err)
+	}
+
+	if len(writer.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(writer.comments))
+	}
+	comment := writer.comments[0]
+	if comment.AuthorType != "agent" || comment.AuthorID != "agent-1" {
+		t.Fatalf("unexpected author: %s/%s", comment.AuthorType, comment.AuthorID)
+	}
+	if comment.Source != "agent" || comment.Body != "hello" || comment.TaskID != "task-1" {
+		t.Fatalf("unexpected comment payload: %+v", comment)
+	}
+	if comment.ID == "" || comment.CreatedAt.IsZero() {
+		t.Fatalf("expected generated id and timestamp: %+v", comment)
+	}
+}
+
+func TestActionsCreateSubtaskDeniesWithoutCapability(t *testing.T) {
+	creator := &recordingTaskCreator{}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "task-1"}
+
+	_, err := actions.CreateSubtask(context.Background(), runCtx, CreateSubtaskInput{
+		Title: "child",
+	})
+	if !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatal("task creator should not be called when capability is missing")
+	}
+}
+
+func TestActionsCreateSubtaskRefusesWildcardBoundRunDefaultParent(t *testing.T) {
+	// An omitted ParentTaskID defaults to runCtx.TaskID. A run whose payload
+	// injected task_id="*" stays task-bound with TaskID == WildcardTaskScope
+	// (context_builder.go#build), so the default here resolves to the
+	// sentinel itself and must be refused rather than treated as an
+	// ordinary bound parent task.
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		TaskID:      WildcardTaskScope,
+		Capabilities: Capabilities{
+			CanCreateSubtasks: true,
+		},
+	}
+
+	_, err := actions.CreateSubtask(context.Background(), runCtx, CreateSubtaskInput{
+		Title: "child",
+	})
+	if !errors.Is(err, ErrTaskOutOfScope) {
+		t.Fatalf("error = %v, want ErrTaskOutOfScope — a wildcard-bound run must not create a subtask under the sentinel", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatal("task creator should not be called when the resolved parent is the wildcard sentinel")
+	}
+}
+
+func TestActionsCreateSubtaskPreservesCallerIdentity(t *testing.T) {
+	creator := &recordingTaskCreator{
+		taskID: "created-task",
+		taskScopes: map[string]taskScope{
+			"task-parent": {WorkspaceID: "ws-1"},
+		},
+	}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		TaskID:      "task-parent",
+		RunID:       "run-1",
+		Capabilities: Capabilities{
+			CanCreateSubtasks: true,
+		},
+	}
+
+	taskID, err := actions.CreateSubtask(context.Background(), runCtx, CreateSubtaskInput{
+		AssigneeAgentID: "agent-2",
+		Title:           "child",
+		Description:     "details",
+	})
+	if err != nil {
+		t.Fatalf("create subtask: %v", err)
+	}
+	if taskID != "created-task" {
+		t.Fatalf("task id = %q, want created-task", taskID)
+	}
+	if len(creator.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(creator.calls))
+	}
+	call := creator.calls[0]
+	if call.CallerAgentID != "agent-1" {
+		t.Fatalf("unexpected caller: %+v", call)
+	}
+	if call.ParentTaskID != "task-parent" || call.AssigneeAgentID != "agent-2" {
+		t.Fatalf("unexpected task routing: %+v", call)
+	}
+	// AC-OFFICE-RUN-CAUSATION-001.5: a subtask creation is an Office
+	// trigger exactly like a root task creation, so the invoking run must
+	// reach the task creator as the causing run.
+	if call.CausingRunID != "run-1" {
+		t.Errorf("causingRunID = %q, want run-1 (the invoking run)", call.CausingRunID)
+	}
+}
+
+func TestActionsCreateTaskUsesTokenWorkspaceAndAssignment(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-1", WorkspaceID: "ws-1"},
+	}}
+	agents := &recordingAgentModifier{agents: map[string]*models.AgentInstance{
+		"agent-2": {ID: "agent-2", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	taskID, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "Root task", ProjectID: "project-1", AssigneeAgentID: "agent-2",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if taskID != "created-task" || len(creator.calls) != 1 {
+		t.Fatalf("task id/calls = %q/%d", taskID, len(creator.calls))
+	}
+	call := creator.calls[0]
+	if !call.Root || call.WorkspaceID != "ws-1" || call.ProjectID != "project-1" || call.AssigneeAgentID != "agent-2" {
+		t.Fatalf("create call = %#v", call)
+	}
+}
+
+func TestActionsCreateTaskWithParentRequiresSubtaskCapabilityBeforeLookup(t *testing.T) {
+	creator := &recordingTaskCreator{taskScopes: map[string]taskScope{
+		"parent-1": {WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "parent-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "child", ParentTaskID: "parent-1",
+	})
+	if !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("error = %v, want subtask capability denial", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called without subtask capability: %#v", creator.calls)
+	}
+	if len(creator.workspaceLookups) != 0 || len(creator.projectLookups) != 0 {
+		t.Fatalf("parent relations looked up before capability denial: %#v/%#v", creator.workspaceLookups, creator.projectLookups)
+	}
+}
+
+func TestActionsCreateTaskWithParentRequiresParentScope(t *testing.T) {
+	creator := &recordingTaskCreator{taskScopes: map[string]taskScope{
+		"parent-2": {WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "task-1",
+		Capabilities: Capabilities{CanCreateSubtasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "child", ParentTaskID: "parent-2",
+	})
+	if !errors.Is(err, ErrTaskOutOfScope) {
+		t.Fatalf("error = %v, want task scope denial", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called for out-of-scope parent: %#v", creator.calls)
+	}
+	if len(creator.workspaceLookups) != 0 || len(creator.projectLookups) != 0 {
+		t.Fatalf("parent relations looked up before scope denial: %#v/%#v", creator.workspaceLookups, creator.projectLookups)
+	}
+}
+
+func TestActionsCreateTaskWithParentUsesScopedSubtaskCapability(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "child-1", taskScopes: map[string]taskScope{
+		"parent-1": {WorkspaceID: "ws-1", ProjectID: "project-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "task-1", RunID: "run-1",
+		Capabilities: Capabilities{
+			CanCreateSubtasks: true,
+			AllowedTaskIDs:    []string{"parent-1"},
+		},
+	}
+
+	taskID, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "child", ParentTaskID: "parent-1",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if taskID != "child-1" || len(creator.calls) != 1 || creator.calls[0].ParentTaskID != "parent-1" {
+		t.Fatalf("task id/calls = %q/%#v", taskID, creator.calls)
+	}
+	// AC-OFFICE-RUN-CAUSATION-001.5: CreateTask's parent-task branch is the
+	// same Office trigger as CreateSubtask; it must thread the invoking run
+	// through identically.
+	if creator.calls[0].CausingRunID != "run-1" {
+		t.Errorf("causingRunID = %q, want run-1 (the invoking run)", creator.calls[0].CausingRunID)
+	}
+}
+
+func TestActionsCreateTaskDeniesNonCanonicalSameWorkspaceAssigneeBeforePersistence(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	agents := &recordingAgentModifier{agents: map[string]*models.AgentInstance{
+		"Platform worker": {ID: "agent-2", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "Root task", AssigneeAgentID: "Platform worker",
+	})
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("error = %v, want workspace scope denial", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called for non-canonical assignee: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskTrimsCanonicalAssigneeBeforePersistence(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	agents := &recordingAgentModifier{agents: map[string]*models.AgentInstance{
+		"agent-2": {ID: "agent-2", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "Root task", AssigneeAgentID: " agent-2 ",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if len(creator.calls) != 1 || creator.calls[0].AssigneeAgentID != "agent-2" {
+		t.Fatalf("creator calls = %#v, want canonical assignee agent-2", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskNormalizesTitleBeforePersistence(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "  Root task  "})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if len(creator.calls) != 1 || creator.calls[0].Title != "Root task" {
+		t.Fatalf("creator calls = %#v, want normalized title", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRejectsBlankRootAndChildTitlesBeforePersistence(t *testing.T) {
+	for _, parentID := range []string{"", "parent-1"} {
+		name := "root"
+		if parentID != "" {
+			name = "child"
+		}
+		t.Run(name, func(t *testing.T) {
+			creator := &recordingTaskCreator{taskScopes: map[string]taskScope{
+				"parent-1": {WorkspaceID: "ws-1"},
+			}}
+			actions := NewActions(ActionDependencies{Tasks: creator})
+			runCtx := RunContext{
+				AgentID: "agent-1", WorkspaceID: "ws-1",
+				Capabilities: Capabilities{
+					CanCreateTasks:    true,
+					CanCreateSubtasks: true,
+					AllowedTaskIDs:    []string{"parent-1"},
+				},
+			}
+
+			_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+				Title: " \t ", ParentTaskID: parentID,
+			})
+			if err == nil || !strings.Contains(err.Error(), "task title is required") {
+				t.Fatalf("error = %v, want required title error", err)
+			}
+			if len(creator.calls) != 0 {
+				t.Fatalf("creator called for blank title: %#v", creator.calls)
+			}
+		})
+	}
+}
+
+func TestActionsCreateTaskDeniesCrossWorkspaceRelationsBeforePersistence(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    CreateTaskInput
+		projects []*models.Project
+		tasks    map[string]taskScope
+		agents   map[string]*models.AgentInstance
+	}{
+		{
+			name: "project", input: CreateTaskInput{Title: "task", ProjectID: "project-2"},
+			projects: []*models.Project{{ID: "project-2", WorkspaceID: "ws-2"}},
+		},
+		{
+			name: "parent", input: CreateTaskInput{Title: "task", ParentTaskID: "parent-2"},
+			tasks: map[string]taskScope{"parent-2": {WorkspaceID: "ws-2"}},
+		},
+		{
+			// parent-2 is absent from tasks (unlike the "parent" case above), so the
+			// test double's GetTaskWorkspaceID returns ("", nil) exactly like the real
+			// repository does for a missing row. This must still deny as a workspace
+			// mismatch, not surface GetTaskProjectID's "task not found" error as a 500 -
+			// locking in that the workspace check runs, and denies, before the project
+			// check is ever reached for a nonexistent parent.
+			name: "missing parent", input: CreateTaskInput{Title: "task", ParentTaskID: "parent-2"},
+		},
+		{
+			name: "assignee", input: CreateTaskInput{Title: "task", AssigneeAgentID: "agent-2"},
+			agents: map[string]*models.AgentInstance{"agent-2": {ID: "agent-2", WorkspaceID: "ws-2"}},
+		},
+		{
+			name: "missing assignee", input: CreateTaskInput{Title: "task", AssigneeAgentID: "missing-agent"},
+			agents: map[string]*models.AgentInstance{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			creator := &recordingTaskCreator{taskScopes: tc.tasks}
+			actions := NewActions(ActionDependencies{
+				Tasks:         creator,
+				Projects:      &recordingProjectManager{projects: tc.projects},
+				AgentModifier: &recordingAgentModifier{agents: tc.agents},
+			})
+			runCtx := RunContext{
+				AgentID: "agent-1", WorkspaceID: "ws-1",
+				Capabilities: Capabilities{
+					CanCreateTasks:    true,
+					CanCreateSubtasks: true,
+					AllowedTaskIDs:    []string{"parent-2"},
+				},
+			}
+
+			_, err := actions.CreateTask(context.Background(), runCtx, tc.input)
+			if !errors.Is(err, ErrWorkspaceOutOfScope) {
+				t.Fatalf("error = %v, want workspace scope denial", err)
+			}
+			if len(creator.calls) != 0 {
+				t.Fatalf("creator called on denied relation: %#v", creator.calls)
+			}
+		})
+	}
+}
+
+func TestActionsCreateTaskDeniesParentProjectMismatchBeforePersistence(t *testing.T) {
+	creator := &recordingTaskCreator{taskScopes: map[string]taskScope{
+		"parent-1": {WorkspaceID: "ws-1", ProjectID: "project-1"},
+	}}
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-2", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanCreateSubtasks: true,
+			AllowedTaskIDs:    []string{"parent-1"},
+		},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "child", ParentTaskID: "parent-1", ProjectID: "project-2",
+	})
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("error = %v, want project scope denial", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called on mismatch: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRootDefaultsToRunTaskProject(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task", taskScopes: map[string]taskScope{
+		"task-1": {WorkspaceID: "ws-1", ProjectID: "project-1"},
+	}}
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-1", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "task-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	taskID, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "Root task"})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if taskID != "created-task" || len(creator.calls) != 1 {
+		t.Fatalf("task id/calls = %q/%d", taskID, len(creator.calls))
+	}
+	if creator.calls[0].ProjectID != "project-1" {
+		t.Fatalf("project_id = %q, want defaulted from run task's project", creator.calls[0].ProjectID)
+	}
+}
+
+func TestActionsCreateTaskSubtaskRejectsProjectMismatchWhenParentHasNone(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "child-1", taskScopes: map[string]taskScope{
+		"parent-1": {WorkspaceID: "ws-1"},
+	}}
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-1", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanCreateSubtasks: true,
+			AllowedTaskIDs:    []string{"parent-1"},
+		},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{
+		Title: "child", ParentTaskID: "parent-1", ProjectID: "project-1",
+	})
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("error = %v, want ErrWorkspaceOutOfScope: a caller-supplied project_id is unreachable on the "+
+			"subtask path and must not be silently dropped", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called on rejected project mismatch: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRootErrorsWhenProjectUnresolvedAndWorkspaceHasProjects(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-1", WorkspaceID: "ws-1"},
+		{ID: "project-2", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "Root task"})
+	if !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("error = %v, want ErrProjectRequired", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called for unresolvable project: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRootAllowsEmptyProjectWhenWorkspaceHasNone(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	projects := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	taskID, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "Root task"})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if taskID != "created-task" || len(creator.calls) != 1 || creator.calls[0].ProjectID != "" {
+		t.Fatalf("task id/calls = %q/%#v, want empty project_id preserved", taskID, creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRootFailsClosedWhenProjectLookupErrors(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	lookupErr := errors.New("list projects: transient repository failure")
+	projects := &recordingProjectManager{listErr: lookupErr}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "Root task"})
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want the ListProjects lookup error surfaced rather than treated as "+
+			"'workspace has no projects'", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called despite project lookup error: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskRootFailsClosedWhenRunTaskProjectLookupErrors(t *testing.T) {
+	creator := &recordingTaskCreator{taskID: "created-task"}
+	lookupErr := errors.New("get task project: transient repository failure")
+	creator.projectLookupErr = lookupErr
+	projects := &recordingProjectManager{projects: []*models.Project{
+		{ID: "project-1", WorkspaceID: "ws-1"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, Projects: projects})
+	runCtx := RunContext{
+		AgentID: "agent-1", WorkspaceID: "ws-1", TaskID: "task-1",
+		Capabilities: Capabilities{CanCreateTasks: true},
+	}
+
+	_, err := actions.CreateTask(context.Background(), runCtx, CreateTaskInput{Title: "Root task"})
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want the GetTaskProjectID lookup error surfaced rather than treated as "+
+			"'run task has no project'", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called despite run-task project lookup error: %#v", creator.calls)
+	}
+}
+
+func TestActionsCreateTaskDeniesMissingCapabilityBeforePersistence(t *testing.T) {
+	creator := &recordingTaskCreator{}
+	actions := NewActions(ActionDependencies{Tasks: creator})
+	_, err := actions.CreateTask(context.Background(), RunContext{WorkspaceID: "ws-1"}, CreateTaskInput{Title: "task"})
+	if !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("error = %v, want capability denial", err)
+	}
+	if len(creator.calls) != 0 {
+		t.Fatalf("creator called without capability: %#v", creator.calls)
+	}
+}
+
+func TestActionsUpdateTaskStatusDeniesUnscopedTask(t *testing.T) {
+	updater := &recordingStatusUpdater{}
+	actions := NewActions(ActionDependencies{TaskStatus: updater})
+	runCtx := RunContext{
+		AgentID: "agent-1",
+		TaskID:  "task-1",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+		},
+	}
+
+	err := actions.UpdateTaskStatus(context.Background(), runCtx, "task-2", "done", "")
+	if !errors.Is(err, ErrTaskOutOfScope) || !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if len(updater.calls) != 0 {
+		t.Fatal("status updater should not be called for an unscoped task")
+	}
+}
+
+func TestActionsUpdateTaskStatusDeniesCrossWorkspaceWildcard(t *testing.T) {
+	updater := &recordingStatusUpdater{}
+	creator := &recordingTaskCreator{taskScopes: map[string]taskScope{
+		"task-other": {WorkspaceID: "workspace-other"},
+	}}
+	actions := NewActions(ActionDependencies{Tasks: creator, TaskStatus: updater})
+	runCtx := RunContext{
+		WorkspaceID: "workspace-run",
+		TaskID:      "task-current",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+			AllowedTaskIDs:      []string{WildcardTaskScope},
+		},
+	}
+
+	err := actions.UpdateTaskStatus(context.Background(), runCtx, "task-other", "done", "")
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("error = %v, want workspace denial", err)
+	}
+	if len(updater.calls) != 0 {
+		t.Fatal("status updater should not be called for a cross-workspace task")
+	}
+}
+
+func TestActionsUpdateTaskStatusPreservesTypedValidationError(t *testing.T) {
+	validationErr := &statusValidationTestError{message: "unknown status: invalid"}
+	updater := &recordingStatusUpdater{err: validationErr}
+	actions := NewActions(ActionDependencies{TaskStatus: updater})
+	runCtx := RunContext{
+		AgentID: "agent-1",
+		TaskID:  "task-1",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+		},
+	}
+
+	err := actions.UpdateTaskStatus(context.Background(), runCtx, "task-1", "invalid", "")
+	var typed StatusValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("error = %v, want StatusValidationError", err)
+	}
+	if len(updater.calls) != 1 {
+		t.Fatalf("status updater calls = %d, want 1", len(updater.calls))
+	}
+}
+
+func TestCapabilitiesAllowsByKey(t *testing.T) {
+	caps := Capabilities{
+		CanCreateAgents:   true,
+		CanListProjects:   true,
+		CanCreateProjects: true,
+		CanReadMemory:     true,
+	}
+
+	if !caps.Allows(CapabilityCreateAgent) {
+		t.Fatal("expected create_agent to be allowed")
+	}
+	if !caps.Allows(CapabilityReadMemory) {
+		t.Fatal("expected read_memory to be allowed")
+	}
+	if !caps.Allows("list_projects") {
+		t.Fatal("expected list_projects to be allowed")
+	}
+	if !caps.Allows("create_project") {
+		t.Fatal("expected create_project to be allowed")
+	}
+	if caps.Allows(CapabilityDeleteSkills) {
+		t.Fatal("expected delete_skills to be denied")
+	}
+}
+
+func TestFromAgentMapsExistingPermissions(t *testing.T) {
+	ceo := &models.AgentInstance{
+		Role: models.AgentRoleCEO,
+	}
+	worker := &models.AgentInstance{
+		Role: models.AgentRoleWorker,
+	}
+
+	ceoCaps := FromAgent(ceo)
+	workerCaps := FromAgent(worker)
+	if !ceoCaps.Allows(CapabilityCreateAgent) {
+		t.Fatal("CEO should be allowed to create agents")
+	}
+	if !ceoCaps.CanListProjects || !ceoCaps.CanCreateProjects {
+		t.Fatal("CEO should be allowed to list and create projects")
+	}
+	if workerCaps.Allows(CapabilityCreateAgent) {
+		t.Fatal("worker should not be allowed to create agents")
+	}
+	if !workerCaps.CanListProjects || workerCaps.CanCreateProjects {
+		t.Fatal("worker should list projects but not create them by default")
+	}
+	if !ceoCaps.Allows("create_task") || !workerCaps.Allows("create_task") {
+		t.Fatal("can_create_tasks should grant the create_task runtime capability")
+	}
+
+	securityCaps := FromAgent(&models.AgentInstance{Role: models.AgentRoleSecurity})
+	if securityCaps.Allows("create_task") {
+		t.Fatal("security should not receive create_task without an explicit permission override")
+	}
+
+	if !ceoCaps.Allows(CapabilityHandoffTask) {
+		t.Fatal("CEO should be allowed to hand off tasks by default")
+	}
+	if workerCaps.Allows(CapabilityHandoffTask) {
+		t.Fatal("worker should not be allowed to hand off tasks by default")
+	}
+
+	overriddenWorker := FromAgent(&models.AgentInstance{
+		Role:        models.AgentRoleWorker,
+		Permissions: `{"can_handoff_tasks":true}`,
+	})
+	if !overriddenWorker.Allows(CapabilityHandoffTask) {
+		t.Fatal("an explicit override should grant handoff_task to a worker")
+	}
+}
+
+func TestActionsCreateAgentUsesCallerAndReportsToDefault(t *testing.T) {
+	creator := &recordingAgentCreator{}
+	actions := NewActions(ActionDependencies{Agents: creator})
+	runCtx := RunContext{
+		AgentID:     "ceo-1",
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanCreateAgents: true,
+		},
+	}
+	caller := &models.AgentInstance{ID: "ceo-1", Name: "CEO"}
+
+	agent, err := actions.CreateAgent(context.Background(), runCtx, caller, CreateAgentInput{
+		Name:   "Builder",
+		Role:   string(models.AgentRoleWorker),
+		Reason: "need implementation help",
+	})
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if agent.ReportsTo != "ceo-1" || agent.WorkspaceID != "ws-1" {
+		t.Fatalf("unexpected created agent: %+v", agent)
+	}
+	if len(creator.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(creator.calls))
+	}
+	if creator.calls[0].Caller != caller || creator.calls[0].Reason != "need implementation help" {
+		t.Fatalf("unexpected creator call: %+v", creator.calls[0])
+	}
+}
+
+func TestActionsListProjectsUsesRunWorkspace(t *testing.T) {
+	projects := &recordingProjectManager{
+		projects: []*models.Project{{ID: "project-1", WorkspaceID: "ws-1", Name: "Alpha"}},
+	}
+	actions := NewActions(ActionDependencies{Projects: projects})
+	runCtx := RunContext{
+		WorkspaceID:  "ws-1",
+		Capabilities: Capabilities{CanListProjects: true},
+	}
+
+	got, err := actions.ListProjects(context.Background(), runCtx)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "project-1" {
+		t.Fatalf("projects = %+v", got)
+	}
+	if len(projects.listWorkspaceIDs) != 1 || projects.listWorkspaceIDs[0] != "ws-1" {
+		t.Fatalf("list workspaces = %+v, want [ws-1]", projects.listWorkspaceIDs)
+	}
+}
+
+func TestActionsListProjectsRejectsMissingWorkspace(t *testing.T) {
+	projects := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{Projects: projects})
+	runCtx := RunContext{Capabilities: Capabilities{CanListProjects: true}}
+
+	_, err := actions.ListProjects(context.Background(), runCtx)
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("expected workspace scope error, got %v", err)
+	}
+	if len(projects.listWorkspaceIDs) != 0 {
+		t.Fatalf("project manager called with missing workspace: %+v", projects.listWorkspaceIDs)
+	}
+}
+
+func TestActionsCreateProjectRequiresCapability(t *testing.T) {
+	projects := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{Projects: projects})
+	runCtx := RunContext{WorkspaceID: "ws-1"}
+
+	_, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{Name: "Alpha"})
+	if !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("expected forbidden, got %v", err)
+	}
+	if len(projects.created) != 0 {
+		t.Fatal("project manager should not be called when capability is missing")
+	}
+}
+
+func TestActionsCreateProjectForcesRunWorkspace(t *testing.T) {
+	projects := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{Projects: projects})
+	runCtx := RunContext{
+		WorkspaceID:  "ws-1",
+		Capabilities: Capabilities{CanCreateProjects: true},
+	}
+
+	project, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{
+		Name:         "Alpha",
+		Repositories: []string{"github.com/acme/alpha"},
+	})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if project.WorkspaceID != "ws-1" || len(projects.created) != 1 {
+		t.Fatalf("created project = %+v, calls = %d", project, len(projects.created))
+	}
+	if project.Repositories != `["github.com/acme/alpha"]` {
+		t.Fatalf("repositories = %q", project.Repositories)
+	}
+}
+
+func TestActionsCreateProjectValidatesLeadWorkspaceBeforePersistence(t *testing.T) {
+	tests := []struct {
+		name   string
+		agents map[string]*models.AgentInstance
+	}{
+		{
+			name: "cross workspace",
+			agents: map[string]*models.AgentInstance{
+				"lead-2": {ID: "lead-2", WorkspaceID: "ws-2"},
+			},
+		},
+		{name: "missing", agents: map[string]*models.AgentInstance{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			projectManager := &recordingProjectManager{}
+			actions := NewActions(ActionDependencies{
+				Projects:      projectManager,
+				AgentModifier: &recordingAgentModifier{agents: tc.agents},
+			})
+			runCtx := RunContext{
+				WorkspaceID:  "ws-1",
+				Capabilities: Capabilities{CanCreateProjects: true},
+			}
+
+			_, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{
+				Name: "Alpha", LeadAgentProfileID: "lead-2",
+			})
+			if !errors.Is(err, ErrWorkspaceOutOfScope) {
+				t.Fatalf("error = %v, want workspace scope denial", err)
+			}
+			if len(projectManager.created) != 0 {
+				t.Fatalf("project manager called on denied lead: %#v", projectManager.created)
+			}
+		})
+	}
+}
+
+func TestActionsCreateProjectAllowsEmptyAndSameWorkspaceLead(t *testing.T) {
+	tests := []struct {
+		name       string
+		leadInput  string
+		wantLeadID string
+	}{
+		{name: "empty"},
+		{name: "same workspace ID", leadInput: "lead-1", wantLeadID: "lead-1"},
+		{name: "trimmed same workspace ID", leadInput: " lead-1 ", wantLeadID: "lead-1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			projectManager := &recordingProjectManager{}
+			actions := NewActions(ActionDependencies{
+				Projects: projectManager,
+				AgentModifier: &recordingAgentModifier{agents: map[string]*models.AgentInstance{
+					"lead-1": {ID: "lead-1", WorkspaceID: "ws-1"},
+				}},
+			})
+			runCtx := RunContext{
+				WorkspaceID:  "ws-1",
+				Capabilities: Capabilities{CanCreateProjects: true},
+			}
+
+			project, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{
+				Name: "Alpha", LeadAgentProfileID: tc.leadInput,
+			})
+			if err != nil {
+				t.Fatalf("create project: %v", err)
+			}
+			if project.LeadAgentProfileID != tc.wantLeadID || len(projectManager.created) != 1 {
+				t.Fatalf("project/calls = %#v/%d", project, len(projectManager.created))
+			}
+		})
+	}
+}
+
+func TestActionsCreateProjectDeniesNonCanonicalSameWorkspaceLeadBeforePersistence(t *testing.T) {
+	projectManager := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{
+		Projects: projectManager,
+		AgentModifier: &recordingAgentModifier{agents: map[string]*models.AgentInstance{
+			"Platform lead": {ID: "lead-1", WorkspaceID: "ws-1"},
+		}},
+	})
+	runCtx := RunContext{
+		WorkspaceID:  "ws-1",
+		Capabilities: Capabilities{CanCreateProjects: true},
+	}
+
+	_, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{
+		Name: "Alpha", LeadAgentProfileID: "Platform lead",
+	})
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("error = %v, want workspace scope denial", err)
+	}
+	if len(projectManager.created) != 0 {
+		t.Fatalf("project manager called for non-canonical lead: %#v", projectManager.created)
+	}
+}
+
+func TestActionsCreateProjectRejectsMissingWorkspace(t *testing.T) {
+	projects := &recordingProjectManager{}
+	actions := NewActions(ActionDependencies{Projects: projects})
+	runCtx := RunContext{Capabilities: Capabilities{CanCreateProjects: true}}
+
+	_, err := actions.CreateProject(context.Background(), runCtx, CreateProjectInput{Name: "Alpha"})
+	if !errors.Is(err, ErrWorkspaceOutOfScope) {
+		t.Fatalf("expected workspace scope error, got %v", err)
+	}
+	if len(projects.created) != 0 {
+		t.Fatalf("project manager called with missing workspace: %+v", projects.created)
+	}
+}
+
+func TestActionsUpdateTaskStatusPreservesRunIdentity(t *testing.T) {
+	updater := &recordingStatusUpdater{}
+	actions := NewActions(ActionDependencies{TaskStatus: updater})
+	runCtx := RunContext{
+		AgentID:   "agent-1",
+		TaskID:    "task-1",
+		RunID:     "run-1",
+		SessionID: "session-1",
+		Capabilities: Capabilities{
+			CanUpdateTaskStatus: true,
+		},
+	}
+
+	if err := actions.UpdateTaskStatus(context.Background(), runCtx, "task-1", "done", "complete"); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+	if len(updater.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(updater.calls))
+	}
+	call := updater.calls[0]
+	if call.TaskID != "task-1" || call.NewStatus != "done" || call.Comment != "complete" {
+		t.Fatalf("unexpected status call: %+v", call)
+	}
+	if call.ActorAgentID != "agent-1" || call.RunID != "run-1" || call.SessionID != "session-1" {
+		t.Fatalf("missing run identity: %+v", call)
+	}
+}
+
+func TestActionsRequestApprovalCreatesRunScopedPayload(t *testing.T) {
+	requester := &recordingApprovalRequester{}
+	actions := NewActions(ActionDependencies{Approvals: requester})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		TaskID:      "task-1",
+		RunID:       "run-1",
+		SessionID:   "sess-1",
+		Capabilities: Capabilities{
+			CanRequestApproval: true,
+		},
+	}
+
+	approval, err := actions.RequestApproval(context.Background(), runCtx, RequestApprovalInput{
+		Type:       models.ApprovalTypeTaskReview,
+		TargetType: "task",
+		TargetID:   "task-1",
+		Reason:     "needs human signoff",
+		Payload:    map[string]interface{}{"extra": "value"},
+	})
+	if err != nil {
+		t.Fatalf("request approval: %v", err)
+	}
+	if approval.WorkspaceID != "ws-1" || approval.RequestedByAgentProfileID != "agent-1" {
+		t.Fatalf("unexpected approval identity: %+v", approval)
+	}
+	if len(requester.approvals) != 1 {
+		t.Fatalf("expected 1 approval, got %d", len(requester.approvals))
+	}
+	if !strings.Contains(approval.Payload, `"run_id":"run-1"`) ||
+		!strings.Contains(approval.Payload, `"reason":"needs human signoff"`) {
+		t.Fatalf("payload missing run context: %s", approval.Payload)
+	}
+}
+
+func TestActionsSpawnAgentRunDeniesCrossWorkspaceTarget(t *testing.T) {
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-2": {ID: "agent-2", WorkspaceID: "ws-2"},
+		},
+	}
+	runs := &recordingRunSpawner{}
+	actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+	runCtx := RunContext{
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanSpawnAgentRun: true,
+		},
+	}
+
+	err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+		AgentID: "agent-2",
+		Reason:  "heartbeat",
+	})
+	if !errors.Is(err, shared.ErrForbidden) {
+		t.Fatalf("expected forbidden, got %v", err)
+	}
+	if len(runs.calls) != 0 {
+		t.Fatal("run spawner should not be called for cross-workspace target")
+	}
+}
+
+// TestActionsSpawnAgentRunThreadsInvokingAgentAsActor covers
+// AC-OFFICE-RUN-CAUSATION-001.15: SpawnAgentRun previously always called the
+// actor-blind QueueRun, so a run spawned by one agent for another was
+// silently attributed to the system actor even though the invoking agent's
+// identity (runCtx.AgentID) was already known. It must now reach
+// QueueRunWithActor as (ActorKindAgent, runCtx.AgentID), and additionally
+// carry runCtx.RunID as the causing run id (AC-OFFICE-RUN-CAUSATION-001.3/.4)
+// so the spawned run chains off the run that spawned it instead of rooting
+// its own causation chain.
+func TestActionsSpawnAgentRunThreadsInvokingAgentAsActor(t *testing.T) {
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-2": {ID: "agent-2", WorkspaceID: "ws-1"},
+		},
+	}
+	runs := &recordingRunSpawner{}
+	actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		RunID:       "run-1",
+		Capabilities: Capabilities{
+			CanSpawnAgentRun: true,
+		},
+	}
+
+	err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+		AgentID: "agent-2",
+		Reason:  "heartbeat",
+	})
+	if err != nil {
+		t.Fatalf("spawn agent run: %v", err)
+	}
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(runs.calls))
+	}
+	call := runs.calls[0]
+	if call.AgentID != "agent-2" {
+		t.Errorf("agent_id = %q, want agent-2", call.AgentID)
+	}
+	if call.ActorKind != models.ActorKindAgent {
+		t.Errorf("actorKind = %q, want %q", call.ActorKind, models.ActorKindAgent)
+	}
+	if call.ActorID != "agent-1" {
+		t.Errorf("actorID = %q, want agent-1 (the invoking agent)", call.ActorID)
+	}
+	if call.CausingRunID != "run-1" {
+		t.Errorf("causingRunID = %q, want run-1 (the invoking run)", call.CausingRunID)
+	}
+}
+
+// TestActionsSpawnAgentRunSelfTargetThreadsMatchingActor pins the
+// self-trigger case: when an agent spawns a run for itself, the actor id
+// and the target agent id must be the same value, since that equality is
+// exactly what REQ-OFFICE-LAUNCH-SAFETY-004's self-trigger refusal gate
+// keys on downstream (runs/service.checkSelfTriggerAllowance).
+func TestActionsSpawnAgentRunSelfTargetThreadsMatchingActor(t *testing.T) {
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-1": {ID: "agent-1", WorkspaceID: "ws-1"},
+		},
+	}
+	runs := &recordingRunSpawner{}
+	actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanSpawnAgentRun: true,
+		},
+	}
+
+	err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+		AgentID: "agent-1",
+		Reason:  shared.RunReasonHeartbeat,
+	})
+	if err != nil {
+		t.Fatalf("spawn agent run: %v", err)
+	}
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(runs.calls))
+	}
+	call := runs.calls[0]
+	if call.AgentID != call.ActorID {
+		t.Errorf("agent_id = %q, actorID = %q, want equal for a self-targeted spawn",
+			call.AgentID, call.ActorID)
+	}
+}
+
+// TestActionsSpawnAgentRunRejectsReasonOutsideRegistry pins
+// AC-OFFICE-LAUNCH-SAFETY-004.3: an agent-requested enqueue must name a
+// reason that is a member of the declared wake-reason registry, not free
+// text of its own choosing. Rejecting it here, before QueueRunWithActor is
+// ever called, is what closes the self-trigger allowance bypass: a free
+// reason lets an agent spread its wakes across arbitrarily many distinct
+// per-reason buckets.
+func TestActionsSpawnAgentRunRejectsReasonOutsideRegistry(t *testing.T) {
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-1": {ID: "agent-1", WorkspaceID: "ws-1"},
+		},
+	}
+	runs := &recordingRunSpawner{}
+	actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanSpawnAgentRun: true,
+		},
+	}
+
+	err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+		AgentID: "agent-1",
+		Reason:  "whatever-reason-the-agent-invents",
+	})
+	if !errors.Is(err, ErrInvalidWakeReason) {
+		t.Fatalf("err = %v, want ErrInvalidWakeReason", err)
+	}
+	if len(runs.calls) != 0 {
+		t.Fatal("run spawner should not be called for a reason outside the registry")
+	}
+}
+
+// TestActionsSpawnAgentRunRejectsEmptyReason pins AC-OFFICE-LAUNCH-SAFETY-004.3's
+// explicit "the empty string included" clause.
+func TestActionsSpawnAgentRunRejectsEmptyReason(t *testing.T) {
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-1": {ID: "agent-1", WorkspaceID: "ws-1"},
+		},
+	}
+	runs := &recordingRunSpawner{}
+	actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+	runCtx := RunContext{
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanSpawnAgentRun: true,
+		},
+	}
+
+	err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+		AgentID: "agent-1",
+		Reason:  "",
+	})
+	if !errors.Is(err, ErrInvalidWakeReason) {
+		t.Fatalf("err = %v, want ErrInvalidWakeReason", err)
+	}
+	if len(runs.calls) != 0 {
+		t.Fatal("run spawner should not be called for an empty reason")
+	}
+}
+
+// TestActionsSpawnAgentRunAcceptsEveryRegistryReason pins the positive
+// side of AC-OFFICE-LAUNCH-SAFETY-004.3: every reason actually declared in
+// shared.WakeReasonRegistry must still be accepted, so the new guard
+// narrows to exactly the registry rather than an accidental subset of it.
+func TestActionsSpawnAgentRunAcceptsEveryRegistryReason(t *testing.T) {
+	for reason := range shared.WakeReasonRegistry {
+		reason := reason
+		t.Run(reason, func(t *testing.T) {
+			agents := &recordingAgentModifier{
+				agents: map[string]*models.AgentInstance{
+					"agent-2": {ID: "agent-2", WorkspaceID: "ws-1"},
+				},
+			}
+			runs := &recordingRunSpawner{}
+			actions := NewActions(ActionDependencies{Runs: runs, AgentModifier: agents})
+			runCtx := RunContext{
+				AgentID:     "agent-1",
+				WorkspaceID: "ws-1",
+				Capabilities: Capabilities{
+					CanSpawnAgentRun: true,
+				},
+			}
+
+			err := actions.SpawnAgentRun(context.Background(), runCtx, SpawnAgentRunInput{
+				AgentID: "agent-2",
+				Reason:  reason,
+			})
+			if err != nil {
+				t.Fatalf("spawn agent run with registry reason %q: %v", reason, err)
+			}
+		})
+	}
+}
+
+func TestActionsModifyAgentUpdatesSameWorkspaceAgent(t *testing.T) {
+	name := "Runtime QA"
+	agents := &recordingAgentModifier{
+		agents: map[string]*models.AgentInstance{
+			"agent-2": {ID: "agent-2", WorkspaceID: "ws-1", Name: "Old", Role: models.AgentRoleWorker},
+		},
+	}
+	actions := NewActions(ActionDependencies{AgentModifier: agents})
+	runCtx := RunContext{
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanModifyAgents: true,
+		},
+	}
+
+	agent, err := actions.ModifyAgent(context.Background(), runCtx, "agent-2", ModifyAgentInput{Name: &name})
+	if err != nil {
+		t.Fatalf("modify agent: %v", err)
+	}
+	if agent.Name != "Runtime QA" || len(agents.updated) != 1 {
+		t.Fatalf("agent not updated: %+v updated=%d", agent, len(agents.updated))
+	}
+}
+
+func TestActionsDeleteSkillRequiresWorkspaceScope(t *testing.T) {
+	skills := &recordingSkillManager{
+		skills: map[string]*models.Skill{
+			"skill-1": {ID: "skill-1", WorkspaceID: "ws-1"},
+		},
+	}
+	actions := NewActions(ActionDependencies{Skills: skills})
+	runCtx := RunContext{
+		WorkspaceID: "ws-1",
+		Capabilities: Capabilities{
+			CanDeleteSkills: true,
+		},
+	}
+
+	if err := actions.DeleteSkill(context.Background(), runCtx, "skill-1"); err != nil {
+		t.Fatalf("delete skill: %v", err)
+	}
+	if len(skills.deleted) != 1 || skills.deleted[0] != "skill-1" {
+		t.Fatalf("unexpected deleted skills: %+v", skills.deleted)
+	}
+}
+
+type recordingCommentWriter struct {
+	comments []*models.TaskComment
+}
+
+func (w *recordingCommentWriter) CreateComment(_ context.Context, comment *models.TaskComment) error {
+	w.comments = append(w.comments, comment)
+	return nil
+}
+
+type recordingTaskCreator struct {
+	calls              []createTaskCall
+	taskID             string
+	taskScopes         map[string]taskScope
+	workspaceLookups   []string
+	projectLookups     []string
+	projectLookupErr   error
+	workspaceLookupErr error
+}
+
+type taskScope struct {
+	WorkspaceID string
+	ProjectID   string
+}
+
+func (c *recordingTaskCreator) CreateOfficeTaskAsAgent(
+	_ context.Context,
+	callerAgentID string,
+	workspaceID string,
+	projectID string,
+	assigneeAgentID string,
+	title string,
+	description string,
+	causingRunID string,
+) (string, error) {
+	c.calls = append(c.calls, createTaskCall{
+		CallerAgentID: callerAgentID, WorkspaceID: workspaceID, ProjectID: projectID,
+		AssigneeAgentID: assigneeAgentID, Title: title, Description: description, Root: true,
+		CausingRunID: causingRunID,
+	})
+	if c.taskID != "" {
+		return c.taskID, nil
+	}
+	return "task-id", nil
+}
+
+type createTaskCall struct {
+	CallerAgentID   string
+	WorkspaceID     string
+	ProjectID       string
+	ParentTaskID    string
+	AssigneeAgentID string
+	Title           string
+	Description     string
+	Root            bool
+	CausingRunID    string
+}
+
+func (c *recordingTaskCreator) GetTaskWorkspaceID(_ context.Context, taskID string) (string, error) {
+	c.workspaceLookups = append(c.workspaceLookups, taskID)
+	if c.workspaceLookupErr != nil {
+		return "", c.workspaceLookupErr
+	}
+	return c.taskScopes[taskID].WorkspaceID, nil
+}
+
+func (c *recordingTaskCreator) GetTaskProjectID(_ context.Context, taskID string) (string, error) {
+	c.projectLookups = append(c.projectLookups, taskID)
+	if c.projectLookupErr != nil {
+		return "", c.projectLookupErr
+	}
+	scope, ok := c.taskScopes[taskID]
+	if !ok {
+		return "", fmt.Errorf("task not found: %s", taskID)
+	}
+	return scope.ProjectID, nil
+}
+
+func (c *recordingTaskCreator) CreateOfficeSubtaskAsAgent(
+	_ context.Context,
+	callerAgentID string,
+	parentTaskID string,
+	assigneeAgentID string,
+	title string,
+	description string,
+	causingRunID string,
+) (string, error) {
+	c.calls = append(c.calls, createTaskCall{
+		CallerAgentID:   callerAgentID,
+		ParentTaskID:    parentTaskID,
+		AssigneeAgentID: assigneeAgentID,
+		Title:           title,
+		Description:     description,
+		CausingRunID:    causingRunID,
+	})
+	if c.taskID != "" {
+		return c.taskID, nil
+	}
+	return "task-id", nil
+}
+
+type recordingStatusUpdater struct {
+	calls []TaskStatusUpdate
+	err   error
+}
+
+func (u *recordingStatusUpdater) UpdateTaskStatusAsAgent(
+	_ context.Context,
+	update TaskStatusUpdate,
+) error {
+	u.calls = append(u.calls, update)
+	return u.err
+}
+
+type recordingAgentCreator struct {
+	calls []agentCreateCall
+}
+
+type recordingProjectManager struct {
+	projects         []*models.Project
+	listWorkspaceIDs []string
+	created          []*models.Project
+	listErr          error
+}
+
+func (m *recordingProjectManager) ListProjects(
+	_ context.Context,
+	workspaceID string,
+) ([]*models.Project, error) {
+	m.listWorkspaceIDs = append(m.listWorkspaceIDs, workspaceID)
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	return m.projects, nil
+}
+
+func (m *recordingProjectManager) CreateProject(_ context.Context, project *models.Project) error {
+	m.created = append(m.created, project)
+	project.ID = "project-created"
+	return nil
+}
+
+type agentCreateCall struct {
+	Agent  *models.AgentInstance
+	Caller *models.AgentInstance
+	Reason string
+}
+
+func (c *recordingAgentCreator) CreateAgentInstanceWithCaller(
+	_ context.Context,
+	agent *models.AgentInstance,
+	caller *models.AgentInstance,
+	reason string,
+) error {
+	c.calls = append(c.calls, agentCreateCall{Agent: agent, Caller: caller, Reason: reason})
+	return nil
+}
+
+type recordingApprovalRequester struct {
+	approvals []*models.Approval
+}
+
+func (r *recordingApprovalRequester) CreateApprovalWithActivity(
+	_ context.Context,
+	approval *models.Approval,
+) error {
+	r.approvals = append(r.approvals, approval)
+	return nil
+}
+
+type recordingRunSpawner struct {
+	calls []spawnRunCall
+	err   error
+}
+
+type spawnRunCall struct {
+	AgentID        string
+	Reason         string
+	Payload        string
+	IdempotencyKey string
+	ActorKind      models.ActorKind
+	ActorID        string
+	CausingRunID   string
+}
+
+func (r *recordingRunSpawner) QueueRunWithActor(
+	_ context.Context,
+	agentInstanceID, reason, payload, idempotencyKey string,
+	actorKind models.ActorKind, actorID string,
+	causingRunID string,
+) (runsservice.QueueOutcome, error) {
+	r.calls = append(r.calls, spawnRunCall{
+		AgentID:        agentInstanceID,
+		Reason:         reason,
+		Payload:        payload,
+		IdempotencyKey: idempotencyKey,
+		ActorKind:      actorKind,
+		ActorID:        actorID,
+		CausingRunID:   causingRunID,
+	})
+	if r.err != nil {
+		return runsservice.QueueOutcomeNone, r.err
+	}
+	return runsservice.QueueOutcomeQueued, nil
+}
+
+type recordingAgentModifier struct {
+	agents  map[string]*models.AgentInstance
+	updated []*models.AgentInstance
+}
+
+func (r *recordingAgentModifier) GetAgentInstance(
+	_ context.Context,
+	idOrName string,
+) (*models.AgentInstance, error) {
+	if agent, ok := r.agents[idOrName]; ok {
+		return agent, nil
+	}
+	return nil, errors.New("agent not found")
+}
+
+func (r *recordingAgentModifier) UpdateAgentInstance(
+	_ context.Context,
+	agent *models.AgentInstance,
+) error {
+	r.updated = append(r.updated, agent)
+	return nil
+}
+
+type recordingSkillManager struct {
+	skills  map[string]*models.Skill
+	deleted []string
+}
+
+func (r *recordingSkillManager) GetSkill(_ context.Context, id string) (*models.Skill, error) {
+	if skill, ok := r.skills[id]; ok {
+		return skill, nil
+	}
+	return nil, errors.New("skill not found")
+}
+
+func (r *recordingSkillManager) DeleteSkill(_ context.Context, id string) error {
+	r.deleted = append(r.deleted, id)
+	return nil
+}

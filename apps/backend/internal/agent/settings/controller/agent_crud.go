@@ -1,0 +1,364 @@
+package controller
+
+import (
+	"cmp"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/discovery"
+	"github.com/kandev/kandev/internal/agent/settings/dto"
+	"github.com/kandev/kandev/internal/agent/settings/models"
+)
+
+func (c *Controller) GetAgent(ctx context.Context, id string) (*dto.AgentDTO, error) {
+	agent, err := c.repo.GetAgent(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAgentNotFound
+		}
+		return nil, err
+	}
+	profiles, err := c.repo.ListAgentProfiles(ctx, agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	result := c.toAgentDTO(agent, filterGlobalProfiles(profiles))
+	if err := c.decorateAgentDTO(ctx, &result); err != nil {
+		return nil, err
+	}
+	c.applyCapabilityStatus(&result, agent.Name)
+	c.applyBillingType(&result, agent.Name)
+	c.applyProviderSupport(&result, agent.Name)
+	return &result, nil
+}
+
+func (c *Controller) ListAgents(ctx context.Context) (*dto.ListAgentsResponse, error) {
+	agents, err := c.repo.ListAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]dto.AgentDTO, 0, len(agents))
+	for _, agent := range agents {
+		profiles, err := c.repo.ListAgentProfiles(ctx, agent.ID)
+		if err != nil {
+			return nil, err
+		}
+		entry := c.toAgentDTO(agent, filterGlobalProfiles(profiles))
+		if err := c.decorateAgentDTO(ctx, &entry); err != nil {
+			return nil, err
+		}
+		c.applyCapabilityStatus(&entry, agent.Name)
+		c.applyBillingType(&entry, agent.Name)
+		c.applyProviderSupport(&entry, agent.Name)
+		payload = append(payload, entry)
+	}
+	c.sortAgentsByDisplayOrder(payload)
+	return &dto.ListAgentsResponse{Agents: payload, Total: len(payload)}, nil
+}
+
+// sortAgentsByDisplayOrder puts saved agents in the same order the rest of the
+// app presents agents in — each agent implementation's DisplayOrder, which is
+// also what GET /agents/discovery is sorted by.
+//
+// The store returns newest-configured-first, which is setup history rather than
+// an order anyone chose. That reached the UI: the settings menu ranks agents by
+// discovery, so until the scan lands it had nothing but this order to show and
+// the list reshuffled underneath the reader. Sorting here means the order is
+// already right the moment the agents arrive, scan or no scan.
+//
+// Agents the registry does not know (a removed CLI, a custom row) keep their
+// store order after the ranked ones: the comparator groups them last and the
+// stable sort leaves their relative order untouched.
+func (c *Controller) sortAgentsByDisplayOrder(payload []dto.AgentDTO) {
+	if c.agentRegistry == nil {
+		return
+	}
+	known := c.agentRegistry.List()
+	rank := make(map[string]int, len(known))
+	for _, ag := range known {
+		rank[ag.ID()] = ag.DisplayOrder()
+	}
+	slices.SortStableFunc(payload, func(a, b dto.AgentDTO) int {
+		aOrder, aKnown := rank[a.Name]
+		bOrder, bKnown := rank[b.Name]
+		if aKnown != bKnown {
+			if aKnown {
+				return -1
+			}
+			return 1
+		}
+		if !aKnown {
+			return 0
+		}
+		return cmp.Compare(aOrder, bOrder)
+	})
+}
+
+// filterGlobalProfiles drops workspace-scoped (office) rows from a profile
+// list so the kanban-facing GET /api/v1/agents endpoints only surface global
+// CLI profiles. Office agents live in the same agent_profiles table since
+// ADR 0005 Wave G but are scoped by workspace_id; the kanban task picker
+// must not show them.
+func filterGlobalProfiles(profiles []*models.AgentProfile) []*models.AgentProfile {
+	out := make([]*models.AgentProfile, 0, len(profiles))
+	for _, p := range profiles {
+		if p.WorkspaceID == "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+type CreateAgentRequest struct {
+	Name        string
+	WorkspaceID *string
+	Profiles    []CreateAgentProfileRequest
+}
+
+type CreateAgentProfileRequest struct {
+	Name                    string
+	Model                   string
+	FallbackModel           string
+	AutoFallback            bool
+	RequireExactModel       bool
+	CursorMCPAuthEnabled    *bool
+	CursorPluginsMCPEnabled *bool
+	Mode                    string
+	// CLIFlags is the explicit list to persist. When nil the list is seeded
+	// from the agent's curated PermissionSettings() catalogue (all disabled
+	// by default) so a fresh profile opens with the agent's suggestions.
+	CLIFlags []dto.CLIFlagDTO
+	EnvVars  []dto.ProfileEnvVarDTO
+	// CommandPrefix is an optional launcher prefix prepended to the agent
+	// command (e.g. "greywall --"). Shell-tokenised at launch time.
+	CommandPrefix string
+}
+
+func (c *Controller) CreateAgent(ctx context.Context, req CreateAgentRequest) (*dto.AgentDTO, error) {
+	if req.Name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	existing, err := c.repo.GetAgentByName(ctx, req.Name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if err == nil && existing != nil {
+		return nil, fmt.Errorf("agent already configured: %s", req.Name)
+	}
+	discoveryResults, err := c.detectAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched, err := c.findMatchedAvailability(req.Name, discoveryResults)
+	if err != nil {
+		return nil, err
+	}
+	agentConfig, agOk := c.agentRegistry.Get(req.Name)
+	if !agOk {
+		return nil, fmt.Errorf("unknown agent: %s", req.Name)
+	}
+	displayName, err := c.resolveDisplayName(agentConfig, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	// Validate every profile request BEFORE inserting the agent row so an
+	// invalid profile (e.g. a malformed command_prefix) returns a 400 without
+	// leaving an orphaned agent behind.
+	for i := range req.Profiles {
+		if err := validateCreateProfileRequest(req.Profiles[i]); err != nil {
+			return nil, err
+		}
+	}
+	agent := &models.Agent{
+		Name:          matched.Name,
+		WorkspaceID:   req.WorkspaceID,
+		SupportsMCP:   matched.SupportsMCP,
+		MCPConfigPath: matched.MCPConfigPath,
+	}
+	if err := c.repo.CreateAgent(ctx, agent); err != nil {
+		return nil, err
+	}
+	profiles, err := c.createAgentProfiles(ctx, agent.ID, displayName, req.Profiles, agentConfig)
+	if err != nil {
+		return nil, err
+	}
+	result := c.toAgentDTO(agent, profiles)
+	c.applyCapabilityStatus(&result, agent.Name)
+	return &result, nil
+}
+
+// applyCapabilityStatus populates the DTO's capability fields from the host
+// utility cache. No-op when the host utility is unavailable or the agent
+// isn't in the cache (e.g. mock, tui-only, or pre-probe).
+func (c *Controller) applyCapabilityStatus(d *dto.AgentDTO, agentName string) {
+	if c.hostUtility == nil {
+		return
+	}
+	caps, ok := c.hostUtility.Get(agentName)
+	if !ok {
+		return
+	}
+	d.CapabilityStatus = string(caps.Status)
+	d.CapabilityError = caps.Error
+}
+
+// applyBillingType populates BillingType on each profile in the DTO.
+// It calls BillingType() on the registered agent implementation at read time
+// so credential detection runs once per request and is not stored in the DB.
+func (c *Controller) applyBillingType(d *dto.AgentDTO, agentName string) {
+	ag, ok := c.agentRegistry.Get(agentName)
+	if !ok {
+		return
+	}
+	bt := string(ag.BillingType())
+	for i := range d.Profiles {
+		d.Profiles[i].BillingType = bt
+	}
+}
+
+// applyProviderSupport populates the computed ProviderSupported flag on each
+// profile in the DTO from the registered agent implementation. Mirrors
+// applyBillingType — a read-time capability lookup, never persisted.
+func (c *Controller) applyProviderSupport(d *dto.AgentDTO, agentName string) {
+	supported := c.providerSupported(agentName)
+	for i := range d.Profiles {
+		d.Profiles[i].ProviderSupported = supported
+	}
+}
+
+func (c *Controller) findMatchedAvailability(name string, results []discovery.Availability) (*discovery.Availability, error) {
+	for _, result := range results {
+		if result.Name == name {
+			if !result.Available {
+				return nil, fmt.Errorf("agent not installed: %s", name)
+			}
+			r := result
+			return &r, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown agent: %s", name)
+}
+
+// validateCreateProfileRequest runs all save-time validation for a nested
+// agent-create profile. Kept separate so CreateAgent can validate every profile
+// before inserting the agent row (avoiding an orphaned agent on a bad profile).
+func validateCreateProfileRequest(p CreateAgentProfileRequest) error {
+	if err := validateRequireExactModelPolicy(p.Model, p.RequireExactModel, false, false); err != nil {
+		return err
+	}
+	if p.CLIFlags != nil {
+		if err := validateCLIFlagDTOs(p.CLIFlags); err != nil {
+			return err
+		}
+	}
+	if err := validateProfileEnvVarDTOs(p.EnvVars); err != nil {
+		return err
+	}
+	return validateCommandPrefix(p.CommandPrefix)
+}
+
+func (c *Controller) createAgentProfiles(ctx context.Context, agentID, displayName string, profileReqs []CreateAgentProfileRequest, agentConfig agents.Agent) ([]*models.AgentProfile, error) {
+	profiles := make([]*models.AgentProfile, 0, len(profileReqs))
+	for _, profileReq := range profileReqs {
+		if err := validateCreateProfileRequest(profileReq); err != nil {
+			return nil, err
+		}
+		cliFlags := cliFlagsFromDTO(profileReq.CLIFlags)
+		if profileReq.CLIFlags == nil {
+			cliFlags = seedCLIFlags(agentConfig)
+		}
+		profile := &models.AgentProfile{
+			AgentID:                 agentID,
+			Name:                    profileReq.Name,
+			AgentDisplayName:        displayName,
+			Model:                   profileReq.Model,
+			FallbackModel:           strings.TrimSpace(profileReq.FallbackModel),
+			AutoFallback:            profileReq.AutoFallback,
+			RequireExactModel:       profileReq.RequireExactModel,
+			CursorMCPAuthEnabled:    cursorMCPAuthEnabled(profileReq.CursorMCPAuthEnabled),
+			CursorPluginsMCPEnabled: cursorPluginsMCPEnabled(profileReq.CursorPluginsMCPEnabled),
+			Mode:                    profileReq.Mode,
+			CLIFlags:                cliFlags,
+			EnvVars:                 envVarsFromDTO(profileReq.EnvVars),
+			CommandPrefix:           strings.TrimSpace(profileReq.CommandPrefix),
+		}
+		if err := c.repo.CreateAgentProfile(ctx, profile); err != nil {
+			return nil, err
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, nil
+}
+
+type UpdateAgentRequest struct {
+	ID               string
+	WorkspaceID      *string
+	SupportsMCP      *bool
+	MCPConfigPath    *string
+	MCPConfigPathSet bool
+}
+
+func (c *Controller) UpdateAgent(ctx context.Context, req UpdateAgentRequest) (*dto.AgentDTO, error) {
+	agent, err := c.repo.GetAgent(ctx, req.ID)
+	if err != nil {
+		return nil, ErrAgentNotFound
+	}
+	if req.WorkspaceID != nil {
+		agent.WorkspaceID = req.WorkspaceID
+	}
+	if req.SupportsMCP != nil {
+		agent.SupportsMCP = *req.SupportsMCP
+	}
+	if req.MCPConfigPathSet {
+		if req.MCPConfigPath == nil {
+			agent.MCPConfigPath = ""
+		} else {
+			agent.MCPConfigPath = *req.MCPConfigPath
+		}
+	} else if req.MCPConfigPath != nil {
+		agent.MCPConfigPath = *req.MCPConfigPath
+	}
+	if err := c.repo.UpdateAgent(ctx, agent); err != nil {
+		return nil, err
+	}
+	profiles, err := c.repo.ListAgentProfiles(ctx, agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	result := c.toAgentDTO(agent, filterGlobalProfiles(profiles))
+	return &result, nil
+}
+
+func (c *Controller) DeleteAgent(ctx context.Context, id string) error {
+	// If the agent has a tui_config, unregister from the in-memory registry
+	agent, err := c.repo.GetAgent(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAgentNotFound
+		}
+		return err
+	}
+	custom := agent.TUIConfig != nil
+	if custom {
+		_ = c.agentRegistry.Unregister(agent.Name)
+	}
+
+	if err := c.repo.DeleteAgent(ctx, id); err != nil {
+		if strings.Contains(err.Error(), "agent not found") {
+			return ErrAgentNotFound
+		}
+		return err
+	}
+	if custom {
+		// Installed Agents is rendered from the cached discovery sweep, which
+		// reports the registry. Without this the deleted agent keeps its card
+		// until the cache expires, and Rescan re-detects its binary.
+		c.InvalidateDiscoveryCache()
+	}
+	return nil
+}

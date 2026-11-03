@@ -1,0 +1,1245 @@
+#!/usr/bin/env bash
+# pr-state — emit a raw JSON snapshot of PR CI and review state.
+#
+# Usage:
+#   scripts/pr-state [--summary] [--all] [--trusted-reviewer <login>] <PR>
+#   scripts/pr-state --comment <comment_id>  # review or top-level issue comment
+#   scripts/pr-state --job-log <job_id>
+#
+# Raw output:
+#   JSON object with:
+#   - pr: { number, branch, is_cross_repository, base_ref_name, base_head_oid,
+#       base_target_oid, merge_base_oid, base_advanced_since_head, head_repository_owner,
+#       head_repository_name, head_ref_name, head_ref_oid, maintainer_can_modify }
+#   - since: { head_oid, committed_at } or null
+#   - checks: [{ type, name, workflow, status, conclusion, details_url, target_url, run_id, job_id }]
+#   - checks_head_sha: <SHA or null>
+#   - checks_snapshot_complete: <boolean>
+#   - required_status_checks: [<status context>]
+#   - required_status_checks_known: <boolean>
+#   - approval_required_runs: [{ run_id, name, workflow, status, conclusion, head_sha, url }]
+#   - review_threads: [{ thread_id, is_resolved, path, comment_id, comment_created_at, author, body_preview }]
+#   - hidden_unresolved_threads: [{ thread_id, comment_id, author, path, body_preview }]
+#   - unresolved_review_thread_count: <N>
+#   - filtered_review_thread_count: <N>
+#   - reviews: [{ author, state, commit_id, body, submitted_at, html_url }]
+#   - review_evidence: { known, complete, opening_head_sha, closing_head_sha,
+#       current_head_sha, evidence_head_sha, exact_current_head_reviews,
+#       trusted_default_producer_exact_current_head_reviews,
+#       blocked_exact_current_head_reviews, blocked_exact_current_head_review_count,
+#       active_changes_requested, active_changes_requested_count, trusted_producer }
+#   - issue_comments: [{ author, body, created_at, url }]
+#   - errors: [{ source, message }]
+#
+# Summary output (--summary):
+#   JSON object with:
+#   - pr: { number, branch, is_cross_repository, base_ref_name, base_head_oid,
+#       base_target_oid, merge_base_oid, base_advanced_since_head, head_repository_owner,
+#       head_repository_name, head_ref_name, head_ref_oid, maintainer_can_modify }
+#   - since: { head_oid, committed_at } or null
+#   - failed_checks: [{ name, workflow, status, conclusion, run_id, job_id, details_url, target_url }]
+#   - pending_checks: [{ name, workflow, status, run_id, job_id, details_url, target_url }]
+#   - successful_checks: [{ name, workflow, status, conclusion, run_id, job_id, details_url, target_url }]
+#   - terminal_checks: [{ name, workflow, status, conclusion, run_id, job_id, details_url, target_url }]
+#   - passed_check_count: <N>
+#   - checks_head_sha: <SHA or null>
+#   - checks_snapshot_complete: <boolean>
+#   - required_status_checks: [<status context>]
+#   - required_status_checks_known: <boolean>
+#   - approval_required_runs: [{ run_id, name, workflow, status, conclusion, head_sha, url }]
+#   - unresolved_review_thread_count: <N>
+#   - filtered_review_thread_count: <N>
+#   - unresolved_threads: [{ thread_id, comment_id, author, path, body_preview }]
+#   - hidden_unresolved_threads: [{ thread_id, comment_id, author, path, body_preview }]
+#   - review_evidence: { known, complete, opening_head_sha, closing_head_sha,
+#       current_head_sha, evidence_head_sha, exact_current_head_reviews,
+#       trusted_default_producer_exact_current_head_reviews,
+#       blocked_exact_current_head_reviews, blocked_exact_current_head_review_count,
+#       active_changes_requested, active_changes_requested_count, trusted_producer }
+#   - actionable_issue_comment_count: <N>
+#   - summary_notes: [<short human-readable notes>]
+#   - errors: [{ source, message }]
+#
+# Comment output (--comment):
+#   JSON object for one PR review or top-level issue comment:
+#   - comment_id, comment_type, author, body, path, line, original_line,
+#     commit_id, html_url, created_at, updated_at
+#
+# Job-log output (--job-log):
+#   Bounded context around the most likely failing test or step. The GitHub
+#   endpoint may return either plain text or a ZIP archive.
+#
+# By default, comments/reviews/review threads are limited to items created after
+# the PR head commit. Checks are already scoped by GitHub to the current head.
+# Pass --all to include historical comments and reviews.
+#
+# Requires: gh (authenticated), jq.
+
+set -euo pipefail
+
+usage() {
+  sed -n '2,/^# Requires:/p' "$0" | sed 's|^# \{0,1\}||'
+  exit "${1:-1}"
+}
+
+INCLUDE_ALL=0
+SUMMARY=0
+TRUSTED_REVIEWER=''
+COMMENT_ID=''
+JOB_LOG_ID=''
+PR=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)
+      INCLUDE_ALL=1
+      shift
+      ;;
+    --summary)
+      SUMMARY=1
+      shift
+      ;;
+    --trusted-reviewer)
+      shift
+      [[ $# -gt 0 && -z "${TRUSTED_REVIEWER:-}" ]] || usage 1
+      TRUSTED_REVIEWER=$1
+      [[ -n "$TRUSTED_REVIEWER" && "$TRUSTED_REVIEWER" != -* ]] || usage 1
+      shift
+      ;;
+    --comment)
+      shift
+      [[ $# -gt 0 && -z "${COMMENT_ID:-}" && -z "${PR:-}" ]] || usage 1
+      [[ "$1" =~ ^[0-9]+$ ]] || usage 1
+      COMMENT_ID=$1
+      shift
+      ;;
+    --job-log)
+      shift
+      [[ $# -gt 0 && -z "${JOB_LOG_ID:-}" && -z "${PR:-}" ]] || usage 1
+      [[ "$1" =~ ^[0-9]+$ ]] || usage 1
+      JOB_LOG_ID=$1
+      shift
+      ;;
+    -h | --help)
+      usage 0
+      ;;
+    --)
+      shift
+      if [[ $# -gt 0 ]]; then
+        [[ -z "${PR:-}" && $# -eq 1 ]] || usage
+        PR=$1
+        shift
+      fi
+      break
+      ;;
+    -*)
+      usage 1
+      ;;
+    *)
+      [[ -z "${PR:-}" ]] || usage
+      PR=$1
+      shift
+      ;;
+  esac
+done
+
+[ $# -eq 0 ] || usage
+
+if [[ -n "${COMMENT_ID:-}" && -n "${JOB_LOG_ID:-}" ]]; then
+  usage 1
+elif [[ -n "${COMMENT_ID:-}" ]]; then
+  [[ -z "${PR:-}" && "$SUMMARY" == "0" && "$INCLUDE_ALL" == "0" ]] || usage
+elif [[ -n "${JOB_LOG_ID:-}" ]]; then
+  [[ -z "${PR:-}" && "$SUMMARY" == "0" && "$INCLUDE_ALL" == "0" ]] || usage
+else
+  [ -n "${PR:-}" ] || usage
+fi
+
+errors='[]'
+GH_ERROR_FILE="$(mktemp "${TMPDIR:-/tmp}/pr-state-gh-error-XXXXXX")"
+state_tmp_dir=''
+pr_json='{}'
+pr_view_succeeded=false
+checks_json='[]'
+checks_head_sha=''
+checks_snapshot_complete=false
+required_status_checks_json='[]'
+required_status_checks_known=false
+base_ref_name=''
+base_head_oid=''
+base_target_oid=''
+merge_base_oid=''
+base_advanced_since_head=null
+approval_required_runs_json='[]'
+review_threads_json='[]'
+hidden_unresolved_threads_json='[]'
+reviews_json='[]'
+reviews_api_json='[]'
+reviews_known=false
+issue_comments_json='[]'
+since_json='null'
+unresolved_review_thread_count=null
+filtered_review_thread_count=null
+
+cleanup_temp_files() {
+  rm -f "$GH_ERROR_FILE"
+  [[ -z "$state_tmp_dir" ]] || rm -rf "$state_tmp_dir"
+}
+trap cleanup_temp_files EXIT
+
+rate_limit_text() {
+  local text=$1
+  local lower
+  lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower" == *'rate limit'* || "$lower" == *'secondary rate'* ||
+    "$lower" == *'secondary-rate'* || "$lower" == *'retry-after'* ||
+    "$lower" == *'x-ratelimit'* || "$lower" == *'http 429'* ||
+    "$lower" == *'status 429'* ]]
+}
+
+rate_limit_detail() {
+  local detail=''
+  [[ -s "$GH_ERROR_FILE" ]] || return 0
+  detail="$(tr '\r\n' '  ' <"$GH_ERROR_FILE" | cut -c1-500)"
+  rate_limit_text "$detail" || return 0
+  printf '%s' "$detail"
+}
+
+add_error() {
+  local source=$1
+  local message=$2
+  local detail
+  detail="$(rate_limit_detail)"
+  [[ -z "$detail" ]] || message="$message: $detail"
+  : >"$GH_ERROR_FILE"
+  errors="$(jq -cn --argjson prev "$errors" --arg source "$source" --arg message "$message" \
+    '$prev + [{source: $source, message: $message}]')"
+}
+
+gh_json() {
+  : >"$GH_ERROR_FILE"
+  env -u GH_DEBUG -u GITHUB_DEBUG -u GH_TRACE -u GITHUB_TRACE \
+    GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh "$@" 2>"$GH_ERROR_FILE"
+}
+
+emit_comment_json() {
+  local comment_id=$1
+  local repo_json
+  local owner
+  local repo
+  local comment_json
+  local comment_type
+
+  repo_json="$(gh_json repo view --json owner,name)"
+  owner="$(jq -r '.owner.login // ""' <<<"$repo_json")"
+  repo="$(jq -r '.name // ""' <<<"$repo_json")"
+  if [[ -z "$owner" || -z "$repo" ]]; then
+    printf 'failed to resolve repository identity\n' >&2
+    return 1
+  fi
+
+  if comment_json="$(gh_json api "repos/$owner/$repo/pulls/comments/$comment_id")"; then
+    comment_type='review'
+  elif comment_json="$(gh_json api "repos/$owner/$repo/issues/comments/$comment_id")"; then
+    comment_type='issue'
+  else
+    printf 'failed to fetch PR comment %s\n' "$comment_id" >&2
+    return 1
+  fi
+
+  jq -c --arg comment_type "$comment_type" '{
+    comment_id: (.id // null),
+    comment_type: $comment_type,
+    author: (.user.login // "unknown"),
+    body: (.body // ""),
+    path: (.path // null),
+    line: (.line // null),
+    original_line: (.original_line // null),
+    commit_id: (.commit_id // null),
+    html_url: (.html_url // null),
+    created_at: (.created_at // null),
+    updated_at: (.updated_at // null)
+  }' <<<"$comment_json"
+}
+
+emit_job_log() {
+  local job_id=$1
+  local repo_json owner repo archive_file log_file magic
+  archive_file="$(mktemp)"
+  log_file="$(mktemp)"
+
+  repo_json="$(gh_json repo view --json owner,name)" || {
+    rm -f "$archive_file" "$log_file"
+    printf 'failed to resolve repository identity\n' >&2
+    return 1
+  }
+  owner="$(jq -r '.owner.login // ""' <<<"$repo_json")"
+  repo="$(jq -r '.name // ""' <<<"$repo_json")"
+  if [[ -z "$owner" || -z "$repo" ]]; then
+    rm -f "$archive_file" "$log_file"
+    printf 'failed to resolve repository identity\n' >&2
+    return 1
+  fi
+  if ! gh_json api "repos/$owner/$repo/actions/jobs/$job_id/logs" >"$archive_file"; then
+    rm -f "$archive_file" "$log_file"
+    printf 'failed to fetch job log %s\n' "$job_id" >&2
+    return 1
+  fi
+
+  magic="$(head -c 4 "$archive_file" || true)"
+  if [[ "$magic" == $'PK\003\004' ]]; then
+    if ! unzip -p "$archive_file" >"$log_file"; then
+      rm -f "$archive_file" "$log_file"
+      printf 'failed to unpack job log %s\n' "$job_id" >&2
+      return 1
+    fi
+  else
+    mv "$archive_file" "$log_file"
+    archive_file=''
+  fi
+
+  if ! rg -n -i -C 4 '(Test timeout|Error:|FAIL|failed|Process completed)' "$log_file" | sed -n '1,240p'; then
+    tail -n 80 "$log_file"
+  fi
+  rm -f "$archive_file" "$log_file"
+}
+
+if [[ -n "${COMMENT_ID:-}" ]]; then
+  emit_comment_json "$COMMENT_ID"
+  exit $?
+fi
+
+if [[ -n "${JOB_LOG_ID:-}" ]]; then
+  emit_job_log "$JOB_LOG_ID"
+  exit $?
+fi
+
+extract_checks_json() {
+  local status_json=$1
+  printf '%s\n' "$status_json" | jq -c '
+    def lower_or_null:
+      if . == null or . == "" then null else ascii_downcase end;
+    def extract($re; $field):
+      if . == null then null else ((capture($re)? | .[$field]) // null) end;
+    def normalized_conclusion:
+      if has("conclusion") then
+        (.conclusion | lower_or_null)
+      else
+        ((.state // "") | lower_or_null) as $state
+        | if $state == "pending" or $state == "expected" then null else $state end
+      end;
+    to_entries
+    | map(.value + {_index: .key} | {
+      type: (.["__typename"] // null),
+      name: (.name // .context // "unknown"),
+      workflow: (.workflowName // .workflow // .checkSuite.workflowRun.workflow.name // null),
+      status: ((.status // .state // "unknown") | ascii_downcase),
+      conclusion: normalized_conclusion,
+      details_url: (.detailsUrl // null),
+      target_url: (.targetUrl // null),
+      run_id: ((.detailsUrl // null) | extract("/actions/runs/(?<id>[0-9]+)"; "id")),
+      job_id: ((.detailsUrl // null) | extract("/job/(?<id>[0-9]+)"; "id")),
+      _index
+    })
+    | sort_by([(.workflow // ""), .name])
+    | group_by([(.workflow // ""), .name])
+    | map({
+      first_index: (map(._index) | min),
+      items: sort_by((.run_id | tonumber? // -1), (.job_id | tonumber? // -1), ._index)
+    })
+    | sort_by(.first_index)
+    | map(
+        .items as $items
+        | ($items | last) as $latest
+        | if ($latest.conclusion == "cancelled" or $latest.conclusion == "skipped" or $latest.conclusion == "neutral") then
+            ([$items[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "error" or .conclusion == "action_required")] | last) // $latest
+          else
+            $latest
+          end
+      )
+    | map(del(._index))
+  '
+}
+
+extract_issue_comments_json() {
+  local comments_json=$1
+  local since=$2
+  printf '%s\n' "$comments_json" | jq -c --arg since "$since" '
+    map(select($since == "" or ((.createdAt // .created_at // "") > $since)))
+    | map({
+      author: (.author.login // "unknown"),
+      body: (.body // ""),
+      created_at: (.createdAt // .created_at // null),
+      url: (.url // null),
+      actionable: (
+        (((.author.login // "unknown") == "github-actions") or ((.author.login // "unknown") == "github-actions[bot]"))
+        and (
+          (((.body // "") | contains("<!-- kandev-docs-cloudflare-preview -->")) | not)
+          and
+          (((.body // "") | gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+            | test("^<!-- opencode-review:no-findings -->\\n\\*\\*OpenCode review complete\\*\\*\\n\\nOpenCode model: `[^`\\n]+`\\n\\nNo suggestions found for commit `[0-9A-Fa-f]{7,40}`\\.$")
+            | not)
+        )
+      )
+    })
+  '
+}
+
+extract_reviews_json() {
+  local reviews_api_json=$1
+  local since=$2
+  printf '%s\n' "$reviews_api_json" | jq -c --arg since "$since" '
+    map(select($since == "" or ((.submitted_at // "") > $since)))
+    | map({
+      author: (.user.login // "unknown"),
+      state: ((.state // "unknown") | ascii_downcase),
+      commit_id: (.commit_id // null),
+      body: (.body // ""),
+      submitted_at: (.submitted_at // null),
+      html_url: (.html_url // null)
+    })
+  '
+}
+
+review_evidence_json() {
+  local opening_head_oid=$1
+  local closing_head_oid=$2
+  local checks_head_oid=$3
+  local reviews_known=$4
+  local reviews_api_json=$5
+  local is_cross_repository=$6
+  local trusted_workflow_json=$7
+  printf '%s\n' "$reviews_api_json" |
+    jq -c --arg opening_head_oid "$opening_head_oid" --arg closing_head_oid "$closing_head_oid" --arg checks_head_oid "$checks_head_oid" --arg trusted_reviewer "$TRUSTED_REVIEWER" --argjson is_cross_repository "$is_cross_repository" --argjson reviews_known "$reviews_known" --argjson trusted_workflow "$trusted_workflow_json" '
+      def normalized_reviews:
+        map({
+          author: (.user.login // "unknown"),
+          state: ((.state // "unknown") | ascii_downcase),
+          commit_id: (.commit_id // null),
+          body: (.body // ""),
+          submitted_at: (.submitted_at // null),
+          html_url: (.html_url // null)
+        });
+      def markdown_prose_lines:
+        reduce (split("\n")[]) as $line (
+          {fence: null, lines: []};
+          ($line | (capture("^[[:space:]]*(?<marker>`{3,}|~{3,})")? // {marker: null}) | .marker) as $marker
+          | if .fence == null then
+              if $marker == null then .lines += [$line]
+              else .fence = ($marker[0:1])
+              end
+            elif $marker != null and ($marker[0:1]) == .fence then
+              .fence = null
+            else .
+            end
+        )
+        | .lines;
+      def has_positive_blocker_label:
+        markdown_prose_lines
+        | any(. | gsub("\\*\\*|__|_|\\*"; "") | test("^[[:space:]]*(?:>\\s*)?(?:(?:[-*+]\\s+)|(?:[0-9]+\\.\\s+))?blockers?[[:space:]]*:[[:space:]]*(?!0\\b|none\\b|no\\b)\\S"; "i"));
+      def has_explicit_blocker_statement:
+        markdown_prose_lines
+        | any(
+            .
+            | sub("^[[:space:]]*(?:(?:[-*+]\\s+)|(?:[0-9]+\\.\\s+))?(?:\\*\\*|__|_|\\*)?"; "")
+            | test("^(?:blocked|changes[ _-]?requested|action required|must fix|required fix|please fix)\\b"; "i")
+          );
+      def review_eligibility:
+        if ((.body | test("\\|\\s*blocker\\s*\\|\\s*[1-9][0-9]*\\s*\\|"; "i")) or (.body | has_positive_blocker_label) or (.body | has_explicit_blocker_statement)) then {eligibility: "blocked", verdict: "blocker"}
+        elif .state == "approved" then {eligibility: "eligible", verdict: "approved"}
+        elif .state == "commented" and (.body | test("<!-- kandev-review: clean -->"; "i")) then {eligibility: "eligible", verdict: "clean"}
+        elif .state == "commented" then {eligibility: "unknown", verdict: "unknown"}
+        else {eligibility: "ineligible", verdict: .state}
+        end;
+      def trusted_default_producer:
+        (.body | capture("<!-- kandev-review: workflow-run id=(?<id>[0-9]+) attempt=(?<attempt>[0-9]+) -->")? // null) as $marker
+        | $marker != null
+        and $trusted_reviewer != ""
+        and $is_cross_repository == false
+        and .author == $trusted_reviewer
+        and .state == "commented"
+        and (.body | contains("<!-- kandev-review: clean -->"))
+        and $trusted_workflow.complete == true
+        and $marker.id == ($trusted_workflow.id | tostring)
+        and $marker.attempt == ($trusted_workflow.attempt | tostring);
+      ($opening_head_oid != "" and $closing_head_oid != "" and $checks_head_oid != "" and $opening_head_oid == $closing_head_oid and $opening_head_oid == $checks_head_oid and $reviews_known) as $complete
+      | (normalized_reviews) as $all
+      | (if $complete then [$all[] | select(.commit_id == $opening_head_oid) | . + review_eligibility + {trusted_default_producer: trusted_default_producer}] else [] end) as $exact
+      | {
+          known: $complete,
+          complete: $complete,
+          opening_head_sha: (if $opening_head_oid == "" then null else $opening_head_oid end),
+          closing_head_sha: (if $closing_head_oid == "" then null else $closing_head_oid end),
+          checks_head_sha: (if $checks_head_oid == "" then null else $checks_head_oid end),
+          current_head_sha: (if $closing_head_oid == "" then null else $closing_head_oid end),
+          evidence_head_sha: (if $complete then $opening_head_oid else null end),
+          is_cross_repository: $is_cross_repository,
+          trusted_workflow_run: $trusted_workflow,
+          exact_current_head_reviews: $exact,
+          trusted_default_producer_exact_current_head_reviews: [$exact[] | select(.trusted_default_producer)],
+          blocked_exact_current_head_reviews: [$exact[] | select(.eligibility == "blocked")],
+          active_changes_requested: (if $complete then
+            [$all[] | select(.commit_id == $opening_head_oid)] | group_by(.author)
+            | map(
+                map(select(
+                  .state == "approved"
+                  or .state == "changes_requested"
+                  or .state == "dismissed"
+                  or (.state == "commented" and (.body | test("<!-- kandev-review: clean -->"; "i")))
+                ))
+                | sort_by(.submitted_at // "")
+                | last
+              )
+            | map(select(.state == "changes_requested"))
+            else [] end)
+        }
+      | .active_changes_requested_count = (.active_changes_requested | length)
+      | .blocked_exact_current_head_review_count = (.blocked_exact_current_head_reviews | length)
+      | .trusted_producer = (if $complete | not or $trusted_workflow.known != true then "unknown"
+          elif $trusted_workflow.complete == true and (.trusted_default_producer_exact_current_head_reviews | length) > 0 then "true"
+          else "false"
+          end)
+    '
+}
+
+fetch_trusted_workflow_json() {
+  local owner=$1 repo=$2 pr_number=$3 head_sha=$4
+  local empty='{"known":false,"complete":false,"id":null,"attempt":null,"status":null,"conclusion":null,"job_complete":false}'
+  if [[ -z "$TRUSTED_REVIEWER" ]]; then
+    printf '%s\n' "$empty"
+    return
+  fi
+  if [[ "$is_cross_repository" != "false" || -z "$owner" || -z "$repo" || -z "$pr_number" || -z "$head_sha" ]]; then
+    add_error "trusted_workflow" "skipped: same-repository PR identity or stable head unavailable"
+    printf '%s\n' "$empty"
+    return
+  fi
+  local runs_pages runs selected run_id attempt jobs_pages
+  if ! runs_pages="$(gh_json api --paginate "repos/$owner/$repo/actions/workflows/opencode-code-review.yml/runs?event=pull_request_target&per_page=100")"; then
+    add_error "trusted_workflow" "workflow runs API failed"
+    printf '%s\n' "$empty"
+    return
+  fi
+  runs="$(jq -cs '[.[].workflow_runs[]?]' <<<"$runs_pages")"
+  selected="$(jq -c --argjson pr "$pr_number" --arg head "$head_sha" '
+    map(select(
+      (.id | type == "number") and (.run_number | type == "number") and (.run_attempt | type == "number")
+      and .path == ".github/workflows/opencode-code-review.yml"
+      and .event == "pull_request_target"
+      and ((.pull_requests | type) == "array")
+      and any(.pull_requests[]?; (.number == $pr) and (.head.sha == $head))
+    )) | sort_by(.run_number, .run_attempt, .id) | last // empty
+  ' <<<"$runs")"
+  if [[ -z "$selected" ]]; then
+    add_error "trusted_workflow" "no authentic workflow run matched PR head"
+    printf '%s\n' "$empty"
+    return
+  fi
+  run_id="$(jq -r '.id' <<<"$selected")"
+  attempt="$(jq -r '.run_attempt' <<<"$selected")"
+  if ! jobs_pages="$(gh_json api --paginate "repos/$owner/$repo/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100")"; then
+    add_error "trusted_workflow" "workflow jobs API failed"
+    jq -c '. + {known: true, complete: false, attempt: .run_attempt, job_complete: false} | {known, complete, id, attempt, status, conclusion, job_complete}' <<<"$selected"
+    return
+  fi
+  jq -cs --argjson run "$selected" '
+    [.[].jobs[]?] as $jobs
+    | ($jobs | any(.[]; .name == "opencode-review-same-repo" and .status == "completed" and .conclusion == "success")) as $job_complete
+    | {
+        known: true,
+        complete: (($run.status == "completed") and ($run.conclusion == "success") and $job_complete),
+        id: $run.id,
+        attempt: $run.run_attempt,
+        status: ($run.status // null),
+        conclusion: ($run.conclusion // null),
+        job_complete: $job_complete
+      }
+  ' <<<"$jobs_pages"
+}
+
+extract_review_threads_json() {
+  local threads_nodes_json=$1
+  local since=$2
+  printf '%s\n' "$threads_nodes_json" | jq -c --arg since "$since" '
+    def relevant_comments:
+      if $since == "" then
+        (.comments.nodes // [])
+      else
+        [(.comments.nodes // [])[] | select((.createdAt // "") > $since)]
+      end;
+    map(. as $thread | (relevant_comments) as $comments | select($comments | length > 0) | {
+      thread_id: .id,
+      is_resolved: (.isResolved // false),
+      path: (.path // ""),
+      comment_id: ($comments[0].databaseId // null),
+      comment_created_at: ($comments[0].createdAt // null),
+      author: ($comments[0].author.login // "unknown"),
+      body_preview: (($comments[0].body // "") | gsub("\n"; " ") | .[0:120])
+    })
+  '
+}
+
+summarize_state_json() {
+  jq -c '
+    def effective_checks:
+      .checks
+      | to_entries
+      | map(.value + {_index: .key})
+      | sort_by([(.workflow // ""), .name])
+      | group_by([(.workflow // ""), .name])
+      | map(sort_by(._index) | .[0] | del(._index));
+
+    def bad_conclusion:
+      .conclusion != null
+      and .conclusion != "success"
+      and .conclusion != "skipped"
+      and .conclusion != "neutral";
+
+    def terminal_failure_status:
+      .status == "completed"
+      or .status == "failure"
+      or .status == "error";
+
+    def pending_status:
+      .status != "completed"
+      and .status != "success"
+      and .status != "failure"
+      and .status != "error";
+
+    def successful_check:
+      (.status == "completed" and .conclusion == "success")
+      or (.status == "success" and (.conclusion == null or .conclusion == "success"));
+
+    (effective_checks) as $effective
+    | (if .required_status_checks_known == true then
+        [
+          (.required_status_checks // [])[] as $required
+          | select(any($effective[]?; .name == $required) | not)
+          | {name: $required, workflow: null, status: "missing", run_id: null,
+             job_id: null, details_url: null, target_url: null}
+        ]
+      else [] end) as $missing_required
+    | {
+      pr,
+      since,
+      checks_head_sha,
+      checks_snapshot_complete,
+      required_status_checks: (.required_status_checks // []),
+      required_status_checks_known: (.required_status_checks_known == true),
+      approval_required_runs: (.approval_required_runs // []),
+      failed_checks: [
+        $effective[]
+        | select(terminal_failure_status and bad_conclusion)
+        | {name, workflow, status, conclusion, run_id, job_id, details_url, target_url}
+      ],
+      pending_checks: ([
+        $effective[]
+        | select(pending_status and .conclusion == null)
+        | {name, workflow, status, run_id, job_id, details_url, target_url}
+      ] + $missing_required),
+      successful_checks: [
+        $effective[]
+        | select(successful_check)
+        | {name, workflow, status, conclusion, run_id, job_id, details_url, target_url}
+      ],
+      terminal_checks: [
+        $effective[]
+        | select(.conclusion == "skipped" or .conclusion == "neutral")
+        | {name, workflow, status, conclusion, run_id, job_id, details_url, target_url}
+      ],
+      check_count: (($effective | length) + ($missing_required | length)),
+      passed_check_count: ([$effective[] | select(successful_check)] | length),
+      unresolved_review_thread_count,
+      filtered_review_thread_count,
+      review_evidence,
+      actionable_issue_comment_count: ([.issue_comments[] | select(.actionable)] | length),
+      unresolved_threads: [
+        .review_threads[]
+        | select(.is_resolved == false)
+        | {thread_id, comment_id, author, path, body_preview}
+      ],
+      hidden_unresolved_threads: (.hidden_unresolved_threads // []),
+      summary_notes: (
+        [
+          if .required_status_checks_known != true then
+            "required status check policy is unavailable; terminal check counts are not sufficient"
+          else
+            empty
+          end,
+          if (
+            (.unresolved_review_thread_count | type) == "number"
+            and .unresolved_review_thread_count > 0
+            and ([
+              .review_threads[]
+              | select(.is_resolved == false)
+            ] | length) == 0
+          ) then
+            "unresolved threads exist outside current-head filter; run `scripts/pr-resolve list <PR>` for full list"
+          else
+            empty
+          end
+        ]
+      ),
+      errors
+    }
+  '
+}
+
+fetch_approval_required_runs_json() {
+  local owner=$1 repo=$2 pr_number=$3 head_sha=$4
+  if [[ "$is_cross_repository" != "true" || -z "$owner" || -z "$repo" || -z "$pr_number" || -z "$head_sha" ]]; then
+    printf '%s\n' '[]'
+    return
+  fi
+
+  local runs_pages
+  if ! runs_pages="$(gh_json api --paginate "repos/$owner/$repo/actions/runs?event=pull_request&head_sha=$head_sha&per_page=100")"; then
+    return 1
+  fi
+
+  jq -cs --argjson pr "$pr_number" --arg head "$head_sha" '
+    [.[].workflow_runs[]?
+      | select(
+          .status == "completed"
+          and .conclusion == "action_required"
+          and .head_sha == $head
+          and any(.pull_requests[]?; .number == $pr and .head.sha == $head)
+        )
+      | {
+          run_id: (.id | tostring),
+          name: (.name // "unknown"),
+          workflow: (.path // null),
+          status: (.status // null),
+          conclusion: (.conclusion // null),
+          head_sha: (.head_sha // null),
+          url: (.html_url // null)
+        }
+    ] | sort_by(.run_id | tonumber)
+  ' <<<"$runs_pages"
+}
+
+fetch_head_commit_json() {
+  local owner=$1
+  local repo=$2
+  local pr_number=$3
+
+  gh_json api graphql \
+    -f query='
+      query($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            headRefOid
+            commits(last: 1) {
+              nodes {
+                commit {
+                  oid
+                  committedDate
+                }
+              }
+            }
+          }
+        }
+      }' \
+    -f owner="$owner" -f repo="$repo" -F pr="$pr_number" |
+    jq -c '{
+      head_oid: (.data.repository.pullRequest.headRefOid // .data.repository.pullRequest.commits.nodes[0].commit.oid // null),
+      committed_at: (.data.repository.pullRequest.commits.nodes[0].commit.committedDate // null)
+    }'
+}
+
+fetch_base_ref_json() {
+  local owner=$1
+  local repo=$2
+  local pr_number=$3
+
+  gh_json api graphql \
+    -f query='
+      query($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            baseRefName
+            baseRefOid
+            baseRef {
+              target {
+                oid
+              }
+            }
+          }
+        }
+      }' \
+    -f owner="$owner" -f repo="$repo" -F pr="$pr_number" |
+    jq -c '{
+      base_ref_name: (.data.repository.pullRequest.baseRefName // null),
+      base_head_oid: (.data.repository.pullRequest.baseRefOid // null),
+      base_target_oid: (.data.repository.pullRequest.baseRef.target.oid // null)
+    }'
+}
+
+fetch_legacy_required_status_checks_json() {
+  local response status body succeeded=false
+  if response="$(gh_json api "$1" --include)"; then
+    succeeded=true
+  fi
+  status="$(awk '/^HTTP\// {code=$2} END {print code}' <<<"$response")"
+  body="$(awk 'body {print} !body && /^\r?$/ {body=1}' <<<"$response")"
+  # A generic 404 can hide inaccessible policy. Only the explicit absence
+  # response establishes that this branch has no legacy status requirements.
+  if [[ "$status" == '404' ]] && jq -e '.message == "Branch not protected"' >/dev/null 2>&1 <<<"$body"; then
+    printf '[]\n'
+  elif [[ "$succeeded" == true && "$status" == '200' ]]; then
+    jq -ce 'select(type == "object" and (.contexts | type) == "array" and (.checks | type) == "array")
+      | [.checks[]?.context, .contexts[]?] | map(select(type == "string" and length > 0)) | unique' <<<"$body"
+  else
+    return 1
+  fi
+}
+
+fetch_required_status_checks_json() {
+  local owner=$1
+  local repo=$2
+  local base_ref=$3
+  local default_ref=$4
+  local rulesets_pages rulesets_json details='[]' ruleset_id detail
+  local ruleset_required='[]' legacy_required='[]'
+
+  [[ -n "$owner" && -n "$repo" && -n "$base_ref" ]] || return 1
+
+  # Rulesets expose the required status contexts, while the list endpoint only
+  # exposes their IDs. Fetch the active rule definitions before deciding that a
+  # small rollup is complete. Legacy branch protection can coexist with
+  # rulesets, so query it as well and union both policy sources.
+  if rulesets_pages="$(gh_json api --paginate "repos/$owner/$repo/rulesets?per_page=100")"; then
+    rulesets_json="$(jq -cs '[.[][]?]' <<<"$rulesets_pages")" || return 1
+    while IFS= read -r ruleset_id; do
+      [[ -n "$ruleset_id" ]] || continue
+      if ! detail="$(gh_json api "repos/$owner/$repo/rulesets/$ruleset_id")"; then
+        return 1
+      fi
+      jq -e . >/dev/null 2>&1 <<<"$detail" || return 1
+      details="$(jq -cn --argjson prev "$details" --argjson detail "$detail" '$prev + [$detail]')" || return 1
+    done < <(jq -r '.[] | select(.target == "branch" and .enforcement == "active") | .id // empty' <<<"$rulesets_json")
+
+    # GitHub uses fnmatch semantics for ref conditions. Exact names and the
+    # documented special values are evaluated below; unsupported glob syntax
+    # must make policy discovery unknown instead of silently dropping a rule.
+    ruleset_required="$(jq -c --arg base "$base_ref" --arg default "$default_ref" '
+      def matches_ref($candidate):
+        $candidate == "~ALL"
+        or $candidate == $base
+        or $candidate == ("refs/heads/" + $base)
+        or ($candidate == "~DEFAULT_BRANCH" and $default != "" and $base == $default);
+      def unsupported_ref_pattern:
+        contains("*") or contains("?") or contains("[") or contains("]") or contains("\\");
+      if any(
+        .[]
+        | select(.enforcement == "active")
+        | ((.conditions.ref_name.include // []) + (.conditions.ref_name.exclude // []))[]?
+        ; unsupported_ref_pattern
+      ) then
+        error("ruleset ref pattern cannot be evaluated safely")
+      else
+        [
+          .[]
+          | select(.enforcement == "active")
+          | select(any((.conditions.ref_name.include // [])[]?; matches_ref(.)))
+          | select(any((.conditions.ref_name.exclude // [])[]?; matches_ref(.)) | not)
+          | .rules[]?
+          | select(.type == "required_status_checks")
+          | .parameters.required_status_checks[]?
+        ] as $required_checks
+        | if any($required_checks[]?; (.integration_id? // null) != null) then
+            error("ruleset required check integration source cannot be verified")
+          else
+            [$required_checks[]? | .context // empty] | unique
+          end
+      end
+    ' <<<"$details" 2>/dev/null)" || return 1
+
+    legacy_required="$(fetch_legacy_required_status_checks_json "repos/$owner/$repo/branches/$base_ref/protection/required_status_checks")" || return 1
+
+    jq -cn --argjson ruleset "$ruleset_required" --argjson legacy "$legacy_required" '$ruleset + $legacy | unique'
+    return
+  fi
+
+  return 1
+}
+
+fetch_merge_base_json() {
+  local owner=$1
+  local repo=$2
+  local base_head_oid=$3
+  local head_oid=$4
+
+  gh_json api "repos/$owner/$repo/compare/$base_head_oid...$head_oid" |
+    jq -c '{merge_base_oid: (.merge_base_commit.sha // null)}'
+}
+
+fetch_review_threads_nodes_json() {
+  local owner=$1
+  local repo=$2
+  local pr_number=$3
+  local cursor=''
+  local nodes_file
+  nodes_file="$(mktemp)"
+  printf '[]\n' >"$nodes_file"
+
+  while :; do
+    local cursor_args=()
+    if [[ -n "$cursor" ]]; then
+      cursor_args=(-f cursor="$cursor")
+    fi
+
+    local page_json
+    if ! page_json="$(gh_json api graphql \
+      -f query='
+        query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pr) {
+              reviewThreads(first: 100, after: $cursor) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                nodes {
+                  id
+                  isResolved
+                  path
+                  comments(last: 100) {
+                    nodes {
+                      databaseId
+                      createdAt
+                      author { login }
+                      body
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }' \
+      -f owner="$owner" -f repo="$repo" -F pr="$pr_number" ${cursor_args[@]+"${cursor_args[@]}"})"; then
+      rm -f "$nodes_file"
+      return 1
+    fi
+
+    local page_nodes
+    page_nodes="$(jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' <<<"$page_json")"
+    local next_nodes_file
+    next_nodes_file="$(mktemp)"
+    if ! printf '%s\n' "$page_nodes" | jq -cn \
+      --slurpfile prev "$nodes_file" \
+      '$prev[0] + input' >"$next_nodes_file"; then
+      add_error "review_threads" "failed to merge paginated review threads"
+      rm -f "$next_nodes_file" "$nodes_file"
+      return 1
+    fi
+    mv "$next_nodes_file" "$nodes_file"
+
+    local has_next
+    has_next="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' <<<"$page_json")"
+    if [[ "$has_next" != "true" ]]; then
+      break
+    fi
+
+    cursor="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // ""' <<<"$page_json")"
+    if [[ -z "$cursor" ]]; then
+      add_error "review_threads" "pagination stopped: missing endCursor"
+      break
+    fi
+  done
+
+  cat "$nodes_file"
+  rm -f "$nodes_file"
+}
+
+repo_owner=''
+repo_name=''
+default_branch_name=''
+if repo_json="$(gh_json repo view --json owner,name,defaultBranchRef)"; then
+  repo_owner="$(jq -r '.owner.login // ""' <<<"$repo_json")"
+  repo_name="$(jq -r '.name // ""' <<<"$repo_json")"
+  default_branch_name="$(jq -r '.defaultBranchRef.name // ""' <<<"$repo_json")"
+else
+  add_error "repo" "gh repo view failed"
+fi
+
+comments_json='[]'
+status_json='[]'
+resolved_pr_number=''
+is_cross_repository=null
+if pr_view_json="$(gh_json pr view "$PR" --json number,baseRefName,headRefName,headRefOid,headRepositoryOwner,headRepository,maintainerCanModify,isCrossRepository,statusCheckRollup,comments,url)"; then
+  pr_view_succeeded=true
+  resolved_pr_number="$(jq -r '.number // ""' <<<"$pr_view_json")"
+  if pr_url_owner="$(jq -r '.url | capture("github.com/(?<owner>[^/]+)/(?<repo>[^/]+)/pull/[0-9]+").owner // ""' <<<"$pr_view_json" 2>/dev/null)" && [[ -n "$pr_url_owner" ]]; then
+    repo_owner="$pr_url_owner"
+    repo_name="$(jq -r '.url | capture("github.com/(?<owner>[^/]+)/(?<repo>[^/]+)/pull/[0-9]+").repo // ""' <<<"$pr_view_json")"
+  fi
+  pr_json="$(jq -c '{
+    number: .number,
+    branch: (.headRefName // "unknown"),
+    is_cross_repository: (if has("isCrossRepository") then .isCrossRepository else null end),
+    base_ref_name: (.baseRefName // null),
+    base_head_oid: null,
+    base_target_oid: null,
+    merge_base_oid: null,
+    base_advanced_since_head: null,
+    head_repository_owner: (.headRepositoryOwner.login // null),
+    head_repository_name: (.headRepository.name // null),
+    head_ref_name: (.headRefName // null),
+    head_ref_oid: (.headRefOid // null),
+    maintainer_can_modify: (.maintainerCanModify // null)
+  }' <<<"$pr_view_json")"
+  is_cross_repository="$(jq -c 'if has("isCrossRepository") then .isCrossRepository else null end' <<<"$pr_view_json")"
+  comments_json="$(jq -c '.comments // []' <<<"$pr_view_json")"
+  status_json="$(jq -c '.statusCheckRollup // []' <<<"$pr_view_json")"
+  checks_json="$(extract_checks_json "$status_json")"
+  checks_head_sha="$(jq -r '.headRefOid // ""' <<<"$pr_view_json")"
+else
+  if [[ "$PR" =~ ^[0-9]+$ ]]; then
+    pr_json="$(jq -cn --argjson number "$PR" '{number: $number, branch: "unknown"}')"
+  else
+    pr_json="$(jq -cn --arg branch "$PR" '{number: null, branch: $branch}')"
+  fi
+  add_error "pr_view" "gh pr view failed"
+fi
+
+if [[ "$pr_view_succeeded" == "true" && -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if base_context_json="$(fetch_base_ref_json "$repo_owner" "$repo_name" "$resolved_pr_number")"; then
+    base_ref_name="$(jq -r '.base_ref_name // ""' <<<"$base_context_json")"
+    base_head_oid="$(jq -r '.base_head_oid // ""' <<<"$base_context_json")"
+    base_target_oid="$(jq -r '.base_target_oid // ""' <<<"$base_context_json")"
+  else
+    add_error "base" "gh api graphql base ref lookup failed"
+  fi
+
+  if [[ -n "$base_ref_name" ]]; then
+    if required_status_checks_json="$(fetch_required_status_checks_json "$repo_owner" "$repo_name" "$base_ref_name" "$default_branch_name")"; then
+      required_status_checks_known=true
+    else
+      add_error "required_status_checks" "required status check policy lookup failed"
+    fi
+  fi
+
+  if [[ -n "$base_head_oid" && -n "$checks_head_sha" ]]; then
+    if merge_base_json="$(fetch_merge_base_json "$repo_owner" "$repo_name" "$base_head_oid" "$checks_head_sha")"; then
+      merge_base_oid="$(jq -r '.merge_base_oid // ""' <<<"$merge_base_json")"
+    else
+      add_error "merge_base" "gh api compare base and head failed"
+    fi
+  fi
+
+  if [[ -n "$base_head_oid" && -n "$merge_base_oid" ]]; then
+    if [[ "$base_head_oid" == "$merge_base_oid" ]]; then
+      base_advanced_since_head=false
+    else
+      base_advanced_since_head=true
+    fi
+  fi
+
+  pr_json="$(jq -c \
+    --arg base_ref_name "$base_ref_name" \
+    --arg base_head_oid "$base_head_oid" \
+    --arg base_target_oid "$base_target_oid" \
+    --arg merge_base_oid "$merge_base_oid" \
+    --argjson base_advanced_since_head "$base_advanced_since_head" \
+    '. + {
+      base_ref_name: (if $base_ref_name == "" then null else $base_ref_name end),
+      base_head_oid: (if $base_head_oid == "" then null else $base_head_oid end),
+      base_target_oid: (if $base_target_oid == "" then null else $base_target_oid end),
+      merge_base_oid: (if $merge_base_oid == "" then null else $merge_base_oid end),
+      base_advanced_since_head: $base_advanced_since_head
+    }' <<<"$pr_json")"
+fi
+
+if ! approval_required_runs_json="$(fetch_approval_required_runs_json "$repo_owner" "$repo_name" "$resolved_pr_number" "$checks_head_sha")"; then
+  approval_required_runs_json='[]'
+  add_error "approval_required_runs" "workflow runs API failed"
+fi
+
+since=''
+if [[ "$INCLUDE_ALL" != "1" && -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if since_json="$(fetch_head_commit_json "$repo_owner" "$repo_name" "$resolved_pr_number")"; then
+    since="$(jq -r '.committed_at // ""' <<<"$since_json")"
+    if [[ -z "$since" ]]; then
+      add_error "since" "head commit timestamp unavailable; including historical comments"
+      since_json='null'
+    fi
+  else
+    add_error "since" "gh api graphql head commit failed; including historical comments"
+    since_json='null'
+  fi
+fi
+
+issue_comments_json="$(extract_issue_comments_json "$comments_json" "$since")"
+
+if [[ -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if reviews_pages_json="$(gh_json api --paginate -X GET "repos/$repo_owner/$repo_name/pulls/$resolved_pr_number/reviews")"; then
+    reviews_api_json="$(jq -cs 'add // []' <<<"$reviews_pages_json")"
+    reviews_json="$(extract_reviews_json "$reviews_api_json" "$since")"
+    reviews_known=true
+  else
+    add_error "reviews" "gh api pulls reviews failed"
+  fi
+else
+  add_error "reviews" "skipped: resolved PR identity unavailable"
+fi
+
+opening_head_oid="$(jq -r '.head_oid // ""' <<<"$since_json")"
+
+if [[ -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if threads_nodes_json="$(fetch_review_threads_nodes_json "$repo_owner" "$repo_name" "$resolved_pr_number")"; then
+    review_threads_json="$(extract_review_threads_json "$threads_nodes_json" "$since")"
+    all_review_threads_json="$(extract_review_threads_json "$threads_nodes_json" "")"
+    hidden_unresolved_threads_json="$(printf '%s\n%s\n' "$all_review_threads_json" "$review_threads_json" |
+      jq -cn '
+        [inputs] as [$all, $filtered]
+        | ($filtered | map(.thread_id)) as $filtered_ids
+        | $all
+        | map(select(.is_resolved == false and (.thread_id as $id | $filtered_ids | index($id) | not)))
+        | map({thread_id, comment_id, author, path, body_preview})
+      ')"
+    unresolved_review_thread_count="$(jq -r '[.[] | select(.isResolved == false)] | length' <<<"$threads_nodes_json")"
+    filtered_review_thread_count="$(jq -r 'length' <<<"$review_threads_json")"
+  else
+    add_error "review_threads" "gh api graphql reviewThreads failed"
+  fi
+elif [[ -z "$repo_owner" || -z "$repo_name" ]]; then
+  add_error "review_threads" "skipped: repo lookup failed"
+elif [[ -z "$resolved_pr_number" ]]; then
+  add_error "review_threads" "skipped: resolved PR identity unavailable"
+fi
+
+trusted_workflow_json="$(fetch_trusted_workflow_json "$repo_owner" "$repo_name" "$resolved_pr_number" "$opening_head_oid")"
+if [[ -n "$TRUSTED_REVIEWER" && "$is_cross_repository" == "false" && "$(jq -r '.known' <<<"$trusted_workflow_json")" != "true" ]]; then
+  add_error "trusted_workflow" "authenticated workflow evidence unavailable"
+fi
+
+closing_head_oid=''
+if [[ -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if closing_since_json="$(fetch_head_commit_json "$repo_owner" "$repo_name" "$resolved_pr_number")"; then
+    closing_head_oid="$(jq -r '.head_oid // ""' <<<"$closing_since_json")"
+    if [[ -z "$closing_head_oid" ]]; then
+      add_error "closing_head" "head commit SHA unavailable after evidence collection"
+    fi
+  else
+    add_error "closing_head" "gh api graphql closing head commit failed"
+  fi
+fi
+
+# Re-read the base alongside the closing head. The base can advance while
+# reviews and checks are collected, so the initial divergence fields are not a
+# safe final snapshot.
+if [[ -n "$repo_owner" && -n "$repo_name" && -n "$resolved_pr_number" ]]; then
+  if closing_base_context_json="$(fetch_base_ref_json "$repo_owner" "$repo_name" "$resolved_pr_number")"; then
+    closing_base_ref_name="$(jq -r '.base_ref_name // ""' <<<"$closing_base_context_json")"
+    closing_base_head_oid="$(jq -r '.base_head_oid // ""' <<<"$closing_base_context_json")"
+    closing_base_target_oid="$(jq -r '.base_target_oid // ""' <<<"$closing_base_context_json")"
+    closing_merge_base_oid=''
+    comparison_head_oid="$closing_head_oid"
+    [[ -n "$comparison_head_oid" ]] || comparison_head_oid="$checks_head_sha"
+    if [[ -n "$closing_base_head_oid" && -n "$comparison_head_oid" ]]; then
+      if closing_merge_base_json="$(fetch_merge_base_json "$repo_owner" "$repo_name" "$closing_base_head_oid" "$comparison_head_oid")"; then
+        closing_merge_base_oid="$(jq -r '.merge_base_oid // ""' <<<"$closing_merge_base_json")"
+      else
+        add_error "closing_merge_base" "gh api compare base and head failed after evidence collection"
+      fi
+    fi
+    base_ref_name="$closing_base_ref_name"
+    base_head_oid="$closing_base_head_oid"
+    base_target_oid="$closing_base_target_oid"
+    merge_base_oid="$closing_merge_base_oid"
+    base_advanced_since_head=null
+    if [[ -n "$base_head_oid" && -n "$merge_base_oid" ]]; then
+      if [[ "$base_head_oid" == "$merge_base_oid" ]]; then
+        base_advanced_since_head=false
+      else
+        base_advanced_since_head=true
+      fi
+    fi
+  else
+    add_error "closing_base" "gh api graphql base ref lookup failed after evidence collection"
+    base_ref_name=''
+    base_head_oid=''
+    base_target_oid=''
+    merge_base_oid=''
+    base_advanced_since_head=null
+  fi
+  pr_json="$(jq -c \
+    --arg base_ref_name "$base_ref_name" \
+    --arg base_head_oid "$base_head_oid" \
+    --arg base_target_oid "$base_target_oid" \
+    --arg merge_base_oid "$merge_base_oid" \
+    --argjson base_advanced_since_head "$base_advanced_since_head" \
+    '. + {
+      base_ref_name: (if $base_ref_name == "" then null else $base_ref_name end),
+      base_head_oid: (if $base_head_oid == "" then null else $base_head_oid end),
+      base_target_oid: (if $base_target_oid == "" then null else $base_target_oid end),
+      merge_base_oid: (if $merge_base_oid == "" then null else $merge_base_oid end),
+      base_advanced_since_head: $base_advanced_since_head
+    }' <<<"$pr_json")"
+fi
+
+if [[ -n "$opening_head_oid" && -n "$closing_head_oid" && "$opening_head_oid" != "$closing_head_oid" ]]; then
+  add_error "review_evidence" "head changed during evidence collection"
+fi
+if [[ -n "$checks_head_sha" && -n "$closing_head_oid" && "$checks_head_sha" == "$closing_head_oid" ]]; then
+  checks_snapshot_complete=true
+fi
+review_evidence_json="$(review_evidence_json "$opening_head_oid" "$closing_head_oid" "$checks_head_sha" "$reviews_known" "$reviews_api_json" "$is_cross_repository" "$trusted_workflow_json")"
+
+state_tmp_dir="$(mktemp -d)"
+
+printf '%s\n' "$pr_json" >"$state_tmp_dir/pr.json"
+printf '%s\n' "$since_json" >"$state_tmp_dir/since.json"
+printf '%s\n' "$checks_json" >"$state_tmp_dir/checks.json"
+printf '%s\n' "$required_status_checks_json" >"$state_tmp_dir/required_status_checks.json"
+printf '%s\n' "$approval_required_runs_json" >"$state_tmp_dir/approval_required_runs.json"
+printf '%s\n' "$review_threads_json" >"$state_tmp_dir/review_threads.json"
+printf '%s\n' "$hidden_unresolved_threads_json" >"$state_tmp_dir/hidden_unresolved_threads.json"
+printf '%s\n' "$reviews_json" >"$state_tmp_dir/reviews.json"
+printf '%s\n' "$review_evidence_json" >"$state_tmp_dir/review_evidence.json"
+printf '%s\n' "$issue_comments_json" >"$state_tmp_dir/issue_comments.json"
+printf '%s\n' "$errors" >"$state_tmp_dir/errors.json"
+
+state_json="$(jq -cn \
+  --slurpfile pr "$state_tmp_dir/pr.json" \
+  --slurpfile since "$state_tmp_dir/since.json" \
+  --slurpfile checks "$state_tmp_dir/checks.json" \
+  --slurpfile required_status_checks "$state_tmp_dir/required_status_checks.json" \
+  --slurpfile approval_required_runs "$state_tmp_dir/approval_required_runs.json" \
+  --slurpfile review_threads "$state_tmp_dir/review_threads.json" \
+  --slurpfile hidden_unresolved_threads "$state_tmp_dir/hidden_unresolved_threads.json" \
+  --slurpfile reviews "$state_tmp_dir/reviews.json" \
+  --slurpfile review_evidence "$state_tmp_dir/review_evidence.json" \
+  --slurpfile issue_comments "$state_tmp_dir/issue_comments.json" \
+  --arg checks_head_sha "$checks_head_sha" \
+  --argjson checks_snapshot_complete "$checks_snapshot_complete" \
+  --argjson required_status_checks_known "$required_status_checks_known" \
+  --argjson unresolved_review_thread_count "$unresolved_review_thread_count" \
+  --argjson filtered_review_thread_count "$filtered_review_thread_count" \
+  --slurpfile errors "$state_tmp_dir/errors.json" \
+  '{
+    pr: $pr[0],
+    since: $since[0],
+    checks: $checks[0],
+    checks_head_sha: (if $checks_head_sha == "" then null else $checks_head_sha end),
+    checks_snapshot_complete: $checks_snapshot_complete,
+    required_status_checks: $required_status_checks[0],
+    required_status_checks_known: $required_status_checks_known,
+    approval_required_runs: $approval_required_runs[0],
+    review_threads: $review_threads[0],
+    hidden_unresolved_threads: $hidden_unresolved_threads[0],
+    unresolved_review_thread_count: $unresolved_review_thread_count,
+    filtered_review_thread_count: $filtered_review_thread_count,
+    reviews: $reviews[0],
+    review_evidence: $review_evidence[0],
+    issue_comments: $issue_comments[0],
+    actionable_issue_comment_count: ([$issue_comments[0][] | select(.actionable)] | length),
+    errors: $errors[0]
+  }')"
+
+if [[ "$SUMMARY" == "1" ]]; then
+  summarize_state_json <<<"$state_json"
+else
+  printf '%s\n' "$state_json"
+fi

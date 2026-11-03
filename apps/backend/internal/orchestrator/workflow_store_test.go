@@ -1,0 +1,592 @@
+package orchestrator
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/task/models"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+)
+
+// noopPublisher satisfies the taskUpdatedPublisher contract without touching
+// an event bus. Workflow-store unit tests don't exercise the event path.
+func noopPublisher(_ context.Context, _ *models.Task, _ ...string) {}
+
+// capturingPublisher records each publishTaskUpdated call's task and
+// old-workflow-ID argument so tests can assert on what ApplyTransition
+// passed through.
+type capturingPublisher struct {
+	calls []capturedTaskUpdate
+}
+
+type capturedTaskUpdate struct {
+	task           *models.Task
+	oldWorkflowIDs []string
+}
+
+func (c *capturingPublisher) publish(_ context.Context, task *models.Task, oldWorkflowIDs ...string) {
+	c.calls = append(c.calls, capturedTaskUpdate{task: task, oldWorkflowIDs: oldWorkflowIDs})
+}
+
+func TestWorkflowStore_LoadState(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	agentMgr := &mockAgentManager{isPassthrough: true}
+	store := newWorkflowStore(repo, newMockStepGetter(), agentMgr, noopPublisher, testLogger(), &operationLedger{})
+
+	state, err := store.LoadState(ctx, "t1", "s1")
+	if err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+
+	if state.TaskID != "t1" {
+		t.Errorf("expected TaskID %q, got %q", "t1", state.TaskID)
+	}
+	if state.SessionID != "s1" {
+		t.Errorf("expected SessionID %q, got %q", "s1", state.SessionID)
+	}
+	if state.WorkflowID != "wf1" {
+		t.Errorf("expected WorkflowID %q, got %q", "wf1", state.WorkflowID)
+	}
+	if state.CurrentStepID != "step1" {
+		t.Errorf("expected CurrentStepID %q, got %q", "step1", state.CurrentStepID)
+	}
+	if state.TaskDescription != "Test" {
+		t.Errorf("expected TaskDescription %q, got %q", "Test", state.TaskDescription)
+	}
+	if !state.IsPassthrough {
+		t.Error("expected IsPassthrough to be true")
+	}
+}
+
+// TestWorkflowStore_LoadState_BlankSessionIDResolvesFromTaskRow is AC-62's
+// production-side companion: a task that has never had a session (the F38/
+// dispatcher case for zero task_sessions rows, sessionID == "") must still
+// resolve via LoadState, because CurrentStepID is derived from the task row,
+// not the session. Skipping GetTaskSession/IsPassthroughSession for a blank
+// sessionID mirrors the existing sessionID == "" sentinel convention used
+// elsewhere in this codebase (AC-16a).
+func TestWorkflowStore_LoadState_BlankSessionIDResolvesFromTaskRow(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedTaskWithoutSession(t, repo, "t1", "step1")
+
+	agentMgr := &mockAgentManager{isPassthrough: true}
+	store := newWorkflowStore(repo, newMockStepGetter(), agentMgr, noopPublisher, testLogger(), &operationLedger{})
+
+	state, err := store.LoadState(ctx, "t1", "")
+	if err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+
+	if state.TaskID != "t1" {
+		t.Errorf("expected TaskID %q, got %q", "t1", state.TaskID)
+	}
+	if state.WorkflowID != "wf1" {
+		t.Errorf("expected WorkflowID %q, got %q", "wf1", state.WorkflowID)
+	}
+	if state.CurrentStepID != "step1" {
+		t.Errorf("expected CurrentStepID %q, got %q", "step1", state.CurrentStepID)
+	}
+}
+
+func TestWorkflowStore_LoadStep(t *testing.T) {
+	ctx := context.Background()
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step1"] = &wfmodels.WorkflowStep{
+		ID:         "step1",
+		WorkflowID: "wf1",
+		Name:       "Planning",
+		Position:   0,
+	}
+
+	store := newWorkflowStore(nil, stepGetter, nil, noopPublisher, testLogger(), &operationLedger{})
+
+	spec, err := store.LoadStep(ctx, "wf1", "step1")
+	if err != nil {
+		t.Fatalf("LoadStep failed: %v", err)
+	}
+
+	if spec.ID != "step1" {
+		t.Errorf("expected ID %q, got %q", "step1", spec.ID)
+	}
+	if spec.Name != "Planning" {
+		t.Errorf("expected Name %q, got %q", "Planning", spec.Name)
+	}
+	if spec.Position != 0 {
+		t.Errorf("expected Position %d, got %d", 0, spec.Position)
+	}
+}
+
+func TestWorkflowStore_LoadNextStep(t *testing.T) {
+	ctx := context.Background()
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step1"] = &wfmodels.WorkflowStep{
+		ID: "step1", WorkflowID: "wf1", Name: "Step 1", Position: 0,
+	}
+	stepGetter.steps["step2"] = &wfmodels.WorkflowStep{
+		ID: "step2", WorkflowID: "wf1", Name: "Step 2", Position: 1,
+	}
+	stepGetter.steps["step3"] = &wfmodels.WorkflowStep{
+		ID: "step3", WorkflowID: "wf1", Name: "Step 3", Position: 2,
+	}
+
+	store := newWorkflowStore(nil, stepGetter, nil, noopPublisher, testLogger(), &operationLedger{})
+
+	t.Run("returns next step by position", func(t *testing.T) {
+		spec, err := store.LoadNextStep(ctx, "wf1", 0)
+		if err != nil {
+			t.Fatalf("LoadNextStep failed: %v", err)
+		}
+		if spec.ID != "step2" {
+			t.Errorf("expected next step ID %q, got %q", "step2", spec.ID)
+		}
+		if spec.Position != 1 {
+			t.Errorf("expected Position %d, got %d", 1, spec.Position)
+		}
+	})
+
+	t.Run("returns error when no next step exists", func(t *testing.T) {
+		_, err := store.LoadNextStep(ctx, "wf1", 2)
+		if err == nil {
+			t.Fatal("expected error when no next step exists, got nil")
+		}
+	})
+}
+
+func TestWorkflowStore_ApplyTransition(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	store := newWorkflowStore(repo, newMockStepGetter(), nil, noopPublisher, testLogger(), &operationLedger{})
+
+	err := store.ApplyTransition(ctx, "t1", "s1", "step1", "step2", "on_turn_complete")
+	if err != nil {
+		t.Fatalf("ApplyTransition failed: %v", err)
+	}
+
+	// Verify task's WorkflowStepID is updated
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.WorkflowStepID != "step2" {
+		t.Errorf("expected task WorkflowStepID %q, got %q", "step2", task.WorkflowStepID)
+	}
+
+	// Verify review status is cleared on session
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	if session.ReviewStatus != models.ReviewStatusNone {
+		t.Errorf("expected review status to be cleared, got %q", session.ReviewStatus)
+	}
+}
+
+func TestWorkflowStore_ApplyTransitionSyncsWorkflowIDAcrossWorkflows(t *testing.T) {
+	// Regression test: applyPendingMove (deferred cross-workflow move_task_kandev
+	// hand-off for tasks with an active/starting session) calls ApplyTransition
+	// directly, bypassing task.Service.MoveTask. Without syncing WorkflowID here,
+	// a cross-workflow move would leave the task pointing at a step ID that
+	// belongs to a different workflow than task.WorkflowID records.
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1") // seedSession puts the task in wf1
+
+	// Create a second workflow the task is moving into.
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf2", WorkspaceID: "ws1", Name: "Other Workflow",
+	}); err != nil {
+		t.Fatalf("CreateWorkflow wf2: %v", err)
+	}
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step-wf2"] = &wfmodels.WorkflowStep{
+		ID: "step-wf2", WorkflowID: "wf2", Name: "Target", Position: 0,
+	}
+	store := newWorkflowStore(repo, stepGetter, nil, noopPublisher, testLogger(), &operationLedger{})
+
+	if err := store.ApplyTransition(ctx, "t1", "s1", "step1", "step-wf2", "manual_move"); err != nil {
+		t.Fatalf("ApplyTransition: %v", err)
+	}
+
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.WorkflowStepID != "step-wf2" {
+		t.Errorf("expected task WorkflowStepID %q, got %q", "step-wf2", task.WorkflowStepID)
+	}
+	if task.WorkflowID != "wf2" {
+		t.Errorf("expected task WorkflowID to sync to the target step's workflow %q, got %q",
+			"wf2", task.WorkflowID)
+	}
+}
+
+func TestWorkflowStore_ApplyTransitionPublishesOldWorkflowIDOnCrossWorkflowMove(t *testing.T) {
+	// Regression test for PR review feedback: ApplyTransition syncs
+	// task.WorkflowID to the target step's workflow, but the task.updated
+	// event must also carry the pre-move workflow ID (old_workflow_id) —
+	// same as the normal task.Service.MoveTask path — so the frontend can
+	// remove the task from its previous workflow's snapshot instead of
+	// leaving a stale duplicate until reload.
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1") // seedSession puts the task in wf1
+
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf2", WorkspaceID: "ws1", Name: "Other Workflow",
+	}); err != nil {
+		t.Fatalf("CreateWorkflow wf2: %v", err)
+	}
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step-wf2"] = &wfmodels.WorkflowStep{
+		ID: "step-wf2", WorkflowID: "wf2", Name: "Target", Position: 0,
+	}
+	pub := &capturingPublisher{}
+	store := newWorkflowStore(repo, stepGetter, nil, pub.publish, testLogger(), &operationLedger{})
+
+	if err := store.ApplyTransition(ctx, "t1", "s1", "step1", "step-wf2", "manual_move"); err != nil {
+		t.Fatalf("ApplyTransition: %v", err)
+	}
+
+	if len(pub.calls) != 1 {
+		t.Fatalf("expected exactly 1 publishTaskUpdated call, got %d", len(pub.calls))
+	}
+	call := pub.calls[0]
+	if call.task.WorkflowID != "wf2" {
+		t.Errorf("expected published task WorkflowID %q, got %q", "wf2", call.task.WorkflowID)
+	}
+	if len(call.oldWorkflowIDs) != 1 || call.oldWorkflowIDs[0] != "wf1" {
+		t.Errorf("expected old_workflow_id %q, got %v", "wf1", call.oldWorkflowIDs)
+	}
+}
+
+func TestWorkflowStore_ApplyTransitionQueuesFullWIPLimitedTarget(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:             "occupant",
+		WorkspaceID:    "ws1",
+		WorkflowID:     "wf1",
+		WorkflowStepID: "step2",
+		Title:          "Occupant",
+		State:          "TODO",
+		Priority:       "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask occupant: %v", err)
+	}
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step2"] = &wfmodels.WorkflowStep{
+		ID: "step2", WorkflowID: "wf1", Name: "Limited", Position: 1, WIPLimit: 1,
+	}
+	store := newWorkflowStore(repo, stepGetter, nil, noopPublisher, testLogger(), &operationLedger{})
+
+	err := store.ApplyTransition(ctx, "t1", "s1", "step1", "step2", "on_turn_complete")
+	if err != nil {
+		t.Fatalf("ApplyTransition: %v", err)
+	}
+
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.WorkflowStepID != "step2" || task.WIPAdmitted || task.QueuedForStepID != "step2" {
+		t.Fatalf("queued task placement: step=%q admitted=%t queue=%q", task.WorkflowStepID, task.WIPAdmitted, task.QueuedForStepID)
+	}
+}
+
+func TestWorkflowStore_ApplyTransitionPullsNextFeederTaskOnVacate(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step-limited")
+	// Creation now assigns each task the next arrival position in its step
+	// regardless of any caller-supplied Position, and step order ranks
+	// position ahead of priority. So the critical task must arrive first to
+	// be the one pulled here; a same-position tiebreak on priority is
+	// covered directly in models.TestStepOrderLess.
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:             "task-critical",
+		WorkspaceID:    "ws1",
+		WorkflowID:     "wf1",
+		WorkflowStepID: "step-feeder",
+		Title:          "Critical",
+		State:          "TODO",
+		Priority:       "critical",
+	}); err != nil {
+		t.Fatalf("CreateTask critical: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:             "task-low",
+		WorkspaceID:    "ws1",
+		WorkflowID:     "wf1",
+		WorkflowStepID: "step-feeder",
+		Title:          "Low",
+		State:          "TODO",
+		Priority:       "low",
+	}); err != nil {
+		t.Fatalf("CreateTask low: %v", err)
+	}
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step-limited"] = &wfmodels.WorkflowStep{
+		ID: "step-limited", WorkflowID: "wf1", Name: "Limited", Position: 0,
+		WIPLimit: 1, PullFromStepID: "step-feeder",
+	}
+	stepGetter.steps["step-next"] = &wfmodels.WorkflowStep{
+		ID: "step-next", WorkflowID: "wf1", Name: "Next", Position: 1,
+	}
+	var movedTaskID string
+	store := newWorkflowStore(repo, stepGetter, nil, noopPublisher, testLogger(), &operationLedger{},
+		func(_ context.Context, task *models.Task, _, _, _, _ string) {
+			movedTaskID = task.ID
+		})
+
+	if err := store.ApplyTransition(ctx, "t1", "s1", "step-limited", "step-next", "on_turn_complete"); err != nil {
+		t.Fatalf("ApplyTransition: %v", err)
+	}
+
+	pulled, err := repo.GetTask(ctx, "task-critical")
+	if err != nil {
+		t.Fatalf("GetTask(task-critical): %v", err)
+	}
+	if pulled.WorkflowStepID != "step-limited" {
+		t.Fatalf("critical feeder task step = %s, want step-limited", pulled.WorkflowStepID)
+	}
+	if movedTaskID != "task-critical" {
+		t.Fatalf("moved event task = %s, want task-critical", movedTaskID)
+	}
+}
+
+// TestWorkflowStore_ApplyTransitionIfAtStep_AppliesWhenStepMatches is the
+// AC-46/48 orchestrator-level happy path: the CAS precondition holds, so the
+// move lands and behaves like ApplyTransition (task moved, review status
+// cleared, task.updated published).
+func TestWorkflowStore_ApplyTransitionIfAtStep_AppliesWhenStepMatches(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step2"] = &wfmodels.WorkflowStep{
+		ID: "step2", WorkflowID: "wf1", Name: "Step 2", Position: 1,
+	}
+	pub := &capturingPublisher{}
+	store := newWorkflowStore(repo, stepGetter, nil, pub.publish, testLogger(), &operationLedger{})
+
+	applied, err := store.ApplyTransitionIfAtStep(ctx, "t1", "s1", "step1", "step2", "on_turn_complete")
+	if err != nil {
+		t.Fatalf("ApplyTransitionIfAtStep failed: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected applied=true when expectedStepID matches the task's persisted step")
+	}
+
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.WorkflowStepID != "step2" {
+		t.Errorf("expected task WorkflowStepID %q, got %q", "step2", task.WorkflowStepID)
+	}
+
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	if session.ReviewStatus != models.ReviewStatusNone {
+		t.Errorf("expected review status to be cleared, got %q", session.ReviewStatus)
+	}
+
+	if len(pub.calls) != 1 {
+		t.Fatalf("expected exactly 1 publishTaskUpdated call, got %d", len(pub.calls))
+	}
+}
+
+// TestWorkflowStore_ApplyTransitionIfAtStep_LostRaceReturnsFalseWithoutSideEffects
+// covers the AC-46/48 abandonment path: another transition already moved the
+// task off expectedStepID by the time the CAS write ran, so no event is
+// published, no review-status clear runs, and the task row is untouched.
+func TestWorkflowStore_ApplyTransitionIfAtStep_LostRaceReturnsFalseWithoutSideEffects(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step2"] = &wfmodels.WorkflowStep{
+		ID: "step2", WorkflowID: "wf1", Name: "Step 2", Position: 1,
+	}
+	pub := &capturingPublisher{}
+	store := newWorkflowStore(repo, stepGetter, nil, pub.publish, testLogger(), &operationLedger{})
+
+	applied, err := store.ApplyTransitionIfAtStep(ctx, "t1", "s1", "not-the-current-step", "step2", "on_turn_complete")
+	if err != nil {
+		t.Fatalf("ApplyTransitionIfAtStep failed: %v", err)
+	}
+	if applied {
+		t.Fatal("expected applied=false when expectedStepID does not match the task's persisted step")
+	}
+
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.WorkflowStepID != "step1" {
+		t.Errorf("expected task to remain at step1 after a lost CAS race, got %q", task.WorkflowStepID)
+	}
+
+	if len(pub.calls) != 0 {
+		t.Fatalf("expected no publishTaskUpdated call on a lost race, got %d", len(pub.calls))
+	}
+}
+
+// TestWorkflowStore_ApplyTransitionIfAtStep_ErrorsWhenTargetStepMissing
+// mirrors the same guard ApplyTransition relies on for its target step
+// lookup: a nil step (unknown ID) must fail loudly rather than silently
+// moving the task nowhere.
+func TestWorkflowStore_ApplyTransitionIfAtStep_ErrorsWhenTargetStepMissing(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	store := newWorkflowStore(repo, newMockStepGetter(), nil, noopPublisher, testLogger(), &operationLedger{})
+
+	_, err := store.ApplyTransitionIfAtStep(ctx, "t1", "s1", "step1", "missing-step", "on_turn_complete")
+	if err == nil {
+		t.Fatal("expected an error when the target step does not exist")
+	}
+}
+
+func TestWorkflowStore_PersistData(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	store := newWorkflowStore(repo, newMockStepGetter(), nil, noopPublisher, testLogger(), &operationLedger{})
+
+	// Persist initial data
+	err := store.PersistData(ctx, "s1", map[string]any{"plan_mode": true})
+	if err != nil {
+		t.Fatalf("PersistData failed: %v", err)
+	}
+
+	// Verify data was stored
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	wd, ok := session.Metadata["workflow_data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected workflow_data in metadata, got %v", session.Metadata)
+	}
+	if wd["plan_mode"] != true {
+		t.Errorf("expected plan_mode=true, got %v", wd["plan_mode"])
+	}
+
+	// Persist more data and verify it merges (does not overwrite)
+	err = store.PersistData(ctx, "s1", map[string]any{"auto_start": false})
+	if err != nil {
+		t.Fatalf("PersistData (merge) failed: %v", err)
+	}
+
+	session, err = repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to get session after merge: %v", err)
+	}
+	wd, ok = session.Metadata["workflow_data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected workflow_data after merge, got %v", session.Metadata)
+	}
+	if wd["plan_mode"] != true {
+		t.Errorf("expected plan_mode to still be true after merge, got %v", wd["plan_mode"])
+	}
+	if wd["auto_start"] != false {
+		t.Errorf("expected auto_start=false, got %v", wd["auto_start"])
+	}
+}
+
+func TestWorkflowStore_OperationIdempotency(t *testing.T) {
+	ctx := context.Background()
+	store := newWorkflowStore(nil, newMockStepGetter(), nil, noopPublisher, testLogger(), &operationLedger{})
+
+	t.Run("empty operation ID returns false", func(t *testing.T) {
+		applied, err := store.IsOperationApplied(ctx, "")
+		if err != nil {
+			t.Fatalf("IsOperationApplied failed: %v", err)
+		}
+		if applied {
+			t.Error("expected empty operation ID to return false")
+		}
+	})
+
+	t.Run("unknown operation returns false", func(t *testing.T) {
+		applied, err := store.IsOperationApplied(ctx, "unknown-op")
+		if err != nil {
+			t.Fatalf("IsOperationApplied failed: %v", err)
+		}
+		if applied {
+			t.Error("expected unknown operation to return false")
+		}
+	})
+
+	t.Run("marked operation returns true", func(t *testing.T) {
+		err := store.MarkOperationApplied(ctx, "op-1")
+		if err != nil {
+			t.Fatalf("MarkOperationApplied failed: %v", err)
+		}
+
+		applied, err := store.IsOperationApplied(ctx, "op-1")
+		if err != nil {
+			t.Fatalf("IsOperationApplied failed: %v", err)
+		}
+		if !applied {
+			t.Error("expected marked operation to return true")
+		}
+	})
+
+	t.Run("marking empty operation ID is a no-op", func(t *testing.T) {
+		if err := store.MarkOperationApplied(ctx, ""); err != nil {
+			t.Fatalf("MarkOperationApplied failed: %v", err)
+		}
+
+		applied, err := store.IsOperationApplied(ctx, "")
+		if err != nil {
+			t.Fatalf("IsOperationApplied failed: %v", err)
+		}
+		if applied {
+			t.Error("expected empty operation ID to never be stored")
+		}
+	})
+}
+
+// TestQueuedTaskBeforeAlignsQueuedAtWithCreatedAtFallback covers
+// AC-TASKS-KANBAN-TASK-REORDERING-001.36: this comparator is byte-identical
+// to service_workflow.go's queuedTaskBefore and must apply the same
+// COALESCE(queued_at, created_at) fallback rather than skipping the key
+// whenever either side's queued_at is nil.
+func TestQueuedTaskBeforeAlignsQueuedAtWithCreatedAtFallback(t *testing.T) {
+	earlier := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	later := earlier.Add(time.Hour)
+
+	left := &models.Task{ID: "a", Position: 1, Priority: "medium", QueuedAt: nil, CreatedAt: earlier}
+	right := &models.Task{ID: "b", Position: 1, Priority: "medium", QueuedAt: &earlier, CreatedAt: later}
+	if !queuedTaskBefore(left, right) {
+		t.Fatalf("queuedTaskBefore(nil queued_at falling back to earlier created_at) = false, want true")
+	}
+
+	leftLate := &models.Task{ID: "a", Position: 1, Priority: "medium", QueuedAt: &later, CreatedAt: earlier}
+	rightNil := &models.Task{ID: "b", Position: 1, Priority: "medium", QueuedAt: nil, CreatedAt: earlier}
+	if queuedTaskBefore(leftLate, rightNil) {
+		t.Fatalf("queuedTaskBefore(later effective queued_at) = true, want false")
+	}
+}

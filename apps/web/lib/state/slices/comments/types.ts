@@ -1,0 +1,188 @@
+/**
+ * Unified comment system types.
+ *
+ * All comment types (diff, plan, file-editor) share a common base and are
+ * distinguished via a `source` discriminant.
+ */
+
+// ---------------------------------------------------------------------------
+// Comment union
+// ---------------------------------------------------------------------------
+
+export type AnnotationSide = "additions" | "deletions";
+
+type CommentBase = {
+  id: string;
+  sessionId: string;
+  /**
+   * Repository this comment belongs to. Optional for backwards compat with
+   * comments persisted before multi-repo support. New comments always set it
+   * so per-repo filtering works in multi-repo task views.
+   */
+  repositoryId?: string;
+  text: string;
+  createdAt: string;
+  status: "pending" | "sent";
+};
+
+export type DiffComment = CommentBase & {
+  source: "diff";
+  filePath: string;
+  /** Explicit scope for new comments; absent on legacy persisted rows. */
+  repositoryName?: string;
+  startLine: number;
+  endLine: number;
+  side: AnnotationSide;
+  codeContent: string;
+};
+
+export type ReviewFileComment = CommentBase & {
+  source: "review-file";
+  filePath: string;
+  repositoryName: string;
+  baseRef?: string;
+  isSubmodule?: boolean;
+};
+
+export type ReviewComment = DiffComment | ReviewFileComment;
+
+export function isReviewComment(c: Comment): c is ReviewComment {
+  return c.source === "diff" || c.source === "review-file";
+}
+
+export type PlanComment = CommentBase & {
+  source: "plan";
+  selectedText: string;
+  from?: number;
+  to?: number;
+  /** Task-owned server identity. Legacy sessionStorage rows omit these. */
+  taskId?: string;
+  planId?: string;
+  version?: number;
+  updatedAt?: string;
+};
+
+export type FileEditorComment = CommentBase & {
+  source: "file-editor";
+  filePath: string;
+  selectedText: string;
+  startLine?: number;
+  endLine?: number;
+};
+
+export type PRFeedbackComment = CommentBase & {
+  source: "pr-feedback";
+  prNumber: number;
+  provider?: "github" | "gitlab";
+  projectPath?: string;
+  mrIid?: number;
+  feedbackType: "check" | "review" | "comment" | "conflict";
+  /** Pre-formatted markdown text for display and sending */
+  content: string;
+};
+
+export type WalkthroughComment = CommentBase & {
+  source: "walkthrough";
+  taskId: string;
+  walkthroughId?: string;
+  walkthroughTitle?: string;
+  stepIndex: number;
+  stepCount: number;
+  repo?: string;
+  filePath: string;
+  startLine: number;
+  endLine: number;
+  /** Markdown explanation authored by the agent for this walkthrough step. */
+  stepText: string;
+};
+
+export type MessageTextAnchor = {
+  messageId: string;
+  start: number;
+  end: number;
+  selectedText: string;
+  /** Text immediately before the selection, used when message content shifts. */
+  prefix: string;
+  /** Text immediately after the selection, used when message content shifts. */
+  suffix: string;
+};
+
+export type AgentMessageComment = CommentBase & {
+  source: "agent-message";
+  messageId: string;
+  selectedText: string;
+  anchor: MessageTextAnchor;
+};
+
+export type Comment =
+  | DiffComment
+  | ReviewFileComment
+  | PlanComment
+  | FileEditorComment
+  | PRFeedbackComment
+  | WalkthroughComment
+  | AgentMessageComment;
+
+// ---------------------------------------------------------------------------
+// Type guards
+// ---------------------------------------------------------------------------
+
+export function isDiffComment(c: Comment): c is DiffComment {
+  return c.source === "diff";
+}
+
+export function isPlanComment(c: Comment): c is PlanComment {
+  return c.source === "plan";
+}
+
+export function isFileEditorComment(c: Comment): c is FileEditorComment {
+  return c.source === "file-editor";
+}
+
+export function isPRFeedbackComment(c: Comment): c is PRFeedbackComment {
+  return c.source === "pr-feedback";
+}
+
+export function isWalkthroughComment(c: Comment): c is WalkthroughComment {
+  return c.source === "walkthrough";
+}
+
+export function isAgentMessageComment(c: Comment): c is AgentMessageComment {
+  return c.source === "agent-message";
+}
+
+// ---------------------------------------------------------------------------
+// Store state & actions
+// ---------------------------------------------------------------------------
+
+export type CommentsState = {
+  byId: Record<string, Comment>;
+  bySession: Record<string, string[]>;
+  pendingForChat: string[];
+  editingCommentId: string | null;
+};
+
+export type CommentsActions = {
+  addComment: (comment: Comment) => void;
+  updateComment: (commentId: string, updates: Partial<Comment>) => void;
+  removeComment: (commentId: string) => void;
+  addToPending: (commentId: string) => void;
+  removeFromPending: (commentId: string) => void;
+  clearPending: () => void;
+  setEditingComment: (commentId: string | null) => void;
+  markCommentsSent: (commentIds: string[]) => void;
+  clearSessionComments: (sessionId: string) => void;
+  hydrateSession: (sessionId: string) => void;
+  /** Remove an acknowledged legacy plan row from memory without rewriting storage. */
+  forgetMigratedPlanComment: (sessionId: string, commentId: string) => void;
+  /**
+   * Returns diff comments for a file in a session. When repositoryId is
+   * provided, results are filtered to that repo only (multi-repo support).
+   * Omitting repositoryId matches comments regardless of repo, preserving
+   * single-repo callers and legacy localStorage entries.
+   */
+  getCommentsForFile: (sessionId: string, filePath: string, repositoryId?: string) => DiffComment[];
+  getPendingComments: () => Comment[];
+};
+
+export type CommentsSlice = CommentsState & CommentsActions;

@@ -1,0 +1,424 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/config", () => ({
+  getBackendConfig: () => ({ apiBaseUrl: "http://backend.test" }),
+}));
+
+import {
+  createWorkflowStepAction,
+  deleteWorkspaceAction,
+  exportAllWorkflowsAction,
+  listWorkflowStepsAction,
+  updateWorkflowStepAction,
+} from "./workspaces";
+
+const REVIEW_STEP_NAME = "Review";
+const STEP_COLOR = "bg-blue-500";
+const WORKSPACE_NAME = "My Workspace";
+
+describe("exportAllWorkflowsAction", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("workflows: []", { status: 200 })),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const requestedUrl = () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    return new URL(String(fetchMock.mock.calls[0][0]));
+  };
+
+  it("omits the ids param when no workflow IDs are passed (export all)", async () => {
+    await exportAllWorkflowsAction("ws-1");
+    expect(requestedUrl().searchParams.has("ids")).toBe(false);
+  });
+
+  it("restricts the export to the provided workflow IDs", async () => {
+    await exportAllWorkflowsAction("ws-1", ["wf-1", "wf-3"]);
+    expect(requestedUrl().searchParams.get("ids")).toBe("wf-1,wf-3");
+  });
+
+  it("sends an empty ids param so nothing is exported when the set is empty", async () => {
+    await exportAllWorkflowsAction("ws-1", []);
+    const url = requestedUrl();
+    expect(url.searchParams.has("ids")).toBe(true);
+    expect(url.searchParams.get("ids")).toBe("");
+  });
+});
+
+describe("deleteWorkspaceAction", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("", { status: 204 })),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const deleteCall = () => {
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    return fetchMock.mock.calls[0];
+  };
+
+  it("sends the workspace name as confirm_name in the DELETE body", async () => {
+    await deleteWorkspaceAction("ws-1", WORKSPACE_NAME, true);
+
+    const [, init] = deleteCall();
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body as string)).toEqual({ confirm_name: WORKSPACE_NAME });
+  });
+
+  it("uses the office route when the office feature is enabled", async () => {
+    await deleteWorkspaceAction("ws-1", WORKSPACE_NAME, true);
+
+    expect(deleteCall()[0]).toBe("http://backend.test/api/v1/office/workspaces/ws-1");
+  });
+
+  // The `/api/v1/office` router group is not mounted when `features.office` is
+  // off, so the office route 404s there. Deletion has to go to the generic
+  // endpoint, which owns the same cascade and confirm-name guard.
+  it("uses the generic route when the office feature is disabled", async () => {
+    await deleteWorkspaceAction("ws-1", WORKSPACE_NAME, false);
+
+    const [url, init] = deleteCall();
+    expect(url).toBe("http://backend.test/api/v1/workspaces/ws-1");
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body as string)).toEqual({ confirm_name: WORKSPACE_NAME });
+  });
+});
+
+describe("workflow step WIP fields", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          id: "step-1",
+          workflow_id: "wf-1",
+          name: REVIEW_STEP_NAME,
+          position: 1,
+          color: STEP_COLOR,
+          wip_limit: 2,
+          pull_from_step_id: "step-0",
+          created_at: "",
+          updated_at: "",
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves WIP fields returned from workflow step APIs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          steps: [
+            {
+              id: "step-1",
+              workflow_id: "wf-1",
+              name: REVIEW_STEP_NAME,
+              position: 1,
+              color: STEP_COLOR,
+              wip_limit: 2,
+              pull_from_step_id: "step-0",
+              created_at: "",
+              updated_at: "",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const result = await listWorkflowStepsAction("wf-1");
+
+    expect(result.steps[0]).toMatchObject({
+      wip_limit: 2,
+      pull_from_step_id: "step-0",
+    });
+  });
+
+  it("sends WIP fields when creating a workflow step", async () => {
+    await createWorkflowStepAction({
+      workflow_id: "wf-1",
+      name: REVIEW_STEP_NAME,
+      position: 1,
+      color: STEP_COLOR,
+      wip_limit: 2,
+      pull_from_step_id: "step-0",
+    } as Parameters<typeof createWorkflowStepAction>[0]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      wip_limit: 2,
+      pull_from_step_id: "step-0",
+    });
+  });
+
+  it("sends WIP fields when updating a workflow step", async () => {
+    await updateWorkflowStepAction("step-1", {
+      wip_limit: 3,
+      pull_from_step_id: "",
+    } as Parameters<typeof updateWorkflowStepAction>[1]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      wip_limit: 3,
+      pull_from_step_id: "",
+    });
+  });
+
+  it("preserves omitted and explicit workflow fallback veto updates", async () => {
+    await updateWorkflowStepAction("step-1", { name: "Review" });
+    await updateWorkflowStepAction("step-1", { disable_unclassified_fallback: false });
+    await updateWorkflowStepAction("step-1", { disable_unclassified_fallback: true });
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body as string));
+    expect("disable_unclassified_fallback" in bodies[0]).toBe(false);
+    expect(bodies[1]).toMatchObject({ disable_unclassified_fallback: false });
+    expect(bodies[2]).toMatchObject({ disable_unclassified_fallback: true });
+  });
+});
+
+describe("workflow step cancellation fields", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          id: "step-1",
+          workflow_id: "wf-1",
+          name: REVIEW_STEP_NAME,
+          position: 1,
+          color: STEP_COLOR,
+          cancel_triggers_turn_complete: true,
+          created_at: "",
+          updated_at: "",
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves cancel completion policy returned from workflow step APIs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          steps: [
+            {
+              id: "step-1",
+              workflow_id: "wf-1",
+              name: REVIEW_STEP_NAME,
+              position: 1,
+              color: STEP_COLOR,
+              cancel_triggers_turn_complete: true,
+              created_at: "",
+              updated_at: "",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const result = await listWorkflowStepsAction("wf-1");
+
+    expect(result.steps[0].cancel_triggers_turn_complete).toBe(true);
+  });
+
+  it("sends cancel completion policy when creating a workflow step", async () => {
+    await createWorkflowStepAction({
+      workflow_id: "wf-1",
+      name: REVIEW_STEP_NAME,
+      position: 1,
+      color: STEP_COLOR,
+      cancel_triggers_turn_complete: true,
+    } as Parameters<typeof createWorkflowStepAction>[0]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      cancel_triggers_turn_complete: true,
+    });
+  });
+
+  it("sends an explicit false when disabling cancel completion policy", async () => {
+    await updateWorkflowStepAction("step-1", {
+      cancel_triggers_turn_complete: false,
+    } as Parameters<typeof updateWorkflowStepAction>[1]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      cancel_triggers_turn_complete: false,
+    });
+  });
+});
+
+describe("workflow step completion fields", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          id: "step-1",
+          workflow_id: "wf-1",
+          name: REVIEW_STEP_NAME,
+          position: 1,
+          color: STEP_COLOR,
+          complete_task_on_enter: true,
+          created_at: "",
+          updated_at: "",
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves the completion policy returned from the step API", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          steps: [
+            {
+              id: "step-1",
+              workflow_id: "wf-1",
+              name: REVIEW_STEP_NAME,
+              position: 1,
+              color: STEP_COLOR,
+              complete_task_on_enter: true,
+              created_at: "",
+              updated_at: "",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const result = await listWorkflowStepsAction("wf-1");
+
+    expect(result.steps[0].complete_task_on_enter).toBe(true);
+  });
+
+  it("sends explicit false when creating and updating completion policy", async () => {
+    await createWorkflowStepAction({
+      workflow_id: "wf-1",
+      name: REVIEW_STEP_NAME,
+      position: 1,
+      color: STEP_COLOR,
+      complete_task_on_enter: false,
+    });
+    await updateWorkflowStepAction("step-1", { complete_task_on_enter: false });
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toMatchObject({
+      complete_task_on_enter: false,
+    });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).toMatchObject({
+      complete_task_on_enter: false,
+    });
+  });
+});
+
+describe("workflow step stage types", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          id: "step-1",
+          workflow_id: "wf-1",
+          name: REVIEW_STEP_NAME,
+          position: 1,
+          color: STEP_COLOR,
+          stage_type: "review",
+          created_at: "",
+          updated_at: "",
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves stage types returned from workflow step APIs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          steps: [
+            {
+              id: "step-1",
+              workflow_id: "wf-1",
+              name: REVIEW_STEP_NAME,
+              position: 1,
+              color: STEP_COLOR,
+              stage_type: "review",
+              created_at: "",
+              updated_at: "",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const result = await listWorkflowStepsAction("wf-1");
+
+    expect(result.steps[0].stage_type).toBe("review");
+  });
+
+  it("sends stage types when creating a workflow step", async () => {
+    await createWorkflowStepAction({
+      workflow_id: "wf-1",
+      name: REVIEW_STEP_NAME,
+      position: 1,
+      color: STEP_COLOR,
+      stage_type: "review",
+    } as Parameters<typeof createWorkflowStepAction>[0]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({ stage_type: "review" });
+  });
+
+  it("sends stage types when updating a workflow step", async () => {
+    await updateWorkflowStepAction("step-1", {
+      stage_type: "review",
+    } as Parameters<typeof updateWorkflowStepAction>[1]);
+
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toMatchObject({ stage_type: "review" });
+  });
+});

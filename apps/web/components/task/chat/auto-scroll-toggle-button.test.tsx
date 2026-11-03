@@ -1,0 +1,108 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { TooltipProvider } from "@kandev/ui/tooltip";
+
+const setTranscriptAutoScrollEnabledMock = vi.fn();
+let enabledBySessionId: Record<string, boolean> = {};
+let showTranscriptAutoScrollControl = true;
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (state: unknown) => unknown) =>
+    selector({
+      transcriptAutoScroll: { enabledBySessionId },
+      userSettings: { showTranscriptAutoScrollControl },
+      setTranscriptAutoScrollEnabled: setTranscriptAutoScrollEnabledMock,
+    }),
+}));
+
+import { AutoScrollToggleButton } from "./auto-scroll-toggle-button";
+
+const TOGGLE_TESTID = "auto-scroll-toggle-button";
+
+function renderButton(sessionId: string) {
+  return render(
+    <TooltipProvider>
+      <AutoScrollToggleButton sessionId={sessionId} />
+    </TooltipProvider>,
+  );
+}
+
+function getButton() {
+  return screen.getByTestId(TOGGLE_TESTID);
+}
+
+describe("AutoScrollToggleButton", () => {
+  beforeEach(() => {
+    enabledBySessionId = {};
+    showTranscriptAutoScrollControl = true;
+    setTranscriptAutoScrollEnabledMock.mockReset();
+    window.sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+  it("renders enabled by default and offers to turn auto-scroll off", () => {
+    renderButton("session-a");
+    const button = getButton();
+    expect(button.getAttribute("aria-pressed")).toBe("true");
+    expect(button.getAttribute("aria-label")).toMatch(/turn off/i);
+  });
+
+  it("shows the icon in dark green, maximized to fill its box, when enabled", () => {
+    renderButton("session-a");
+    const icon = screen.getByTestId("auto-scroll-toggle-icon");
+    expect(icon.getAttribute("class")).toMatch(/text-green-600/);
+    expect(icon.getAttribute("class")).toMatch(/h-6 w-6/);
+  });
+
+  it("clicking while enabled disables auto-scroll for the session", () => {
+    renderButton("session-a");
+    fireEvent.click(getButton());
+    expect(setTranscriptAutoScrollEnabledMock).toHaveBeenCalledWith("session-a", false);
+  });
+
+  it("renders disabled state and offers to turn auto-scroll on", () => {
+    enabledBySessionId = { "session-a": false };
+    renderButton("session-a");
+    const button = getButton();
+    expect(button.getAttribute("aria-pressed")).toBe("false");
+    expect(button.getAttribute("aria-label")).toMatch(/turn on/i);
+  });
+
+  it("shows the icon with no color when disabled", () => {
+    enabledBySessionId = { "session-a": false };
+    renderButton("session-a");
+    const icon = screen.getByTestId("auto-scroll-toggle-icon");
+    expect(icon.getAttribute("class")).not.toMatch(/text-green-600/);
+  });
+
+  it("clicking while disabled re-enables auto-scroll for the session", () => {
+    enabledBySessionId = { "session-a": false };
+    renderButton("session-a");
+    fireEvent.click(getButton());
+    expect(setTranscriptAutoScrollEnabledMock).toHaveBeenCalledWith("session-a", true);
+  });
+
+  it("only toggles the session it was rendered for", () => {
+    enabledBySessionId = { "session-a": false, "session-b": true };
+    renderButton("session-b");
+    fireEvent.click(getButton());
+    expect(setTranscriptAutoScrollEnabledMock).toHaveBeenCalledWith("session-b", false);
+  });
+
+  it("does not render when the user hides the transcript auto-scroll control", () => {
+    showTranscriptAutoScrollControl = false;
+
+    renderButton("session-a");
+
+    expect(screen.queryByTestId(TOGGLE_TESTID)).toBeNull();
+  });
+
+  it("falls back to the sessionStorage-persisted preference when the store hasn't hydrated this session yet", () => {
+    window.sessionStorage.setItem("kandev.transcript-auto-scroll-enabled.session-a", "false");
+    renderButton("session-a");
+    const button = getButton();
+    expect(button.getAttribute("aria-pressed")).toBe("false");
+  });
+});

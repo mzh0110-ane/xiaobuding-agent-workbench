@@ -1,0 +1,713 @@
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
+import { StateProvider } from "@/components/state-provider";
+import type { TaskSession } from "@/lib/types/http";
+
+const MODEL_SELECTOR_TEST_ID = "mock-model-selector";
+
+const responsiveMock = vi.hoisted(() => ({
+  breakpoint: "desktop" as "mobile" | "tablet" | "compactDesktop" | "desktop",
+}));
+
+afterEach(() => {
+  cleanup();
+});
+
+beforeEach(() => {
+  responsiveMock.breakpoint = "desktop";
+});
+
+vi.mock("@/hooks/use-responsive-breakpoint", () => ({
+  useResponsiveBreakpoint: () => ({
+    breakpoint: responsiveMock.breakpoint,
+    isMobile: responsiveMock.breakpoint === "mobile",
+    isTablet: responsiveMock.breakpoint === "tablet",
+    isDesktop:
+      responsiveMock.breakpoint === "compactDesktop" || responsiveMock.breakpoint === "desktop",
+    isCompactDesktop: responsiveMock.breakpoint === "compactDesktop",
+    isFullDesktop: responsiveMock.breakpoint === "desktop",
+    isFinePointer: true,
+    usesDesktopWorkbench:
+      responsiveMock.breakpoint === "compactDesktop" || responsiveMock.breakpoint === "desktop",
+  }),
+}));
+
+vi.mock("@kandev/ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipContent: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}));
+
+vi.mock("@/components/keyboard-shortcut-tooltip", () => ({
+  KeyboardShortcutTooltip: ({
+    children,
+    description,
+  }: {
+    children: React.ReactNode;
+    description?: string;
+  }) => (
+    <>
+      {children}
+      {description ? <span>{description}</span> : null}
+    </>
+  ),
+}));
+
+vi.mock("@/components/task/model-selector", () => ({
+  ModelSelector: ({ triggerClassName }: { triggerClassName?: string }) => (
+    <button type="button" data-testid="mock-model-selector" className={triggerClassName}>
+      model
+    </button>
+  ),
+}));
+
+vi.mock("@/components/task/mode-selector", () => ({
+  ModeSelector: ({ triggerClassName }: { triggerClassName?: string }) => (
+    <button type="button" data-testid="mock-mode-selector" className={triggerClassName}>
+      mode
+    </button>
+  ),
+}));
+
+vi.mock("@/components/task/sessions-dropdown", () => ({
+  SessionsDropdown: () => (
+    <button type="button" data-testid="mock-sessions-dropdown">
+      sessions
+    </button>
+  ),
+}));
+
+vi.mock("@/components/task/chat/token-usage-display", () => ({
+  TokenUsageDisplay: () => <span data-testid="mock-token-usage" />,
+}));
+
+vi.mock("@/components/enhance-prompt-button", () => ({
+  EnhancePromptButton: () => <button type="button">Enhance</button>,
+}));
+
+vi.mock("./context-popover", () => ({
+  ContextPopover: ({ trigger }: { trigger: React.ReactNode }) => <>{trigger}</>,
+}));
+
+vi.mock("./implement-plan-button", () => ({
+  ImplementPlanButton: ({
+    presentation = "desktop",
+    disabled,
+    disabledReason,
+  }: {
+    presentation?: "desktop" | "mobile";
+    disabled?: boolean;
+    disabledReason?: string;
+  }) => (
+    <button
+      type="button"
+      data-testid="mock-implement-plan-button"
+      data-presentation={presentation}
+      disabled={disabled}
+      title={disabledReason}
+    >
+      Implement plan
+    </button>
+  ),
+}));
+
+vi.mock("./reset-context-button", () => ({
+  ResetContextButton: ({
+    presentation = "desktop",
+    onConfirmationOpenChange,
+  }: {
+    presentation?: "desktop" | "mobile";
+    onConfirmationOpenChange?: (open: boolean) => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="reset-context-button"
+      data-reset-presentation={presentation}
+      onClick={() => onConfirmationOpenChange?.(true)}
+    >
+      Reset context
+    </button>
+  ),
+}));
+
+vi.mock("./chat-input-plugin-actions", () => ({
+  ChatInputPluginActions: () => null,
+}));
+
+import { ChatInputToolbar } from "./chat-input-toolbar";
+import type { ChatInputToolbarProps } from "./chat-input-toolbar";
+import { pluginRegistry } from "@/lib/plugins/registry";
+import type { ChatSubmitDecorationSlotProps } from "./chat-submit-plugin-decoration";
+
+const MOBILE_TOOLBAR_TEST_ID = "mobile-chat-input-toolbar";
+const CANCEL_AGENT_BUTTON_TEST_ID = "cancel-agent-button";
+const SUBMIT_MESSAGE_BUTTON_TEST_ID = "submit-message-button";
+const DECORATION_PROBE_TEST_ID = "decoration-probe";
+const PRESENTATION_ATTRIBUTE = "data-presentation";
+const SESSION_TIMESTAMP = "2026-01-01T00:00:00Z";
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function renderToolbar(onCancel: () => void | Promise<void>) {
+  return render(
+    <StateProvider>
+      <ChatInputToolbar
+        planModeEnabled={false}
+        onPlanModeChange={() => {}}
+        sessionId="s1"
+        taskId="t1"
+        taskDescription=""
+        isAgentBusy
+        canCancelAgent
+        isDisabled={false}
+        isSending={false}
+        onCancel={onCancel}
+        onSubmit={() => {}}
+        minimalToolbar
+      />
+    </StateProvider>,
+  );
+}
+
+function renderMinimalToolbar(overrides: Partial<ChatInputToolbarProps> = {}) {
+  return render(
+    <StateProvider>
+      <ChatInputToolbar
+        planModeEnabled={false}
+        onPlanModeChange={() => {}}
+        sessionId="s1"
+        taskId="t1"
+        taskDescription=""
+        isAgentBusy
+        hasContent
+        isDisabled={false}
+        isSending={false}
+        onCancel={() => {}}
+        onSubmit={() => {}}
+        minimalToolbar
+        {...overrides}
+      />
+    </StateProvider>,
+  );
+}
+
+function renderFullToolbar(overrides: Partial<ChatInputToolbarProps> = {}) {
+  return render(
+    <StateProvider>
+      <ChatInputToolbar
+        planModeEnabled={false}
+        onPlanModeChange={() => {}}
+        sessionId="s1"
+        taskId="t1"
+        taskDescription=""
+        isAgentBusy={false}
+        hasContent
+        isDisabled={false}
+        isSending={false}
+        onCancel={() => {}}
+        onSubmit={() => {}}
+        hidePlanMode
+        mcpServers={["filesystem"]}
+        contextCount={2}
+        onAttachFiles={() => {}}
+        onEnhancePrompt={() => {}}
+        isUtilityConfigured
+        {...overrides}
+      />
+    </StateProvider>,
+  );
+}
+
+function makeRunningSession(cancellationPending: boolean): TaskSession {
+  return {
+    id: "s1",
+    task_id: "t1",
+    state: "RUNNING",
+    cancellation_pending: cancellationPending,
+    started_at: SESSION_TIMESTAMP,
+    updated_at: SESSION_TIMESTAMP,
+  } as TaskSession;
+}
+
+it("keeps phone composer controls mounted while a reset sheet is open", () => {
+  responsiveMock.breakpoint = "mobile";
+  renderFullToolbar();
+  const model = screen.getByTestId(MODEL_SELECTOR_TEST_ID);
+  const submit = screen.getByTestId(SUBMIT_MESSAGE_BUTTON_TEST_ID);
+  fireEvent.click(screen.getByTestId("reset-context-button"));
+  expect(model.isConnected).toBe(true);
+  expect(submit.isConnected).toBe(true);
+});
+
+describe("ChatInputToolbar backend cancellation state", () => {
+  it("renders backend-owned pending state after store hydration", () => {
+    render(
+      <StateProvider initialState={{ taskSessions: { items: { s1: makeRunningSession(true) } } }}>
+        <ChatInputToolbar
+          planModeEnabled={false}
+          onPlanModeChange={() => {}}
+          sessionId="s1"
+          taskId="t1"
+          taskDescription=""
+          isAgentBusy
+          canCancelAgent
+          isDisabled={false}
+          isSending={false}
+          onCancel={() => {}}
+          onSubmit={() => {}}
+          hasContent={false}
+        />
+      </StateProvider>,
+    );
+
+    const button = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.querySelector('[role="status"]')).toBeTruthy();
+  });
+
+  it("uses backend pending state as the duplicate-click guard", () => {
+    const onCancel = vi.fn();
+
+    render(
+      <StateProvider initialState={{ taskSessions: { items: { s1: makeRunningSession(true) } } }}>
+        <ChatInputToolbar
+          planModeEnabled={false}
+          onPlanModeChange={() => {}}
+          sessionId="s1"
+          taskId="t1"
+          taskDescription=""
+          isAgentBusy
+          canCancelAgent
+          isDisabled={false}
+          isSending={false}
+          onCancel={onCancel}
+          onSubmit={() => {}}
+          hasContent={false}
+        />
+      </StateProvider>,
+    );
+
+    const button = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+    fireEvent.click(button);
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(button.disabled).toBe(true);
+    expect(button.querySelector('[role="status"]')).toBeTruthy();
+  });
+});
+
+// The cancel button must disable itself while a cancel request is in flight.
+// Without this guard, an impatient user clicking it repeatedly while the agent
+// tears down a long-running tool (Claude Monitor, etc.) sends N cancel requests
+// to the backend, each producing a duplicate "Turn cancelled by user" message.
+// eslint-disable-next-line max-lines-per-function -- cancellation cases share one toolbar harness.
+describe("ChatInputToolbar cancel button", () => {
+  it("gives the cancel icon its localized accessible name", () => {
+    renderToolbar(() => {});
+
+    expect(screen.getByRole("button", { name: "Cancel agent" })).toBeTruthy();
+  });
+
+  it("keeps the cancel button name stable while cancellation is pending", async () => {
+    const { promise, resolve } = deferred<void>();
+    const onCancel = vi.fn(() => promise);
+
+    renderToolbar(onCancel);
+    const button = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+
+    fireEvent.click(button);
+    await act(async () => {});
+
+    expect(button.getAttribute("aria-label")).toBe("Cancel agent");
+    expect(screen.getByRole("status", { name: "Cancelling..." })).toBeTruthy();
+
+    await act(async () => {
+      resolve();
+      await promise;
+    });
+  });
+
+  it.each(["desktop", "mobile"] as const)(
+    "keeps cancellation progress after a %s toolbar remount",
+    async (breakpoint) => {
+      responsiveMock.breakpoint = breakpoint;
+      const { promise, resolve } = deferred<void>();
+      const onCancel = vi.fn(() => promise);
+      let mounted = true;
+
+      const renderToolbarTree = () => (
+        <StateProvider>
+          {mounted ? (
+            <ChatInputToolbar
+              planModeEnabled={false}
+              onPlanModeChange={() => {}}
+              sessionId="s1"
+              taskId="t1"
+              taskDescription=""
+              isAgentBusy
+              canCancelAgent
+              isDisabled={false}
+              isSending={false}
+              onCancel={onCancel}
+              onSubmit={() => {}}
+              hasContent={false}
+            />
+          ) : null}
+        </StateProvider>
+      );
+
+      const view = render(renderToolbarTree());
+      fireEvent.click(screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID));
+      await act(async () => {});
+
+      mounted = false;
+      view.rerender(renderToolbarTree());
+      mounted = true;
+      view.rerender(renderToolbarTree());
+
+      const remountedButton = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+      expect(remountedButton.disabled).toBe(true);
+      expect(remountedButton.querySelector('[role="status"]')).toBeTruthy();
+      expect(onCancel).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolve();
+        await promise;
+      });
+      expect(remountedButton.disabled).toBe(false);
+    },
+  );
+
+  it("keeps the queue affordance without a cancel control after clarification detaches", () => {
+    renderFullToolbar({ isAgentBusy: true, canCancelAgent: false });
+
+    expect(screen.queryByTestId(CANCEL_AGENT_BUTTON_TEST_ID)).toBeNull();
+    expect(screen.getByTestId(SUBMIT_MESSAGE_BUTTON_TEST_ID)).toBeTruthy();
+    expect(screen.getByText("Queue message")).toBeTruthy();
+  });
+
+  it("disables itself and blocks duplicate clicks while cancel is in flight", async () => {
+    const { promise, resolve } = deferred<void>();
+    const onCancel = vi.fn(() => promise);
+
+    renderToolbar(onCancel);
+
+    const button = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+
+    fireEvent.click(button);
+    // Click is processed synchronously; React then flushes the setState that
+    // marks the button disabled. We assert post-flush.
+    await act(async () => {});
+    expect(button.disabled).toBe(true);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    // Subsequent clicks while the promise is pending must not call onCancel.
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    // Once the in-flight cancel resolves, the button re-enables for retry
+    // (rare, but possible if the first cancel returned an error).
+    await act(async () => {
+      resolve();
+      await promise;
+    });
+    expect(button.disabled).toBe(false);
+  });
+
+  it("re-enables the button if onCancel rejects", async () => {
+    const { promise, resolve } = deferred<void>();
+    const onCancel = vi.fn(() => promise.then(() => Promise.reject(new Error("network"))));
+
+    renderToolbar(onCancel);
+    const button = screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID) as HTMLButtonElement;
+
+    fireEvent.click(button);
+    await act(async () => {});
+    expect(button.disabled).toBe(true);
+
+    await act(async () => {
+      resolve();
+      // Allow the rejected promise to settle inside the click handler.
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(button.disabled).toBe(false);
+  });
+});
+
+describe("ChatInputToolbar submit button", () => {
+  it("shows the setup-disabled reason while keeping the submit button disabled", () => {
+    render(
+      <StateProvider>
+        <ChatInputToolbar
+          planModeEnabled={false}
+          onPlanModeChange={() => {}}
+          sessionId="s1"
+          taskId="t1"
+          taskDescription=""
+          isAgentBusy={false}
+          hasContent
+          isDisabled
+          submitDisabledReason="The agent is still being set up."
+          isSending={false}
+          onCancel={() => {}}
+          onSubmit={() => {}}
+          minimalToolbar
+        />
+      </StateProvider>,
+    );
+
+    expect((screen.getByTestId(SUBMIT_MESSAGE_BUTTON_TEST_ID) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect(screen.getByText("The agent is still being set up.")).toBeTruthy();
+  });
+});
+
+describe("ChatInputToolbar responsive wrapper", () => {
+  it("gives mobile composer controls 44px touch targets", () => {
+    responsiveMock.breakpoint = "mobile";
+    renderFullToolbar({
+      hidePlanMode: false,
+      isAgentBusy: true,
+      canCancelAgent: true,
+    });
+
+    for (const testId of [
+      "plan-mode-toggle-button",
+      "chat-attachments-button",
+      "chat-context-button",
+      "cancel-agent-button",
+      SUBMIT_MESSAGE_BUTTON_TEST_ID,
+    ]) {
+      const control = screen.getByTestId(testId);
+      const classes = control.className.split(/\s+/);
+      const hasSquareTarget = classes.includes("size-11");
+      const hasMinimumTarget = classes.includes("min-h-11") && classes.includes("min-w-11");
+      expect(hasSquareTarget || hasMinimumTarget).toBe(true);
+    }
+  });
+
+  it("keeps compact composer geometry on desktop", () => {
+    responsiveMock.breakpoint = "desktop";
+    renderFullToolbar({ hidePlanMode: false });
+
+    for (const testId of [
+      "plan-mode-toggle-button",
+      "chat-attachments-button",
+      "chat-context-button",
+      SUBMIT_MESSAGE_BUTTON_TEST_ID,
+    ]) {
+      const control = screen.getByTestId(testId);
+      const classes = control.className.split(/\s+/);
+      expect(classes.includes("size-7") || classes.includes("h-7")).toBe(true);
+      expect(classes).not.toContain("min-h-11");
+      expect(classes).not.toContain("min-w-11");
+    }
+  });
+
+  it("routes mobile breakpoints to the compact toolbar without a duplicate sessions control", () => {
+    responsiveMock.breakpoint = "mobile";
+    renderFullToolbar();
+
+    const mobileToolbar = screen.getByTestId(MOBILE_TOOLBAR_TEST_ID);
+    expect(mobileToolbar).toBeTruthy();
+    expect(mobileToolbar.getAttribute("data-legacy-testid")).toBe("chat-input-toolbar");
+    expect(screen.getByTestId("mobile-chat-toolbar-left-actions")).toBeTruthy();
+    expect(screen.getByTestId("mobile-chat-toolbar-left-actions").className).toContain("pr-8");
+    expect(screen.getByTestId("mobile-chat-toolbar-scroll-fade").className).toContain(
+      "bg-gradient-to-l",
+    );
+    expect(screen.getByTestId("toolbar-item-mcp")).toBeTruthy();
+    expect(screen.getByTestId("toolbar-item-mode")).toBeTruthy();
+    expect(screen.getByTestId("toolbar-item-model")).toBeTruthy();
+    expect(screen.queryByTestId("toolbar-item-sessions")).toBeNull();
+    expect(screen.queryByTestId("mock-sessions-dropdown")).toBeNull();
+    expect(screen.getByTestId("toolbar-item-context")).toBeTruthy();
+    expect(screen.getByTestId("toolbar-item-reset-context")).toBeTruthy();
+    expect(screen.getByTestId("reset-context-button").getAttribute("data-reset-presentation")).toBe(
+      "mobile",
+    );
+    expect(screen.getByTestId("toolbar-item-enhance")).toBeTruthy();
+    expect(screen.getByTestId("mock-mode-selector").className).toContain("max-w-[46vw]");
+    expect(screen.getByTestId(MODEL_SELECTOR_TEST_ID).className).toContain("max-w-[56vw]");
+    expect(screen.getByTestId(MODEL_SELECTOR_TEST_ID).className).toContain("min-w-0");
+    expect(screen.getByTestId(MODEL_SELECTOR_TEST_ID).className).toContain("overflow-hidden");
+  });
+
+  it("keeps the compact sessions control on tablet layouts", () => {
+    responsiveMock.breakpoint = "tablet";
+    renderFullToolbar();
+
+    expect(screen.getByTestId(MOBILE_TOOLBAR_TEST_ID)).toBeTruthy();
+    expect(screen.getByTestId("toolbar-item-sessions")).toBeTruthy();
+    expect(screen.getByTestId("mock-sessions-dropdown")).toBeTruthy();
+  });
+
+  it("hides the compact sessions control when requested", () => {
+    responsiveMock.breakpoint = "tablet";
+    renderFullToolbar({ hideSessionsDropdown: true });
+
+    expect(screen.getByTestId(MOBILE_TOOLBAR_TEST_ID)).toBeTruthy();
+    expect(screen.queryByTestId("toolbar-item-sessions")).toBeNull();
+    expect(screen.queryByTestId("mock-sessions-dropdown")).toBeNull();
+  });
+
+  it.each(["compactDesktop", "desktop"] as const)(
+    "routes %s breakpoints to the desktop toolbar",
+    (breakpoint) => {
+      responsiveMock.breakpoint = breakpoint;
+      renderFullToolbar();
+
+      expect(screen.getByTestId("chat-input-toolbar")).toBeTruthy();
+      expect(
+        screen.getByTestId("reset-context-button").getAttribute("data-reset-presentation"),
+      ).toBe("desktop");
+      expect(screen.queryByTestId(MOBILE_TOOLBAR_TEST_ID)).toBeNull();
+    },
+  );
+});
+
+describe("ChatInputToolbar plan attachment gate", () => {
+  // @covers AC-TASKS-PROMPT-ATTACHMENTS-001.17
+  it.each(["desktop", "tablet", "mobile"] as const)(
+    "preserves %s presentation and disables plan implementation for incomplete attachments",
+    (breakpoint) => {
+      responsiveMock.breakpoint = breakpoint;
+      renderFullToolbar({
+        planModeEnabled: true,
+        onImplementPlan: () => {},
+        planActionDisabledReason: "Finish uploading attachments before sending.",
+      });
+
+      const implement = screen.getByTestId("mock-implement-plan-button") as HTMLButtonElement;
+      expect(implement.getAttribute(PRESENTATION_ATTRIBUTE)).toBe(
+        breakpoint === "desktop" ? "desktop" : "mobile",
+      );
+      expect(implement.disabled).toBe(true);
+      expect(implement.title).toBe("Finish uploading attachments before sending.");
+    },
+  );
+});
+
+describe("ChatInputToolbar chat-submit-decoration slot", () => {
+  const SLOT = "chat-submit-decoration";
+  const PLUGIN_ID = "plugin-decoration";
+
+  afterEach(() => {
+    pluginRegistry.unregisterPlugin(PLUGIN_ID);
+  });
+
+  function registerProbe() {
+    pluginRegistry.forPlugin(PLUGIN_ID).registerComponent(SLOT, ({ slotProps }) => {
+      const ctx = slotProps as ChatSubmitDecorationSlotProps;
+      return (
+        <i
+          data-testid={DECORATION_PROBE_TEST_ID}
+          data-task={String(ctx.taskId)}
+          data-session={String(ctx.activeSessionId)}
+          data-presentation={ctx.presentation}
+          data-sending={String(ctx.isSending)}
+          data-busy={String(ctx.isAgentBusy)}
+          data-disabled={String(ctx.disabled)}
+          data-plan={String(ctx.planModeEnabled)}
+        />
+      );
+    });
+  }
+
+  // Renders the real toolbar rather than the slot wrapper: every prop below
+  // travels toolbar -> SubmitButton -> SendSubmitButton -> the slot, and a
+  // dropped hop anywhere on that chain is invisible to a leaf-level test.
+  it("reaches the slot through the desktop toolbar with the live button state", () => {
+    registerProbe();
+
+    renderFullToolbar({ isSending: true, isDisabled: true, planModeEnabled: true });
+
+    const probe = screen.getByTestId(DECORATION_PROBE_TEST_ID);
+    expect(probe.getAttribute("data-task")).toBe("t1");
+    expect(probe.getAttribute("data-session")).toBe("s1");
+    expect(probe.getAttribute(PRESENTATION_ATTRIBUTE)).toBe("desktop");
+    expect(probe.getAttribute("data-sending")).toBe("true");
+    expect(probe.getAttribute("data-disabled")).toBe("true");
+    expect(probe.getAttribute("data-plan")).toBe("true");
+  });
+
+  // A coarse-pointer tablet renders the compact toolbar, so the minimal
+  // composer must not disagree with it about which presentation is in play.
+  it.each(["mobile", "tablet"] as const)(
+    "reports the compact presentation on %s for the minimal toolbar too",
+    (breakpoint) => {
+      responsiveMock.breakpoint = breakpoint;
+      registerProbe();
+
+      renderMinimalToolbar();
+
+      expect(
+        screen.getByTestId(DECORATION_PROBE_TEST_ID).getAttribute(PRESENTATION_ATTRIBUTE),
+      ).toBe("mobile");
+    },
+  );
+
+  it("reaches the slot through the mobile toolbar", () => {
+    responsiveMock.breakpoint = "mobile";
+    registerProbe();
+
+    renderFullToolbar();
+
+    expect(screen.getByTestId(DECORATION_PROBE_TEST_ID).getAttribute(PRESENTATION_ATTRIBUTE)).toBe(
+      "mobile",
+    );
+  });
+
+  it("reaches the slot through the minimal toolbar, which renders only the submit button", () => {
+    registerProbe();
+
+    renderMinimalToolbar();
+
+    const probe = screen.getByTestId(DECORATION_PROBE_TEST_ID);
+    expect(probe.getAttribute("data-task")).toBe("t1");
+    expect(probe.getAttribute("data-busy")).toBe("true");
+  });
+
+  // The decoration belongs to the send button, not to the toolbar: when the
+  // agent is mid-turn with an empty composer the send button is replaced by
+  // Cancel, and a ring with nothing to sit on must go with it.
+  it("does not render when the send button itself is hidden", () => {
+    registerProbe();
+
+    renderToolbar(() => {});
+
+    expect(screen.getByTestId(CANCEL_AGENT_BUTTON_TEST_ID)).toBeTruthy();
+    expect(screen.queryByTestId(SUBMIT_MESSAGE_BUTTON_TEST_ID)).toBeNull();
+    expect(screen.queryByTestId(DECORATION_PROBE_TEST_ID)).toBeNull();
+  });
+
+  it("renders no decoration layer at all when no plugin registered one", () => {
+    renderFullToolbar();
+
+    expect(screen.queryByTestId(DECORATION_PROBE_TEST_ID)).toBeNull();
+    expect(screen.queryByTestId("chat-submit-decoration-layer")).toBeNull();
+  });
+
+  it("positions the layer inside the send button's own box", () => {
+    registerProbe();
+
+    renderFullToolbar();
+
+    const button = screen.getByTestId(SUBMIT_MESSAGE_BUTTON_TEST_ID);
+    const layer = screen.getByTestId("chat-submit-decoration-layer");
+    // Same positioned parent as the button: the plugin can size against
+    // inset-0 without measuring the DOM.
+    expect(layer.parentElement).toBe(button.parentElement);
+    expect(button.parentElement?.className).toContain("relative");
+  });
+});

@@ -1,0 +1,1435 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"maps"
+	"strconv"
+	"time"
+
+	"go.uber.org/zap"
+
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/sysprompt"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+type taskPublicationQueue struct {
+	pending  []taskPublication
+	draining bool
+	// deleted tombstones a task once its task.deleted publication is enqueued.
+	// Without it, drainTaskPublications' delete(s.taskPublications, taskID)
+	// on an empty queue gives a later stale publication (e.g. a delayed
+	// task.updated racing task.deleted) a clean map slot to recreate the
+	// queue in, and the frontend upserts whatever arrives last — resurrecting
+	// a task the operator already deleted. Once set, only a task.created for
+	// the same ID (theoretical ID reuse) clears it.
+	deleted bool
+}
+
+type taskPublication struct {
+	ctx     context.Context
+	publish func(context.Context)
+}
+
+type taskActivitySnapshot struct {
+	activity            v1.ForegroundActivity
+	activeSubagentCount int
+	known               bool
+}
+
+// PublishTaskUpdated publishes a task.updated event for the given task.
+// Used when task metadata changes (e.g., primary session assignment) that
+// don't go through the normal UpdateTask path. Callers that changed the
+// task's workflow (e.g. a cross-workflow transition) should pass the
+// pre-move workflow ID so the payload carries old_workflow_id — the
+// frontend uses that field to remove the task from its previous
+// workflow's snapshot instead of leaving a stale duplicate until reload.
+func (s *Service) PublishTaskUpdated(ctx context.Context, task *models.Task, oldWorkflowIDs ...string) {
+	s.publishTaskEvent(ctx, events.TaskUpdated, task, nil, oldWorkflowIDs...)
+}
+
+// PublishTaskUpdatedByID reloads and publishes the canonical task.updated
+// event inside the task's FIFO publication queue. Callers use this after a
+// direct task-row mutation when the database row is the source of truth.
+func (s *Service) PublishTaskUpdatedByID(ctx context.Context, taskID string) {
+	if s.eventBus == nil || taskID == "" {
+		return
+	}
+	s.enqueueTaskPublication(ctx, taskID, events.TaskUpdated, func(publicationCtx context.Context) {
+		task, err := s.GetTask(publicationCtx, taskID)
+		if err != nil {
+			s.logger.Error("failed to load task for task.updated publication",
+				zap.String("task_id", taskID), zap.Error(err))
+			return
+		}
+		if task == nil {
+			return
+		}
+		s.publishTaskEventNow(publicationCtx, events.TaskUpdated, task, nil, nil, nil, nil)
+	})
+}
+
+// PublishTaskQueuePromoted notifies subscribers that a queued task has been
+// admitted to its destination step. The event is distinct from task.updated so
+// orchestration can launch deferred work exactly when capacity is granted.
+func (s *Service) PublishTaskQueuePromoted(ctx context.Context, task *models.Task) {
+	s.publishTaskEvent(ctx, events.TaskQueuePromoted, task, nil)
+}
+
+// PublishWorkspaceSourcesAdopted publishes the session refresh boundary after
+// a runtime has adopted the materialized workspace. Materializers must call it
+// only after agentctl adoption succeeds; protocol handlers never publish an
+// optimistic success event.
+func (s *Service) PublishWorkspaceSourcesAdopted(ctx context.Context, taskID, workspacePath string, sessionIDs []string) {
+	if s.eventBus == nil {
+		return
+	}
+	for _, sessionID := range sessionIDs {
+		if sessionID == "" {
+			continue
+		}
+		data := map[string]interface{}{"task_id": taskID, "session_id": sessionID, "workspace_path": workspacePath}
+		if err := s.eventBus.Publish(ctx, events.SessionWorkspaceSourcesUpdated, bus.NewEvent(events.SessionWorkspaceSourcesUpdated, "task-service", data)); err != nil {
+			s.logger.Error("failed to publish workspace source adoption", zap.String("task_id", taskID), zap.String("session_id", sessionID), zap.Error(err))
+		}
+	}
+}
+
+// PublishTaskStateChanged publishes a task.state_changed event for callers
+// that mutate task state outside the normal task service update path.
+func (s *Service) PublishTaskStateChanged(ctx context.Context, task *models.Task, oldState v1.TaskState) {
+	s.publishTaskEvent(ctx, events.TaskStateChanged, task, &oldState)
+}
+
+// PublishAfterTaskEvents appends a task-scoped publication behind any task
+// events already being drained. Reentrant callers append without waiting,
+// preserving FIFO order without deadlocking the active publication.
+func (s *Service) PublishAfterTaskEvents(
+	ctx context.Context,
+	taskID, eventType string,
+	publish func(context.Context),
+) {
+	if publish == nil {
+		return
+	}
+	if taskID == "" {
+		publish(ctx)
+		return
+	}
+	s.enqueueTaskPublication(ctx, taskID, eventType, publish)
+}
+
+// PublishTaskDeleted publishes a task.deleted event for the given task.
+// Used by cascade-delete callers (HandoffService.DeleteTaskTree) that
+// bypass Service.DeleteTask and therefore would otherwise leave WS
+// clients with a stale kanban view.
+func (s *Service) PublishTaskDeleted(ctx context.Context, task *models.Task) {
+	s.publishTaskEvent(ctx, events.TaskDeleted, task, nil)
+}
+
+// PublishTaskDeletedWithExtra publishes a task.deleted event with additional
+// lifecycle attribution fields.
+func (s *Service) PublishTaskDeletedWithExtra(
+	ctx context.Context,
+	task *models.Task,
+	extra map[string]interface{},
+) {
+	s.publishTaskEventWithExtra(ctx, events.TaskDeleted, task, nil, extra)
+}
+
+// PublishTaskSessionsCancelled publishes session.state_changed events for
+// sessions finalized by a cascade path that bypasses Service.ArchiveTask.
+func (s *Service) PublishTaskSessionsCancelled(
+	ctx context.Context,
+	taskID string,
+	cancelledSessions []*models.TaskSession,
+	reason string,
+) {
+	s.publishSessionsCancelled(context.WithoutCancel(ctx), taskID, nil, cancelledSessions, reason)
+}
+
+// taskPublicationTimeout bounds publication-owned repository reads and
+// synchronous EventBus delivery. It intentionally starts when a queued closure
+// drains, rather than inheriting a caller deadline that may already have expired.
+const taskPublicationTimeout = 10 * time.Second
+
+// Field names shared by every session.state_changed publish in this file —
+// extracted to satisfy goconst without borrowing unrelated constants.
+const (
+	sessionEventFieldTaskID    = "task_id"
+	sessionEventFieldSessionID = "session_id"
+	sessionEventFieldUpdatedAt = "updated_at"
+	sessionEventFieldName      = "name"
+)
+
+// publishSessionsCancelled publishes a session.state_changed event for each
+// session in cancelledSessions — the full rows CancelActiveTaskSessionsByTaskID's
+// UPDATE ... RETURNING already produced. The event's old_state is a
+// best-effort hint from snapshot (the pre-cancellation session list a
+// caller already had in hand) — used only for logging/diagnostics — while
+// every other field, including new_state, comes directly from the returned
+// row.
+//
+// This used to re-read each session via GetTaskSession after the UPDATE
+// committed, which raced: if that lookup failed or timed out after commit,
+// the CANCELLED transition was permanent but its event was silently lost
+// (see the now-closed "Cancelled events escape reconciliation" review
+// thread, PR #1891 comment 3638052588). Building the payload straight from
+// cancelledSessions closes that gap structurally — there is no longer a
+// separate post-commit read to race, so a session in cancelledSessions can
+// no longer "vanish" between the write and the publish.
+//
+// ctx is expected to be detached-but-unbounded (callers typically pass a
+// context.WithoutCancel derivative with no deadline of its own): each
+// session in cancelledSessions gets its own independent 10-second timeout
+// around the Publish call below, rather than the whole batch sharing one
+// deadline. That way a single slow synchronous event subscriber can only
+// ever starve its own session's publish, not the events for every session
+// that comes after it in cancelledSessions.
+//
+// CancelActiveTaskSessionsByTaskID is a repository-level DB write with no
+// event of its own; without this, any client cache kept fresh exclusively by
+// session.state_changed (e.g. an Office task list's "is running" indicator)
+// never learns the session left RUNNING/WAITING_FOR_INPUT and spins forever.
+func (s *Service) publishSessionsCancelled(
+	ctx context.Context,
+	taskID string,
+	snapshot []*models.TaskSession,
+	cancelledSessions []*models.TaskSession,
+	reason string,
+) {
+	if s.eventBus == nil {
+		return
+	}
+	oldStateByID := make(map[string]models.TaskSessionState, len(snapshot))
+	for _, sess := range snapshot {
+		if sess != nil {
+			oldStateByID[sess.ID] = sess.State
+		}
+	}
+	for _, sess := range cancelledSessions {
+		sessCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		data := map[string]interface{}{
+			sessionEventFieldTaskID:    taskID,
+			sessionEventFieldSessionID: sess.ID,
+			"old_state":                string(oldStateByID[sess.ID]),
+			"new_state":                string(sess.State),
+			"error_message":            reason,
+			"agent_profile_id":         sess.AgentProfileID,
+			"agent_profile_snapshot":   sess.AgentProfileSnapshot,
+			"is_passthrough":           sess.IsPassthrough,
+			"is_primary":               sess.IsPrimary,
+			sessionEventFieldUpdatedAt: sess.UpdatedAt.Format(time.RFC3339Nano),
+			sessionEventFieldName:      sess.Name,
+		}
+		if sess.ReviewStatus != models.ReviewStatusNone {
+			data["review_status"] = string(sess.ReviewStatus)
+		}
+		if len(sess.Metadata) > 0 {
+			data["session_metadata"] = sess.Metadata
+		}
+		if sess.TaskEnvironmentID != "" {
+			data["task_environment_id"] = sess.TaskEnvironmentID
+		}
+		event := bus.NewEvent(events.TaskSessionStateChanged, "task-service", data)
+		if err := s.eventBus.Publish(sessCtx, events.TaskSessionStateChanged, event); err != nil {
+			s.logger.Error("failed to publish session cancellation event",
+				zap.String(sessionEventFieldTaskID, taskID), zap.String(sessionEventFieldSessionID, sess.ID), zap.Error(err))
+		}
+		cancel()
+	}
+}
+
+// publishSessionRecovered publishes the state transition produced by
+// execution-loss recovery. It mirrors the session.state_changed payload used
+// by cancellation while carrying an empty error message and the recoverable
+// WAITING_FOR_INPUT state.
+func (s *Service) publishSessionRecovered(
+	ctx context.Context,
+	taskID string,
+	oldState models.TaskSessionState,
+	session *models.TaskSession,
+) error {
+	if s.eventBus == nil || session == nil {
+		return nil
+	}
+	sessCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	data := map[string]interface{}{
+		sessionEventFieldTaskID:    taskID,
+		sessionEventFieldSessionID: session.ID,
+		"old_state":                string(oldState),
+		"new_state":                string(session.State),
+		"error_message":            "",
+		"agent_profile_id":         session.AgentProfileID,
+		"agent_profile_snapshot":   session.AgentProfileSnapshot,
+		"is_passthrough":           session.IsPassthrough,
+		"is_primary":               session.IsPrimary,
+		sessionEventFieldUpdatedAt: session.UpdatedAt.Format(time.RFC3339Nano),
+		sessionEventFieldName:      session.Name,
+	}
+	if session.ReviewStatus != models.ReviewStatusNone {
+		data["review_status"] = string(session.ReviewStatus)
+	}
+	if len(session.Metadata) > 0 {
+		data["session_metadata"] = session.Metadata
+	}
+	if session.TaskEnvironmentID != "" {
+		data["task_environment_id"] = session.TaskEnvironmentID
+	}
+	event := bus.NewEvent(events.TaskSessionStateChanged, "task-service", data)
+	if err := s.eventBus.Publish(sessCtx, events.TaskSessionStateChanged, event); err != nil {
+		s.logger.Error("failed to publish session recovery event",
+			zap.String(sessionEventFieldTaskID, taskID),
+			zap.String(sessionEventFieldSessionID, session.ID),
+			zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// publishTaskEvent publishes task events to the event bus
+func (s *Service) publishTaskEvent(ctx context.Context, eventType string, task *models.Task, oldState *v1.TaskState, oldWorkflowIDs ...string) {
+	s.publishTaskEventWithExtra(ctx, eventType, task, oldState, nil, oldWorkflowIDs...)
+}
+
+// publishTaskEventWithExtra is publishTaskEvent with caller-supplied extra
+// fields merged into the payload (e.g. a deletion reason on task.deleted).
+// Caller-supplied keys must not shadow the standard task fields written below
+// (task_id, title, workflow_id, etc.); colliding keys silently overwrite them.
+func (s *Service) publishTaskEventWithExtra(ctx context.Context, eventType string, task *models.Task, oldState *v1.TaskState, extra map[string]interface{}, oldWorkflowIDs ...string) {
+	if s.eventBus == nil {
+		return
+	}
+	if task == nil {
+		return
+	}
+
+	// Callers can reuse and mutate task/extra while a prior same-task event is
+	// blocked in a synchronous subscriber. Queue an immutable request snapshot.
+	taskSnapshot := snapshotTaskForPublication(task)
+	extraSnapshot := maps.Clone(extra)
+	oldWorkflowSnapshot := append([]string(nil), oldWorkflowIDs...)
+	var oldStateSnapshot *v1.TaskState
+	if oldState != nil {
+		value := *oldState
+		oldStateSnapshot = &value
+	}
+	s.enqueueTaskPublication(ctx, taskSnapshot.ID, eventType, func(publicationCtx context.Context) {
+		s.publishTaskEventNow(publicationCtx, eventType, taskSnapshot, oldStateSnapshot, extraSnapshot, oldWorkflowSnapshot, nil)
+	})
+}
+
+// enqueueTaskPublication runs one FIFO drainer for each task. A reentrant
+// EventBus subscriber only appends work: it never waits for the drainer that
+// called it, avoiding self-deadlock while preserving publication order. Each
+// closure retains its caller's context values but drops cancellation and
+// deadlines when it begins draining, then receives a bounded service-owned
+// publication context.
+//
+// eventType lets this enqueue apply the deletion tombstone: a task.deleted
+// enqueue tombstones the queue and drops any not-yet-published pending
+// entries (they are moot once the task is gone — see taskPublicationQueue.
+// deleted), keeping ONLY the deletion publication itself. Once tombstoned,
+// every later enqueue whose eventType is not task.created is silently
+// dropped; a task.created enqueue clears the tombstone (theoretical ID
+// reuse).
+func (s *Service) enqueueTaskPublication(ctx context.Context, taskID, eventType string, publish func(context.Context)) {
+	s.taskPublicationMu.Lock()
+	if s.taskPublications == nil {
+		s.taskPublications = make(map[string]*taskPublicationQueue)
+	}
+	queue := s.taskPublications[taskID]
+	if queue == nil {
+		queue = &taskPublicationQueue{}
+		s.taskPublications[taskID] = queue
+	}
+	if queue.deleted {
+		if eventType != events.TaskCreated {
+			s.taskPublicationMu.Unlock()
+			s.logger.Debug("dropped task publication for a tombstoned (deleted) task",
+				zap.String("task_id", taskID), zap.String("event_type", eventType))
+			return
+		}
+		queue.deleted = false
+	}
+	if eventType == events.TaskDeleted {
+		queue.deleted = true
+		queue.pending = nil
+	}
+	queue.pending = append(queue.pending, taskPublication{ctx: ctx, publish: publish})
+	if queue.draining {
+		s.taskPublicationMu.Unlock()
+		return
+	}
+	queue.draining = true
+	s.taskPublicationMu.Unlock()
+
+	s.drainTaskPublications(taskID, queue)
+}
+
+// drainTaskPublications runs the FIFO drain loop for one task's publication
+// queue. queue.draining is ALWAYS released before this call ends — including
+// when next.publish itself panics (event-data construction, not the
+// EventBus subscribers it calls into, which recover their own panics) — via
+// the deferred recover below. Without this, queue.draining would stay true
+// forever, and enqueueTaskPublication would silently append every later
+// publication for that task without ever draining them again.
+func (s *Service) drainTaskPublications(taskID string, queue *taskPublicationQueue) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.taskPublicationMu.Lock()
+			queue.draining = false
+			hasPending := len(queue.pending) > 0
+			s.taskPublicationMu.Unlock()
+			// Re-arm a drainer for any work still queued: a concurrent
+			// enqueueTaskPublication call would already do this itself
+			// (draining is now false), but nothing guarantees one arrives.
+			if hasPending {
+				go s.resumeDrainTaskPublications(taskID, queue)
+			}
+			panic(r)
+		}
+	}()
+
+	for {
+		s.taskPublicationMu.Lock()
+		if len(queue.pending) == 0 {
+			// A tombstoned queue stays in the map so a later stale enqueue for
+			// this (deleted) task ID sees queue.deleted and is dropped, instead
+			// of finding no entry and silently recreating a fresh, un-tombstoned
+			// queue. This is bounded: one small struct per task ID deleted over
+			// the process lifetime, not per publication.
+			if !queue.deleted {
+				delete(s.taskPublications, taskID)
+			}
+			queue.draining = false
+			s.taskPublicationMu.Unlock()
+			return
+		}
+		next := queue.pending[0]
+		queue.pending = queue.pending[1:]
+		s.taskPublicationMu.Unlock()
+
+		func() {
+			publicationCtx, cancel := context.WithTimeout(context.WithoutCancel(next.ctx), taskPublicationTimeout)
+			defer cancel()
+			next.publish(publicationCtx)
+		}()
+	}
+}
+
+// resumeDrainTaskPublications re-arms the drainer for a queue that still had
+// pending work when a panic unwound drainTaskPublications. It runs on its own
+// goroutine so the panicking caller can keep unwinding/recovering without
+// waiting for the remaining publications to drain.
+func (s *Service) resumeDrainTaskPublications(taskID string, queue *taskPublicationQueue) {
+	s.taskPublicationMu.Lock()
+	if queue.draining || len(queue.pending) == 0 {
+		s.taskPublicationMu.Unlock()
+		return
+	}
+	queue.draining = true
+	s.taskPublicationMu.Unlock()
+	s.drainTaskPublications(taskID, queue)
+}
+
+func snapshotTaskForPublication(task *models.Task) *models.Task {
+	snapshot := *task
+	snapshot.Metadata = maps.Clone(task.Metadata)
+	if task.ArchivedAt != nil {
+		archivedAt := *task.ArchivedAt
+		snapshot.ArchivedAt = &archivedAt
+	}
+	snapshot.Repositories = make([]*models.TaskRepository, len(task.Repositories))
+	for index, repository := range task.Repositories {
+		if repository == nil {
+			continue
+		}
+		copy := *repository
+		snapshot.Repositories[index] = &copy
+	}
+	return &snapshot
+}
+
+func (s *Service) publishTaskEventNow(ctx context.Context, eventType string, task *models.Task, oldState *v1.TaskState, extra map[string]interface{}, oldWorkflowIDs []string, activity *taskActivitySnapshot) {
+
+	data := map[string]interface{}{
+		"task_id":            task.ID,
+		"step_transition_id": task.WorkflowStepTransitionID,
+		"workspace_id":       task.WorkspaceID,
+		"workflow_id":        task.WorkflowID,
+		"workflow_step_id":   task.WorkflowStepID,
+		"title":              task.Title,
+		"description":        task.Description,
+		"state":              string(task.State),
+		"priority":           task.Priority,
+		"position":           task.Position,
+		"wip_admitted":       task.WIPAdmitted,
+		"created_at":         task.CreatedAt.Format(time.RFC3339Nano),
+		"updated_at":         task.UpdatedAt.Format(time.RFC3339Nano),
+		"is_ephemeral":       task.IsEphemeral,
+		"autopilot":          task.Autopilot,
+		// Always explicit because a project reassignment can change Office
+		// ownership in either direction while a client has the task cached.
+		"is_from_office": task.IsFromOffice,
+		// Consumers that restore quick-chat tabs filter on origin, so it has to
+		// travel with the event and not just the HTTP DTO.
+		"origin": task.Origin,
+		"labels": task.Labels,
+		// Sent as an explicit true/false (never omitted) so a clear reaches
+		// open clients too: preserveOmittedField on the frontend only pins the
+		// previous value when the key is absent from the payload, and an
+		// omitted key here would make clearTaskAutoStartFailedMarker's publish
+		// as invisible as the set it is meant to undo.
+		"auto_start_failed": task.Metadata[models.MetaKeyAutoStartFailed] != nil,
+		// Keep the interruption projection explicit on task.updated so a live
+		// client receives the warning immediately after reconciliation writes
+		// the marker; task-merge preserves omitted fields for partial updates.
+		"interrupted": task.Metadata[models.MetaKeyInterruptedAt] != nil,
+		// The human assignee, always sent, never omitted when empty, for the
+		// same reason as auto_start_failed above: the frontend pins the
+		// previous value when the key is absent, so omitting it would make
+		// unassigning invisible to every open client, and a takeover would
+		// leave the previous owner's name on their screens.
+		"assignee_user_id": task.AssigneeUserID,
+		// Same reasoning as auto_start_failed above: sent explicit so a clear
+		// (mode moved off inherit_parent, or the marker retracted) reaches
+		// already-open clients rather than being pinned by preserveOmittedField.
+		"workspace_orphaned": models.WorkspaceOrphaned(task.Metadata),
+	}
+	// runner_editable/runner_ineligible_reason mirror the task projection's
+	// always-present contract: never omitted, so a client merging this event
+	// never mistakes an absent key for a retained stale value.
+	runnerView := s.runnerMutabilityEventView(ctx, task)
+	data["runner_editable"] = runnerView.Editable
+	data["runner_ineligible_reason"] = runnerView.Reason
+	data["queued_for_step_id"] = task.QueuedForStepID
+	if task.QueuedAt != nil {
+		data["queued_at"] = task.QueuedAt.Format(time.RFC3339Nano)
+	} else {
+		data["queued_at"] = nil
+	}
+
+	activity = s.addTaskSessionEventFieldsWithActivity(ctx, task.ID, data, activity)
+	s.addTaskParkedEventField(data, task.ID)
+
+	if task.ParentID != "" {
+		data["parent_id"] = task.ParentID
+	}
+	// external_id (docs/specs/tasks/requirements/external-id-idempotency.md): omitted rather
+	// than sent as null/"" when the task holds none, matching the REST DTO's
+	// omitempty and parent_id's convention above. This map is hand-built, not
+	// derived from TaskDTO, so it needs its own explicit field.
+	if task.ExternalID != "" {
+		data["external_id"] = task.ExternalID
+	}
+	data["archived_at"] = nil
+	if task.ArchivedAt != nil {
+		data["archived_at"] = task.ArchivedAt.Format(time.RFC3339Nano)
+	}
+	// Orchestrator-originated events fetch the task via the raw repo.GetTask,
+	// which does not populate Repositories. Load on demand so the payload
+	// carries the full per-task repository list — matching the HTTP DTO and
+	// preventing the frontend from collapsing multi-repo tasks down to the
+	// primary repo on WS updates.
+	if repos, ok := taskRepositoriesForEvent(ctx, s, task); ok {
+		data["repositories"] = serializeTaskRepositories(repos)
+		if len(repos) > 0 {
+			data["repository_id"] = repos[0].RepositoryID
+		}
+	}
+	s.addTaskWorkspaceFoldersToEvent(ctx, task, data)
+	if task.Metadata != nil {
+		data["metadata"] = models.PublicTaskMetadata(task.Metadata)
+	}
+	if oldState != nil {
+		data["old_state"] = string(*oldState)
+		data["new_state"] = string(task.State)
+	}
+	if len(oldWorkflowIDs) > 0 && oldWorkflowIDs[0] != "" && oldWorkflowIDs[0] != task.WorkflowID {
+		data["old_workflow_id"] = oldWorkflowIDs[0]
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	if eventType == events.TaskStateChanged && oldState != nil && s.taskStateActivity != nil {
+		// Write the Office read-model row before publishing the event. The
+		// WebSocket broadcaster can then trigger a detail GET without racing
+		// the activity projection that supplies Started and Completed.
+		s.taskStateActivity.LogTaskStateChange(ctx, task, *oldState)
+	}
+
+	event := bus.NewEvent(eventType, "task-service", data)
+	err := s.eventBus.Publish(ctx, eventType, event)
+	if err != nil {
+		s.logger.Error("failed to publish task event",
+			zap.String("event_type", eventType),
+			zap.String("task_id", task.ID),
+			zap.Error(err))
+	} else if activity.known {
+		s.recordTaskActivitySnapshot(task.ID, activity)
+	}
+	if eventType == events.TaskDeleted {
+		s.forgetTaskActivity(task.ID)
+	}
+	if err != nil {
+		return
+	}
+	s.logTaskLifecycleEventPublished(eventType, task, data)
+}
+
+func (s *Service) addTaskWorkspaceFoldersToEvent(ctx context.Context, task *models.Task, data map[string]interface{}) {
+	if folders, ok := taskWorkspaceFoldersForEvent(ctx, s, task); ok {
+		data["workspace_folders"] = serializeTaskWorkspaceFolders(folders)
+	}
+}
+
+func (s *Service) logTaskLifecycleEventPublished(eventType string, task *models.Task, data map[string]interface{}) {
+	switch eventType {
+	case events.TaskCreated, events.TaskUpdated, events.TaskStateChanged, events.TaskDeleted:
+	default:
+		return
+	}
+	s.logger.Debug("task lifecycle event published",
+		zap.String("event_type", eventType),
+		zap.String("task_id", task.ID),
+		zap.Any("state", data["state"]),
+		zap.Any("workflow_step_id", data["workflow_step_id"]),
+		zap.Any("primary_session_id", data["primary_session_id"]),
+		zap.Any("primary_session_state", data["primary_session_state"]),
+		zap.Any("session_count", data["session_count"]),
+		zap.Any("old_state", data["old_state"]),
+		zap.Any("new_state", data["new_state"]),
+	)
+}
+
+// addTaskSessionEventFields merges session count, primary session info, and
+// primary executor details into the task event payload. Extracted to keep
+// publishTaskEvent under the project's function-length limit.
+func (s *Service) addTaskSessionEventFields(ctx context.Context, taskID string, data map[string]interface{}) {
+	s.addTaskSessionEventFieldsWithActivity(ctx, taskID, data, nil)
+}
+
+func (s *Service) addTaskSessionEventFieldsWithActivity(ctx context.Context, taskID string, data map[string]interface{}, activity *taskActivitySnapshot) *taskActivitySnapshot {
+	// Load the active session list once for this event: both the foreground
+	// activity aggregate and the pending-action rollup need the same set, and
+	// splitting the query per-helper doubled the DB reads on every task event.
+	sessions, sessionsErr := s.sessions.ListActiveTaskSessionsByTaskID(ctx, taskID)
+	if sessionsErr != nil {
+		s.logger.Warn("failed to list active sessions for task event fields",
+			zap.String("task_id", taskID), zap.Error(sessionsErr))
+	}
+
+	activity = s.addTaskForegroundActivityEventField(data, activity, sessions, sessionsErr)
+
+	if sessionCountMap, err := s.GetSessionCountsForTasks(ctx, []string{taskID}); err == nil {
+		if count, ok := sessionCountMap[taskID]; ok {
+			data["session_count"] = count
+		}
+	}
+	s.addTaskPendingActionEventField(ctx, taskID, data, sessions, sessionsErr)
+
+	primarySessionInfoMap, err := s.GetPrimarySessionInfoForTasks(ctx, []string{taskID})
+	if err != nil {
+		return activity
+	}
+	sessionInfo, ok := primarySessionInfoMap[taskID]
+	if !ok || sessionInfo == nil {
+		data["primary_session_id"] = nil
+		data["primary_session_state"] = nil
+		data["primary_session_pending_action"] = nil
+		data["primary_executor_profile_id"] = nil
+		return activity
+	}
+	s.addPrimarySessionEventFields(ctx, taskID, data, sessionInfo)
+	return activity
+}
+
+func (s *Service) addTaskForegroundActivityEventField(data map[string]interface{}, activity *taskActivitySnapshot, sessions []*models.TaskSession, sessionsErr error) *taskActivitySnapshot {
+	// Task-level MOST-ACTIVE-WINS activity aggregate.
+	// Present as the value or explicit nil when the aggregate is KNOWN, so a coarse
+	// state change never leaves a stale background-running reading on the client, and
+	// recording it keeps the live-propagation dedup baseline in step with every task
+	// event. When the session set could not be loaded the aggregate is UNKNOWN: omit
+	// the field entirely and leave the dedup baseline untouched, so the WS merge
+	// preserves the client's last-known reading rather than clearing a still-working
+	// task to a coarse "done".
+	if activity == nil {
+		switch {
+		case s.foregroundActivity == nil:
+			activity = &taskActivitySnapshot{activity: "", known: true}
+		case sessionsErr != nil:
+			activity = &taskActivitySnapshot{known: false}
+		default:
+			activity = &taskActivitySnapshot{
+				activity:            s.computeTaskForegroundActivityForSessions(sessions),
+				activeSubagentCount: s.computeTaskActiveSubagentCountForSessions(sessions),
+				known:               true,
+			}
+		}
+	}
+	if activity.known {
+		if activity.activity != "" {
+			data["foreground_activity"] = string(activity.activity)
+		} else {
+			data["foreground_activity"] = nil
+		}
+		data["active_subagent_count"] = activity.activeSubagentCount
+	}
+	return activity
+}
+
+// addTaskParkedEventField stamps the task-level parked_on_background_work
+// OR-aggregate, its own monotonic revision, and the process epoch onto a
+// task.updated payload (AC-22, AC-62, AC-78). Always serialized when a
+// provider is wired, so a settled projection clears stale client state; a nil
+// provider (unwired, or in tests) omits the fields entirely rather than
+// asserting false values the backend cannot actually vouch for.
+func (s *Service) addTaskParkedEventField(data map[string]interface{}, taskID string) {
+	if s.taskParkedProvider == nil {
+		return
+	}
+	parked, revision := s.taskParkedProvider.TaskParkedSnapshot(taskID)
+	data["parked_on_background_work"] = parked
+	data["parked_revision"] = revision
+	data["parked_epoch"] = s.taskParkedProvider.ParkedEpoch()
+}
+
+func (s *Service) addPrimarySessionEventFields(ctx context.Context, taskID string, data map[string]interface{}, sessionInfo *models.TaskSession) {
+	data["primary_session_id"] = sessionInfo.ID
+	if sessionInfo.ReviewStatus != models.ReviewStatusNone {
+		data["review_status"] = string(sessionInfo.ReviewStatus)
+	}
+	if sessionInfo.State != "" {
+		data["primary_session_state"] = string(sessionInfo.State)
+	} else {
+		data["primary_session_state"] = nil
+	}
+	s.addPrimarySessionPendingActionEventField(ctx, taskID, sessionInfo, data)
+	if sessionInfo.ExecutorID != "" {
+		data["primary_executor_id"] = sessionInfo.ExecutorID
+	}
+	if sessionInfo.ExecutorProfileID != "" {
+		data["primary_executor_profile_id"] = sessionInfo.ExecutorProfileID
+	} else {
+		data["primary_executor_profile_id"] = nil
+	}
+	data["primary_agent_profile_id"] = nil
+	data["primary_agent_name"] = nil
+	if sessionInfo.AgentProfileID != "" {
+		data["primary_agent_profile_id"] = sessionInfo.AgentProfileID
+	}
+	if sessionInfo.AgentProfileSnapshot != nil {
+		if name, ok := sessionInfo.AgentProfileSnapshot["name"].(string); ok && name != "" {
+			data["primary_agent_name"] = name
+		}
+	}
+	var execType string
+	if sessionInfo.ExecutorSnapshot != nil {
+		if t, ok := sessionInfo.ExecutorSnapshot["executor_type"].(string); ok && t != "" {
+			execType = t
+			data["primary_executor_type"] = t
+		}
+		if n, ok := sessionInfo.ExecutorSnapshot["executor_name"].(string); ok && n != "" {
+			data["primary_executor_name"] = n
+		}
+	}
+	if execType != "" {
+		data["is_remote_executor"] = models.IsRemoteExecutorType(models.ExecutorType(execType))
+	}
+}
+
+func (s *Service) addTaskPendingActionEventField(ctx context.Context, taskID string, data map[string]interface{}, sessions []*models.TaskSession, sessionsErr error) {
+	if sessionsErr != nil {
+		// Already logged once by the shared load in addTaskSessionEventFieldsWithActivity.
+		return
+	}
+	sessionIDs := make([]string, 0, len(sessions))
+	for _, session := range sessions {
+		if session != nil && (session.State == models.TaskSessionStateRunning || session.State == models.TaskSessionStateWaitingForInput) {
+			sessionIDs = append(sessionIDs, session.ID)
+		}
+	}
+	if len(sessionIDs) == 0 {
+		data["task_pending_action"] = nil
+		return
+	}
+	actions, err := s.GetPendingActionsForSessions(ctx, sessionIDs)
+	if err != nil {
+		s.logger.Warn("failed to load task pending action", zap.String("task_id", taskID), zap.Error(err))
+		return
+	}
+	var clarification bool
+	for _, sessionID := range sessionIDs {
+		switch actions[sessionID] {
+		case models.TaskPendingActionPermission:
+			data["task_pending_action"] = string(models.TaskPendingActionPermission)
+			return
+		case models.TaskPendingActionClarification:
+			clarification = true
+		}
+	}
+	if clarification {
+		data["task_pending_action"] = string(models.TaskPendingActionClarification)
+	} else {
+		data["task_pending_action"] = nil
+	}
+}
+
+func (s *Service) addPrimarySessionPendingActionEventField(ctx context.Context, taskID string, sessionInfo *models.TaskSession, data map[string]interface{}) {
+	if sessionInfo.State != models.TaskSessionStateWaitingForInput {
+		data["primary_session_pending_action"] = nil
+		return
+	}
+	actions, err := s.GetPendingActionsForSessions(ctx, []string{sessionInfo.ID})
+	if err != nil {
+		s.logger.Warn("failed to load pending action for task event",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionInfo.ID),
+			zap.Error(err))
+		return
+	}
+	action, ok := actions[sessionInfo.ID]
+	if !ok {
+		data["primary_session_pending_action"] = nil
+		return
+	}
+	data["primary_session_pending_action"] = string(action)
+}
+
+// taskRepositoriesForEvent returns the task's full repository list, ordered by
+// position. Prefers Task.Repositories when already loaded; falls back to a
+// lookup so publishers that pass a task without eagerly loaded repositories
+// (e.g. the orchestrator's raw repo.GetTask) still emit per-repo data.
+func taskRepositoriesForEvent(ctx context.Context, s *Service, task *models.Task) ([]*models.TaskRepository, bool) {
+	if len(task.Repositories) > 0 {
+		return task.Repositories, true
+	}
+	repos, err := s.taskRepos.ListTaskRepositories(ctx, task.ID)
+	if err != nil {
+		return nil, false
+	}
+	return repos, true
+}
+
+// serializeTaskRepositories returns the WS-shaped repositories array. Mirrors
+// the HTTP DTO's TaskRepositoryDTO so the frontend can use the same parser
+// across SSR snapshot and WS update paths.
+func serializeTaskRepositories(repos []*models.TaskRepository) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(repos))
+	for _, r := range repos {
+		serialized := map[string]interface{}{
+			"id":            r.ID,
+			"task_id":       r.TaskID,
+			"repository_id": r.RepositoryID,
+			"base_branch":   r.BaseBranch,
+			"position":      r.Position,
+			"created_at":    r.CreatedAt.Format(time.RFC3339Nano),
+			"updated_at":    r.UpdatedAt.Format(time.RFC3339Nano),
+		}
+		if r.CheckoutBranch != "" {
+			serialized["checkout_branch"] = r.CheckoutBranch
+		}
+		if r.BranchPolicyID != "" {
+			serialized["branch_policy_id"] = r.BranchPolicyID
+		}
+		if r.BranchPolicyName != "" {
+			serialized["branch_policy_name"] = r.BranchPolicyName
+		}
+		if r.BranchPolicyBaseBranch != "" {
+			serialized["branch_policy_base_branch"] = r.BranchPolicyBaseBranch
+		}
+		if r.BranchPolicyBranchTemplate != "" {
+			serialized["branch_policy_branch_template"] = r.BranchPolicyBranchTemplate
+		}
+		if r.BranchPolicyPullRequestTarget != "" {
+			serialized["branch_policy_pull_request_target"] = r.BranchPolicyPullRequestTarget
+		}
+		if len(r.Metadata) > 0 {
+			serialized["metadata"] = r.Metadata
+		}
+		out = append(out, serialized)
+	}
+	return out
+}
+
+func taskWorkspaceFoldersForEvent(ctx context.Context, s *Service, task *models.Task) ([]*models.TaskWorkspaceFolder, bool) {
+	if len(task.WorkspaceFolders) > 0 {
+		return task.WorkspaceFolders, true
+	}
+	if s.workspaceFolders == nil {
+		return nil, false
+	}
+	folders, err := s.workspaceFolders.ListTaskWorkspaceFolders(ctx, task.ID)
+	if err != nil {
+		return nil, false
+	}
+	return folders, true
+}
+
+func serializeTaskWorkspaceFolders(folders []*models.TaskWorkspaceFolder) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(folders))
+	for _, folder := range folders {
+		out = append(out, map[string]interface{}{
+			"id":           folder.ID,
+			"task_id":      folder.TaskID,
+			"local_path":   folder.LocalPath,
+			"display_name": folder.DisplayName,
+			"position":     folder.Position,
+			"created_at":   folder.CreatedAt.Format(time.RFC3339),
+			"updated_at":   folder.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+// publishTaskMovedEvent publishes a task.moved event so the orchestrator can process
+// on_exit/on_enter actions for the new workflow step.
+func (s *Service) publishTaskMovedEvent(ctx context.Context, task *models.Task, fromWorkflowID, fromStepID, toStepID, sessionID, moveID string) {
+	if s.eventBus == nil {
+		return
+	}
+	queuePromotion := false
+	if task.Metadata != nil {
+		_, queuePromotion = task.Metadata[models.MetaKeyQueuePromotionPending]
+	}
+	data := map[string]interface{}{
+		"task_id":                   task.ID,
+		"step_transition_id":        task.WorkflowStepTransitionID,
+		"move_id":                   moveID,
+		"from_workflow_id":          fromWorkflowID,
+		"to_workflow_id":            task.WorkflowID,
+		"from_step_id":              fromStepID,
+		"to_step_id":                toStepID,
+		"session_id":                sessionID,
+		"workflow_id":               task.WorkflowID,
+		"task_description":          task.Description,
+		"parent_id":                 task.ParentID,
+		"assignee_agent_profile_id": task.AssigneeAgentProfileID,
+		"assignee_user_id":          task.AssigneeUserID,
+		"wip_admitted":              task.WIPAdmitted,
+		"queued_for_step_id":        task.QueuedForStepID,
+		"queue_promotion":           queuePromotion,
+	}
+	if task.QueuedAt != nil {
+		data["queued_at"] = task.QueuedAt.Format(time.RFC3339)
+	} else {
+		data["queued_at"] = nil
+	}
+	event := bus.NewEvent(events.TaskMoved, "task-service", data)
+	if err := s.eventBus.Publish(ctx, events.TaskMoved, event); err != nil {
+		s.logger.Error("failed to publish task.moved event",
+			zap.String("task_id", task.ID),
+			zap.Error(err))
+	}
+}
+
+func (s *Service) publishEventToBus(ctx context.Context, eventType, resourceType, resourceID string, data map[string]interface{}) {
+	event := bus.NewEvent(eventType, "task-service", data)
+	if err := s.eventBus.Publish(ctx, eventType, event); err != nil {
+		s.logger.Error("failed to publish "+resourceType+" event",
+			zap.String("event_type", eventType),
+			zap.String(resourceType+"_id", resourceID),
+			zap.Error(err))
+	}
+}
+
+func (s *Service) publishWorkspaceEvent(ctx context.Context, eventType string, workspace *models.Workspace) {
+	if s.eventBus == nil || workspace == nil {
+		return
+	}
+
+	data := map[string]interface{}{
+		"id":                              workspace.ID,
+		"name":                            workspace.Name,
+		"description":                     workspace.Description,
+		"owner_id":                        workspace.OwnerID,
+		"default_executor_id":             workspace.DefaultExecutorID,
+		"default_environment_id":          workspace.DefaultEnvironmentID,
+		"default_agent_profile_id":        workspace.DefaultAgentProfileID,
+		"default_config_agent_profile_id": workspace.DefaultConfigAgentProfileID,
+		"acp_idle_suspension_enabled":     workspace.ACPIdleSuspensionEnabled,
+		"acp_idle_timeout_minutes":        workspace.ACPIdleTimeoutMinutes,
+		// Placement is reach: moving a workspace between units is what grants
+		// and withdraws access now, so an access-changed event that omitted it
+		// would tell clients something changed without telling them what.
+		"unit_id":    workspace.UnitID,
+		"created_at": workspace.CreatedAt.Format(time.RFC3339),
+		"updated_at": workspace.UpdatedAt.Format(time.RFC3339),
+	}
+
+	s.publishEventToBus(ctx, eventType, "workspace", workspace.ID, data)
+}
+
+// publishWorkspaceAccessChanged tells open clients that who-can-reach-this
+// changed (unit placement, membership, ownership) so they re-evaluate access
+// without a reload. It rides the existing workspace-updated event: the payload
+// carries owner and unit_id, and a client that lost access is dropped from the
+// workspace's subscriber set on the next broadcast.
+func (s *Service) publishWorkspaceAccessChanged(ctx context.Context, workspace *models.Workspace) {
+	s.publishWorkspaceEvent(ctx, events.WorkspaceUpdated, workspace)
+}
+
+func (s *Service) publishWorkflowEvent(ctx context.Context, eventType string, workflow *models.Workflow) {
+	if s.eventBus == nil || workflow == nil {
+		return
+	}
+
+	data := map[string]interface{}{
+		"id":               workflow.ID,
+		"workspace_id":     workflow.WorkspaceID,
+		"name":             workflow.Name,
+		"description":      workflow.Description,
+		"prompt":           workflow.Prompt,
+		"agent_profile_id": workflow.AgentProfileID,
+		"hidden":           workflow.Hidden,
+		"source":           workflow.Source,
+		"source_path":      workflow.SourcePath,
+		"created_at":       workflow.CreatedAt.Format(time.RFC3339),
+		"updated_at":       workflow.UpdatedAt.Format(time.RFC3339),
+	}
+
+	s.publishEventToBus(ctx, eventType, "workflow", workflow.ID, data)
+}
+
+func (s *Service) publishExecutorEvent(ctx context.Context, eventType string, executor *models.Executor) {
+	if s.eventBus == nil || executor == nil {
+		return
+	}
+
+	data := map[string]interface{}{
+		"id":         executor.ID,
+		"name":       executor.Name,
+		"type":       executor.Type,
+		"status":     executor.Status,
+		"is_system":  executor.IsSystem,
+		"resumable":  executor.Resumable,
+		"config":     executor.Config,
+		"created_at": executor.CreatedAt.Format(time.RFC3339),
+		"updated_at": executor.UpdatedAt.Format(time.RFC3339),
+	}
+
+	s.publishEventToBus(ctx, eventType, "executor", executor.ID, data)
+}
+
+func (s *Service) publishExecutorProfileEvent(ctx context.Context, eventType string, profile *models.ExecutorProfile) {
+	if s.eventBus == nil || profile == nil {
+		return
+	}
+	config, secretFields := models.RedactExecutorProfileConfig(profile.Config)
+	var provider *models.ExecutorProvider
+	if executor, err := s.GetExecutor(ctx, profile.ExecutorID); err == nil {
+		provider = executor.Provider
+	}
+	data := map[string]interface{}{
+		"id":             profile.ID,
+		"executor_id":    profile.ExecutorID,
+		"name":           profile.Name,
+		"mcp_policy":     profile.McpPolicy,
+		"config":         config,
+		"secret_fields":  secretFields,
+		"provider":       provider,
+		"prepare_script": profile.PrepareScript,
+		"cleanup_script": profile.CleanupScript,
+		"created_at":     profile.CreatedAt.Format(time.RFC3339),
+		"updated_at":     profile.UpdatedAt.Format(time.RFC3339),
+	}
+	s.publishEventToBus(ctx, eventType, "executor_profile", profile.ID, data)
+}
+
+func (s *Service) publishEnvironmentEvent(ctx context.Context, eventType string, environment *models.Environment) {
+	if s.eventBus == nil || environment == nil {
+		return
+	}
+
+	data := map[string]interface{}{
+		"id":            environment.ID,
+		"name":          environment.Name,
+		"kind":          environment.Kind,
+		"is_system":     environment.IsSystem,
+		"worktree_root": environment.WorktreeRoot,
+		"image_tag":     environment.ImageTag,
+		"dockerfile":    environment.Dockerfile,
+		"build_config":  environment.BuildConfig,
+		"created_at":    environment.CreatedAt.Format(time.RFC3339),
+		"updated_at":    environment.UpdatedAt.Format(time.RFC3339),
+	}
+
+	s.publishEventToBus(ctx, eventType, "environment", environment.ID, data)
+}
+
+// PublishMessageEvent is publishMessageEvent's exported form, for callers
+// outside this package that insert a message directly (bypassing
+// CreateMessage) but still need the same message-added/updated event and its
+// session-scoped pending_action projection side effect. The e2e test harness
+// (internal/office/testharness) is the only current caller: it seeds messages
+// straight into the repository so specs can script clarification/permission
+// states deterministically, and without this it never triggers the
+// pending_action recompute a real agent turn would.
+func (s *Service) PublishMessageEvent(
+	ctx context.Context,
+	eventType string,
+	message *models.Message,
+	receipts ...*models.ConversationMutationReceipt,
+) error {
+	return s.publishMessageEvent(ctx, eventType, message, receipts...)
+}
+
+// publishMessageEvent publishes message events to the event bus.
+// Only true system-injected content (wrapped in <kandev-system> tags) is stripped
+// from the visible message content delivered to clients.
+// Ordinary persistence callers intentionally treat delivery as best effort
+// after their durable write succeeds. Synchronization-sensitive callers, such
+// as clarification bundle convergence, check and propagate the returned error.
+func (s *Service) publishMessageEvent(ctx context.Context, eventType string, message *models.Message, receipts ...*models.ConversationMutationReceipt) error {
+	if s.eventBus == nil {
+		s.logger.Warn("publishMessageEvent: eventBus is nil, skipping")
+		return errors.New("event bus is unavailable")
+	}
+	event := newMessageEvent(eventType, message)
+	if len(receipts) > 0 && receipts[0] != nil {
+		if data, ok := event.Data.(map[string]interface{}); ok {
+			data["conversation_receipt"] = projectConversationReceipt(receipts[0])
+		}
+	}
+	pendingProjection := s.addMessagePendingAction(ctx, eventType, message, event)
+	if err := s.eventBus.Publish(ctx, eventType, event); err != nil {
+		s.logger.Error("failed to publish message event",
+			zap.String("event_type", eventType),
+			zap.String("message_id", message.ID),
+			zap.Error(err))
+		return err
+	}
+	if pendingProjection != nil {
+		s.publishSessionPendingActionChanged(ctx, message, *pendingProjection)
+	}
+	return nil
+}
+
+// projectConversationReceipt keeps the transient source receipt useful to the
+// live conversation transport without exposing repository-owned metadata or
+// system-injected message content through the event bus.
+func projectConversationReceipt(receipt *models.ConversationMutationReceipt) *models.ConversationMutationReceipt {
+	if receipt == nil {
+		return nil
+	}
+	projected := &models.ConversationMutationReceipt{
+		SessionID:    receipt.SessionID,
+		BaseRevision: receipt.BaseRevision,
+		Revision:     receipt.Revision,
+		Complete:     receipt.Complete,
+		Operations:   make([]models.ConversationMutationOperation, 0, len(receipt.Operations)),
+	}
+	for _, operation := range receipt.Operations {
+		copyOperation := operation
+		if operation.Message != nil {
+			message := *operation.Message
+			message.Content = sysprompt.StripSystemContent(message.Content)
+			message.Metadata = models.ProjectMessageMetadata(message.Metadata)
+			copyOperation.Message = &message
+		}
+		if operation.Turn != nil {
+			turn := *operation.Turn
+			turn.Metadata = models.ProjectTurnMetadata(turn.Metadata)
+			copyOperation.Turn = &turn
+		}
+		if operation.HadOutput != nil {
+			hadOutput := *operation.HadOutput
+			copyOperation.HadOutput = &hadOutput
+		}
+		projected.Operations = append(projected.Operations, copyOperation)
+	}
+	return projected
+}
+
+type pendingActionProjection struct {
+	action   models.TaskPendingAction
+	revision models.PendingActionRevision
+	changed  bool
+}
+
+type pendingActionProjectionState struct {
+	action   models.TaskPendingAction
+	revision models.PendingActionRevision
+}
+
+func (s *Service) addMessagePendingAction(
+	ctx context.Context,
+	eventType string,
+	message *models.Message,
+	event *bus.Event,
+) *pendingActionProjection {
+	if s.messages == nil ||
+		!messageEventChangesPendingAction(eventType, message) ||
+		message.TaskSessionID == "" {
+		return nil
+	}
+	actions, revisions, err := s.GetPendingActionProjectionsForSessions(
+		ctx,
+		[]string{message.TaskSessionID},
+	)
+	if err != nil {
+		s.logger.Warn("failed to project pending action for message event",
+			zap.String("event_type", eventType),
+			zap.String("message_id", message.ID),
+			zap.Error(err))
+		return nil
+	}
+	data, ok := event.Data.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	action := models.TaskPendingAction("")
+	if projected, ok := actions[message.TaskSessionID]; ok {
+		action = projected
+		data["pending_action"] = string(action)
+	} else {
+		data["pending_action"] = nil
+	}
+	revision := revisions[message.TaskSessionID]
+	data["pending_action_revision"] = revision
+	return &pendingActionProjection{
+		action:   action,
+		revision: revision,
+		changed:  s.pendingActionProjectionChanged(message.TaskSessionID, action, revision),
+	}
+}
+
+func (s *Service) pendingActionProjectionChanged(
+	sessionID string,
+	action models.TaskPendingAction,
+	revision models.PendingActionRevision,
+) bool {
+	s.pendingActionProjectionMu.Lock()
+	defer s.pendingActionProjectionMu.Unlock()
+
+	if s.lastPendingActionProjections == nil {
+		s.lastPendingActionProjections = make(map[string]pendingActionProjectionState)
+	}
+	if observed, exists := s.pendingActionProjectionObserved[sessionID]; exists &&
+		!pendingActionRevisionAfter(revision, observed.revision) && revision != observed.revision {
+		return false
+	}
+	previous, exists := s.lastPendingActionProjections[sessionID]
+	if exists && revision != previous.revision && !pendingActionRevisionAfter(revision, previous.revision) {
+		return false
+	}
+	if exists && previous.action == action {
+		if pendingActionRevisionAfter(revision, previous.revision) {
+			previous.revision = revision
+			s.lastPendingActionProjections[sessionID] = previous
+		}
+		return false
+	}
+	if exists && revision == previous.revision {
+		return false
+	}
+	s.lastPendingActionProjections[sessionID] = pendingActionProjectionState{
+		action:   action,
+		revision: revision,
+	}
+	return !exists || previous.action != action
+}
+
+func pendingActionRevisionAfter(
+	incoming models.PendingActionRevision,
+	existing models.PendingActionRevision,
+) bool {
+	if incoming.Epoch != existing.Epoch {
+		incomingEpoch, incomingErr := strconv.ParseUint(incoming.Epoch, 10, 64)
+		existingEpoch, existingErr := strconv.ParseUint(existing.Epoch, 10, 64)
+		if incomingErr == nil && existingErr == nil {
+			return incomingEpoch > existingEpoch
+		}
+		return incoming.Epoch > existing.Epoch
+	}
+	return incoming.Sequence > existing.Sequence
+}
+
+func (s *Service) publishSessionPendingActionChanged(
+	ctx context.Context,
+	message *models.Message,
+	projection pendingActionProjection,
+) {
+	if !projection.changed || message == nil || message.TaskSessionID == "" || s.tasks == nil {
+		return
+	}
+	taskID := message.TaskID
+	if taskID == "" && s.sessions != nil {
+		session, err := s.sessions.GetTaskSession(ctx, message.TaskSessionID)
+		if err != nil || session == nil {
+			s.logger.Warn("failed to resolve task for pending-action event",
+				zap.String("session_id", message.TaskSessionID), zap.Error(err))
+			return
+		}
+		taskID = session.TaskID
+	}
+	if taskID == "" {
+		return
+	}
+	task, err := s.tasks.GetTask(ctx, taskID)
+	if err != nil || task == nil || task.WorkspaceID == "" {
+		// This event is workspace-scoped. Drop it when the owner cannot be
+		// established instead of allowing the gateway to fan it out globally.
+		s.logger.Warn("failed to resolve workspace for pending-action event",
+			zap.String("task_id", taskID),
+			zap.String("session_id", message.TaskSessionID),
+			zap.Error(err))
+		return
+	}
+	pendingAction := interface{}(nil)
+	if projection.action != "" {
+		pendingAction = string(projection.action)
+	}
+	data := map[string]interface{}{
+		"workspace_id":            task.WorkspaceID,
+		"task_id":                 taskID,
+		"session_id":              message.TaskSessionID,
+		"pending_action":          pendingAction,
+		"pending_action_revision": projection.revision,
+	}
+	event := bus.NewEvent(events.SessionPendingActionChanged, "task-service", data)
+	if err := s.eventBus.Publish(ctx, events.SessionPendingActionChanged, event); err != nil {
+		s.logger.Warn("failed to publish compact pending-action event",
+			zap.String("task_id", taskID),
+			zap.String("session_id", message.TaskSessionID),
+			zap.Error(err))
+	}
+}
+
+func messageEventChangesPendingAction(eventType string, message *models.Message) bool {
+	switch eventType {
+	case events.MessageAdded, events.MessageDeleted:
+		// Adding or deleting any message can establish or remove the message
+		// evidence that makes an unpublished successor turn authoritative.
+		return true
+	case events.MessageUpdated:
+		return message.Type == models.MessageTypeClarificationRequest ||
+			message.Type == models.MessageTypePermissionRequest
+	default:
+		return false
+	}
+}
+
+// newMessageEvent builds a bus event for a message lifecycle change, embedding the message's prompt index when present.
+func newMessageEvent(eventType string, message *models.Message) *bus.Event {
+
+	messageType := string(message.Type)
+	if messageType == "" {
+		messageType = "message"
+	}
+
+	hasHidden := sysprompt.HasSystemContent(message.Content)
+	data := map[string]interface{}{
+		"message_id":     message.ID,
+		"session_id":     message.TaskSessionID,
+		"task_id":        message.TaskID,
+		"turn_id":        message.TurnID,
+		"author_type":    string(message.AuthorType),
+		"author_id":      message.AuthorID,
+		"content":        sysprompt.StripSystemContent(message.Content),
+		"type":           messageType,
+		"requests_input": message.RequestsInput,
+		// RFC3339Nano keeps sub-second precision so rapid updates within the same
+		// second produce distinct timestamps; the REST/DTO path serializes these
+		// fields with nanosecond precision too, so both delivery channels agree.
+		"created_at": message.CreatedAt.Format(time.RFC3339Nano),
+		"updated_at": message.UpdatedAt.Format(time.RFC3339Nano),
+	}
+
+	// User messages carry their stable prompt ordinal so WS consumers can
+	// render the panel label without an extra fetch; agent rows omit it.
+	if message.PromptIndex > 0 {
+		data["prompt_index"] = message.PromptIndex
+	}
+
+	if hasHidden {
+		data["raw_content"] = message.Content
+	}
+
+	meta := models.ProjectMessageMetadata(message.Metadata)
+	if hasHidden {
+		if meta == nil {
+			meta = make(map[string]interface{})
+		} else {
+			cp := make(map[string]interface{}, len(meta))
+			for k, v := range meta {
+				cp[k] = v
+			}
+			meta = cp
+		}
+		meta["has_hidden_prompts"] = true
+	}
+	if meta != nil {
+		data["metadata"] = meta
+	}
+
+	return bus.NewEvent(eventType, "task-service", data)
+}
+
+func (s *Service) publishRepositoryEvent(ctx context.Context, eventType string, repository *models.Repository) {
+	if s.eventBus == nil || repository == nil {
+		return
+	}
+	bindings := make([]map[string]string, 0, len(repository.SecretBindings))
+	for _, binding := range repository.SecretBindings {
+		bindings = append(bindings, map[string]string{"key": binding.Key, "secret_id": binding.SecretID})
+	}
+	data := map[string]interface{}{
+		"id":                     repository.ID,
+		"workspace_id":           repository.WorkspaceID,
+		"name":                   repository.Name,
+		"source_type":            repository.SourceType,
+		"local_path":             repository.LocalPath,
+		"provider":               repository.Provider,
+		"provider_repo_id":       repository.ProviderRepoID,
+		"provider_host":          repository.ProviderHost,
+		"provider_scope":         repository.ProviderScope,
+		"provider_owner":         repository.ProviderOwner,
+		"provider_name":          repository.ProviderName,
+		"default_branch":         repository.DefaultBranch,
+		"worktree_branch_prefix": repository.WorktreeBranchPrefix,
+		"pull_before_worktree":   repository.PullBeforeWorktree,
+		"setup_script":           repository.SetupScript,
+		"cleanup_script":         repository.CleanupScript,
+		"dev_script":             repository.DevScript,
+		"copy_files":             repository.CopyFiles,
+		"secret_bindings":        bindings,
+		"created_at":             repository.CreatedAt.Format(time.RFC3339),
+		"updated_at":             repository.UpdatedAt.Format(time.RFC3339),
+	}
+	event := bus.NewEvent(eventType, "task-service", data)
+	if err := s.eventBus.Publish(ctx, eventType, event); err != nil {
+		s.logger.Error("failed to publish repository event",
+			zap.String("event_type", eventType),
+			zap.String("repository_id", repository.ID),
+			zap.Error(err))
+	}
+}
+
+func (s *Service) publishRepositoryScriptEvent(ctx context.Context, eventType string, script *models.RepositoryScript) {
+	if s.eventBus == nil || script == nil {
+		return
+	}
+	data := map[string]interface{}{
+		"id":            script.ID,
+		"repository_id": script.RepositoryID,
+		"name":          script.Name,
+		"command":       script.Command,
+		"position":      script.Position,
+		"created_at":    script.CreatedAt.Format(time.RFC3339),
+		"updated_at":    script.UpdatedAt.Format(time.RFC3339),
+	}
+	event := bus.NewEvent(eventType, "task-service", data)
+	if err := s.eventBus.Publish(ctx, eventType, event); err != nil {
+		s.logger.Error("failed to publish repository script event",
+			zap.String("event_type", eventType),
+			zap.String("script_id", script.ID),
+			zap.Error(err))
+	}
+}

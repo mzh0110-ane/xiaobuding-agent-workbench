@@ -1,0 +1,143 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+
+	"github.com/kandev/kandev/internal/common/subproc"
+	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
+)
+
+// branchFetchCooldown is the minimum interval between successive `git fetch`
+// invocations for the same repository when triggered via the branches API.
+// The branches dropdown auto-refreshes on every dialog open, so the cooldown
+// keeps a noisy UI from spamming the network and the local git index.
+const branchFetchCooldown = 30 * time.Second
+
+// branchFetchTimeout bounds a single fetch invocation. Long-lived auth prompts
+// or unreachable remotes must not stall the dropdown beyond this window.
+const branchFetchTimeout = 30 * time.Second
+
+// BranchRefreshResult reports the outcome of a `git fetch` issued by the
+// branches API. Skipped is true when the cooldown short-circuited the fetch;
+// in that case FetchedAt and Err are copied from the previous attempt so
+// callers see the same outcome until the cooldown expires.
+type BranchRefreshResult struct {
+	FetchedAt time.Time
+	Skipped   bool
+	Err       error
+}
+
+// branchFetcher serializes `git fetch` calls for a repository path with a
+// per-path cooldown and single-flight deduplication. Concurrent callers for
+// the same path observe the same result; callers within the cooldown window
+// receive the cached result without re-fetching.
+type branchFetcher struct {
+	group     singleflight.Group
+	mu        sync.Mutex
+	lastByKey map[string]BranchRefreshResult
+	logger    *zap.Logger
+}
+
+func newBranchFetcher(log *zap.Logger) *branchFetcher {
+	return &branchFetcher{
+		lastByKey: make(map[string]BranchRefreshResult),
+		logger:    log,
+	}
+}
+
+// Fetch runs `git fetch --all --prune --no-tags` for repoPath unless the
+// cooldown is still active, in which case the previous result is returned
+// with Skipped=true. Concurrent calls for the same path coalesce.
+//
+// The singleflight closure deliberately uses a context detached from the
+// caller's: if the first caller's HTTP request is cancelled mid-flight (e.g.
+// browser tab closed), waiting callers must still get a real result and the
+// cooldown cache must not be poisoned with context.Canceled.
+func (f *branchFetcher) Fetch(ctx context.Context, repoPath string) BranchRefreshResult {
+	if cached, ok := f.checkCooldown(repoPath); ok {
+		return cached
+	}
+	v, _, _ := f.group.Do(repoPath, func() (any, error) {
+		// Re-check inside the singleflight to avoid running back-to-back fetches
+		// when many callers arrived during the previous flight.
+		if cached, ok := f.checkCooldown(repoPath); ok {
+			return cached, nil
+		}
+		res := f.runFetch(context.WithoutCancel(ctx), repoPath)
+		f.mu.Lock()
+		f.lastByKey[repoPath] = res
+		f.mu.Unlock()
+		return res, nil
+	})
+	return v.(BranchRefreshResult)
+}
+
+func (f *branchFetcher) checkCooldown(repoPath string) (BranchRefreshResult, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prev, ok := f.lastByKey[repoPath]
+	if !ok {
+		return BranchRefreshResult{}, false
+	}
+	if time.Since(prev.FetchedAt) >= branchFetchCooldown {
+		return BranchRefreshResult{}, false
+	}
+	return BranchRefreshResult{FetchedAt: prev.FetchedAt, Skipped: true, Err: prev.Err}, true
+}
+
+func (f *branchFetcher) runFetch(ctx context.Context, repoPath string) BranchRefreshResult {
+	output, runErr, execCtxErr := subproc.RunGitCombinedAfterAcquire(
+		ctx,
+		subproc.GitInteractive,
+		branchFetchTimeout,
+		func(execCtx context.Context) *exec.Cmd {
+			return newNonInteractiveGitFetchCmd(execCtx, repoPath)
+		},
+	)
+	res := BranchRefreshResult{FetchedAt: time.Now()}
+	if runErr != nil || execCtxErr != nil {
+		effectiveErr := runErr
+		if effectiveErr == nil {
+			effectiveErr = execCtxErr
+		}
+		res.Err = fmt.Errorf("git fetch: %w", effectiveErr)
+		if f.logger != nil {
+			// Avoid logging raw git output: it can contain remote URLs with
+			// embedded credentials or other sensitive data. Surface only the
+			// length and a sanitized summary instead.
+			f.logger.Warn("branch refresh fetch failed",
+				zap.String("path", repoPath),
+				zap.Int("output_bytes", len(output)),
+				zap.Error(res.Err))
+		}
+	}
+	return res
+}
+
+// newNonInteractiveGitFetchCmd builds a `git fetch --all --prune --no-tags`
+// command with the same non-interactive environment used by the worktree
+// manager. Auth prompts are disabled so missing credentials surface as fast
+// failures rather than hanging the dropdown.
+func newNonInteractiveGitFetchCmd(ctx context.Context, repoPath string) *exec.Cmd {
+	cmd := subproc.NewGitCommand(ctx, "-C", repoPath, "fetch", "--all", "--prune", "--no-tags")
+	cmd.Env = os.Environ()
+	return cmd
+}
+
+// RefreshRepositoryBranches resolves the repository's local path and runs
+// `git fetch` for it, subject to a per-repository cooldown and single-flight
+// deduplication. The persisted repository path is the durable exact-path grant;
+// discovery roots only constrain automatic scanning.
+func (s *Service) RefreshRepositoryBranches(ctx context.Context, repoID string) (BranchRefreshResult, error) {
+	localPath, err := s.resolveRepositoryLocalPath(ctx, repoID)
+	if err != nil {
+		return BranchRefreshResult{}, err
+	}
+	return s.branchFetcher.Fetch(ctx, localPath), nil
+}

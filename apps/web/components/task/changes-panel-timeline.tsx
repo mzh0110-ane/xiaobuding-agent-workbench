@@ -1,0 +1,353 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { cn } from "@/lib/utils";
+import type { FileInfo } from "@/lib/state/store";
+import { type CommitItem } from "./commit-row";
+import { groupByRepositoryName, isSingleRepoGroup } from "@/lib/group-by-repo";
+import { CommitsGroupActions, CommitsRepoGroup } from "./changes-panel-repo-groups";
+import { PRFilesGroupedList } from "./changes-panel-pr-files";
+import type {
+  CommitDetailTarget,
+  CommitFileNavigationRequest,
+  OpenDiffOptions,
+} from "@/lib/state/diff-target-types";
+import { useTranslation } from "react-i18next";
+
+// --- Timeline visual components ---
+
+// Per-repo grouping is shared with the Review dialog — see @/lib/group-by-repo.
+
+// --- Timeline section dot colors ---
+const DOT_COLORS = {
+  unstaged: "bg-yellow-500",
+  staged: "bg-emerald-500",
+  commits: "bg-blue-500",
+  pr: "bg-purple-500",
+} as const;
+
+function TimelineDot({ color }: { color: string }) {
+  return <div className={cn("relative z-10 size-1.5 rounded-full shrink-0 mt-[5px]", color)} />;
+}
+
+function TimelineSection({
+  dotColor,
+  label,
+  count,
+  action,
+  children,
+  collapsible = true,
+  defaultCollapsed = false,
+  expandOnRequestToken,
+  focusOnExpand,
+  "data-testid": testId,
+}: {
+  dotColor: string;
+  label?: string;
+  count?: number;
+  action?: React.ReactNode;
+  children?: React.ReactNode;
+  collapsible?: boolean;
+  defaultCollapsed?: boolean;
+  expandOnRequestToken?: number;
+  focusOnExpand?: boolean;
+  "data-testid": string;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  // Git data arrives in separate async store updates, so `defaultCollapsed`
+  // (derived from which section is first-visible) can flip after mount. Re-sync
+  // to it whenever it changes — but stop once the user has manually toggled, so
+  // their choice is never clobbered by a later data update. Adjusting state
+  // during render (storing the previous prop in state) is the React-recommended
+  // pattern and avoids both the setState-in-effect and ref-during-render lint
+  // rules.
+  const [userToggled, setUserToggled] = useState(false);
+  const [prevDefaultCollapsed, setPrevDefaultCollapsed] = useState(defaultCollapsed);
+  const [lastExpandOnRequestToken, setLastExpandOnRequestToken] = useState<number | undefined>();
+  const headingRef = useRef<HTMLButtonElement>(null);
+  if (prevDefaultCollapsed !== defaultCollapsed) {
+    setPrevDefaultCollapsed(defaultCollapsed);
+    if (!userToggled) setCollapsed(defaultCollapsed);
+  }
+  if (expandOnRequestToken !== undefined && expandOnRequestToken !== lastExpandOnRequestToken) {
+    setLastExpandOnRequestToken(expandOnRequestToken);
+    setCollapsed(false);
+    setUserToggled(false);
+  }
+  useEffect(() => {
+    if (!focusOnExpand || expandOnRequestToken === undefined) return;
+    // The request closes a Radix menu/drawer before this section expands. Defer
+    // one frame so the disclosure remains the final focus target after the
+    // primitive's close and focus-management callbacks have run.
+    const frame = requestAnimationFrame(() => headingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [expandOnRequestToken, focusOnExpand]);
+  const canCollapse = collapsible && !!label;
+
+  return (
+    <div className="relative flex gap-2.5" data-testid={testId}>
+      {/* Vertical line + dot */}
+      <div className="flex flex-col items-center">
+        <TimelineDot color={dotColor} />
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0 pb-3">
+        {/* Header */}
+        {label && (
+          <div className="flex items-center justify-between gap-2 -mt-0.5 mb-1">
+            {canCollapse ? (
+              <button
+                type="button"
+                className="flex items-center gap-1 text-[11px] font-medium uppercase tracking-wider text-foreground/70 cursor-pointer hover:text-foreground/90"
+                onClick={() => {
+                  setUserToggled(true);
+                  setCollapsed((c) => !c);
+                }}
+                aria-expanded={!collapsed}
+                data-testid={`${testId}-collapse-toggle`}
+                ref={headingRef}
+              >
+                {label}
+                {typeof count === "number" && (
+                  <span className="text-muted-foreground/50 font-normal">({count})</span>
+                )}
+                {collapsed ? (
+                  <IconChevronRight className="h-3 w-3 text-muted-foreground/50" />
+                ) : (
+                  <IconChevronDown className="h-3 w-3 text-muted-foreground/50" />
+                )}
+              </button>
+            ) : (
+              <span className="text-[11px] font-medium uppercase tracking-wider text-foreground/70">
+                {label}
+                {typeof count === "number" && (
+                  <span className="ml-1 text-muted-foreground/50 font-normal">({count})</span>
+                )}
+              </span>
+            )}
+            {action}
+          </div>
+        )}
+
+        {/* Children (file list, buttons, etc.) */}
+        {!collapsed && children}
+      </div>
+    </div>
+  );
+}
+
+// --- Commits section ---
+
+type CommitsSectionProps = {
+  commits: CommitItem[];
+  onOpenCommitDetail?: (
+    target: CommitDetailTarget,
+    fileNavigation?: CommitFileNavigationRequest,
+  ) => void;
+  // Handlers receive the commit's repository_name so amend/revert/reset land
+  // in the right git repo. The empty string routes to the workspace root for
+  // single-repo workspaces.
+  onRevertCommit?: (sha: string, repo?: string) => void;
+  onAmendCommit?: (currentMessage: string, repo?: string) => void;
+  onResetToCommit?: (sha: string, repo?: string) => void;
+  /** Per-repo Push button rendered in each commits group header. */
+  onRepoPush?: (repo: string) => void;
+  /** Per-repo Create PR button rendered in each commits group header. */
+  onRepoCreatePR?: (repo: string) => void;
+  /** Maps a repository_name to its display label (used for the empty single-repo case). */
+  repoDisplayName?: (repositoryName: string) => string | undefined;
+  /** The session's base branch — passed through to the per-repo PR dialog. */
+  repoBaseBranch?: string;
+  /** Per-repo branch / upstream summary; used for the Push indicator. */
+  perRepoStatus?: Array<{ repository_name: string; pushAhead?: number; ahead?: number }>;
+  /** Existing PR URL keyed by repository_name; "" key for single-repo. */
+  prByRepo?: Record<string, string | undefined>;
+  /** Initial collapse state. Defaults to collapsed; the panel expands it when it is the first visible section. */
+  defaultCollapsed?: boolean;
+  /** Expands this section when a comparison request targets the Changes panel. */
+  expandOnRequestToken?: number;
+  /** Moves focus to this section heading after a comparison request. */
+  focusOnExpand?: boolean;
+  label?: string;
+  testId?: string;
+  pushDisabled?: boolean;
+  showActions?: boolean;
+};
+
+// Commits grouping shares the helper above with files — see @/lib/group-by-repo.
+
+export function CommitsSection({
+  commits,
+  onOpenCommitDetail,
+  onRevertCommit,
+  onAmendCommit,
+  onResetToCommit,
+  onRepoPush,
+  onRepoCreatePR,
+  repoDisplayName,
+  repoBaseBranch,
+  perRepoStatus,
+  prByRepo,
+  defaultCollapsed = true,
+  expandOnRequestToken,
+  focusOnExpand,
+  label,
+  testId = "commits-section",
+  pushDisabled = false,
+  showActions = true,
+}: CommitsSectionProps) {
+  const { t } = useTranslation();
+  const groups = groupByRepositoryName(commits, (c) => c.repository_name);
+  const aheadByRepo = new Map(
+    (perRepoStatus ?? []).map((s) => [s.repository_name, s.pushAhead ?? s.ahead ?? 0]),
+  );
+  // Single-repo: drop the per-repo sub-header (CommitsRepoGroup with
+  // showHeader=false renders flat) and lift the Push / PR buttons into the
+  // section header.
+  const isSingleRepo = isSingleRepoGroup(groups);
+  const sectionAction = isSingleRepo ? (
+    <CommitsGroupActions
+      repositoryName=""
+      aheadCount={aheadByRepo.get("") ?? 0}
+      prExists={!!prByRepo?.[""]}
+      canCreatePR={!!onRepoCreatePR && !prByRepo?.[""]}
+      onRepoPush={showActions && !pushDisabled ? onRepoPush : undefined}
+      onRepoCreatePR={showActions ? onRepoCreatePR : undefined}
+      stop={(e) => e.stopPropagation()}
+    />
+  ) : undefined;
+
+  return (
+    <TimelineSection
+      dotColor={DOT_COLORS.commits}
+      label={label ?? t("task:commits")}
+      count={commits.length}
+      defaultCollapsed={defaultCollapsed}
+      expandOnRequestToken={expandOnRequestToken}
+      focusOnExpand={focusOnExpand}
+      data-testid={testId}
+      action={sectionAction}
+    >
+      <ul data-testid="commits-list" className="space-y-0.5">
+        {groups.map((g) => (
+          <CommitsRepoGroup
+            key={g.repositoryName || "__no_repo__"}
+            repositoryName={g.repositoryName}
+            displayName={repoDisplayName?.(g.repositoryName)}
+            groupCommits={g.items}
+            aheadCount={aheadByRepo.get(g.repositoryName) ?? 0}
+            existingPrUrl={prByRepo?.[g.repositoryName] ?? prByRepo?.[""]}
+            showHeader={!isSingleRepo}
+            baseBranch={repoBaseBranch}
+            onOpenCommitDetail={onOpenCommitDetail}
+            onAmendCommit={onAmendCommit}
+            onRevertCommit={onRevertCommit}
+            onResetToCommit={onResetToCommit}
+            onRepoPush={showActions && !pushDisabled ? onRepoPush : undefined}
+            onRepoCreatePR={showActions ? onRepoCreatePR : undefined}
+          />
+        ))}
+      </ul>
+    </TimelineSection>
+  );
+}
+
+// --- PR files section (read-only, from GitHub PR diff) ---
+
+export type PRChangedFile = {
+  path: string;
+  /** Stable owner/repo/number identity for the PR that produced this row. */
+  prKey?: string;
+  status: FileInfo["status"];
+  plus: number | undefined;
+  minus: number | undefined;
+  oldPath: string | undefined;
+  /**
+   * The repository the file belongs to. Empty string for single-repo tasks
+   * (the section header alone is enough). Multi-repo tasks stamp this so
+   * `PRFilesSection` can group rows under per-repo subheaders, mirroring
+   * how the Commits and Changes sections render.
+   */
+  repository_name?: string;
+};
+
+type PRFilesSectionProps = {
+  files: PRChangedFile[];
+  onOpenDiff: (path: string, options?: OpenDiffOptions) => void;
+  /** Maps a repository_name to a human-readable label (used for the per-repo header). */
+  repoDisplayName?: (repositoryName: string) => string | undefined;
+  /** Initial collapse state. Defaults to collapsed; the panel expands it when it is the first visible section. */
+  defaultCollapsed?: boolean;
+};
+
+export function PRFilesSection({
+  files,
+  onOpenDiff,
+  repoDisplayName,
+  defaultCollapsed = true,
+}: PRFilesSectionProps) {
+  const { t } = useTranslation();
+  return (
+    <TimelineSection
+      dotColor={DOT_COLORS.pr}
+      label={t("task:prChanges")}
+      count={files.length}
+      defaultCollapsed={defaultCollapsed}
+      data-testid="pr-changes-section"
+    >
+      {files.length > 0 && (
+        <PRFilesGroupedList
+          files={files}
+          onOpenDiff={onOpenDiff}
+          repoDisplayName={repoDisplayName}
+        />
+      )}
+    </TimelineSection>
+  );
+}
+
+// --- Review progress bar ---
+
+type ReviewProgressBarProps = {
+  reviewedCount: number;
+  totalFileCount: number;
+  onOpenReview?: () => void;
+};
+
+export function ReviewProgressBar({
+  reviewedCount,
+  totalFileCount,
+  onOpenReview,
+}: ReviewProgressBarProps) {
+  const { t } = useTranslation();
+  const progressPercent = totalFileCount > 0 ? (reviewedCount / totalFileCount) * 100 : 0;
+
+  if (totalFileCount <= 0) return null;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          className="shrink-0 flex items-center gap-2 pt-2 border-t border-border/40 cursor-pointer transition-colors"
+          onClick={onOpenReview}
+        >
+          <div className="flex-1 h-0.5 rounded-full bg-muted-foreground/10 overflow-hidden">
+            <div
+              className="h-full bg-muted-foreground/25 rounded-full transition-all duration-300"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-muted-foreground/40 whitespace-nowrap">
+            {reviewedCount}/{totalFileCount} reviewed
+          </span>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent>
+        {t("task:filesReviewedCount", { reviewedCount, totalFileCount })}
+      </TooltipContent>
+    </Tooltip>
+  );
+}

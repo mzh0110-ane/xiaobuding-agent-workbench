@@ -1,0 +1,615 @@
+"use client";
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MutableRefObject,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { searchKeywords } from "@/lib/commands/search-keywords";
+import { useRouter } from "@/lib/routing/client-router";
+import { useAppStore } from "@/components/state-provider";
+import { useCommandPanelOpen } from "@/lib/commands/command-registry";
+import { useRegisterCommands } from "@/hooks/use-register-commands";
+import type { KeyboardShortcut } from "@/lib/keyboard/constants";
+import { getShortcut } from "@/lib/keyboard/shortcut-overrides";
+import { formatShortcut } from "@/lib/keyboard/utils";
+import { linkToTask } from "@/lib/links";
+import {
+  getRecentTasks,
+  RECENT_TASKS_CHANGED_EVENT,
+  RECENT_TASKS_STORAGE_KEY,
+  upsertRecentTask,
+  type RecentTaskEntry,
+} from "@/lib/recent-tasks";
+import {
+  buildRecentTaskDisplayItems,
+  buildRecentTaskEntry,
+  getInitialReverseSelectionIndex,
+  getInitialSelectionIndex,
+  getNextSelectionIndex,
+  getPreviousSelectionIndex,
+  type RecentTaskBuildContext,
+  type RecentTaskDisplayItem,
+} from "./recent-task-switcher-model";
+import {
+  hasHoldModifier,
+  isCommitReleaseEvent,
+  isCycleShortcutEvent,
+} from "./recent-task-switcher-keys";
+
+/** Direction the switcher cycles through recent tasks. */
+type CycleDirection = "forward" | "backward";
+
+export type RecentTaskSwitcherController = {
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  items: RecentTaskDisplayItem[];
+  selectedIndex: number;
+  setSelectedIndex: (index: number) => void;
+  shortcutLabel: string;
+  reverseShortcutLabel: string;
+  selectItem: (item: RecentTaskDisplayItem | undefined) => void;
+  handleKeyDown: (event: ReactKeyboardEvent) => void;
+};
+
+type SwitcherRefs = {
+  openRef: MutableRefObject<boolean>;
+  selectedIndexRef: MutableRefObject<number>;
+  commitOnReleaseRef: MutableRefObject<boolean>;
+  cancelledRef: MutableRefObject<boolean>;
+  itemsRef: MutableRefObject<RecentTaskDisplayItem[]>;
+  activeTaskIdRef: MutableRefObject<string | null>;
+  shortcutRef: MutableRefObject<KeyboardShortcut>;
+  reverseShortcutRef: MutableRefObject<KeyboardShortcut>;
+  // The binding whose hold-modifier release should commit — set to the shortcut
+  // of the direction that opened/last drove the switcher, so a divergent custom
+  // binding for the other direction can't commit early.
+  activeCommitShortcutRef: MutableRefObject<KeyboardShortcut | null>;
+};
+
+type SwitcherActions = {
+  setOpen: (open: boolean) => void;
+  setSelectedIndex: (index: number) => void;
+  selectItem: (item: RecentTaskDisplayItem | undefined) => void;
+  openSwitcher: (commitOnRelease: boolean, direction?: CycleDirection) => void;
+  cycleSwitcher: (commitOnRelease: boolean, direction?: CycleDirection) => void;
+  cancelSwitcher: () => void;
+  selectCurrentItem: () => void;
+};
+
+function useRecentTaskEntries() {
+  const [entries, setEntries] = useState<RecentTaskEntry[]>(() => getRecentTasks());
+
+  useEffect(() => {
+    const handleChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ entries?: RecentTaskEntry[] }>;
+      setEntries(customEvent.detail?.entries ?? getRecentTasks());
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === RECENT_TASKS_STORAGE_KEY) setEntries(getRecentTasks());
+    };
+
+    window.addEventListener(RECENT_TASKS_CHANGED_EVENT, handleChanged);
+    window.addEventListener("storage", handleStorage);
+    return () => {
+      window.removeEventListener(RECENT_TASKS_CHANGED_EVENT, handleChanged);
+      window.removeEventListener("storage", handleStorage);
+    };
+  }, []);
+
+  return entries;
+}
+
+function useRecentTaskBuildContext(): RecentTaskBuildContext {
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const activeWorkspaceId = useAppStore((state) => state.workspaces.activeId);
+  const kanbanWorkflowId = useAppStore((state) => state.kanban.workflowId);
+  const kanbanTasks = useAppStore((state) => state.kanban.tasks);
+  const kanbanSteps = useAppStore((state) => state.kanban.steps);
+  const snapshots = useAppStore((state) => state.kanbanMulti.snapshots);
+  const workflows = useAppStore((state) => state.workflows.items);
+  const repositoriesByWorkspace = useAppStore((state) => state.repositories.itemsByWorkspaceId);
+  const sessionsByTaskId = useAppStore((state) => state.taskSessionsByTask.itemsByTaskId);
+  const gitStatusByEnvId = useAppStore((state) => state.gitStatus.byEnvironmentId);
+  const environmentIdBySessionId = useAppStore((state) => state.environmentIdBySessionId);
+
+  return useMemo(
+    () => ({
+      activeTaskId,
+      activeWorkspaceId,
+      kanbanWorkflowId,
+      kanbanTasks,
+      kanbanSteps,
+      snapshots,
+      workflows,
+      repositoriesByWorkspace,
+      sessionsByTaskId,
+      gitStatusByEnvId,
+      environmentIdBySessionId,
+    }),
+    [
+      activeTaskId,
+      activeWorkspaceId,
+      kanbanWorkflowId,
+      kanbanTasks,
+      kanbanSteps,
+      snapshots,
+      workflows,
+      repositoriesByWorkspace,
+      sessionsByTaskId,
+      gitStatusByEnvId,
+      environmentIdBySessionId,
+    ],
+  );
+}
+
+function getEntrySignature(entry: RecentTaskEntry): string {
+  return JSON.stringify({ ...entry, visitedAt: "" });
+}
+
+function useRecordActiveTask(context: RecentTaskBuildContext) {
+  const lastTaskIdRef = useRef<string | null>(null);
+  const lastSignatureRef = useRef<string | null>(null);
+  const lastEntryRef = useRef<RecentTaskEntry | undefined>(undefined);
+
+  useEffect(() => {
+    if (!context.activeTaskId) return;
+
+    const isNewVisit = lastTaskIdRef.current !== context.activeTaskId;
+    const previous = isNewVisit
+      ? getRecentTasks().find((entry) => entry.taskId === context.activeTaskId)
+      : lastEntryRef.current;
+    const visitedAt = isNewVisit ? new Date().toISOString() : undefined;
+    const entry = buildRecentTaskEntry(context.activeTaskId, context, previous, visitedAt);
+    const signature = getEntrySignature(entry);
+
+    if (!isNewVisit && lastSignatureRef.current === signature) return;
+
+    lastTaskIdRef.current = context.activeTaskId;
+    lastSignatureRef.current = signature;
+    lastEntryRef.current = entry;
+    upsertRecentTask(entry);
+  }, [context]);
+}
+
+function getResolvedSelectionIndex(
+  selectedIndex: number,
+  items: RecentTaskDisplayItem[],
+  activeTaskId: string | null,
+): number {
+  if (selectedIndex >= 0 && selectedIndex < items.length) return selectedIndex;
+  return getInitialSelectionIndex(items, activeTaskId);
+}
+
+function useLatestRef<T>(value: T) {
+  const ref = useRef(value);
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref;
+}
+
+function useSwitcherRefs({
+  open,
+  selectedIndex,
+  items,
+  activeTaskId,
+  shortcut,
+  reverseShortcut,
+}: {
+  open: boolean;
+  selectedIndex: number;
+  items: RecentTaskDisplayItem[];
+  activeTaskId: string | null;
+  shortcut: KeyboardShortcut;
+  reverseShortcut: KeyboardShortcut;
+}): SwitcherRefs {
+  const openRef = useRef(open);
+  const selectedIndexRef = useRef(selectedIndex);
+  const commitOnReleaseRef = useRef(false);
+  const cancelledRef = useRef(false);
+  const itemsRef = useLatestRef(items);
+  const activeTaskIdRef = useLatestRef(activeTaskId);
+  const shortcutRef = useLatestRef(shortcut);
+  const reverseShortcutRef = useLatestRef(reverseShortcut);
+  const activeCommitShortcutRef = useRef<KeyboardShortcut | null>(null);
+
+  useEffect(() => {
+    openRef.current = open;
+    selectedIndexRef.current = selectedIndex;
+  }, [open, selectedIndex, openRef, selectedIndexRef]);
+
+  return {
+    openRef,
+    selectedIndexRef,
+    commitOnReleaseRef,
+    cancelledRef,
+    itemsRef,
+    activeTaskIdRef,
+    shortcutRef,
+    reverseShortcutRef,
+    activeCommitShortcutRef,
+  };
+}
+
+function useSelectedIndexSetter(refs: SwitcherRefs, setRawSelectedIndex: (index: number) => void) {
+  const { activeTaskIdRef, itemsRef, selectedIndexRef } = refs;
+  return useCallback(
+    (index: number) => {
+      selectedIndexRef.current = getResolvedSelectionIndex(
+        index,
+        itemsRef.current,
+        activeTaskIdRef.current,
+      );
+      setRawSelectedIndex(index);
+    },
+    [activeTaskIdRef, itemsRef, selectedIndexRef, setRawSelectedIndex],
+  );
+}
+
+type SwitcherCycleActions = Pick<SwitcherActions, "openSwitcher" | "cycleSwitcher">;
+
+function useSwitcherCycleActions({
+  refs,
+  setCommandPanelOpen,
+  setOpenState,
+  setSelectedIndex,
+}: {
+  refs: SwitcherRefs;
+  setCommandPanelOpen: (open: boolean) => void;
+  setOpenState: (open: boolean) => void;
+  setSelectedIndex: (index: number) => void;
+}): SwitcherCycleActions {
+  const {
+    activeCommitShortcutRef,
+    activeTaskIdRef,
+    cancelledRef,
+    commitOnReleaseRef,
+    itemsRef,
+    openRef,
+    reverseShortcutRef,
+    selectedIndexRef,
+    shortcutRef,
+  } = refs;
+
+  const commitShortcutForDirection = useCallback(
+    (direction: CycleDirection) =>
+      direction === "backward" ? reverseShortcutRef.current : shortcutRef.current,
+    [reverseShortcutRef, shortcutRef],
+  );
+
+  const openSwitcher = useCallback(
+    (commitOnRelease: boolean, direction: CycleDirection = "forward") => {
+      setCommandPanelOpen(false);
+      cancelledRef.current = false;
+      commitOnReleaseRef.current = commitOnRelease;
+      activeCommitShortcutRef.current = commitShortcutForDirection(direction);
+      openRef.current = true;
+      const initialIndex =
+        direction === "backward"
+          ? getInitialReverseSelectionIndex(itemsRef.current, activeTaskIdRef.current)
+          : getInitialSelectionIndex(itemsRef.current, activeTaskIdRef.current);
+      setSelectedIndex(initialIndex);
+      setOpenState(true);
+    },
+    [
+      activeCommitShortcutRef,
+      activeTaskIdRef,
+      cancelledRef,
+      commitOnReleaseRef,
+      commitShortcutForDirection,
+      itemsRef,
+      openRef,
+      setCommandPanelOpen,
+      setOpenState,
+      setSelectedIndex,
+    ],
+  );
+
+  const cycleSwitcher = useCallback(
+    (commitOnRelease: boolean, direction: CycleDirection = "forward") => {
+      if (!openRef.current) {
+        openSwitcher(commitOnRelease, direction);
+        return;
+      }
+      if (commitOnRelease) commitOnReleaseRef.current = true;
+      activeCommitShortcutRef.current = commitShortcutForDirection(direction);
+      const count = itemsRef.current.length;
+      const nextIndex =
+        direction === "backward"
+          ? getPreviousSelectionIndex(selectedIndexRef.current, count)
+          : getNextSelectionIndex(selectedIndexRef.current, count);
+      setSelectedIndex(nextIndex);
+    },
+    [
+      activeCommitShortcutRef,
+      commitOnReleaseRef,
+      commitShortcutForDirection,
+      itemsRef,
+      openRef,
+      openSwitcher,
+      selectedIndexRef,
+      setSelectedIndex,
+    ],
+  );
+
+  return { openSwitcher, cycleSwitcher };
+}
+
+function useSwitcherActions({
+  refs,
+  routeToTask,
+  setCommandPanelOpen,
+  setOpenState,
+  setSelectedIndex,
+}: {
+  refs: SwitcherRefs;
+  routeToTask: (taskId: string) => void;
+  setCommandPanelOpen: (open: boolean) => void;
+  setOpenState: (open: boolean) => void;
+  setSelectedIndex: (index: number) => void;
+}): SwitcherActions {
+  const {
+    activeCommitShortcutRef,
+    cancelledRef,
+    commitOnReleaseRef,
+    itemsRef,
+    openRef,
+    selectedIndexRef,
+  } = refs;
+  const { openSwitcher, cycleSwitcher } = useSwitcherCycleActions({
+    refs,
+    setCommandPanelOpen,
+    setOpenState,
+    setSelectedIndex,
+  });
+
+  const closeSwitcher = useCallback(() => {
+    openRef.current = false;
+    commitOnReleaseRef.current = false;
+    activeCommitShortcutRef.current = null;
+    setOpenState(false);
+  }, [activeCommitShortcutRef, commitOnReleaseRef, openRef, setOpenState]);
+
+  const cancelSwitcher = useCallback(() => {
+    cancelledRef.current = true;
+    closeSwitcher();
+  }, [cancelledRef, closeSwitcher]);
+
+  const setOpen = useCallback(
+    (nextOpen: boolean) => {
+      if (!nextOpen) {
+        cancelSwitcher();
+        return;
+      }
+      cancelledRef.current = false;
+      openRef.current = true;
+      setOpenState(true);
+    },
+    [cancelSwitcher, cancelledRef, openRef, setOpenState],
+  );
+
+  const selectItem = useCallback(
+    (item: RecentTaskDisplayItem | undefined) => {
+      closeSwitcher();
+      if (item) routeToTask(item.taskId);
+    },
+    [closeSwitcher, routeToTask],
+  );
+
+  const selectCurrentItem = useCallback(() => {
+    selectItem(itemsRef.current[selectedIndexRef.current]);
+  }, [itemsRef, selectItem, selectedIndexRef]);
+
+  return {
+    setOpen,
+    setSelectedIndex,
+    selectItem,
+    openSwitcher,
+    cycleSwitcher,
+    cancelSwitcher,
+    selectCurrentItem,
+  };
+}
+
+function useRecentTaskSwitcherCommand(shortcut: KeyboardShortcut, openSwitcher: () => void) {
+  // `group` is the command palette's Map key AND its rendered heading, so it has
+  // to be translated in lockstep with every other producer or the heading splits
+  // in two under a non-English locale.
+  const { t } = useTranslation();
+  const commands = useMemo(
+    () => [
+      {
+        id: "open-recent-task-switcher",
+        label: t("common:commandOpenRecentTaskSwitcher"),
+        group: t("common:commandGroupNavigation"),
+        shortcut,
+        keywords: searchKeywords(t, "common:commandOpenRecentTaskSwitcherKeywords"),
+        action: openSwitcher,
+      },
+    ],
+    [openSwitcher, shortcut, t],
+  );
+  useRegisterCommands(commands);
+}
+
+function useSwitcherGlobalKeyboard(refs: SwitcherRefs, actions: SwitcherActions) {
+  const {
+    activeCommitShortcutRef,
+    cancelledRef,
+    commitOnReleaseRef,
+    openRef,
+    reverseShortcutRef,
+    shortcutRef,
+  } = refs;
+  const { cancelSwitcher, cycleSwitcher, selectCurrentItem } = actions;
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && openRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelSwitcher();
+        return;
+      }
+
+      // Check the reverse shortcut first: it carries an extra modifier (Shift),
+      // so it is the more specific match and the forward shortcut never matches
+      // a Shift-held event anyway.
+      const reverseShortcut = reverseShortcutRef.current;
+      if (isCycleShortcutEvent(event, reverseShortcut)) {
+        event.preventDefault();
+        event.stopPropagation();
+        cycleSwitcher(hasHoldModifier(reverseShortcut), "backward");
+        return;
+      }
+
+      const currentShortcut = shortcutRef.current;
+      if (!isCycleShortcutEvent(event, currentShortcut)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      cycleSwitcher(hasHoldModifier(currentShortcut), "forward");
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (!openRef.current || !commitOnReleaseRef.current) return;
+      // Commit only when the hold modifier of the binding that drove the
+      // switcher is released. Both directions default to Ctrl/Cmd, but custom
+      // bindings may differ — releasing the other direction's modifier must not
+      // commit early.
+      const activeShortcut = activeCommitShortcutRef.current;
+      if (!activeShortcut || !isCommitReleaseEvent(event, activeShortcut)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (cancelledRef.current) {
+        cancelSwitcher();
+        return;
+      }
+      selectCurrentItem();
+    };
+
+    const handleBlur = () => {
+      if (openRef.current) cancelSwitcher();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden" && openRef.current) cancelSwitcher();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [
+    activeCommitShortcutRef,
+    cancelSwitcher,
+    cancelledRef,
+    commitOnReleaseRef,
+    cycleSwitcher,
+    openRef,
+    reverseShortcutRef,
+    selectCurrentItem,
+    shortcutRef,
+  ]);
+}
+
+function useDialogKeyDown({
+  actions,
+  items,
+  refs,
+  selectedIndex,
+}: {
+  actions: SwitcherActions;
+  items: RecentTaskDisplayItem[];
+  refs: SwitcherRefs;
+  selectedIndex: number;
+}) {
+  const { cancelSwitcher, selectItem, setSelectedIndex } = actions;
+  const { selectedIndexRef } = refs;
+
+  return useCallback(
+    (event: ReactKeyboardEvent) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSelectedIndex(getNextSelectionIndex(selectedIndexRef.current, items.length));
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSelectedIndex(getPreviousSelectionIndex(selectedIndexRef.current, items.length));
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        selectItem(items[selectedIndex]);
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelSwitcher();
+      }
+    },
+    [cancelSwitcher, items, selectItem, selectedIndex, selectedIndexRef, setSelectedIndex],
+  );
+}
+
+export function useRecentTaskSwitcherController(): RecentTaskSwitcherController {
+  const router = useRouter();
+  const entries = useRecentTaskEntries();
+  const [open, setOpenState] = useState(false);
+  const [rawSelectedIndex, setRawSelectedIndex] = useState(-1);
+  const { setOpen: setCommandPanelOpen } = useCommandPanelOpen();
+  const keyboardShortcuts = useAppStore((state) => state.userSettings.keyboardShortcuts);
+  const shortcut = getShortcut("TASK_SWITCHER", keyboardShortcuts);
+  const reverseShortcut = getShortcut("TASK_SWITCHER_REVERSE", keyboardShortcuts);
+  const context = useRecentTaskBuildContext();
+  useRecordActiveTask(context);
+
+  const items = useMemo(() => buildRecentTaskDisplayItems(entries, context), [entries, context]);
+  const selectedIndex = getResolvedSelectionIndex(rawSelectedIndex, items, context.activeTaskId);
+  const refs = useSwitcherRefs({
+    open,
+    selectedIndex,
+    items,
+    activeTaskId: context.activeTaskId,
+    shortcut,
+    reverseShortcut,
+  });
+  const setSelectedIndex = useSelectedIndexSetter(refs, setRawSelectedIndex);
+  const routeToTask = useCallback((taskId: string) => router.push(linkToTask(taskId)), [router]);
+  const actions = useSwitcherActions({
+    refs,
+    routeToTask,
+    setCommandPanelOpen,
+    setOpenState,
+    setSelectedIndex,
+  });
+  const { openSwitcher } = actions;
+  const openFromCommand = useCallback(() => openSwitcher(false), [openSwitcher]);
+  useRecentTaskSwitcherCommand(shortcut, openFromCommand);
+  useSwitcherGlobalKeyboard(refs, actions);
+  const handleKeyDown = useDialogKeyDown({ actions, items, refs, selectedIndex });
+
+  return {
+    open,
+    setOpen: actions.setOpen,
+    items,
+    selectedIndex,
+    setSelectedIndex,
+    shortcutLabel: formatShortcut(shortcut),
+    reverseShortcutLabel: formatShortcut(reverseShortcut),
+    selectItem: actions.selectItem,
+    handleKeyDown,
+  };
+}

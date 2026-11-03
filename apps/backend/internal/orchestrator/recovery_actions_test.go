@@ -1,0 +1,480 @@
+package orchestrator
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/runtime/routingerr"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/orchestrator/watcher"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/stretchr/testify/require"
+)
+
+// thinkingBlocks400 is the resume-corrupted signature surfaced by the
+// claude-agent-acp adapter after a session/load resume.
+const thinkingBlocks400 = `{"code":-32603,"message":"Internal error: API Error: 400 messages.0.content.1: ` +
+	"`thinking`" + ` or ` + "`redacted_thinking`" + ` blocks in the latest assistant message cannot be modified."}`
+
+func actionByTestID(actions []map[string]interface{}, testID string) map[string]interface{} {
+	for _, a := range actions {
+		if a["test_id"] == testID {
+			return a
+		}
+	}
+	return nil
+}
+
+func TestBuildRecoveryActions_LocalizedTooltips(t *testing.T) {
+	for _, corrupted := range []bool{false, true} {
+		actions := buildRecoveryActions("t1", "s1", true, false, corrupted)
+		resumeKey := "sessionRecoveryResumeDescription"
+		if corrupted {
+			resumeKey = "sessionRecoveryCorruptedDescription"
+		}
+		require.Equal(t, resumeKey, actionByTestID(actions, recoveryResumeButtonTestID)["tooltip_key"])
+		require.Equal(t, "sessionRecoveryFreshDescription", actionByTestID(actions, recoveryFreshButtonTestID)["tooltip_key"])
+	}
+}
+
+func TestBuildRecoveryActions_NormalOrdering(t *testing.T) {
+	// Regression: ordinary failures keep Resume first, then Start fresh.
+	actions := buildRecoveryActions("t1", "s1", true /*hasResumeToken*/, false /*auth*/, false /*resumeCorrupted*/)
+	if len(actions) != 2 {
+		t.Fatalf("expected 2 actions, got %d", len(actions))
+	}
+	if actions[0]["test_id"] != recoveryResumeButtonTestID {
+		t.Errorf("expected resume button first, got %v", actions[0]["test_id"])
+	}
+	if actions[1]["test_id"] != recoveryFreshButtonTestID {
+		t.Errorf("expected fresh button second, got %v", actions[1]["test_id"])
+	}
+}
+
+func TestBuildRecoveryActions_ResumeCorruptedReordersFreshFirst(t *testing.T) {
+	actions := buildRecoveryActions("t1", "s1", true /*hasResumeToken*/, false /*auth*/, true /*resumeCorrupted*/)
+	if len(actions) != 2 {
+		t.Fatalf("expected 2 actions (fresh primary + resume), got %d", len(actions))
+	}
+	// Start fresh is the primary, so it comes first.
+	if actions[0]["test_id"] != recoveryFreshButtonTestID {
+		t.Errorf("expected fresh button first, got %v", actions[0]["test_id"])
+	}
+	// Resume is kept but de-emphasized with a note that it will likely fail.
+	resume := actionByTestID(actions, recoveryResumeButtonTestID)
+	if resume == nil {
+		t.Fatal("expected resume button to still be present")
+	}
+	tooltip, _ := resume["tooltip"].(string)
+	if !strings.Contains(strings.ToLower(tooltip), "likely fail") {
+		t.Errorf("expected resume tooltip to warn it will likely fail, got %q", tooltip)
+	}
+}
+
+func TestBuildRecoveryActions_ResumeCorruptedWithoutToken(t *testing.T) {
+	// No resume token → only the fresh-start action regardless.
+	actions := buildRecoveryActions("t1", "s1", false, false, true)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0]["test_id"] != recoveryFreshButtonTestID {
+		t.Errorf("expected fresh button, got %v", actions[0]["test_id"])
+	}
+}
+
+func TestCreateRecoveryStatusMessage_ManagedRuntimeNpmUsesOneRetryAction(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-npm", "s-npm", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{repoForExecutionLookup: repo})
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:         "t-npm",
+		SessionID:      "s-npm",
+		ErrorMessage:   "managed npm runtime failed to prepare",
+		FailureCode:    "managed_runtime_npm_resolution",
+		FailureDetails: "npm error code ETARGET\nnpm error notarget No matching version found",
+	}, ""))
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:         "t-npm",
+		SessionID:      "s-npm",
+		ErrorMessage:   "managed npm runtime failed to prepare",
+		FailureCode:    "managed_runtime_npm_resolution",
+		FailureDetails: "npm error code ETARGET\nnpm error notarget No matching version found",
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected one recovery message, got %d", len(mc.sessionMessages))
+	}
+	meta := mc.sessionMessages[0].metadata
+	if meta["scope"] != models.ErrorScopeSession || meta["error_stamp"] == "" {
+		t.Fatalf("recovery identity = %#v", meta)
+	}
+	if meta["failure_kind"] != "managed_runtime_npm_resolution" {
+		t.Fatalf("failure_kind = %#v", meta["failure_kind"])
+	}
+	if meta["error_output"] != "npm error code ETARGET\nnpm error notarget No matching version found" {
+		t.Fatalf("error_output = %#v", meta["error_output"])
+	}
+	actions, ok := meta["actions"].([]map[string]interface{})
+	if !ok || len(actions) != 1 {
+		t.Fatalf("actions = %#v, want one action", meta["actions"])
+	}
+	if actions[0]["test_id"] != "managed-runtime-npm-retry-button" {
+		t.Fatalf("action test_id = %#v", actions[0]["test_id"])
+	}
+	if _, ok := actions[0]["tooltip"]; ok {
+		t.Fatal("managed runtime recovery action must not carry an untranslated tooltip")
+	}
+	payload := actions[0]["params"].(map[string]interface{})["payload"].(map[string]interface{})
+	if payload["action"] != "runtime_retry" {
+		t.Fatalf("action payload = %#v", payload)
+	}
+}
+
+func TestCreateRecoveryStatusMessage_ManagedRuntimeStartupKeepsTypedReasonAndAttempts(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-startup", "s-startup", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{repoForExecutionLookup: repo})
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:                 "t-startup",
+		SessionID:              "s-startup",
+		ErrorMessage:           "managed runtime startup failed",
+		FailureCode:            "managed_runtime_startup",
+		FailureDetails:         "reason=early_exit attempts=2",
+		StartupFailureReason:   "early_exit",
+		StartupFailureAttempts: 2,
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("recovery messages = %d, want one", len(mc.sessionMessages))
+	}
+	metadata := mc.sessionMessages[0].metadata
+	if metadata["startup_reason"] != "early_exit" || metadata["startup_attempts"] != 2 {
+		t.Fatalf("startup metadata = %#v, want typed reason and attempts", metadata)
+	}
+	if metadata["failure_kind"] != "managed_runtime_startup" {
+		t.Fatalf("failure_kind = %#v", metadata["failure_kind"])
+	}
+	actions, ok := metadata["actions"].([]map[string]interface{})
+	if !ok || len(actions) != 1 || actions[0]["test_id"] != "managed-runtime-npm-retry-button" {
+		t.Fatalf("recovery actions = %#v, want one runtime retry", metadata["actions"])
+	}
+}
+
+func TestCreateRecoveryStatusMessage_AuthFailureKeepsStartupAttempts(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-auth-startup", "s-auth-startup", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{repoForExecutionLookup: repo})
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:                 "t-auth-startup",
+		SessionID:              "s-auth-startup",
+		ErrorMessage:           "Authentication required: please log in",
+		FailureCode:            string(routingerr.CodeAuthRequired),
+		FailureDetails:         "reason=retry_initialize_failed attempts=2\nfinal_diagnostic=Authentication required: please log in",
+		StartupFailureReason:   "retry_initialize_failed",
+		StartupFailureAttempts: 2,
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("recovery messages = %d, want one", len(mc.sessionMessages))
+	}
+	metadata := mc.sessionMessages[0].metadata
+	if metadata["is_auth_error"] != true || metadata["startup_reason"] != "retry_initialize_failed" || metadata["startup_attempts"] != 2 {
+		t.Fatalf("authentication recovery metadata = %#v, want auth classification and startup attempts", metadata)
+	}
+}
+
+func TestCreateRecoveryStatusMessage_ManagedRuntimePolicyUsesOneRetryAction(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-policy", "s-policy", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{repoForExecutionLookup: repo})
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:         "t-policy",
+		SessionID:      "s-policy",
+		ErrorMessage:   "managed npm runtime failed to prepare",
+		FailureCode:    "managed_runtime_npm_policy",
+		FailureDetails: "npm error code ETARGET\nnpm error notarget No matching version found with a date before <release-date>",
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected one recovery message, got %d", len(mc.sessionMessages))
+	}
+	meta := mc.sessionMessages[0].metadata
+	if meta["failure_kind"] != "managed_runtime_npm_policy" {
+		t.Fatalf("failure_kind = %#v, want policy code", meta["failure_kind"])
+	}
+	if meta["error_output"] != "npm error code ETARGET\nnpm error notarget No matching version found with a date before <release-date>" {
+		t.Fatalf("error_output = %#v, want sanitized policy details", meta["error_output"])
+	}
+	actions, ok := meta["actions"].([]map[string]interface{})
+	if !ok || len(actions) != 1 || actions[0]["test_id"] != "managed-runtime-npm-retry-button" {
+		t.Fatalf("actions = %#v, want one runtime retry", meta["actions"])
+	}
+	payload := actions[0]["params"].(map[string]interface{})["payload"].(map[string]interface{})
+	if payload["action"] != "runtime_retry" {
+		t.Fatalf("action payload = %#v, want runtime_retry", payload)
+	}
+}
+
+func TestCreateRecoveryStatusMessage_ResumeCorrupted(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:       "t1",
+		SessionID:    "s1",
+		ErrorMessage: thinkingBlocks400,
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected 1 session message, got %d", len(mc.sessionMessages))
+	}
+	msg := mc.sessionMessages[0]
+	if !strings.Contains(strings.ToLower(msg.content), "fresh session") {
+		t.Errorf("expected message to steer toward a fresh session, got %q", msg.content)
+	}
+	if msg.metadata["resume_corrupted"] != true {
+		t.Errorf("expected resume_corrupted=true in metadata, got %v", msg.metadata["resume_corrupted"])
+	}
+}
+
+func TestCreateRecoveryStatusMessage_TransientManualRecoveryUsesSafeReason(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-capacity", "s-capacity", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:       "t-capacity",
+		SessionID:    "s-capacity",
+		AgentID:      "codex-acp",
+		ErrorMessage: "Selected model is at capacity. Please try a different model.",
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected 1 session message, got %d", len(mc.sessionMessages))
+	}
+	content := mc.sessionMessages[0].content
+	if !strings.Contains(content, "Model at capacity") {
+		t.Fatalf("content = %q, want provider-neutral capacity reason", content)
+	}
+	if strings.Contains(content, "Please try a different model") {
+		t.Fatalf("content copied raw provider evidence: %q", content)
+	}
+	require.NotContains(t, content, "after several retries")
+	require.Equal(t, "provider_interrupted", mc.sessionMessages[0].metadata["failure_kind"])
+}
+
+func TestCreateRecoveryStatusMessage_OpenCodeQuotaCarriesSafeMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-quota", "s-quota", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+	resetAt := time.Date(2026, 8, 2, 19, 34, 44, 0, time.UTC)
+	const wantURL = "https://opencode.ai/workspace/wrk_01KQM7K5CYT715264YKKFB17ZY/go"
+
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:       "t-quota",
+		SessionID:    "s-quota",
+		AgentID:      "opencode-acp",
+		ErrorMessage: "5-hour usage limit reached",
+		ProviderError: &streams.ProviderError{
+			Source:         streams.ProviderErrorSourceOpenCodeStderr,
+			ProviderID:     "opencode-go",
+			ModelID:        "kimi-k3",
+			Message:        "5-hour usage limit reached",
+			RemediationURL: wantURL,
+			OccurredAt:     time.Date(2026, 8, 2, 15, 15, 44, 0, time.UTC),
+			ResetAt:        &resetAt,
+		},
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected 1 session message, got %d", len(mc.sessionMessages))
+	}
+	meta := mc.sessionMessages[0].metadata
+	if meta["failure_kind"] != "provider_quota_limited" {
+		t.Fatalf("failure_kind = %#v", meta["failure_kind"])
+	}
+	if meta["provider_name"] != "OpenCode" || meta["model_id"] != "kimi-k3" {
+		t.Fatalf("provider metadata = %#v", meta)
+	}
+	if meta["reset_at"] != resetAt.Format(time.RFC3339) {
+		t.Fatalf("reset_at = %#v", meta["reset_at"])
+	}
+	if meta["error_output"] != "5-hour usage limit reached" {
+		t.Fatalf("error_output = %#v", meta["error_output"])
+	}
+	if meta["remediation_url"] != wantURL {
+		t.Fatalf("remediation_url = %#v, want %q", meta["remediation_url"], wantURL)
+	}
+}
+
+func TestCreateRecoveryStatusMessage_GenericFailureCarriesRemediationURL(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-generic", "s-generic", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+	const wantURL = "https://opencode.ai/workspace/wrk_01KQM7K5CYT715264YKKFB17ZY/go"
+
+	// A structured ACP-sourced diagnostic is not quota-classified, but the
+	// validated link still reaches the generic recoverable card.
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:       "t-generic",
+		SessionID:    "s-generic",
+		AgentID:      "opencode-acp",
+		ErrorMessage: "AI_APICallError: usage limit reached",
+		ProviderError: &streams.ProviderError{
+			Source:         streams.ProviderErrorSourceOpenCodeACP,
+			Message:        "usage limit reached",
+			RemediationURL: wantURL,
+			OccurredAt:     time.Date(2026, 8, 2, 15, 15, 44, 0, time.UTC),
+		},
+	}, ""))
+
+	if len(mc.sessionMessages) != 1 {
+		t.Fatalf("expected 1 session message, got %d", len(mc.sessionMessages))
+	}
+	meta := mc.sessionMessages[0].metadata
+	if meta["failure_kind"] != nil {
+		t.Fatalf("failure_kind = %#v, want unset for generic failure", meta["failure_kind"])
+	}
+	if meta["remediation_url"] != wantURL {
+		t.Fatalf("remediation_url = %#v, want %q", meta["remediation_url"], wantURL)
+	}
+	if _, ok := meta["error_output"]; ok {
+		t.Fatalf("error_output unexpectedly set for non-quota diagnostic: %#v", meta["error_output"])
+	}
+}
+
+func TestCreateRecoveryStatusMessage_PostStartFailureSurfacesSanitizedDetail(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-detail", "s-detail", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	// A post-start recoverable failure (e.g. the model provider rejecting a
+	// dispatched prompt) is not a bootstrap, managed-runtime-npm, or quota
+	// classification, but its sanitized detail should still reach the collapsed
+	// disclosure so the user sees why the turn failed.
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:         "t-detail",
+		SessionID:      "s-detail",
+		ErrorMessage:   "Internal error: HTTP error: 400 Bad Request",
+		FailureDetails: "Tool schema rejected. Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+	}, ""))
+
+	require.Len(t, mc.sessionMessages, 1)
+	meta := mc.sessionMessages[0].metadata
+	out, ok := meta["error_output"].(string)
+	if !ok || out == "" {
+		t.Fatalf("error_output = %#v, want the sanitized failure detail", meta["error_output"])
+	}
+	require.Contains(t, out, "Tool schema rejected")
+	// The credential in the raw detail must not survive into the disclosure.
+	require.NotContains(t, out, "abcdefghijklmnopqrstuvwxyz")
+	// A generic post-start failure carries no specialized classification.
+	if meta["failure_kind"] != nil {
+		t.Fatalf("failure_kind = %#v, want unset for generic post-start failure", meta["failure_kind"])
+	}
+}
+
+func TestCreateRecoveryStatusMessage_PostStartFailureOmitsEmptyDetail(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-empty", "s-empty", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	// No usable failure detail: the disclosure is omitted and the generic
+	// recovery card is shown.
+	require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+		TaskID:       "t-empty",
+		SessionID:    "s-empty",
+		ErrorMessage: "Internal error: HTTP error: 400 Bad Request",
+	}, ""))
+
+	require.Len(t, mc.sessionMessages, 1)
+	if out, ok := mc.sessionMessages[0].metadata["error_output"]; ok {
+		t.Fatalf("error_output unexpectedly set when no failure detail: %#v", out)
+	}
+}
+
+func TestProviderRemediationURLRejectsInvalidDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t-none", "s-none", "step1")
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	mc := &mockMessageCreator{}
+	svc.messageCreator = mc
+
+	for _, tt := range []struct {
+		name        string
+		providerErr *streams.ProviderError
+	}{
+		{name: "no provider error"},
+		{name: "no remediation url", providerErr: &streams.ProviderError{
+			Source:     streams.ProviderErrorSourceOpenCodeStderr,
+			Message:    "usage limit reached",
+			OccurredAt: time.Date(2026, 8, 2, 15, 15, 44, 0, time.UTC),
+		}},
+		{name: "invalid provider error", providerErr: &streams.ProviderError{
+			Source:         streams.ProviderErrorSourceOpenCodeStderr,
+			RemediationURL: "https://opencode.ai/workspace/wrk_123/go",
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, svc.createRecoveryStatusMessage(ctx, watcher.AgentEventData{
+				TaskID:        "t-none",
+				SessionID:     "s-none",
+				ErrorMessage:  "provider failed",
+				ProviderError: tt.providerErr,
+			}, ""))
+			if len(mc.sessionMessages) == 0 {
+				t.Fatal("expected a session message")
+			}
+			if url, ok := mc.sessionMessages[0].metadata["remediation_url"]; ok && url != "" {
+				t.Fatalf("remediation_url = %#v, want absent", url)
+			}
+			mc.sessionMessages = nil
+			mc.idempotentSessionMessages = nil
+		})
+	}
+}

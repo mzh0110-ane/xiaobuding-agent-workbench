@@ -1,0 +1,699 @@
+/**
+ * Env switch logic for dockview layout management.
+ *
+ * Layouts are keyed by `taskEnvironmentId`. Sessions sharing an env reuse the
+ * same layout, so switching between same-env sessions is a no-op at the
+ * layout level (handled by the caller). Cross-env switches use either a
+ * "fast path" (skip fromJSON when the structure already matches) or a
+ * "slow path" (full layout rebuild via fromJSON).
+ */
+import type { DockviewApi, SerializedDockview } from "dockview-react";
+import { getEnvLayout, getManualRightWidth } from "@/lib/local-storage";
+import { getEnvHiddenSessions, resolveVisibleSessionId } from "@/lib/env-hidden-sessions";
+import { applyLayoutFixups } from "./dockview-layout-builders";
+import { isLayoutShapeHealthy } from "./dockview-layout-health";
+import {
+  fromDockviewApi,
+  savedLayoutMatchesLive,
+  layoutStructuresMatch,
+  getPinnedWidth,
+  getRootSplitview,
+  isCenterCandidateGroupId,
+  setPinnedTarget,
+  CENTER_GROUP,
+  RIGHT_TOP_GROUP,
+  RIGHT_BOTTOM_GROUP,
+} from "./layout-manager";
+import { resolveResponsiveRightWidth } from "./layout-manager/right-width";
+import type { LayoutState, LayoutGroupIds } from "./layout-manager";
+import {
+  restoreDefaultActiveViews,
+  restoreSavedActiveViews,
+} from "./dockview-env-switch-active-views";
+import { ENV_SCOPED_DOCKVIEW_COMPONENTS } from "./dockview-env-scoped-components";
+import { stripHiddenRightPaneMetadata } from "./dockview-right-pane";
+import { sanitizeSerializedLayout } from "./layout-manager/sanitize-serialized-layout";
+import { createDebugLogger, isDebug } from "@/lib/debug/log";
+import {
+  snapshotColumnWidths,
+  formatWidthsSnapshot,
+  formatJsonRootSizes,
+} from "./dockview-widths-debug";
+import { t } from "@/lib/i18n";
+
+const debug = createDebugLogger("dockview:env-switch");
+const debugWidths = createDebugLogger("dockview:widths");
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function snapshotGridShape(node: any, depth = 0): unknown {
+  if (!node || depth > 6) return null;
+  if (node.type === "leaf") {
+    return {
+      type: "leaf",
+      groupId: node.data?.id,
+      activeView: node.data?.activeView,
+      views: node.data?.views,
+    };
+  }
+  if (node.type === "branch" && Array.isArray(node.data)) {
+    return {
+      type: "branch",
+      orientation: node.orientation,
+      children: node.data.map((c: unknown) => snapshotGridShape(c, depth + 1)),
+    };
+  }
+  return null;
+}
+
+const EPHEMERAL_COMPONENTS = ENV_SCOPED_DOCKVIEW_COMPONENTS;
+
+/** Fetch the saved layout for an env, dropping it if its shape is corrupted. */
+function getHealthyEnvLayout(envId: string): object | null {
+  const saved = getEnvLayout(envId);
+  if (!saved) return null;
+  const dockviewLayout = stripHiddenRightPaneMetadata(saved);
+  return isLayoutShapeHealthy(dockviewLayout) ? dockviewLayout : null;
+}
+
+function restoreSerializedDockview(api: DockviewApi, next: SerializedDockview): void {
+  const previous = typeof api.toJSON === "function" ? api.toJSON() : null;
+  try {
+    api.fromJSON(next);
+  } catch (error) {
+    if (previous) {
+      try {
+        api.fromJSON(previous);
+      } catch {
+        // A failed rollback cannot be repaired by retrying without risking another partial mutation.
+      }
+    }
+    throw error;
+  }
+}
+
+/** Check whether a serialized dockview layout contains ephemeral panels. */
+function savedLayoutHasEphemeralPanels(serialized: SerializedDockview): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const panels = (serialized as any).panels as
+    | Record<string, { contentComponent?: string }>
+    | undefined;
+  if (!panels) return false;
+  return Object.values(panels).some((p) => EPHEMERAL_COMPONENTS.has(p.contentComponent ?? ""));
+}
+
+export type SessionListRestoreState = {
+  loaded: boolean;
+  knownForeignSessionIds: Set<string>;
+};
+export type EnvSwitchOptions = {
+  initialLayout?: string | null;
+  sessionListRestoreState?: SessionListRestoreState;
+};
+
+export type EnvSwitchParams = {
+  api: DockviewApi;
+  oldEnvId: string | null;
+  newEnvId: string;
+  /** Active session for the incoming env — used to keep the right session chat tab. */
+  activeSessionId: string | null;
+  /** All sessions for the active task, so slow-path restores keep sibling chat tabs. */
+  currentSessionIds?: string[];
+  /** Readiness and known foreign sessions for a partially hydrated task list. */
+  sessionListRestoreState?: SessionListRestoreState;
+  safeWidth: number;
+  safeHeight: number;
+  /** Build the effective default, optionally honoring a route layout intent. */
+  buildDefault: (api: DockviewApi, intentName?: string) => void;
+  getDefaultLayout: () => LayoutState;
+  /** Resolve pinned widths from the effective custom default for a workbench. */
+  getDefaultPinnedWidths?: (totalWidth: number) => Map<string, number>;
+  /** Explicit layout from the task route, such as `?layout=plan`. */
+  initialLayout?: string | null;
+};
+
+/** Close non-session env-scoped panels before the new env's panels are restored. */
+function removeEphemeralPanels(api: DockviewApi): void {
+  const toRemove = api.panels.filter(
+    (p) => p.id !== "pr-detail" && EPHEMERAL_COMPONENTS.has(p.api.component),
+  );
+  for (const p of toRemove) {
+    try {
+      p.api.close();
+    } catch {
+      /* panel may already be gone */
+    }
+  }
+}
+
+/**
+ * Replace stale session chat panels with the incoming active session.
+ *
+ * A "stale" session is any `session:*` panel whose id isn't
+ * `session:${keepSessionId}` — typically a phantom carried in from a saved
+ * layout whose session belongs to a different env (or has been deleted).
+ *
+ * Before closing the first stale panel, add the active session at the same
+ * (group, tab-index). This preserves the user's grouping when the stale was
+ * co-tabbed with non-session siblings (pr-detail, dragged file-editors,
+ * etc.) — without it, the siblings would be orphaned in a group with no
+ * session, and `useAutoSessionTab` would later add the active session as a
+ * fresh split next to the sidebar.
+ *
+ * File-editors/diffs/browser/etc. are NEVER touched here — they
+ * legitimately belong to this env's saved state.
+ */
+export function replaceStaleSessionPanels(
+  api: DockviewApi,
+  keepSessionId: string | null,
+  currentSessionIds: string[] = [],
+  sessionListRestoreState?: SessionListRestoreState,
+  envId: string | null = null,
+): void {
+  keepSessionId = resolveVisibleSessionId(
+    keepSessionId,
+    currentSessionIds,
+    envId ? getEnvHiddenSessions(envId) : [],
+  );
+  const keepId = keepSessionId ? `session:${keepSessionId}` : null;
+  const sessionListLoaded = sessionListRestoreState?.loaded ?? true;
+  const knownForeignSessionIds = sessionListRestoreState?.knownForeignSessionIds;
+  // Until the task list is authoritative, only remove sessions proven to
+  // belong to another environment.
+  const stale = api.panels.filter((panel) => {
+    if (panel.api.component !== "chat" || !panel.id.startsWith("session:") || panel.id === keepId) {
+      return false;
+    }
+    const sessionId = panel.id.slice("session:".length);
+    return sessionListLoaded || knownForeignSessionIds?.has(sessionId) === true;
+  });
+  // Anchor the active session to the first stale's (group, index) so co-tabbed
+  // siblings (pr-detail etc.) stay grouped with the agent tab. Skipped when:
+  //   - no keepSessionId (sessionless task)
+  //   - the active session panel already exists in the layout
+  //   - the stale's group is missing from the live api (defensive)
+  //
+  // Limitation: if the saved layout had stale sessions in multiple groups
+  // (rare — requires multi-session contamination across env boundaries),
+  // only the first stale's group keeps its siblings. Sessions in other
+  // groups still close, orphaning anything co-tabbed with them. One active
+  // session can only re-anchor one group.
+  if (keepSessionId && !api.getPanel(`session:${keepSessionId}`) && stale.length > 0) {
+    const first = stale[0];
+    const groupId = first.group.id;
+    if (api.groups.some((g) => g.id === groupId)) {
+      const idx = first.group.panels.findIndex((p) => p.id === first.id);
+      addIncomingSessionPanel(api, keepSessionId, groupId, idx);
+    }
+  }
+
+  if (isDebug()) {
+    debug("replaceStaleSessionPanels", {
+      keepSessionId,
+      livePanelIds: api.panels.map((p) => p.id),
+      removingIds: stale.map((p) => p.id),
+    });
+  }
+  for (const p of stale) {
+    try {
+      p.api.close();
+    } catch {
+      /* panel may already be gone */
+    }
+  }
+
+  addCurrentSessionSiblings(api, keepSessionId, currentSessionIds, envId);
+}
+
+const RESTORED_SESSION_ANCHOR_IDS = ["plan"];
+
+function findRestoredSessionGroup(api: DockviewApi): DockviewApi["groups"][number] | undefined {
+  const canonicalCenter = api.groups.find((group) => group.id === CENTER_GROUP);
+  if (canonicalCenter) return canonicalCenter;
+
+  for (const panelId of RESTORED_SESSION_ANCHOR_IDS) {
+    const group = api.getPanel(panelId)?.group;
+    if (group && isCenterCandidateGroupId(group.id)) return group;
+  }
+
+  return api.groups.find((group) => isCenterCandidateGroupId(group.id));
+}
+
+function restoreMissingSessionPanel(api: DockviewApi, sessionId: string): void {
+  if (api.getPanel(`session:${sessionId}`)) return;
+
+  const targetGroup = findRestoredSessionGroup(api);
+  const shouldActivate = !api.activePanel;
+  const panel = addIncomingSessionPanel(api, sessionId, targetGroup?.id, targetGroup ? 0 : -1, {
+    inactive: !shouldActivate,
+  });
+  if (shouldActivate) panel?.api.setActive();
+}
+
+function addCurrentSessionSiblings(
+  api: DockviewApi,
+  keepSessionId: string | null,
+  currentSessionIds: string[],
+  envId: string | null,
+): void {
+  if (!keepSessionId) return;
+  const activePanel = api.getPanel(`session:${keepSessionId}`);
+  if (!activePanel) return;
+
+  const uniqueSessionIds = currentSessionIds.filter(
+    (sessionId, index, sessionIds) =>
+      sessionId && sessionId !== keepSessionId && sessionIds.indexOf(sessionId) === index,
+  );
+  const hiddenSessionIds = new Set(envId ? getEnvHiddenSessions(envId) : []);
+  for (const sessionId of uniqueSessionIds) {
+    if (hiddenSessionIds.has(sessionId)) continue;
+    if (api.getPanel(`session:${sessionId}`)) continue;
+    addIncomingSessionPanel(api, sessionId, activePanel.group.id, activePanel.group.panels.length, {
+      inactive: true,
+    });
+  }
+}
+
+function fastSwitchStructuresMatch(
+  params: EnvSwitchParams,
+  currentLayout: LayoutState,
+  saved: object | null,
+): boolean {
+  if (saved) {
+    return savedLayoutMatchesLive(currentLayout, saved as SerializedDockview);
+  }
+  return layoutStructuresMatch(currentLayout, params.getDefaultLayout());
+}
+
+function canUseFastEnvSwitch(
+  params: EnvSwitchParams,
+  currentLayout: LayoutState,
+  saved: object | null,
+): boolean {
+  if (!fastSwitchStructuresMatch(params, currentLayout, saved)) {
+    if (isDebug()) {
+      debug("tryFastEnvSwitch: structures do not match, falling back to slow path", {
+        newEnvId: params.newEnvId,
+        hasSaved: !!saved,
+        currentPanelIds: params.api.panels.map((p) => p.id),
+      });
+    }
+    return false;
+  }
+  if (!saved || !savedLayoutHasEphemeralPanels(saved as SerializedDockview)) return true;
+
+  debug("tryFastEnvSwitch: saved layout has ephemeral panels, falling back to slow path", {
+    newEnvId: params.newEnvId,
+  });
+  return false;
+}
+
+function isSessionPanel(p: DockviewApi["panels"][number]): boolean {
+  return p.id.startsWith("session:") || p.api.component === "chat";
+}
+
+function findOutgoingSessionPanel(api: DockviewApi): DockviewApi["panels"][number] | undefined {
+  return (
+    api.panels.find((p) => isSessionPanel(p) && p.api.isActive) ?? api.panels.find(isSessionPanel)
+  );
+}
+
+/**
+ * Fast path: check if we can skip `api.fromJSON()` because the layout
+ * structure hasn't changed. Returns group IDs if the fast path was taken,
+ * or null if a full rebuild is needed.
+ */
+function tryFastEnvSwitch(params: EnvSwitchParams): LayoutGroupIds | null {
+  const { api, newEnvId, activeSessionId, currentSessionIds = [] } = params;
+  const currentLayout = fromDockviewApi(api);
+  const saved = getHealthyEnvLayout(newEnvId);
+
+  if (!canUseFastEnvSwitch(params, currentLayout, saved)) return null;
+  if (isDebug()) {
+    debug("tryFastEnvSwitch: taking fast path", {
+      newEnvId,
+      activeSessionId,
+      hasSaved: !!saved,
+      currentPanelIds: api.panels.map((p) => p.id),
+    });
+  }
+
+  // Prefer the active session panel so multi-session tasks anchor the
+  // incoming panel to the group the user was looking at, not whichever
+  // session tab happens to come first in `api.panels` iteration order.
+  const outgoingSessionPanel = findOutgoingSessionPanel(api);
+  const outgoingGroup = outgoingSessionPanel?.group;
+  const outgoingGroupId = outgoingGroup?.id;
+  // The outgoing session panel's current index in its group. We insert the
+  // incoming session at this same slot *before* removing stale session panels,
+  // so removing the stale panel shifts the new panel into the right final
+  // position.
+  const outgoingIndex =
+    outgoingGroup && outgoingSessionPanel
+      ? outgoingGroup.panels.findIndex((p) => p.id === outgoingSessionPanel.id)
+      : -1;
+
+  // Add the incoming session panel BEFORE removing the outgoing chat. Removing
+  // first can leave the outgoing group empty, at which point dockview destroys
+  // it: `outgoingGroupId` no longer exists, and post-#1165 the old
+  // `referenceGroup: "sidebar"` fallback is dead, so `addPanel` runs with an
+  // undefined position and dockview drops the incoming chat into whatever group
+  // is active (e.g. the terminal) — collapsing the grid root to a vertical
+  // stack. Adding first keeps the group alive throughout the swap.
+  if (activeSessionId && !outgoingSessionPanel && !api.getPanel(`session:${activeSessionId}`)) {
+    addIncomingSessionPanel(api, activeSessionId, outgoingGroupId, outgoingIndex);
+  }
+  removeEphemeralPanels(api);
+  replaceStaleSessionPanels(
+    api,
+    activeSessionId,
+    currentSessionIds,
+    params.sessionListRestoreState,
+    newEnvId,
+  );
+
+  // The fast path skips `fromJSON`, so per-group active tabs from the
+  // outgoing env would otherwise persist into the incoming env. Reapply
+  // them from the saved layout to match what `fromJSON` would have done.
+  if (saved) {
+    restoreSavedActiveViews(api, saved as SerializedDockview, activeSessionId);
+  } else {
+    restoreDefaultActiveViews(
+      api,
+      params.getDefaultLayout(),
+      fromDockviewApi(api),
+      activeSessionId,
+    );
+  }
+
+  // Column widths from the outgoing env stay live across the switch because
+  // we skipped fromJSON. Apply the target env's widths explicitly:
+  //   - saved layout exists → use responsive defaults (or a manual right width)
+  //   - no saved layout with a custom default → use its scaled pinned widths
+  //   - otherwise → compute fresh defaults via getPinnedWidth
+  applyPinnedColumnSizes(
+    api,
+    saved as SerializedDockview | null,
+    params.safeWidth,
+    getManualRightWidth(newEnvId),
+    !saved ? (params.getDefaultPinnedWidths?.(params.safeWidth) ?? new Map()) : new Map(),
+  );
+
+  api.layout(params.safeWidth, params.safeHeight);
+  return applyLayoutFixups(
+    api,
+    savedRightColumnWidth(saved as SerializedDockview | null),
+    getManualRightWidth(newEnvId),
+  );
+}
+
+/**
+ * The serialized width of the right column (the last grid-root child) for a
+ * default-preset layout, or undefined when the saved layout has no distinct
+ * right column. Retained for diagnostics/compatibility only; callers use the
+ * separate manual-width preference for an intentional override.
+ *
+ * The right column is identified by the presence of RIGHT_TOP_GROUP /
+ * RIGHT_BOTTOM_GROUP inside the last grid-root child — NOT by column count.
+ * A task with the sidebar hidden has only 2 grid-root children but the last
+ * one is still the pinned right branch; column-count gating leaked Task A's
+ * resized width into Task B's restored layout (per-task width persistence bug).
+ */
+export function savedRightColumnWidth(saved: SerializedDockview | null): number | undefined {
+  if (!saved) return undefined;
+  const sizes = extractSavedColumnSizes(saved);
+  if (!sizes || sizes.length < 2) return undefined;
+  if (!savedLastChildIsRightColumn(saved)) return undefined;
+  const w = sizes[sizes.length - 1];
+  return Number.isFinite(w) && w > 0 ? w : undefined;
+}
+
+/** True when the last grid-root child contains a pinned right column group. */
+function savedLastChildIsRightColumn(saved: SerializedDockview): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const root = (saved as any).grid?.root;
+  if (!root?.data || !Array.isArray(root.data) || root.data.length < 2) return false;
+  const last = root.data[root.data.length - 1];
+  return leafContainsRightGroup(last);
+}
+
+/** True when a serialized leaf-or-branch node contains a pinned right group. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function leafContainsRightGroup(node: any): boolean {
+  if (!node) return false;
+  if (node.type === "leaf") {
+    const id = node.data?.id;
+    return id === RIGHT_TOP_GROUP || id === RIGHT_BOTTOM_GROUP;
+  }
+  if (node.type === "branch" && Array.isArray(node.data)) {
+    return node.data.some((c: unknown) => leafContainsRightGroup(c));
+  }
+  return false;
+}
+
+/** Extract per-column sizes from a saved SerializedDockview grid root. */
+function extractSavedColumnSizes(saved: SerializedDockview): number[] | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const root = (saved as any).grid?.root;
+  if (!root?.data || !Array.isArray(root.data)) return null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return root.data.map((child: any) => (typeof child?.size === "number" ? child.size : NaN));
+}
+
+/** Compute the target width for a pinned column from the target environment. */
+// eslint-disable-next-line max-params
+function targetPinnedWidth(
+  col: LayoutState["columns"][number],
+  index: number,
+  savedSizes: number[] | null,
+  totalWidth: number,
+  manualRightWidth: number | null,
+  sidebarWidth: number,
+  defaultPinnedWidths: ReadonlyMap<string, number>,
+): number | undefined {
+  if (!savedSizes && manualRightWidth === null) {
+    const defaultWidth = defaultPinnedWidths.get(col.id);
+    if (typeof defaultWidth === "number" && defaultWidth > 0) return defaultWidth;
+  }
+  if (col.id === "right") {
+    return resolveResponsiveRightWidth(totalWidth, sidebarWidth, manualRightWidth);
+  }
+  if (savedSizes && Number.isFinite(savedSizes[index])) return savedSizes[index];
+  return getPinnedWidth(col, totalWidth, undefined);
+}
+
+/**
+ * After a fast-path env switch, override the inherited column widths with
+ * the target env's values. Without this, the outgoing env's user-resized
+ * widths bleed into the new env — a brand-new task would open at whatever
+ * width the user last dragged the previous task's sidebar/right to.
+ */
+// eslint-disable-next-line complexity
+function applyPinnedColumnSizes(
+  api: DockviewApi,
+  saved: SerializedDockview | null,
+  totalWidth: number,
+  manualRightWidth: number | null,
+  defaultPinnedWidths: ReadonlyMap<string, number> = new Map(),
+): void {
+  const sv = getRootSplitview(api);
+  if (!sv || sv.length < 2) return;
+
+  const savedSizes = saved ? extractSavedColumnSizes(saved) : null;
+  const liveLayout = fromDockviewApi(api);
+  const sidebarColumn = liveLayout.columns.find((column) => column.id === "sidebar");
+  const sidebarTarget = sidebarColumn ? getPinnedWidth(sidebarColumn, totalWidth, undefined) : 0;
+  if (isDebug()) {
+    const savedStr = savedSizes
+      ? savedSizes.map((n) => (Number.isFinite(n) ? String(Math.round(n)) : "-")).join(",")
+      : "-";
+    debugWidths(
+      `env-switch-resize totalWidth=${totalWidth} savedSizes=${savedStr} ` +
+        `pre=${formatWidthsSnapshot(snapshotColumnWidths(api))}`,
+    );
+  }
+  for (let i = 0; i < liveLayout.columns.length && i < sv.length; i++) {
+    const col = liveLayout.columns[i];
+    if (col.id !== "sidebar" && col.id !== "right") continue;
+    // Sidebar uses the GLOBAL width pref (single source of truth across tasks),
+    // so it ignores this env's saved size. Right keeps per-env saved sizes.
+    const target =
+      col.id === "sidebar"
+        ? getPinnedWidth(col, totalWidth, undefined)
+        : targetPinnedWidth(
+            col,
+            i,
+            savedSizes,
+            totalWidth,
+            manualRightWidth,
+            sidebarTarget,
+            defaultPinnedWidths,
+          );
+    if (typeof target !== "number" || target <= 0) continue;
+    try {
+      sv.resizeView(i, target);
+      // Update the pinned-target so enforcement keeps the new env's width
+      // through subsequent rebalances.
+      setPinnedTarget(col.id, target);
+      if (isDebug()) {
+        debugWidths(`env-switch-resize-col col=${col.id} idx=${i} target=${Math.round(target)}`);
+      }
+    } catch {
+      /* dockview rejects out-of-range sizes — ignore */
+    }
+  }
+}
+
+/**
+ * Add the incoming task's session chat panel, restoring it to the same tab
+ * slot the outgoing session occupied within `outgoingGroupId` when possible.
+ */
+function addIncomingSessionPanel(
+  api: DockviewApi,
+  sessionId: string,
+  outgoingGroupId: string | undefined,
+  outgoingIndex: number,
+  options: { inactive?: boolean } = {},
+): DockviewApi["panels"][number] {
+  let position: import("dockview-react").AddPanelOptions["position"];
+  if (outgoingGroupId && api.groups.some((g) => g.id === outgoingGroupId)) {
+    position =
+      outgoingIndex >= 0
+        ? { referenceGroup: outgoingGroupId, index: outgoingIndex }
+        : { referenceGroup: outgoingGroupId };
+  } else if (api.getPanel("sidebar")) {
+    position = { direction: "right" as const, referencePanel: "sidebar" };
+  }
+  return api.addPanel({
+    id: `session:${sessionId}`,
+    component: "chat",
+    tabComponent: "sessionTab",
+    title: t("common:agent"),
+    params: { sessionId },
+    position,
+    inactive: options.inactive,
+  });
+}
+
+/** Apply a route layout intent that raced the first environment hydration. */
+function applyInitialRouteLayout(params: EnvSwitchParams): LayoutGroupIds | null {
+  if (params.oldEnvId !== null || !params.initialLayout) return null;
+  params.buildDefault(params.api, params.initialLayout);
+  params.api.layout(params.safeWidth, params.safeHeight);
+  return applyLayoutFixups(params.api);
+}
+
+/**
+ * Switch the dockview layout between task environments.
+ *
+ * Uses a fast path when layouts are structurally identical (common case),
+ * falling back to a full `api.fromJSON()` rebuild when they differ.
+ *
+ * The caller is responsible for saving the old env's layout and releasing
+ * env-scoped portals before calling this function.
+ */
+export function performEnvSwitch({
+  currentSessionIds = [],
+  ...input
+}: EnvSwitchParams): LayoutGroupIds {
+  const params = {
+    ...input,
+    currentSessionIds,
+    activeSessionId: resolveVisibleSessionId(
+      input.activeSessionId,
+      currentSessionIds,
+      getEnvHiddenSessions(input.newEnvId),
+    ),
+  };
+  const { api, oldEnvId, newEnvId, activeSessionId, safeWidth, safeHeight, buildDefault } = params;
+  if (isDebug()) {
+    debug("performEnvSwitch: entry", {
+      oldEnvId,
+      newEnvId,
+      activeSessionId,
+      livePanelIdsBefore: api.panels.map((p) => p.id),
+    });
+  }
+
+  // A task route can render before its session's environment id has hydrated.
+  // In that window onReady applies the explicit route intent (for example,
+  // ?layout=plan) to a temporary global layout. First adoption must replay the
+  // intent instead of restoring the env's saved/default layout over it.
+  // Later env switches intentionally ignore this one-shot route override.
+  const initialRouteLayout = applyInitialRouteLayout(params);
+  if (initialRouteLayout) return initialRouteLayout;
+
+  const fastResult = tryFastEnvSwitch(params);
+  if (fastResult) {
+    if (isDebug()) {
+      debug("performEnvSwitch: completed via fast path", {
+        newEnvId,
+        livePanelIdsAfter: api.panels.map((p) => p.id),
+      });
+    }
+    return fastResult;
+  }
+
+  const saved = sanitizeSerializedLayout(getHealthyEnvLayout(newEnvId));
+  if (saved) {
+    try {
+      if (isDebug()) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const savedPanelIds = Object.keys((saved as any).panels ?? {});
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const savedShape = snapshotGridShape((saved as any).grid?.root);
+        debug("performEnvSwitch: slow path - calling api.fromJSON", {
+          newEnvId,
+          savedPanelIds,
+          savedShape,
+        });
+        debugWidths(
+          `slow-path-load env=${newEnvId} savedSizes=${formatJsonRootSizes(saved)} ` +
+            `savedRight=${savedRightColumnWidth(saved as SerializedDockview) ?? "-"}`,
+        );
+      }
+      restoreSerializedDockview(api, saved as SerializedDockview);
+      // Saved layout may carry a stale session panel from a previously-deleted
+      // task (phantom). Replace stale session panels with the incoming active
+      // session in the same (group, tab-index), then close the stale ones —
+      // preserves grouping with co-tabbed siblings (pr-detail, dragged file
+      // editors, etc.). File editors/diffs/etc. on their own are legitimately
+      // part of this env's saved state and must NOT be touched.
+      // useAutoSessionTab will still no-op if the panel was just added here.
+      replaceStaleSessionPanels(
+        api,
+        activeSessionId,
+        currentSessionIds,
+        params.sessionListRestoreState,
+        params.newEnvId,
+      );
+      if (activeSessionId) restoreMissingSessionPanel(api, activeSessionId);
+      restoreSavedActiveViews(api, saved as SerializedDockview, activeSessionId);
+      api.layout(safeWidth, safeHeight);
+      if (isDebug()) {
+        debug("performEnvSwitch: completed via slow path (fromJSON)", {
+          newEnvId,
+          livePanelIdsAfter: api.panels.map((p) => p.id),
+        });
+      }
+      return applyLayoutFixups(
+        api,
+        savedRightColumnWidth(saved as SerializedDockview),
+        getManualRightWidth(newEnvId),
+      );
+    } catch (err) {
+      console.warn("performEnvSwitch: fromJSON threw", err);
+      debug("performEnvSwitch: fromJSON threw, falling through to default", { newEnvId, err });
+      /* fall through to default layout build */
+    }
+  }
+  debug("performEnvSwitch: building default layout", { newEnvId, hasSaved: !!saved });
+  buildDefault(api);
+  api.layout(safeWidth, safeHeight);
+  if (isDebug()) {
+    debug("performEnvSwitch: completed via default build", {
+      newEnvId,
+      livePanelIdsAfter: api.panels.map((p) => p.id),
+    });
+  }
+  return applyLayoutFixups(api);
+}

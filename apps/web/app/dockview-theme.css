@@ -1,0 +1,305 @@
+/* Dockview workbench chrome */
+
+.dockview-theme-kandev {
+  --dv-background-color: var(--card);
+  --dv-group-view-background-color: var(--background);
+
+  --dv-separator-border: var(--border);
+  --dv-active-sash-color: var(--primary);
+  --dv-paneview-header-border-color: var(--border);
+
+  --dv-tabs-and-actions-container-font-size: 12px;
+  --dv-tabs-and-actions-container-height: 40px;
+  --dv-tabs-and-actions-container-background-color: var(--background);
+
+  --dv-activegroup-visiblepanel-tab-background-color: var(--muted);
+  --dv-activegroup-visiblepanel-tab-color: var(--foreground);
+
+  --dv-activegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-activegroup-hiddenpanel-tab-color: var(--muted-foreground);
+
+  --dv-inactivegroup-visiblepanel-tab-background-color: color-mix(
+    in srgb,
+    var(--muted) 100%,
+    transparent
+  );
+  --dv-inactivegroup-visiblepanel-tab-color: color-mix(
+    in srgb,
+    var(--muted-foreground) 100%,
+    transparent
+  );
+  --dv-inactivegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-inactivegroup-hiddenpanel-tab-color: color-mix(
+    in srgb,
+    var(--muted-foreground) 100%,
+    transparent
+  );
+
+  --dv-tab-close-icon: var(--muted-foreground);
+  --dv-tabs-container-scrollbar-color: var(--scrollbar-thumb);
+  --dv-drag-over-background-color: color-mix(in oklab, var(--primary) 10%, transparent);
+  --dv-drag-over-border-color: var(--primary);
+}
+
+.dockview-theme-kandev .dv-tabs-and-actions-container {
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+  min-height: 40px;
+  height: 40px;
+  padding: 7px 5px 5px;
+  align-items: center;
+}
+
+/* The layout editor can place several reusable panels in one group. Let its
+ * tab strip shrink so Dockview can surface overflowing tabs in its menu rather
+ * than extending past a narrow mobile editor. */
+[data-testid="layout-editor"] .dv-tabs-and-actions-container .dv-scrollable {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+[data-testid="layout-editor"] .dv-tabs-and-actions-container .dv-tabs-container {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.dockview-theme-kandev .dv-tabs-container.dv-horizontal .dv-tab::before {
+  display: none !important;
+}
+
+/* Give the tab strip back native horizontal scrolling.
+ *
+ * Dockview hides the strip's overflow and drives scrolling entirely from its
+ * own `wheel` handler, which reads `deltaY` only: a two-finger horizontal
+ * swipe on a touchpad produces `deltaX` and moved nothing. Handing the axis
+ * back to the browser makes the gesture work. Dockview's overlay scrollbar
+ * stays the visible affordance and follows along (it syncs from the element's
+ * `scroll` event), so the native bar is hidden rather than squeezed into the
+ * 40px strip. */
+.dockview-theme-kandev .dv-scrollable > .dv-tabs-container {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.dockview-theme-kandev .dv-scrollable > .dv-tabs-container::-webkit-scrollbar {
+  display: none;
+}
+
+/* Tabs shrink before the strip clips them.
+ *
+ * Dockview pins `.dv-tab` at `flex-shrink: 0`, so a group narrower than its tab
+ * row kept every tab at full width and the strip clipped the row from the
+ * right. The close button sits at a tab's right edge, so it was the first thing
+ * to disappear and a tab could become impossible to close without widening the
+ * group again. Shrinking down to a floor truncates the label instead and keeps
+ * the close button in view; past the floor Dockview's own overflow dropdown
+ * takes over.
+ *
+ * The floor is 4rem because that leaves a few characters of label beside the
+ * close button, and because it sits just under the natural width of the
+ * shortest panel titles ("Plan", "Files") so the common case is not widened. */
+.dockview-theme-kandev .dv-tab {
+  padding: 0;
+  margin: 0 1px;
+  font-size: 12px;
+  font-weight: 500;
+  flex-shrink: 1;
+  min-width: 4rem;
+  border-radius: 5px;
+  border-bottom: none !important;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+  cursor: pointer;
+}
+
+.dockview-theme-kandev .dv-tab:hover {
+  background: color-mix(in srgb, var(--muted) 50%, transparent);
+  color: var(--foreground);
+}
+
+.dockview-theme-kandev .dv-active-tab {
+  border-bottom: none !important;
+}
+
+.dockview-theme-kandev .dv-tab:focus-within,
+.dockview-theme-kandev .dv-tab:focus-visible {
+  box-shadow:
+    inset 0 0 0 1px var(--ring),
+    0 0 0 1px color-mix(in oklab, var(--ring) 20%, transparent);
+}
+
+.dockview-theme-kandev .dv-default-tab {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 0 7px;
+  gap: 5px;
+  height: 24px;
+  line-height: 1;
+}
+
+/* Every wrapper a tab component puts between `.dv-tab` and `.dv-default-tab`
+ * (context-menu trigger, terminal ordinal row, session badge row, plugin icon
+ * row) is a flex container, and a flex item's default `min-width: auto` would
+ * stop the shrink above before it ever reaches the label. */
+.dockview-theme-kandev .dv-tab *:has(.dv-default-tab),
+.dockview-theme-kandev .dv-default-tab {
+  min-width: 0;
+}
+
+.dockview-theme-kandev .dv-default-tab .dv-default-tab-content {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* `flex-shrink: 0` — the close control is the one part of a tab that must
+ * never be shrunk away. */
+.dockview-theme-kandev .dv-default-tab .dv-default-tab-action {
+  flex-shrink: 0;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    background-color 0.15s ease,
+    color 0.15s ease;
+  border-radius: 4px;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.dockview-theme-kandev .dv-default-tab .dv-default-tab-action .dv-svg {
+  height: 8px;
+  width: 8px;
+}
+
+.dockview-theme-kandev .dv-default-tab .dv-default-tab-action:hover {
+  background: color-mix(in srgb, var(--foreground) 12%, transparent);
+  color: var(--foreground);
+}
+
+.dockview-theme-kandev .dv-default-tab .dv-default-tab-action:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.dockview-theme-kandev .dv-tab:hover .dv-default-tab .dv-default-tab-action,
+.dockview-theme-kandev .dv-active-tab .dv-default-tab .dv-default-tab-action {
+  opacity: 1;
+}
+
+/* Session tabs own their delete control so the X can transition to an
+ * in-place spinner while the delete request is in flight. */
+.dockview-theme-kandev .session-tab-close-action {
+  flex-shrink: 0;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    background-color 0.15s ease,
+    color 0.15s ease;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.dockview-theme-kandev .session-tab-close-action:hover {
+  background: color-mix(in srgb, var(--foreground) 12%, transparent);
+  color: var(--foreground);
+}
+
+.dockview-theme-kandev .session-tab-close-action:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.dockview-theme-kandev .dv-tab:hover .session-tab-close-action,
+.dockview-theme-kandev .dv-active-tab .session-tab-close-action,
+.dockview-theme-kandev .session-tab-close-action[aria-busy="true"] {
+  opacity: 1;
+}
+
+.dockview-theme-kandev .session-tab-close-action:disabled {
+  cursor: wait;
+}
+
+.dockview-theme-kandev .dv-locked-groupview .session-tab-close-action {
+  display: none !important;
+}
+
+.dockview-theme-kandev .dv-content-container {
+  background: var(--card);
+}
+
+.dockview-theme-kandev .dv-content-container .session-panel-content-wrapper {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+.dockview-theme-kandev .dv-content-container .session-panel-wrapper {
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.dockview-theme-kandev .dv-resize-container > .sash-container .sash {
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.dockview-theme-kandev .dv-resize-container > .sash-container .sash:hover,
+.dockview-theme-kandev .dv-resize-container > .sash-container .sash.active {
+  background: var(--primary);
+}
+
+.dockview-theme-kandev .dv-locked-groupview .dv-default-tab .dv-default-tab-action {
+  display: none !important;
+}
+
+.dockview-theme-kandev .dv-left-actions-container {
+  display: flex;
+  align-items: center;
+  padding-left: 3px;
+  gap: 2px;
+}
+
+.dockview-theme-kandev .dv-tab:focus-within::after,
+.dockview-theme-kandev .dv-tab:focus::after {
+  outline: none !important;
+}
+
+.dockview-theme-kandev .dv-right-actions-container {
+  display: flex;
+  align-items: center;
+  padding-right: 3px;
+  gap: 2px;
+}
+
+.dockview-theme-kandev .dv-left-actions-container button,
+.dockview-theme-kandev .dv-right-actions-container button {
+  cursor: pointer;
+}
+
+.dockview-theme-kandev .dv-left-actions-container button:focus-visible,
+.dockview-theme-kandev .dv-right-actions-container button:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.dockview-theme-kandev .dv-void-container {
+  flex: 1;
+}
+
+.dockview-theme-kandev .dv-watermark {
+  background: transparent;
+}
+
+.dockview-theme-kandev .drop-target-dropzone > .drop-target-selection {
+  border: 2px solid var(--primary);
+  background: color-mix(in oklab, var(--primary) 8%, transparent);
+  border-radius: 4px;
+}

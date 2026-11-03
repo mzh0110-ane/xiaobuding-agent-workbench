@@ -1,0 +1,1098 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	orchmodels "github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/task/models"
+	taskrepo "github.com/kandev/kandev/internal/task/repository"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// fakeWSGroupRepo is an in-memory implementation of WorkspaceGroupRepo
+// covering the slim surface AttachWorkspacePolicy needs.
+type fakeWSGroupRepo struct {
+	groups   map[string]*orchmodels.WorkspaceGroup
+	members  map[string]map[string]string // groupID -> taskID -> role
+	mu       sync.Mutex
+	createID int
+}
+
+func newFakeWSGroupRepo() *fakeWSGroupRepo {
+	return &fakeWSGroupRepo{
+		groups:  map[string]*orchmodels.WorkspaceGroup{},
+		members: map[string]map[string]string{},
+	}
+}
+
+func (f *fakeWSGroupRepo) CreateWorkspaceGroup(_ context.Context, g *orchmodels.WorkspaceGroup) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if g.ID == "" {
+		f.createID++
+		g.ID = "g-" + itoa(f.createID)
+	}
+	if g.CleanupStatus == "" {
+		g.CleanupStatus = orchmodels.WorkspaceCleanupStatusActive
+	}
+	f.groups[g.ID] = g
+	f.members[g.ID] = map[string]string{}
+	return nil
+}
+
+func (f *fakeWSGroupRepo) GetWorkspaceGroup(_ context.Context, id string) (*orchmodels.WorkspaceGroup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.groups[id], nil
+}
+
+func (f *fakeWSGroupRepo) ListWorkspaceGroupsByWorkspace(_ context.Context, workspaceID string) ([]*orchmodels.WorkspaceGroup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*orchmodels.WorkspaceGroup{}
+	for _, g := range f.groups {
+		if g.WorkspaceID == workspaceID {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeWSGroupRepo) GetWorkspaceGroupForTask(_ context.Context, taskID string) (*orchmodels.WorkspaceGroup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for gid, mem := range f.members {
+		if _, ok := mem[taskID]; ok {
+			return f.groups[gid], nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeWSGroupRepo) AddWorkspaceGroupMember(_ context.Context, groupID, taskID, role string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.members[groupID] == nil {
+		f.members[groupID] = map[string]string{}
+	}
+	if _, ok := f.members[groupID][taskID]; !ok {
+		f.members[groupID][taskID] = role
+	}
+	return nil
+}
+
+// Phase 6 surface — base implementation. The cascade-specific
+// fakeWSGroupRepoCascade overrides Release/List/UpdateStatus.
+func (f *fakeWSGroupRepo) ReleaseWorkspaceGroupMember(_ context.Context, groupID, taskID, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.members[groupID] != nil {
+		delete(f.members[groupID], taskID)
+	}
+	return nil
+}
+
+func (f *fakeWSGroupRepo) RestoreWorkspaceGroupMemberByCascade(_ context.Context, _, _ string) error {
+	return nil
+}
+
+func (f *fakeWSGroupRepo) ListActiveWorkspaceGroupMembers(_ context.Context, groupID string) ([]orchmodels.WorkspaceGroupMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []orchmodels.WorkspaceGroupMember{}
+	for tid, role := range f.members[groupID] {
+		out = append(out, orchmodels.WorkspaceGroupMember{
+			WorkspaceGroupID: groupID,
+			TaskID:           tid,
+			Role:             role,
+		})
+	}
+	return out, nil
+}
+
+// ListWorkspaceGroupMembers returns the same set as the Active variant
+// in the fake — tests that need to distinguish released vs active
+// override this on fakeWSGroupRepoCascade.
+func (f *fakeWSGroupRepo) ListWorkspaceGroupMembers(_ context.Context, groupID string) ([]orchmodels.WorkspaceGroupMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []orchmodels.WorkspaceGroupMember{}
+	for tid, role := range f.members[groupID] {
+		out = append(out, orchmodels.WorkspaceGroupMember{
+			WorkspaceGroupID: groupID,
+			TaskID:           tid,
+			Role:             role,
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeWSGroupRepo) UpdateWorkspaceGroupCleanupStatus(_ context.Context, _, _, _ string, _ *time.Time) error {
+	return nil
+}
+
+func (f *fakeWSGroupRepo) MarkWorkspaceMaterialized(_ context.Context, id string, m orchmodels.MaterializedWorkspace) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.groups[id]
+	if g == nil {
+		return nil
+	}
+	g.MaterializedPath = m.Path
+	g.MaterializedEnvironmentID = m.EnvironmentID
+	g.MaterializedKind = m.Kind
+	g.OwnedByKandev = m.OwnedByKandev
+	g.RestoreConfigJSON = m.RestoreConfig
+	if m.OwnedByKandev {
+		g.CleanupPolicy = orchmodels.WorkspaceCleanupPolicyDeleteWhenLastMemberArchivedOrDel
+	} else {
+		g.CleanupPolicy = orchmodels.WorkspaceCleanupPolicyNeverDelete
+	}
+	return nil
+}
+
+func (f *fakeWSGroupRepo) UpdateWorkspaceGroupRestoreStatus(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+// fakeBlockerRepo is a tiny in-memory implementation of BlockerRepository
+// so AttachWorkspacePolicy's sequential-chain logic can be exercised.
+type fakeBlockerRepo struct {
+	mu       sync.Mutex
+	blockers []*orchmodels.TaskBlocker
+}
+
+func (f *fakeBlockerRepo) CreateTaskBlocker(_ context.Context, b *orchmodels.TaskBlocker) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockers = append(f.blockers, b)
+	return nil
+}
+
+func (f *fakeBlockerRepo) ListTaskBlockers(_ context.Context, taskID string) ([]*orchmodels.TaskBlocker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*orchmodels.TaskBlocker{}
+	for _, b := range f.blockers {
+		if b.TaskID == taskID {
+			out = append(out, b)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeBlockerRepo) DeleteTaskBlocker(_ context.Context, taskID, blockerTaskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, b := range f.blockers {
+		if b.TaskID == taskID && b.BlockerTaskID == blockerTaskID {
+			f.blockers = append(f.blockers[:i], f.blockers[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
+func (f *fakeBlockerRepo) DeleteTaskBlockersForTask(_ context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.blockers[:0]
+	for _, blocker := range f.blockers {
+		if blocker.TaskID != taskID && blocker.BlockerTaskID != taskID {
+			kept = append(kept, blocker)
+		}
+	}
+	f.blockers = kept
+	return nil
+}
+
+func (f *fakeBlockerRepo) ListTasksBlockedBy(_ context.Context, blockerTaskID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for _, b := range f.blockers {
+		if b.BlockerTaskID == blockerTaskID {
+			ids = append(ids, b.TaskID)
+		}
+	}
+	return ids, nil
+}
+
+func (f *fakeBlockerRepo) ListBlockersForTasks(_ context.Context, taskIDs []string) (map[string][]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]struct{}, len(taskIDs))
+	for _, id := range taskIDs {
+		want[id] = struct{}{}
+	}
+	out := map[string][]string{}
+	for _, b := range f.blockers {
+		if _, ok := want[b.TaskID]; ok {
+			out[b.TaskID] = append(out[b.TaskID], b.BlockerTaskID)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeBlockerRepo) ListDependentsForTasks(_ context.Context, blockerTaskIDs []string) (map[string][]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]struct{}, len(blockerTaskIDs))
+	for _, id := range blockerTaskIDs {
+		want[id] = struct{}{}
+	}
+	out := map[string][]string{}
+	for _, b := range f.blockers {
+		if _, ok := want[b.BlockerTaskID]; ok {
+			out[b.BlockerTaskID] = append(out[b.BlockerTaskID], b.TaskID)
+		}
+	}
+	return out, nil
+}
+
+// fakeTaskRepo provides the minimal TaskRepository surface AttachWorkspacePolicy
+// uses. It supports GetTask + ListChildren so sibling lookup works.
+type fakeTaskRepo struct {
+	mu               sync.Mutex
+	tasks            map[string]*models.Task
+	children         map[string][]string // parentID -> ordered child IDs
+	taskEnvironments map[string]*models.TaskEnvironment
+	// taskEnvironmentErrs injects a lookup failure for one environment ID so a
+	// test can distinguish a positively absent row from an uncertain signal.
+	taskEnvironmentErrs map[string]error
+}
+
+func newFakeTaskRepo() *fakeTaskRepo {
+	return &fakeTaskRepo{
+		tasks:               map[string]*models.Task{},
+		children:            map[string][]string{},
+		taskEnvironments:    map[string]*models.TaskEnvironment{},
+		taskEnvironmentErrs: map[string]error{},
+	}
+}
+
+func (f *fakeTaskRepo) addTask(id, parentID, ws string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks[id] = &models.Task{ID: id, ParentID: parentID, WorkspaceID: ws}
+	if parentID != "" {
+		f.children[parentID] = append(f.children[parentID], id)
+	}
+}
+
+func (f *fakeTaskRepo) GetTask(_ context.Context, id string) (*models.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tasks[id], nil
+}
+
+func (f *fakeTaskRepo) GetTasksByIDs(_ context.Context, ids []string) ([]*models.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*models.Task
+	for _, id := range ids {
+		if t, ok := f.tasks[id]; ok {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// cloneTaskForRead returns a copy of t whose Metadata (and its "workspace"
+// sub-map) are independent maps, mirroring a real repository read: sqlite
+// unmarshals a fresh map from the stored JSON on every scan, so a caller
+// mutating the returned task's metadata in place (as the orphan mark/clear
+// paths do, before calling a guarded write) never aliases this fake's
+// "persisted" state — matching production, where the guard's CAS clauses
+// compare against the DB row, not the caller's in-memory copy.
+func cloneTaskForRead(t *models.Task) *models.Task {
+	if t == nil {
+		return nil
+	}
+	clone := *t
+	if t.Metadata != nil {
+		clone.Metadata = make(map[string]interface{}, len(t.Metadata))
+		for k, v := range t.Metadata {
+			if nested, ok := v.(map[string]interface{}); ok {
+				nestedClone := make(map[string]interface{}, len(nested))
+				for nk, nv := range nested {
+					nestedClone[nk] = nv
+				}
+				clone.Metadata[k] = nestedClone
+				continue
+			}
+			clone.Metadata[k] = v
+		}
+	}
+	return &clone
+}
+
+func (f *fakeTaskRepo) ListChildren(_ context.Context, parentID string) ([]*models.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*models.Task{}
+	for _, id := range f.children[parentID] {
+		if t, ok := f.tasks[id]; ok && t.ArchivedAt == nil {
+			out = append(out, cloneTaskForRead(t))
+		}
+	}
+	return out, nil
+}
+
+// ReparentDirectChildren mirrors the sqlite impl: every child of
+// oldParentID is updated to point at newParentID. Used by the
+// no-cascade delete tests to verify children are orphaned to root
+// rather than left dangling.
+func (f *fakeTaskRepo) ReparentDirectChildren(_ context.Context, oldParentID, newParentID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := f.children[oldParentID]
+	delete(f.children, oldParentID)
+	for _, id := range ids {
+		if t, ok := f.tasks[id]; ok {
+			t.ParentID = newParentID
+		}
+		if newParentID != "" {
+			f.children[newParentID] = append(f.children[newParentID], id)
+		}
+	}
+	return nil
+}
+
+func (f *fakeTaskRepo) ReparentDirectChildrenInWorkspace(
+	_ context.Context,
+	oldParentID, newParentID, workspaceID string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := f.children[oldParentID]
+	for _, id := range ids {
+		if task := f.tasks[id]; task != nil && task.WorkspaceID != workspaceID {
+			return errors.New("cross-workspace child")
+		}
+	}
+	delete(f.children, oldParentID)
+	for _, id := range ids {
+		if task := f.tasks[id]; task != nil {
+			task.ParentID = newParentID
+		}
+		if newParentID != "" {
+			f.children[newParentID] = append(f.children[newParentID], id)
+		}
+	}
+	return nil
+}
+
+func (f *fakeTaskRepo) SetTaskMetadataKey(_ context.Context, taskID, key string, value interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	task := f.tasks[taskID]
+	if task == nil {
+		return nil
+	}
+	if task.Metadata == nil {
+		task.Metadata = map[string]interface{}{}
+	}
+	task.Metadata[key] = value
+	return nil
+}
+func (f *fakeTaskRepo) RestoreTaskParentIfUnchanged(
+	_ context.Context,
+	taskID, expectedParentID, restoredParentID, restoredWorkspaceMode string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	task := f.tasks[taskID]
+	if task == nil {
+		return errors.New("task not found")
+	}
+	if task.ParentID != expectedParentID {
+		return errors.New("task parent changed during compensation")
+	}
+	task.ParentID = restoredParentID
+	if restoredWorkspaceMode == workspaceModeInheritParent {
+		if workspace, ok := task.Metadata["workspace"].(map[string]interface{}); ok &&
+			workspace["mode"] == workspaceModeSharedGroup {
+			workspace["mode"] = restoredWorkspaceMode
+		}
+	}
+	return nil
+}
+
+// SetTaskWorkspaceMetadataIfUnchanged is a best-effort in-memory mirror of
+// the sqlite guard: it evaluates the same clauses against fake state so
+// cascade/delete tests still exercise the guard rather than always
+// succeeding. It does not model the CAS's type-aware string coercion since
+// no test here stores a non-string claim.
+func (f *fakeTaskRepo) SetTaskWorkspaceMetadataIfUnchanged(
+	_ context.Context, taskID string, guard models.OrphanWriteGuard, value map[string]interface{},
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	task := f.tasks[taskID]
+	if task == nil {
+		return false, nil
+	}
+	existing, _ := task.Metadata["workspace"].(map[string]interface{})
+	claim, _ := existing["orphaned_parent_id"].(string)
+	mode, _ := existing["mode"].(string)
+	if claim != guard.ExpectedOrphanedParentID || mode != guard.ExpectedMode {
+		return false, nil
+	}
+	if guard.RequireParentID != "" && task.ParentID != guard.RequireParentID {
+		return false, nil
+	}
+	if guard.RequireParentArchivedID != "" {
+		p := f.tasks[guard.RequireParentArchivedID]
+		if p == nil || p.ArchivedAt == nil {
+			return false, nil
+		}
+	}
+	if guard.RequireParentUnarchivedID != "" {
+		p := f.tasks[guard.RequireParentUnarchivedID]
+		if p == nil || p.ArchivedAt != nil {
+			return false, nil
+		}
+	}
+	if guard.RequireNoOwnEnvironment {
+		if _, ok := f.taskEnvironments[taskID]; ok {
+			return false, nil
+		}
+	}
+	if guard.RequireTaskNotArchived && task.ArchivedAt != nil {
+		return false, nil
+	}
+	if task.Metadata == nil {
+		task.Metadata = map[string]interface{}{}
+	}
+	task.Metadata["workspace"] = value
+	return true, nil
+}
+
+func (f *fakeTaskRepo) GetTaskEnvironment(_ context.Context, id string) (*models.TaskEnvironment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err, ok := f.taskEnvironmentErrs[id]; ok {
+		return nil, err
+	}
+	return f.taskEnvironments[id], nil
+}
+
+func (f *fakeTaskRepo) GetTaskEnvironmentByTaskID(_ context.Context, taskID string) (*models.TaskEnvironment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, env := range f.taskEnvironments {
+		if env != nil && env.TaskID == taskID {
+			return env, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeTaskRepo) TransferTaskEnvironmentOwnership(
+	_ context.Context,
+	envID, expectedTaskID string,
+	expectedGeneration int64,
+	taskID string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	env := f.taskEnvironments[envID]
+	if env == nil {
+		return nil
+	}
+	if env.TaskID != expectedTaskID || env.OwnershipGeneration != expectedGeneration {
+		return taskrepo.ErrTaskEnvironmentOwnershipChanged
+	}
+	env.TaskID = taskID
+	env.OwnershipGeneration++
+	return nil
+}
+
+func (f *fakeTaskRepo) ListChildrenIncludingArchived(_ context.Context, parentID string) ([]*models.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*models.Task{}
+	for _, id := range f.children[parentID] {
+		if t, ok := f.tasks[id]; ok {
+			out = append(out, cloneTaskForRead(t))
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeTaskRepo) ListChildrenLimited(ctx context.Context, parentID string, limit int) ([]*models.Task, error) {
+	children, err := f.ListChildren(ctx, parentID)
+	if err != nil || limit <= 0 || len(children) <= limit {
+		return children, err
+	}
+	return children[:limit], nil
+}
+
+func (f *fakeTaskRepo) ListChildrenIncludingArchivedLimited(
+	ctx context.Context,
+	parentID string,
+	limit int,
+) ([]*models.Task, error) {
+	children, err := f.ListChildrenIncludingArchived(ctx, parentID)
+	if err != nil || limit <= 0 || len(children) <= limit {
+		return children, err
+	}
+	return children[:limit], nil
+}
+
+func (f *fakeTaskRepo) ListChildrenIncludingArchivedByCascadeLimited(
+	ctx context.Context,
+	parentID, cascadeID string,
+	limit int,
+) ([]*models.Task, error) {
+	children, err := f.ListChildrenIncludingArchived(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]*models.Task, 0, min(limit, len(children)))
+	for _, child := range children {
+		if child.ArchivedByCascadeID == cascadeID {
+			filtered = append(filtered, child)
+			if limit > 0 && len(filtered) == limit {
+				break
+			}
+		}
+	}
+	return filtered, nil
+}
+
+func (f *fakeTaskRepo) ListStructuralChildrenLimited(
+	_ context.Context,
+	parentID string,
+	limit int,
+) ([]*models.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	children := make([]*models.Task, 0, len(f.children[parentID]))
+	for _, id := range f.children[parentID] {
+		if child, ok := f.tasks[id]; ok {
+			children = append(children, child)
+			if limit > 0 && len(children) >= limit {
+				break
+			}
+		}
+	}
+	return children, nil
+}
+
+// Stubs to satisfy repository.TaskRepository — only the methods actually
+// used by AttachWorkspacePolicy do real work.
+func (f *fakeTaskRepo) ListSiblings(context.Context, string) ([]*models.Task, error) {
+	return nil, nil
+}
+
+func newPhase4Service(t *testing.T, fakeTasks *fakeTaskRepo, blockers BlockerRepository, ws WorkspaceGroupRepo) *HandoffService {
+	t.Helper()
+	tr := &phase4TaskRepo{base: fakeTasks}
+	return NewHandoffService(tr, nil, nil, blockers, ws, nil)
+}
+
+// phase4TaskRepo satisfies repository.TaskRepository by delegating the
+// methods AttachWorkspacePolicy actually calls and panicking on the rest
+// (which would catch accidental new dependencies in tests).
+type phase4TaskRepo struct {
+	unsupportedTaskFieldUpdater
+	base *fakeTaskRepo
+}
+
+func (r *phase4TaskRepo) GetTask(ctx context.Context, id string) (*models.Task, error) {
+	return r.base.GetTask(ctx, id)
+}
+func (r *phase4TaskRepo) GetTasksByIDs(ctx context.Context, ids []string) ([]*models.Task, error) {
+	return r.base.GetTasksByIDs(ctx, ids)
+}
+func (r *phase4TaskRepo) ListChildren(ctx context.Context, parentID string) ([]*models.Task, error) {
+	return r.base.ListChildren(ctx, parentID)
+}
+func (r *phase4TaskRepo) ListChildrenIncludingArchived(ctx context.Context, parentID string) ([]*models.Task, error) {
+	return r.base.ListChildrenIncludingArchived(ctx, parentID)
+}
+func (r *phase4TaskRepo) ListChildrenLimited(ctx context.Context, parentID string, limit int) ([]*models.Task, error) {
+	return r.base.ListChildrenLimited(ctx, parentID, limit)
+}
+func (r *phase4TaskRepo) ListChildrenIncludingArchivedLimited(
+	ctx context.Context,
+	parentID string,
+	limit int,
+) ([]*models.Task, error) {
+	return r.base.ListChildrenIncludingArchivedLimited(ctx, parentID, limit)
+}
+func (r *phase4TaskRepo) ListStructuralChildrenLimited(
+	ctx context.Context,
+	parentID string,
+	limit int,
+) ([]*models.Task, error) {
+	return r.base.ListStructuralChildrenLimited(ctx, parentID, limit)
+}
+func (r *phase4TaskRepo) ListChildrenIncludingArchivedByCascadeLimited(
+	ctx context.Context,
+	parentID, cascadeID string,
+	limit int,
+) ([]*models.Task, error) {
+	return r.base.ListChildrenIncludingArchivedByCascadeLimited(ctx, parentID, cascadeID, limit)
+}
+func (r *phase4TaskRepo) ReparentDirectChildren(ctx context.Context, oldParentID, newParentID string) error {
+	return r.base.ReparentDirectChildren(ctx, oldParentID, newParentID)
+}
+
+func (r *phase4TaskRepo) ReparentDirectChildrenInWorkspace(
+	ctx context.Context,
+	oldParentID, newParentID, workspaceID string,
+) error {
+	return r.base.ReparentDirectChildrenInWorkspace(ctx, oldParentID, newParentID, workspaceID)
+}
+func (r *phase4TaskRepo) SetTaskMetadataKey(ctx context.Context, taskID, key string, value interface{}) error {
+	return r.base.SetTaskMetadataKey(ctx, taskID, key, value)
+}
+func (r *phase4TaskRepo) SetTaskWorkspaceMetadataIfUnchanged(
+	ctx context.Context, taskID string, guard models.OrphanWriteGuard, value map[string]interface{},
+) (bool, error) {
+	return r.base.SetTaskWorkspaceMetadataIfUnchanged(ctx, taskID, guard, value)
+}
+func (r *phase4TaskRepo) GetTaskEnvironment(ctx context.Context, id string) (*models.TaskEnvironment, error) {
+	return r.base.GetTaskEnvironment(ctx, id)
+}
+func (r *phase4TaskRepo) GetTaskEnvironmentByTaskID(ctx context.Context, taskID string) (*models.TaskEnvironment, error) {
+	return r.base.GetTaskEnvironmentByTaskID(ctx, taskID)
+}
+func (r *phase4TaskRepo) TransferTaskEnvironmentOwnership(
+	ctx context.Context,
+	envID, expectedTaskID string,
+	expectedGeneration int64,
+	taskID string,
+) error {
+	return r.base.TransferTaskEnvironmentOwnership(ctx, envID, expectedTaskID, expectedGeneration, taskID)
+}
+
+// All other TaskRepository methods panic — the AttachWorkspacePolicy
+// path should only call GetTask + ListChildren. If a future change
+// reaches into another method the panic forces a deliberate update.
+func (r *phase4TaskRepo) panicNotUsed(name string) {
+	panic("phase4TaskRepo: unexpected call to " + name)
+}
+
+// The full TaskRepository interface has many methods; we panic-stub them so
+// the compiler is happy. In tests we only ever drive AttachWorkspacePolicy.
+func (r *phase4TaskRepo) CreateTask(context.Context, *models.Task) error {
+	r.panicNotUsed("CreateTask")
+	return nil
+}
+func (r *phase4TaskRepo) UpdateTask(context.Context, *models.Task) error {
+	r.panicNotUsed("UpdateTask")
+	return nil
+}
+func (r *phase4TaskRepo) UpdateTaskWithExplicitPosition(context.Context, *models.Task) error {
+	r.panicNotUsed("UpdateTaskWithExplicitPosition")
+	return nil
+}
+func (r *phase4TaskRepo) UpdateTaskPreservingDeferredLaunch(context.Context, *models.Task) error {
+	r.panicNotUsed("UpdateTaskPreservingDeferredLaunch")
+	return nil
+}
+func (r *phase4TaskRepo) GetTaskDeferredLaunch(context.Context, string) (map[string]interface{}, interface{}, error) {
+	r.panicNotUsed("GetTaskDeferredLaunch")
+	return nil, nil, nil
+}
+func (r *phase4TaskRepo) SetTaskDeferredLaunchIfUnchanged(
+	context.Context, string, interface{}, map[string]interface{},
+) (bool, bool, error) {
+	r.panicNotUsed("SetTaskDeferredLaunchIfUnchanged")
+	return false, false, nil
+}
+func (r *phase4TaskRepo) DeleteTask(context.Context, string) error {
+	r.panicNotUsed("DeleteTask")
+	return nil
+}
+func (r *phase4TaskRepo) ListTasks(context.Context, string) ([]*models.Task, error) {
+	r.panicNotUsed("ListTasks")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListTasksByWorkspace(context.Context, string, string, string, string, int, int, string, bool, bool, bool, bool) ([]*models.Task, int, error) {
+	r.panicNotUsed("ListTasksByWorkspace")
+	return nil, 0, nil
+}
+func (r *phase4TaskRepo) ListTasksByWorkflowStep(context.Context, string) ([]*models.Task, error) {
+	r.panicNotUsed("ListTasksByWorkflowStep")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ArchiveTask(context.Context, string) error {
+	r.panicNotUsed("ArchiveTask")
+	return nil
+}
+func (r *phase4TaskRepo) ArchiveTaskIfActive(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (r *phase4TaskRepo) UnarchiveTaskByCascade(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (r *phase4TaskRepo) UnarchiveTask(context.Context, string) (bool, error) {
+	r.panicNotUsed("UnarchiveTask")
+	return false, nil
+}
+func (r *phase4TaskRepo) ListTasksForAutoArchive(context.Context) ([]*models.Task, error) {
+	r.panicNotUsed("ListTasksForAutoArchive")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListArchivedTasksWithActiveSessions(context.Context) ([]string, error) {
+	r.panicNotUsed("ListArchivedTasksWithActiveSessions")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListUnarchivedTasksWithActiveSessions(context.Context) ([]*models.Task, error) {
+	r.panicNotUsed("ListUnarchivedTasksWithActiveSessions")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListExpiredQuickChatTasks(context.Context, time.Time) ([]*models.Task, error) {
+	r.panicNotUsed("ListExpiredQuickChatTasks")
+	return nil, nil
+}
+func (r *phase4TaskRepo) DeleteExpiredQuickChatTask(context.Context, string, time.Time) (bool, error) {
+	r.panicNotUsed("DeleteExpiredQuickChatTask")
+	return false, nil
+}
+func (r *phase4TaskRepo) CountOpenWatcherCreatedTasks(context.Context, string, string) (int, error) {
+	r.panicNotUsed("CountOpenWatcherCreatedTasks")
+	return 0, nil
+}
+func (r *phase4TaskRepo) UpdateTaskState(context.Context, string, v1.TaskState) error {
+	r.panicNotUsed("UpdateTaskState")
+	return nil
+}
+func (r *phase4TaskRepo) UpdateTaskStateIfSessionState(
+	context.Context, string, string, models.TaskSessionState, v1.TaskState,
+) (v1.TaskState, bool, error) {
+	r.panicNotUsed("UpdateTaskStateIfSessionState")
+	return "", false, nil
+}
+func (r *phase4TaskRepo) UpdateTaskStateIfCurrentIn(context.Context, string, v1.TaskState, []v1.TaskState) (v1.TaskState, bool, error) {
+	r.panicNotUsed("UpdateTaskStateIfCurrentIn")
+	return "", false, nil
+}
+func (r *phase4TaskRepo) UpdateTaskStateIfNotArchived(context.Context, string, v1.TaskState) (v1.TaskState, bool, error) {
+	r.panicNotUsed("UpdateTaskStateIfNotArchived")
+	return "", false, nil
+}
+func (r *phase4TaskRepo) CountTasksByWorkflow(context.Context, string) (int, error) {
+	r.panicNotUsed("CountTasksByWorkflow")
+	return 0, nil
+}
+func (r *phase4TaskRepo) CountTasksByWorkflowStep(context.Context, string) (int, error) {
+	r.panicNotUsed("CountTasksByWorkflowStep")
+	return 0, nil
+}
+func (r *phase4TaskRepo) AddTaskToWorkflow(context.Context, string, string, string, int) error {
+	r.panicNotUsed("AddTaskToWorkflow")
+	return nil
+}
+func (r *phase4TaskRepo) RemoveTaskFromWorkflow(context.Context, string, string) error {
+	r.panicNotUsed("RemoveTaskFromWorkflow")
+	return nil
+}
+func (r *phase4TaskRepo) ListTasksByProject(context.Context, string) ([]*models.Task, error) {
+	r.panicNotUsed("ListTasksByProject")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListTasksByAssignee(context.Context, string) ([]*models.Task, error) {
+	r.panicNotUsed("ListTasksByAssignee")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListTaskTree(context.Context, string, models.TaskTreeFilters) ([]*models.Task, error) {
+	r.panicNotUsed("ListTaskTree")
+	return nil, nil
+}
+func (r *phase4TaskRepo) ListSiblings(ctx context.Context, taskID string) ([]*models.Task, error) {
+	// Implemented via the fake's data so phase 7 GetTaskContext tests
+	// can exercise the sibling rule without relying on the real repo.
+	r.base.mu.Lock()
+	self := r.base.tasks[taskID]
+	r.base.mu.Unlock()
+	if self == nil || self.ParentID == "" {
+		return []*models.Task{}, nil
+	}
+	siblings, err := r.base.ListChildren(ctx, self.ParentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*models.Task, 0, len(siblings))
+	for _, s := range siblings {
+		if s.ID != taskID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+func (r *phase4TaskRepo) SetTaskMetadataKeyIfPresent(context.Context, string, string, interface{}) (bool, error) {
+	return false, nil
+}
+
+func (r *phase4TaskRepo) IncrementTaskSequence(context.Context, string) (int, error) {
+	r.panicNotUsed("IncrementTaskSequence")
+	return 0, nil
+}
+func (r *phase4TaskRepo) GetWorkspaceTaskPrefix(context.Context, string) (string, string, error) {
+	r.panicNotUsed("GetWorkspaceTaskPrefix")
+	return "", "", nil
+}
+func (r *phase4TaskRepo) GetTaskByExternalID(context.Context, string, string) (*models.Task, error) {
+	r.panicNotUsed("GetTaskByExternalID")
+	return nil, nil
+}
+func (r *phase4TaskRepo) SettleTaskExternalID(context.Context, string, string, time.Time) (bool, error) {
+	r.panicNotUsed("SettleTaskExternalID")
+	return false, nil
+}
+func (r *phase4TaskRepo) ReleaseTaskExternalID(context.Context, string, string) (*models.Task, error) {
+	r.panicNotUsed("ReleaseTaskExternalID")
+	return nil, nil
+}
+func (r *phase4TaskRepo) SwitchTaskRunner(context.Context, models.RunnerSwitchRequest) (*models.RunnerSwitchResult, error) {
+	r.panicNotUsed("SwitchTaskRunner")
+	return nil, nil
+}
+
+func TestWorkspacePolicy_MetadataBlock(t *testing.T) {
+	pol := WorkspacePolicy{
+		Mode:                  "inherit_parent",
+		DefaultChildWorkspace: "new_workspace",
+		DefaultChildOrdering:  "sequential",
+	}
+	meta := pol.MetadataBlock()
+	ws, ok := meta["workspace"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("workspace map missing: %#v", meta)
+	}
+	if ws["mode"] != "inherit_parent" {
+		t.Errorf("mode = %v", ws["mode"])
+	}
+	if ws["default_child_workspace"] != "new_workspace" {
+		t.Errorf("default_child_workspace = %v", ws["default_child_workspace"])
+	}
+	if ws["default_child_ordering"] != "sequential" {
+		t.Errorf("default_child_ordering = %v", ws["default_child_ordering"])
+	}
+
+	empty := WorkspacePolicy{Mode: "new_workspace"}
+	got := empty.MetadataBlock()
+	if got == nil {
+		t.Fatal("non-empty policy must return a metadata block")
+	}
+	none := WorkspacePolicy{}
+	if got := none.MetadataBlock(); got != nil {
+		t.Fatalf("empty policy should return nil, got %v", got)
+	}
+}
+
+// TestWorkspacePolicy_MergeMetadataBlock pins the merge both task-create
+// surfaces (HTTP in internal/task/handlers, MCP in internal/mcp/handlers) now
+// share, so their metadata precedence cannot diverge again.
+func TestWorkspacePolicy_MergeMetadataBlock(t *testing.T) {
+	pol := WorkspacePolicy{Mode: "new_workspace"}
+
+	t.Run("policy wins over caller metadata", func(t *testing.T) {
+		got := pol.MergeMetadataBlock(map[string]interface{}{
+			"workspace": map[string]interface{}{"mode": "smuggled"},
+			"other":     "kept",
+		})
+		wsBlock, ok := got["workspace"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("workspace map missing: %#v", got)
+		}
+		if wsBlock["mode"] != "new_workspace" {
+			t.Errorf("mode = %v, want new_workspace", wsBlock["mode"])
+		}
+		if got["other"] != "kept" {
+			t.Errorf("unrelated key dropped: %#v", got)
+		}
+	})
+
+	t.Run("nil metadata is allocated", func(t *testing.T) {
+		got := pol.MergeMetadataBlock(nil)
+		if _, ok := got["workspace"]; !ok {
+			t.Fatalf("workspace block missing: %#v", got)
+		}
+	})
+
+	t.Run("empty policy leaves metadata untouched", func(t *testing.T) {
+		if got := (WorkspacePolicy{}).MergeMetadataBlock(nil); got != nil {
+			t.Errorf("got %#v, want nil", got)
+		}
+		base := map[string]interface{}{"other": "kept"}
+		got := (WorkspacePolicy{}).MergeMetadataBlock(base)
+		if len(got) != 1 || got["other"] != "kept" {
+			t.Errorf("got %#v, want the caller's map unchanged", got)
+		}
+	})
+}
+
+func TestWorkspacePolicy_NeedsAttachment(t *testing.T) {
+	cases := []struct {
+		name string
+		pol  WorkspacePolicy
+		want bool
+	}{
+		{"new_workspace + parallel parent", WorkspacePolicy{Mode: "new_workspace"}, false},
+		{"inherit_parent", WorkspacePolicy{Mode: "inherit_parent"}, true},
+		{"shared_group", WorkspacePolicy{Mode: "shared_group", GroupID: "g1"}, true},
+		{"new_workspace + sequential parent", WorkspacePolicy{Mode: "new_workspace", ParentOrdering: "sequential"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.pol.NeedsAttachment(); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAttachWorkspacePolicy_InheritParentCreatesGroupAndJoinsChild(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	tasks.addTask("parent", "", "ws-1")
+	tasks.addTask("child", "parent", "ws-1")
+	groups := newFakeWSGroupRepo()
+	svc := newPhase4Service(t, tasks, &fakeBlockerRepo{}, groups)
+
+	pol := WorkspacePolicy{Mode: "inherit_parent"}
+	if err := svc.AttachWorkspacePolicy(context.Background(), "child", "parent", pol); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if len(groups.groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups.groups))
+	}
+	var gid string
+	for id := range groups.groups {
+		gid = id
+	}
+	if groups.members[gid]["parent"] != orchmodels.WorkspaceMemberRoleOwner {
+		t.Errorf("parent should be owner, got %q", groups.members[gid]["parent"])
+	}
+	if groups.members[gid]["child"] != orchmodels.WorkspaceMemberRoleMember {
+		t.Errorf("child should be member, got %q", groups.members[gid]["child"])
+	}
+
+	// A second inherit_parent child reuses the existing group.
+	tasks.addTask("child2", "parent", "ws-1")
+	if err := svc.AttachWorkspacePolicy(context.Background(), "child2", "parent", pol); err != nil {
+		t.Fatalf("attach 2: %v", err)
+	}
+	if len(groups.groups) != 1 {
+		t.Errorf("group must be reused; got %d groups", len(groups.groups))
+	}
+	if _, ok := groups.members[gid]["child2"]; !ok {
+		t.Error("child2 should be added to the same group")
+	}
+}
+
+func TestAttachWorkspacePolicy_SharedGroupRefusesInactive(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	tasks.addTask("child", "parent", "ws-1")
+	groups := newFakeWSGroupRepo()
+	g := &orchmodels.WorkspaceGroup{
+		ID: "g-cleaned", WorkspaceID: "ws-1", OwnerTaskID: "x",
+		MaterializedKind: orchmodels.WorkspaceGroupKindSingleRepo,
+		CleanupStatus:    orchmodels.WorkspaceCleanupStatusCleaned,
+	}
+	groups.groups[g.ID] = g
+	groups.members[g.ID] = map[string]string{}
+	svc := newPhase4Service(t, tasks, &fakeBlockerRepo{}, groups)
+	err := svc.AttachWorkspacePolicy(context.Background(), "child", "parent",
+		WorkspacePolicy{Mode: "shared_group", GroupID: "g-cleaned"})
+	if err == nil {
+		t.Fatal("expected error for cleaned group")
+	}
+}
+
+func TestAttachWorkspacePolicy_SequentialChainsSiblings(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	tasks.addTask("parent", "", "ws-1")
+	blockers := &fakeBlockerRepo{}
+	svc := newPhase4Service(t, tasks, blockers, newFakeWSGroupRepo())
+
+	pol := WorkspacePolicy{Mode: "new_workspace", ParentOrdering: "sequential"}
+	// Attach in creation order — the production caller (handleCreateTask)
+	// always invokes attach immediately after creating the task, so the
+	// child is the most recently-added sibling at attach time.
+	tasks.addTask("a", "parent", "ws-1")
+	if err := svc.AttachWorkspacePolicy(context.Background(), "a", "parent", pol); err != nil {
+		t.Fatalf("attach a: %v", err)
+	}
+	tasks.addTask("b", "parent", "ws-1")
+	// Attach for b: b should be blocked-by a.
+	if err := svc.AttachWorkspacePolicy(context.Background(), "b", "parent", pol); err != nil {
+		t.Fatalf("attach b: %v", err)
+	}
+	tasks.addTask("c", "parent", "ws-1")
+	// Attach for c: c should be blocked-by b.
+	if err := svc.AttachWorkspacePolicy(context.Background(), "c", "parent", pol); err != nil {
+		t.Fatalf("attach c: %v", err)
+	}
+
+	if len(blockers.blockers) != 2 {
+		t.Fatalf("expected 2 blocker edges, got %d", len(blockers.blockers))
+	}
+	bb, _ := blockers.ListTaskBlockers(context.Background(), "b")
+	if len(bb) != 1 || bb[0].BlockerTaskID != "a" {
+		t.Errorf("b blockers = %+v", bb)
+	}
+	cb, _ := blockers.ListTaskBlockers(context.Background(), "c")
+	if len(cb) != 1 || cb[0].BlockerTaskID != "b" {
+		t.Errorf("c blockers = %+v", cb)
+	}
+}
+
+// TestAttachWorkspacePolicy_SequentialIsRaceFree exercises the per-parent
+// mutex by attaching multiple siblings concurrently. The blocker chain
+// should be deterministic (no duplicate or self-blocking edges).
+//
+// Real callers (handleCreateTask) call addTask + attach atomically per
+// sibling; we model that here by adding+attaching each goroutine in one
+// critical section so the contention is over the per-parent attach lock.
+func TestAttachWorkspacePolicy_SequentialIsRaceFree(t *testing.T) {
+	tasks := newFakeTaskRepo()
+	tasks.addTask("parent", "", "ws-1")
+	blockers := &fakeBlockerRepo{}
+	svc := newPhase4Service(t, tasks, blockers, newFakeWSGroupRepo())
+
+	pol := WorkspacePolicy{Mode: "new_workspace", ParentOrdering: "sequential"}
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			tasks.addTask(id, "parent", "ws-1")
+			_ = svc.AttachWorkspacePolicy(context.Background(), id, "parent", pol)
+		}("k" + itoa(i))
+	}
+	wg.Wait()
+
+	// Under raw concurrency the first task to claim the per-parent lock
+	// may already see one or more siblings (their addTask raced ahead),
+	// so the count of blockers depends on interleaving — anywhere from
+	// n-1 (deterministic chain) up to n (every attach saw a previous
+	// sibling). The contract we DO enforce is: no self-edges, and each
+	// sibling has at most one blocker (the lock prevents double-attach).
+	if len(blockers.blockers) > n {
+		t.Errorf("blocker edges = %d, want <= %d", len(blockers.blockers), n)
+	}
+	for _, b := range blockers.blockers {
+		if b.TaskID == b.BlockerTaskID {
+			t.Errorf("self-blocker detected: %s", b.TaskID)
+		}
+	}
+	seen := map[string]bool{}
+	for _, b := range blockers.blockers {
+		if seen[b.TaskID] {
+			t.Errorf("task %s has more than one blocker (lock leaked)", b.TaskID)
+		}
+		seen[b.TaskID] = true
+	}
+}

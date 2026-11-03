@@ -1,0 +1,379 @@
+package shared
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	"go.uber.org/zap"
+)
+
+// SavedAttachment represents an attachment saved to the workspace.
+type SavedAttachment struct {
+	// RelPath is the path relative to workDir (e.g. ".kandev/attachments/{sid}/file.pdf").
+	RelPath string
+	// AbsPath is the absolute path to the saved file.
+	AbsPath string
+	// Name is the original filename.
+	Name string
+	// MimeType is the MIME type of the attachment.
+	MimeType string
+	// Type is the attachment type ("image" or "resource").
+	Type string
+}
+
+// AttachmentManager saves attachments to session-scoped directories and cleans up.
+// Each session gets its own subdirectory under .kandev/attachments/{sessionID}/
+// so concurrent agents sharing a workspace don't interfere with each other.
+type AttachmentManager struct {
+	workDir   string
+	sessionID string
+	logger    *zap.Logger
+}
+
+var ErrMaterializedAttachmentMissing = errors.New("materialized attachment is missing")
+
+// NewAttachmentManager creates a new AttachmentManager.
+// sessionID can be empty initially and set later via SetSessionID.
+func NewAttachmentManager(workDir string, logger *zap.Logger) *AttachmentManager {
+	return &AttachmentManager{
+		workDir: workDir,
+		logger:  logger,
+	}
+}
+
+// SetSessionID updates the session ID used for the scoped subdirectory.
+func (m *AttachmentManager) SetSessionID(id string) {
+	m.sessionID = id
+}
+
+// SaveAttachments saves all attachments to .kandev/attachments/{sessionID}/.
+// Returns saved attachment metadata so the caller can decide how to reference them.
+func (m *AttachmentManager) SaveAttachments(attachments []v1.MessageAttachment) ([]SavedAttachment, error) {
+	if len(attachments) == 0 {
+		return nil, nil
+	}
+	if m.workDir == "" || m.sessionID == "" {
+		return nil, fmt.Errorf("workDir or sessionID not set")
+	}
+	if !isSafeAttachmentComponent(m.sessionID) {
+		return nil, fmt.Errorf("invalid sessionID")
+	}
+
+	dir, err := safeAttachmentPath(m.workDir, ".kandev", "attachments", m.sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create attachments dir: %w", err)
+	}
+
+	var saved []SavedAttachment
+	usedNames := make(map[string]bool, len(attachments))
+	for _, att := range attachments {
+		name := att.Name
+		if name == "" {
+			name = m.generateName(att)
+		}
+		name = filepath.Base(name)
+		if !isSafeAttachmentComponent(name) {
+			m.logger.Warn("skipping attachment with invalid name", zap.String("original_name", att.Name))
+			continue
+		}
+		if att.AttachmentID != "" && att.Data == "" {
+			// Descriptor attachments are materialized by the backend before the
+			// prompt reaches agentctl. Reuse that file instead of trying to
+			// decode an empty base64 payload (which would create a zero-byte file).
+			absPath, pathErr := safeAttachmentPath(dir, name)
+			if pathErr != nil {
+				m.logger.Warn("skipping attachment with invalid path", zap.String("name", name), zap.Error(pathErr))
+				continue
+			}
+			info, statErr := os.Stat(absPath)
+			if statErr != nil || !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("%w: %s", ErrMaterializedAttachmentMissing, att.AttachmentID)
+			}
+			usedNames[name] = true
+			relPath := filepath.Join(".kandev", "attachments", m.sessionID, name)
+			saved = append(saved, SavedAttachment{
+				RelPath: relPath, AbsPath: absPath, Name: name,
+				MimeType: att.MimeType, Type: att.Type,
+			})
+			m.logger.Debug("reused materialized attachment", zap.String("path", relPath), zap.Int64("size", info.Size()))
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(att.Data)
+		if err != nil {
+			m.logger.Warn("failed to decode attachment", zap.String("name", name), zap.Error(err))
+			continue
+		}
+
+		name, absPath, err := writeUniqueAttachmentFile(dir, name, usedNames, decoded)
+		if err != nil {
+			m.logger.Warn("failed to write attachment", zap.String("path", absPath), zap.Error(err))
+			continue
+		}
+		usedNames[name] = true
+
+		relPath := filepath.Join(".kandev", "attachments", m.sessionID, name)
+		saved = append(saved, SavedAttachment{
+			RelPath:  relPath,
+			AbsPath:  absPath,
+			Name:     name,
+			MimeType: att.MimeType,
+			Type:     att.Type,
+		})
+
+		m.logger.Debug("saved attachment", zap.String("path", relPath), zap.Int("size", len(decoded)))
+	}
+
+	return saved, nil
+}
+
+// SaveAttachmentStream writes one claimed attachment without buffering its
+// contents in memory. The caller owns src and must close it.
+func (m *AttachmentManager) SaveAttachmentStream(att v1.MessageAttachment, src io.Reader) (SavedAttachment, error) {
+	if src == nil {
+		return SavedAttachment{}, fmt.Errorf("attachment stream is nil")
+	}
+	if m.workDir == "" || m.sessionID == "" {
+		return SavedAttachment{}, fmt.Errorf("workDir or sessionID not set")
+	}
+	if !isSafeAttachmentComponent(m.sessionID) {
+		return SavedAttachment{}, fmt.Errorf("invalid sessionID")
+	}
+	if att.SizeBytes < 0 {
+		return SavedAttachment{}, fmt.Errorf("attachment size is invalid")
+	}
+
+	dir, err := safeAttachmentPath(m.workDir, ".kandev", "attachments", m.sessionID)
+	if err != nil {
+		return SavedAttachment{}, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return SavedAttachment{}, fmt.Errorf("create attachments dir: %w", err)
+	}
+
+	name := att.Name
+	if name == "" {
+		name = m.generateName(att)
+	}
+	name = filepath.Base(name)
+	if !isSafeAttachmentComponent(name) {
+		return SavedAttachment{}, fmt.Errorf("invalid attachment name")
+	}
+
+	name, absPath, err := writeUniqueAttachmentStream(dir, name, make(map[string]bool), src, att.SizeBytes)
+	if err != nil {
+		return SavedAttachment{}, err
+	}
+	relPath := filepath.Join(".kandev", "attachments", m.sessionID, name)
+	saved := SavedAttachment{
+		RelPath:  relPath,
+		AbsPath:  absPath,
+		Name:     name,
+		MimeType: att.MimeType,
+		Type:     att.Type,
+	}
+	m.logger.Debug("saved streamed attachment", zap.String("path", relPath), zap.Int64("size", att.SizeBytes))
+	return saved, nil
+}
+
+// Cleanup removes the session's attachment directory.
+// Safe to call multiple times or with empty sessionID (no-op).
+func (m *AttachmentManager) Cleanup() {
+	if m.sessionID == "" || m.workDir == "" {
+		return
+	}
+	dir, err := safeAttachmentPath(m.workDir, ".kandev", "attachments", m.sessionID)
+	if err != nil {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		m.logger.Debug("failed to clean attachments dir", zap.String("dir", dir), zap.Error(err))
+	}
+}
+
+// BuildAttachmentPrompt generates prompt text referencing saved attachment files.
+// Used by adapters that don't support native multimodal content.
+func BuildAttachmentPrompt(saved []SavedAttachment, writable bool) string {
+	if len(saved) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	if len(saved) == 1 {
+		s := saved[0]
+		name := sanitizePromptValue(s.Name)
+		relPath := sanitizePromptValue(s.RelPath)
+		if writable {
+			fmt.Fprintf(&sb, "The user attached a writable file: %s (saved to %s in the workspace). Use your file reading tools to access or modify it.\n\n", name, relPath)
+		} else {
+			fmt.Fprintf(&sb, "The user attached a file: %s (saved to %s in the workspace). Use your file reading tools to access it.\n\n", name, relPath)
+		}
+	} else {
+		if writable {
+			sb.WriteString("The user attached writable files that you should read and analyze:\n")
+		} else {
+			sb.WriteString("The user attached files that you should read and analyze:\n")
+		}
+		for _, s := range saved {
+			fmt.Fprintf(&sb, "- %s (saved to %s)\n", sanitizePromptValue(s.Name), sanitizePromptValue(s.RelPath))
+		}
+		if writable {
+			sb.WriteString("\nUse your file reading tools to access or modify them.\n\n")
+		} else {
+			sb.WriteString("\nUse your file reading tools to access them.\n\n")
+		}
+	}
+	return sb.String()
+}
+
+func writeUniqueAttachmentFile(dir, name string, used map[string]bool, data []byte) (string, string, error) {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 1; ; i++ {
+		candidate := name
+		if i > 1 {
+			candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
+		}
+		if used[candidate] {
+			continue
+		}
+
+		absPath, err := safeAttachmentPath(dir, candidate)
+		if err != nil {
+			return "", "", err
+		}
+		file, err := os.OpenFile(absPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			used[candidate] = true
+			continue
+		}
+		if err != nil {
+			return "", absPath, err
+		}
+
+		_, writeErr := file.Write(data)
+		closeErr := file.Close()
+		if writeErr != nil {
+			_ = os.Remove(absPath)
+			return "", absPath, writeErr
+		}
+		if closeErr != nil {
+			_ = os.Remove(absPath)
+			return "", absPath, closeErr
+		}
+		return candidate, absPath, nil
+	}
+}
+
+func writeUniqueAttachmentStream(dir, name string, used map[string]bool, src io.Reader, expectedSize int64) (string, string, error) {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 1; ; i++ {
+		candidate := name
+		if i > 1 {
+			candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
+		}
+		if used[candidate] {
+			continue
+		}
+
+		absPath, err := safeAttachmentPath(dir, candidate)
+		if err != nil {
+			return "", "", err
+		}
+		file, err := os.OpenFile(absPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			used[candidate] = true
+			continue
+		}
+		if err != nil {
+			return "", absPath, err
+		}
+
+		written, copyErr := io.Copy(file, io.LimitReader(src, expectedSize+1))
+		closeErr := file.Close()
+		if copyErr == nil && written != expectedSize {
+			copyErr = fmt.Errorf("attachment size mismatch: wrote %d bytes, expected %d", written, expectedSize)
+		}
+		if copyErr != nil {
+			_ = os.Remove(absPath)
+			return "", absPath, copyErr
+		}
+		if closeErr != nil {
+			_ = os.Remove(absPath)
+			return "", absPath, closeErr
+		}
+		return candidate, absPath, nil
+	}
+}
+
+func isSafeAttachmentComponent(value string) bool {
+	return value != "" && filepath.IsLocal(value) && filepath.Base(value) == value && !strings.ContainsAny(value, "/\\\x00")
+}
+
+func safeAttachmentPath(root string, components ...string) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("attachment root is required")
+	}
+	parts := make([]string, 0, len(components)+1)
+	parts = append(parts, root)
+	for _, component := range components {
+		if !isSafeAttachmentComponent(component) {
+			return "", fmt.Errorf("invalid attachment path component")
+		}
+		parts = append(parts, component)
+	}
+	path := filepath.Join(parts...)
+	rel, err := filepath.Rel(root, path)
+	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("attachment path escapes root")
+	}
+	return path, nil
+}
+
+func sanitizePromptValue(value string) string {
+	replacer := strings.NewReplacer("\r", " ", "\n", " ", "<", "(", ">", ")", "`", "'")
+	return strings.TrimSpace(replacer.Replace(value))
+}
+
+// generateName creates a filename for attachments that don't have a Name field.
+func (m *AttachmentManager) generateName(att v1.MessageAttachment) string {
+	ext := extensionFromMimeType(att.MimeType)
+	return "attachment" + ext
+}
+
+// extensionFromMimeType returns a file extension for common MIME types.
+func extensionFromMimeType(mimeType string) string {
+	switch mimeType {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "application/pdf":
+		return ".pdf"
+	case "text/plain":
+		return ".txt"
+	case "application/json":
+		return ".json"
+	case "text/csv":
+		return ".csv"
+	case "text/html":
+		return ".html"
+	case "text/markdown":
+		return ".md"
+	default:
+		return ""
+	}
+}

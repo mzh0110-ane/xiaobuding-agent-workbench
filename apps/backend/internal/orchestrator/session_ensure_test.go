@@ -1,0 +1,828 @@
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/orchestrator/executor"
+	"github.com/kandev/kandev/internal/task/models"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+func TestEnsureSession_RequiresTaskID(t *testing.T) {
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	if _, err := svc.EnsureSession(context.Background(), ""); err == nil {
+		t.Fatal("expected error when task_id is empty")
+	}
+}
+
+func TestEnsureSession_TaskNotFound(t *testing.T) {
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	if _, err := svc.EnsureSession(context.Background(), "missing"); err == nil {
+		t.Fatal("expected error when task is missing")
+	}
+}
+
+func TestEnsureSession_ReturnsExistingPrimary(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	seedTaskAndSession(t, repo, "task1", "session-old", models.TaskSessionStateCompleted)
+	// Add a newer non-primary session, then mark the older one primary.
+	now := time.Now().UTC()
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-new", TaskID: "task1", State: models.TaskSessionStateRunning,
+		StartedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("failed to create newer session: %v", err)
+	}
+	if err := repo.SetSessionPrimary(ctx, "session-old"); err != nil {
+		t.Fatalf("failed to mark primary: %v", err)
+	}
+
+	resp, err := svc.EnsureSession(ctx, "task1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SessionID != "session-old" {
+		t.Errorf("expected primary session-old, got %q", resp.SessionID)
+	}
+	if resp.Source != "existing_primary" {
+		t.Errorf("expected source=existing_primary, got %q", resp.Source)
+	}
+	if resp.NewlyCreated {
+		t.Error("expected NewlyCreated=false")
+	}
+}
+
+func TestEnsureSession_ReturnsExistingNewest_NoPrimary(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	seedTaskAndSession(t, repo, "task1", "session-old", models.TaskSessionStateCompleted)
+	now := time.Now().UTC()
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-new", TaskID: "task1", State: models.TaskSessionStateRunning,
+		StartedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("failed to create newer session: %v", err)
+	}
+
+	resp, err := svc.EnsureSession(ctx, "task1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SessionID != "session-new" {
+		t.Errorf("expected newest session-new, got %q", resp.SessionID)
+	}
+	if resp.Source != "existing_newest" {
+		t.Errorf("expected source=existing_newest, got %q", resp.Source)
+	}
+}
+
+func TestEnsureSession_PassiveOpenReturnsExactQueuedDestination(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	seedTaskAndSession(t, repo, "task1", "session-astra", models.TaskSessionStateWaitingForInput)
+	if err := repo.SetSessionPrimary(ctx, "session-astra"); err != nil {
+		t.Fatalf("set parked session primary: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-luna", TaskID: "task1", State: models.TaskSessionStateCreated,
+		AgentProfileID: "profile-luna", StartedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create queued destination: %v", err)
+	}
+	queuedAt := now.Add(-time.Minute)
+	record := models.CeilingRecordKeys(models.CeilingDeferral{
+		Kind: models.CeilingLaunchStartCreated,
+		Payload: map[string]interface{}{
+			metaKeySessionID:      "session-luna",
+			metaKeyAgentProfileID: "profile-luna",
+			metaKeyWorkflowStepID: "step-implement",
+		},
+		Origin:          string(launchOriginAutomatic),
+		QueuedAt:        queuedAt,
+		Population:      5,
+		PopulationKnown: true,
+		Ceiling:         5,
+	})
+	if err := repo.SetTaskMetadataKey(ctx, "task1", models.MetaKeyDeferredLaunch, record); err != nil {
+		t.Fatalf("set queued launch: %v", err)
+	}
+
+	response, err := svc.EnsureSession(ctx, "task1", EnsureSessionOptions{
+		ActivationSource: LaunchActivationSourceSessionOpen,
+	})
+	if err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if response.SessionID != "session-luna" {
+		t.Fatalf("passive ensure session = %q, want exact queued destination", response.SessionID)
+	}
+	if response.Source != "existing_queued" || response.ActivationDisposition != "queued" ||
+		response.ActivationReason != "session_capacity" {
+		t.Fatalf("passive queued response = %+v", response)
+	}
+
+	sessions, err := repo.ListTaskSessions(ctx, "task1")
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("passive ensure created or removed a session: got %d rows", len(sessions))
+	}
+	queuedTask, err := repo.GetTask(ctx, "task1")
+	if err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if !models.HasCeilingDeferredIntent(queuedTask) {
+		t.Fatal("passive ensure cleared the queued launch")
+	}
+}
+
+func TestFindOfficeSessionForResumeUsesCanonicalOfficeProjection(t *testing.T) {
+	tests := []struct {
+		name         string
+		isFromOffice bool
+		assignee     string
+		viewer       string
+		wantOffice   bool
+	}{
+		{name: "unassigned Office task with agent viewer", isFromOffice: true, viewer: "profile1", wantOffice: true},
+		{name: "assigned Kanban task", assignee: "profile1", wantOffice: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedTaskAndSession(t, repo, "task1", "session1", models.TaskSessionStateRunning)
+			session, err := repo.GetTaskSession(ctx, "session1")
+			if err != nil {
+				t.Fatalf("get session: %v", err)
+			}
+			session.AgentProfileID = "profile1"
+			if err := repo.UpdateTaskSession(ctx, session); err != nil {
+				t.Fatalf("update session: %v", err)
+			}
+
+			svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+			svc.repo = ownershipOverrideRepo{
+				sessionExecutorStore: repo,
+				tasks: map[string]*models.Task{"task1": {
+					ID: "task1", IsFromOffice: tt.isFromOffice, AssigneeAgentProfileID: tt.assignee,
+				}},
+			}
+			if tt.viewer != "" {
+				ctx = WithViewerAgent(ctx, tt.viewer)
+			}
+			got, isOffice := svc.findOfficeSessionForResume(ctx, "task1")
+			if isOffice != tt.wantOffice {
+				t.Fatalf("is office task = %v, want %v", isOffice, tt.wantOffice)
+			}
+			if (got != nil) != (tt.wantOffice && tt.viewer != "") {
+				t.Fatalf("office session found = %v, want %v", got != nil, tt.wantOffice && tt.viewer != "")
+			}
+		})
+	}
+}
+
+func TestEnsureSession_Concurrent_ReturnsSameExistingSession(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	seedTaskAndSession(t, repo, "task1", "session1", models.TaskSessionStateRunning)
+
+	const N = 8
+	var wg sync.WaitGroup
+	results := make([]string, N)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			resp, err := svc.EnsureSession(ctx, "task1")
+			if err != nil {
+				t.Errorf("concurrent ensure failed: %v", err)
+				return
+			}
+			results[idx] = resp.SessionID
+		}(i)
+	}
+	wg.Wait()
+
+	for i, sid := range results {
+		if sid != "session1" {
+			t.Errorf("call %d: expected session1, got %q", i, sid)
+		}
+	}
+}
+
+// acquireEnsureLock must serialize callers per task id. The previous attempt
+// to bound map growth (Delete on release) opened a window where a third
+// caller could LoadOrStore a fresh mutex while a second caller still held
+// the about-to-be-discarded one, putting two goroutines in the critical
+// section at the same time. This test pins down that property by counting
+// the maximum observed concurrency under the same task id.
+func TestAcquireEnsureLock_SerializesPerTaskID(t *testing.T) {
+	const N = 16
+	var (
+		active int
+		mu     sync.Mutex
+		maxCon int
+		wg     sync.WaitGroup
+	)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			release := acquireEnsureLock("task-x")
+			defer release()
+			mu.Lock()
+			active++
+			if active > maxCon {
+				maxCon = active
+			}
+			mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+			mu.Lock()
+			active--
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if maxCon != 1 {
+		t.Errorf("expected max concurrency 1 under same task id, got %d", maxCon)
+	}
+}
+
+// Distinct task ids must NOT serialize against each other. Uses a
+// channel-based rendezvous (rather than a sleep) so the assertion is
+// deterministic on slow CI runners: every goroutine signals after acquiring
+// its lock, the test releases them all at once, and only then do they
+// observe peak concurrency.
+func TestAcquireEnsureLock_AllowsConcurrencyAcrossTaskIDs(t *testing.T) {
+	const N = 8
+	acquired := make(chan struct{}, N)
+	start := make(chan struct{})
+	var holding int
+	var mu sync.Mutex
+	var peak int
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		taskID := fmt.Sprintf("task-%d", i)
+		go func() {
+			defer wg.Done()
+			release := acquireEnsureLock(taskID)
+			defer release()
+			acquired <- struct{}{}
+			<-start
+			mu.Lock()
+			holding++
+			if holding > peak {
+				peak = holding
+			}
+			mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+			mu.Lock()
+			holding--
+			mu.Unlock()
+		}()
+	}
+	for i := 0; i < N; i++ {
+		<-acquired
+	}
+	close(start)
+	wg.Wait()
+	if peak < 2 {
+		t.Errorf("expected concurrency across distinct task ids, peak=%d", peak)
+	}
+}
+
+func TestPrepareTaskSession_UsesExecutorIDFromTaskMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	taskRepo := newMockTaskRepo()
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), taskRepo, &mockAgentManager{})
+
+	now := time.Now().UTC()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Test Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workflow: %v", err)
+	}
+	metadata := map[string]interface{}{
+		models.MetaKeyAgentProfileID: "profile1",
+		models.MetaKeyExecutorID:     "exec-special",
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:          "task1",
+		WorkflowID:  "wf1",
+		WorkspaceID: "ws1",
+		Title:       "T",
+		Metadata:    metadata,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	taskRepo.tasks["task1"] = &v1.Task{
+		ID:          "task1",
+		WorkspaceID: "ws1",
+		Metadata:    metadata,
+	}
+
+	sessionID, err := svc.PrepareTaskSession(ctx, "task1", "", "", "", "", false)
+	if err != nil {
+		t.Fatalf("PrepareTaskSession: %v", err)
+	}
+	session, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.ExecutorID != "exec-special" {
+		t.Fatalf("ExecutorID = %q, want exec-special", session.ExecutorID)
+	}
+}
+
+func TestPrepareTaskSession_InheritParentKeepsImplicitParentExecutor(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	taskRepo := newMockTaskRepo()
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), taskRepo, &mockAgentManager{})
+
+	now := time.Now().UTC()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Test Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "parent1", WorkflowID: "wf1", WorkspaceID: "ws1", Title: "Parent", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed parent task: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "child1", ParentID: "parent1", WorkflowID: "wf1", WorkspaceID: "ws1", Title: "Child",
+		Metadata:  map[string]interface{}{"workspace": map[string]interface{}{"mode": "inherit_parent"}},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed child task: %v", err)
+	}
+	if err := repo.CreateTaskEnvironment(ctx, &models.TaskEnvironment{
+		ID: "env-parent", TaskID: "parent1", Status: models.TaskEnvironmentStatusReady,
+	}); err != nil {
+		t.Fatalf("seed parent environment: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "parent-session", TaskID: "parent1", IsPrimary: true,
+		State: models.TaskSessionStateRunning, AgentProfileID: "parent-agent",
+		TaskEnvironmentID: "env-parent", StartedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed parent session: %v", err)
+	}
+	taskRepo.tasks["child1"] = &v1.Task{
+		ID: "child1", ParentID: "parent1", WorkspaceID: "ws1", WorkflowID: "wf1",
+		Metadata: map[string]interface{}{"workspace": map[string]interface{}{"mode": "inherit_parent"}},
+	}
+
+	sessionID, err := svc.PrepareTaskSession(ctx, "child1", "", "", "", "", false)
+	if err != nil {
+		t.Fatalf("PrepareTaskSession: %v", err)
+	}
+	session, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.ExecutorID != "" {
+		t.Fatalf("ExecutorID = %q, want empty to preserve the parent's implicit local executor", session.ExecutorID)
+	}
+	if session.TaskEnvironmentID != "env-parent" {
+		t.Fatalf("TaskEnvironmentID = %q, want env-parent", session.TaskEnvironmentID)
+	}
+}
+
+// Service-level companion to the lock primitive tests: with no pre-existing
+// session, N concurrent EnsureSession calls must converge on exactly one
+// created session. This catches regressions in findExistingSession or
+// LaunchSession idempotency that the lock tests alone wouldn't surface.
+func TestEnsureSession_Concurrent_CreatesSingleSession(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	taskRepo := newMockTaskRepo()
+	// Stub LaunchAgent so the background workspace launch goroutine spawned
+	// by PrepareTaskSession completes without nil-deref'ing on the response.
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, _ *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+			return &executor.LaunchAgentResponse{AgentExecutionID: "exec-1"}, nil
+		},
+	}
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), taskRepo, agentMgr)
+
+	now := time.Now().UTC()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Test Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{ID: "task1", WorkflowID: "wf1", WorkspaceID: "ws1", Title: "T", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	// PrepareTaskSession resolves agent_profile_id from task metadata via
+	// scheduler.GetTask (backed by the mock taskRepo), so seed both stores.
+	taskRepo.tasks["task1"] = &v1.Task{
+		ID:          "task1",
+		WorkspaceID: "ws1",
+		Metadata:    map[string]any{"agent_profile_id": "profile1"},
+	}
+
+	const N = 8
+	var wg sync.WaitGroup
+	results := make([]string, N)
+	errs := make([]error, N)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			resp, err := svc.EnsureSession(ctx, "task1")
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			results[idx] = resp.SessionID
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("call %d failed: %v", i, err)
+		}
+	}
+	first := results[0]
+	if first == "" {
+		t.Fatal("expected a session id from the first caller")
+	}
+	for i, sid := range results {
+		if sid != first {
+			t.Errorf("call %d: expected %q, got %q", i, first, sid)
+		}
+	}
+
+	sessions, err := repo.ListTaskSessions(ctx, "task1")
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Errorf("expected exactly 1 session created, got %d", len(sessions))
+	}
+}
+
+func TestEnsureSession_EnsureExecution_TriggersResume(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+
+	seedTaskAndSession(t, repo, "task1", "session1", models.TaskSessionStateWaitingForInput)
+
+	// Session exists but agent is not running — ensureSessionRunning will be called.
+	// Without a real executor it will fail, but we verify it was attempted by checking
+	// the error path (non-fatal in EnsureSession, session is still returned).
+	agentMgr := &mockAgentManager{isAgentRunning: false}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	log := testLogger()
+	svc.executor = executor.NewExecutor(agentMgr, repo, log, executor.ExecutorConfig{})
+
+	resp, err := svc.EnsureSession(ctx, "task1", EnsureSessionOptions{EnsureExecution: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SessionID != "session1" {
+		t.Errorf("expected session1, got %q", resp.SessionID)
+	}
+	if resp.Source != "existing_newest" {
+		t.Errorf("expected source=existing_newest, got %q", resp.Source)
+	}
+	// tryEnsureExecution is non-fatal — the response is still returned even if
+	// resume fails (no executor running record in this test setup).
+}
+
+func TestEnsureSession_WithoutEnsureExecution_SkipsResume(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+
+	seedTaskAndSession(t, repo, "task1", "session1", models.TaskSessionStateWaitingForInput)
+
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+
+	// Without EnsureExecution, should return existing session without attempting resume.
+	resp, err := svc.EnsureSession(ctx, "task1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SessionID != "session1" {
+		t.Errorf("expected session1, got %q", resp.SessionID)
+	}
+}
+
+func TestStepAllowsAutoStart(t *testing.T) {
+	if !stepAllowsAutoStart(nil) {
+		t.Error("expected nil step to allow auto-start (no workflow step constraint)")
+	}
+	stepWith := &wfmodels.WorkflowStep{
+		Events: wfmodels.StepEvents{
+			OnEnter: []wfmodels.OnEnterAction{{Type: wfmodels.OnEnterAutoStartAgent}},
+		},
+	}
+	if !stepAllowsAutoStart(stepWith) {
+		t.Error("expected step with auto_start_agent to allow auto-start")
+	}
+	stepWithout := &wfmodels.WorkflowStep{}
+	if stepAllowsAutoStart(stepWithout) {
+		t.Error("expected step without auto_start_agent to disallow auto-start")
+	}
+}
+
+func TestResolveTaskAgentProfile_WorkflowStepProfileWinsOverTaskMetadata(t *testing.T) {
+	repo := setupTestRepo(t)
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", AgentProfileID: "step-profile"}
+	stepGetter.workflowAgentProfileID = "wf-profile"
+	svc := createTestService(repo, stepGetter, newMockTaskRepo())
+
+	task := &models.Task{
+		ID:             "t1",
+		WorkspaceID:    "ws1",
+		WorkflowStepID: "step1",
+		Metadata:       map[string]interface{}{"agent_profile_id": "task-profile"},
+	}
+	if got, _ := svc.resolveTaskAgentProfile(context.Background(), task); got != "step-profile" {
+		t.Errorf("expected step-profile, got %q", got)
+	}
+}
+
+func TestResolveTaskAgentProfile_TaskOverrideWinsOverTaskMetadata(t *testing.T) {
+	repo := setupTestRepo(t)
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", WorkflowID: "workflow-1", AgentProfileID: "step-profile"}
+	svc := createTestService(repo, stepGetter, newMockTaskRepo())
+
+	task := &models.Task{
+		ID:             "t1",
+		WorkflowID:     "workflow-1",
+		WorkflowStepID: "step1",
+		Metadata:       map[string]interface{}{"agent_profile_id": "task-profile"},
+		WorkflowAgentOverrides: &models.WorkflowAgentOverrides{
+			WorkflowID: "workflow-1",
+			Steps: []models.WorkflowAgentOverrideBinding{{
+				StepID:               "step1",
+				SourceProfileID:      "step-profile",
+				ReplacementProfileID: "replacement-profile",
+			}},
+		},
+	}
+	if got, _ := svc.resolveTaskAgentProfile(context.Background(), task); got != "replacement-profile" {
+		t.Errorf("expected replacement-profile, got %q", got)
+	}
+}
+
+func TestResolveTaskAgentProfile_StepThenWorkflowThenWorkspace(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	t.Run("step override", func(t *testing.T) {
+		repo := setupTestRepo(t)
+		stepGetter := newMockStepGetter()
+		stepGetter.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", AgentProfileID: "step-profile"}
+		svc := createTestService(repo, stepGetter, newMockTaskRepo())
+		task := &models.Task{ID: "t1", WorkflowStepID: "step1"}
+		if got, _ := svc.resolveTaskAgentProfile(ctx, task); got != "step-profile" {
+			t.Errorf("expected step-profile, got %q", got)
+		}
+	})
+
+	t.Run("workflow default when step has none", func(t *testing.T) {
+		repo := setupTestRepo(t)
+		stepGetter := newMockStepGetter()
+		stepGetter.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", WorkflowID: "wf1"}
+		stepGetter.workflowAgentProfileID = "wf-profile"
+		svc := createTestService(repo, stepGetter, newMockTaskRepo())
+		task := &models.Task{ID: "t1", WorkflowStepID: "step1"}
+		if got, _ := svc.resolveTaskAgentProfile(ctx, task); got != "wf-profile" {
+			t.Errorf("expected wf-profile, got %q", got)
+		}
+	})
+
+	t.Run("workspace default when step+workflow have none", func(t *testing.T) {
+		repo := setupTestRepo(t)
+		ws := &models.Workspace{
+			ID: "ws-x", Name: "X", DefaultAgentProfileID: strPtr("ws-profile"),
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := repo.CreateWorkspace(ctx, ws); err != nil {
+			t.Fatalf("create workspace: %v", err)
+		}
+		svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+		task := &models.Task{ID: "t1", WorkspaceID: "ws-x"}
+		if got, _ := svc.resolveTaskAgentProfile(ctx, task); got != "ws-profile" {
+			t.Errorf("expected ws-profile, got %q", got)
+		}
+	})
+
+	t.Run("office assignee before workspace default", func(t *testing.T) {
+		repo := setupTestRepo(t)
+		ws := &models.Workspace{
+			ID: "ws-office", Name: "Office", DefaultAgentProfileID: strPtr("ws-profile"),
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := repo.CreateWorkspace(ctx, ws); err != nil {
+			t.Fatalf("create workspace: %v", err)
+		}
+		svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+		task := &models.Task{
+			ID: "t-office", WorkspaceID: "ws-office", AssigneeAgentProfileID: "office-agent",
+		}
+		if got, _ := svc.resolveTaskAgentProfile(ctx, task); got != "office-agent" {
+			t.Errorf("expected office-agent, got %q", got)
+		}
+	})
+
+	t.Run("returns empty when nothing resolves", func(t *testing.T) {
+		repo := setupTestRepo(t)
+		ws := &models.Workspace{ID: "ws-y", Name: "Y", CreatedAt: now, UpdatedAt: now}
+		if err := repo.CreateWorkspace(ctx, ws); err != nil {
+			t.Fatalf("create workspace: %v", err)
+		}
+		svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+		task := &models.Task{ID: "t1", WorkspaceID: "ws-y"}
+		if got, _ := svc.resolveTaskAgentProfile(ctx, task); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+}
+
+func TestEnsureSession_AutoStartFalsePreparesInsteadOfStarting(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	now := time.Now().UTC()
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step-start"] = &wfmodels.WorkflowStep{
+		ID: "step-start",
+		Events: wfmodels.StepEvents{
+			OnEnter: []wfmodels.OnEnterAction{{Type: wfmodels.OnEnterAutoStartAgent}},
+		},
+	}
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, _ *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+			return &executor.LaunchAgentResponse{AgentExecutionID: "exec-1"}, nil
+		},
+	}
+	taskRepo := newMockTaskRepo()
+	svc := createTestServiceWithScheduler(repo, stepGetter, taskRepo, agentMgr)
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Test Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workflow: %v", err)
+	}
+
+	seedTask := func(taskID string) {
+		if err := repo.CreateTask(ctx, &models.Task{ID: taskID, WorkflowID: "wf1", WorkspaceID: "ws1", WorkflowStepID: "step-start", Title: "T", Metadata: map[string]interface{}{"agent_profile_id": "profile1"}, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("seed task %s: %v", taskID, err)
+		}
+		taskRepo.tasks[taskID] = &v1.Task{
+			ID:          taskID,
+			WorkspaceID: "ws1",
+			Metadata:    map[string]any{"agent_profile_id": "profile1"},
+		}
+	}
+
+	t.Run("control: no override starts on an auto-start step", func(t *testing.T) {
+		seedTask("task-start")
+		resp, err := svc.EnsureSession(ctx, "task-start")
+		if err != nil {
+			t.Fatalf("ensure session: %v", err)
+		}
+		if resp.Source != "created_start" {
+			t.Fatalf("Source = %q, want created_start", resp.Source)
+		}
+	})
+
+	t.Run("auto_start false prepares instead of starting", func(t *testing.T) {
+		seedTask("task-prepare")
+		falseVal := false
+		resp, err := svc.EnsureSession(ctx, "task-prepare", EnsureSessionOptions{AutoStart: &falseVal})
+		if err != nil {
+			t.Fatalf("ensure session: %v", err)
+		}
+		if resp.Source != "created_prepare" {
+			t.Fatalf("Source = %q, want created_prepare", resp.Source)
+		}
+		if resp.State != string(models.TaskSessionStateCreated) {
+			t.Fatalf("State = %q, want %q", resp.State, models.TaskSessionStateCreated)
+		}
+	})
+}
+
+func TestEnsureSession_AutoStartFalseNeverUpgradesPassthrough(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	now := time.Now().UTC()
+	stepGetter := newMockStepGetter()
+	// A step WITHOUT auto_start_agent forces the prepare path, where the
+	// passthrough upgrade would otherwise fire.
+	stepGetter.steps["step-plain"] = &wfmodels.WorkflowStep{ID: "step-plain"}
+	stepGetter.steps["step-start"] = &wfmodels.WorkflowStep{
+		ID: "step-start",
+		Events: wfmodels.StepEvents{
+			OnEnter: []wfmodels.OnEnterAction{{Type: wfmodels.OnEnterAutoStartAgent}},
+		},
+	}
+	taskRepo := newMockTaskRepo()
+	agentMgr := &mockAgentManager{
+		isPassthrough: true,
+		launchAgentFunc: func(_ context.Context, _ *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+			return &executor.LaunchAgentResponse{AgentExecutionID: "exec-1"}, nil
+		},
+	}
+	svc := createTestServiceWithScheduler(repo, stepGetter, taskRepo, agentMgr)
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Test Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed workflow: %v", err)
+	}
+
+	seedPassthroughTask := func(taskID, stepID string) {
+		if err := repo.CreateTask(ctx, &models.Task{ID: taskID, WorkflowID: "wf1", WorkspaceID: "ws1", WorkflowStepID: stepID, Title: "T", Metadata: map[string]interface{}{"agent_profile_id": "passthrough-profile"}, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("seed task %s: %v", taskID, err)
+		}
+		taskRepo.tasks[taskID] = &v1.Task{
+			ID:          taskID,
+			WorkspaceID: "ws1",
+			Metadata:    map[string]any{"agent_profile_id": "passthrough-profile"},
+		}
+	}
+
+	t.Run("passthrough prepare without override still upgrades (existing behavior)", func(t *testing.T) {
+		seedPassthroughTask("ptask-upgrade", "step-plain")
+		resp, err := svc.EnsureSession(ctx, "ptask-upgrade")
+		if err != nil {
+			t.Fatalf("ensure session: %v", err)
+		}
+		// The passthrough prepare is eagerly upgraded into a full launch, so
+		// the session reaches STARTING (agent process started synchronously).
+		if resp.State != string(models.TaskSessionStateStarting) {
+			t.Fatalf("State = %q, want %q (eager passthrough upgrade)", resp.State, models.TaskSessionStateStarting)
+		}
+	})
+
+	t.Run("passthrough prepare with auto_start false stays prepared", func(t *testing.T) {
+		seedPassthroughTask("ptask-no-launch", "step-plain")
+		falseVal := false
+		resp, err := svc.EnsureSession(ctx, "ptask-no-launch", EnsureSessionOptions{AutoStart: &falseVal})
+		if err != nil {
+			t.Fatalf("ensure session: %v", err)
+		}
+		if resp.Source != "created_prepare" {
+			t.Fatalf("Source = %q, want created_prepare", resp.Source)
+		}
+		if resp.State != string(models.TaskSessionStateCreated) {
+			t.Fatalf("State = %q, want %q (override must not launch the passthrough agent)", resp.State, models.TaskSessionStateCreated)
+		}
+	})
+
+	t.Run("passthrough auto-start step with auto_start false stays prepared", func(t *testing.T) {
+		seedPassthroughTask("ptask-start-step", "step-start")
+		falseVal := false
+		resp, err := svc.EnsureSession(ctx, "ptask-start-step", EnsureSessionOptions{AutoStart: &falseVal})
+		if err != nil {
+			t.Fatalf("ensure session: %v", err)
+		}
+		if resp.Source != "created_prepare" {
+			t.Fatalf("Source = %q, want created_prepare", resp.Source)
+		}
+		if resp.State != string(models.TaskSessionStateCreated) {
+			t.Fatalf("State = %q, want %q (override must not launch the passthrough agent)", resp.State, models.TaskSessionStateCreated)
+		}
+	})
+}

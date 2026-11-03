@@ -1,0 +1,139 @@
+name: Plugin Registry Index
+
+# Builds the marketplace catalog (plugin-registry/index.json) from the curated
+# plugins.yaml pointer list and publishes it to GitHub Pages. This is the single
+# source of the built catalog: its daily schedule also serves as the star-count
+# refresh (see plugin-registry-stars.yml for a manual "refresh now" trigger).
+
+on:
+  # Rebuild whenever the curated list or the build tooling changes.
+  push:
+    branches: [main]
+    paths:
+      - "plugin-registry/**"
+      - ".github/workflows/plugin-registry-index.yml"
+      - ".github/workflows/plugin-registry-release-poll.yml"
+  # Validate registry edits before merge (the build job runs; the separate
+  # deploy job is gated to non-PR events, so a PR never deploys to Pages).
+  pull_request:
+    paths:
+      - "plugin-registry/**"
+      - ".github/workflows/plugin-registry-index.yml"
+      - ".github/workflows/plugin-registry-release-poll.yml"
+  # Manual rebuild.
+  workflow_dispatch:
+  # Allow a sibling workflow (star refresh) to invoke this build.
+  workflow_call:
+    inputs:
+      reason:
+        description: Why the reusable registry build was requested
+        required: false
+        type: string
+  # Daily rebuild — keeps star counts and latest versions fresh without commits.
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+# Only one concurrent Pages deployment; let an in-progress deploy finish.
+concurrency:
+  group: plugin-registry-pages
+  cancel-in-progress: false
+
+jobs:
+  # Build the catalog and, on non-PR events, stage it as a Pages artifact.
+  # Kept free of the `github-pages` environment so it runs on PRs — a job that
+  # binds that environment is checked against its protection rules even when its
+  # deploy steps are skipped, which fails every PR that touches plugin-registry/.
+  build:
+    name: Build index.json
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: apps/backend/go.mod
+
+      - name: Test registry automation
+        run: node --test plugin-registry/*.test.mjs
+
+      - name: Test package verifier
+        working-directory: apps/backend
+        run: go test ./cmd/plugin-package-verify ./internal/plugins/pkgtar
+
+      - name: Build package verifier
+        working-directory: apps/backend
+        run: go build -o "$RUNNER_TEMP/plugin-package-verify" ./cmd/plugin-package-verify
+
+      - name: Build canvas package inspector
+        working-directory: apps/backend
+        run: go build -o bin/canvas-package ./cmd/canvas-package
+
+      - name: Fetch last known-good official index
+        run: |
+          if ! curl --fail --location --retry 3 --retry-all-errors \
+              --connect-timeout 10 --max-time 30 \
+              --output "$RUNNER_TEMP/prior-plugin-index.json" \
+              https://kdlbs.github.io/kandev/plugins/index.json; then
+            echo "::warning::Published index unavailable; continuing without retention data"
+            printf 'null\n' > "$RUNNER_TEMP/prior-plugin-index.json"
+          fi
+
+      - name: Build index.json
+        # The Node script uses stdlib + global fetch and delegates archive
+        # verification to the Go binary built above. GITHUB_TOKEN authenticates
+        # read-only GitHub API calls for the curated public repositories.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PACKAGE_VERIFIER: ${{ runner.temp }}/plugin-package-verify
+          PLUGIN_REGISTRY_PRIOR_INDEX: ${{ runner.temp }}/prior-plugin-index.json
+          KANDEV_CANVAS_PACKAGE_INSPECTOR: apps/backend/bin/canvas-package
+        run: node plugin-registry/build-index.mjs
+
+      - name: Stage Pages site
+        # Publish index.json under /plugins/index.json on the Pages host.
+        run: |
+          mkdir -p _site/plugins
+          cp plugin-registry/index.json _site/plugins/index.json
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  # Deploy the staged artifact to GitHub Pages. Separate job so the
+  # `github-pages` environment (and its protection rules) is only ever
+  # evaluated on non-PR events.
+  deploy:
+    name: Deploy to Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

@@ -1,0 +1,342 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook } from "@testing-library/react";
+import { discardTargetFromReviewFileKey, scrollToFileAndClear } from "./task-changes-panel";
+import {
+  filterVisibleFiles,
+  resolveSelectedFileRepositoryName,
+  shouldBlockChangesForPR,
+  shouldDeferReviewStateForPR,
+  shouldCloseFileDiffPanel,
+  useAutoCloseWhenEmpty,
+} from "./task-changes-panel-state";
+import type { ReviewFile } from "@/components/review/types";
+
+const PATH = "src/foo.ts";
+
+describe("discardTargetFromReviewFileKey", () => {
+  it("preserves an explicit workspace-root repository scope", () => {
+    expect(discardTargetFromReviewFileKey("\u0000README.md")).toEqual({
+      repositoryName: "",
+      path: "README.md",
+    });
+  });
+});
+
+describe("shouldCloseFileDiffPanel", () => {
+  it("returns false when gitStatus is undefined (not loaded yet)", () => {
+    expect(shouldCloseFileDiffPanel(undefined, PATH)).toBe(false);
+  });
+
+  it("does not close while membership is loading or incomplete", () => {
+    expect(shouldCloseFileDiffPanel({ status_state: "loading" }, PATH)).toBe(false);
+    expect(shouldCloseFileDiffPanel({ files: {}, files_complete: false }, PATH)).toBe(false);
+  });
+
+  it("uses the selected repository and change layer as the membership scope", () => {
+    const statusByRepo: NonNullable<Parameters<typeof shouldCloseFileDiffPanel>[4]> = [
+      {
+        repository_name: "frontend",
+        status: { files: { [PATH]: { staged: true } } },
+      },
+      { repository_name: "backend", status: { files: {} } },
+    ];
+
+    expect(shouldCloseFileDiffPanel(undefined, PATH, "frontend", "staged", statusByRepo)).toBe(
+      false,
+    );
+    expect(shouldCloseFileDiffPanel(undefined, PATH, "frontend", "unstaged", statusByRepo)).toBe(
+      true,
+    );
+    expect(shouldCloseFileDiffPanel(undefined, PATH, "backend", undefined, statusByRepo)).toBe(
+      true,
+    );
+    expect(shouldCloseFileDiffPanel(undefined, PATH, "missing", undefined, statusByRepo)).toBe(
+      false,
+    );
+  });
+
+  it("does not close when gitStatus has no complete file map", () => {
+    expect(shouldCloseFileDiffPanel({}, PATH)).toBe(false);
+  });
+
+  it("returns true when the file is missing from gitStatus.files (discarded)", () => {
+    expect(shouldCloseFileDiffPanel({ files: {} }, PATH)).toBe(true);
+  });
+
+  it("returns false when the file has a non-empty uncommitted diff", () => {
+    const gitStatus = { files: { [PATH]: { diff: "@@ -1 +1 @@\n-a\n+b\n" } } };
+    expect(shouldCloseFileDiffPanel(gitStatus, PATH)).toBe(false);
+  });
+
+  it("keeps a file open when membership exists but its diff is empty", () => {
+    const gitStatus = { files: { [PATH]: { diff: "" } } };
+    expect(shouldCloseFileDiffPanel(gitStatus, PATH)).toBe(false);
+  });
+
+  it("keeps a file open when membership exists but its diff is not ready", () => {
+    const gitStatus = { files: { [PATH]: {} } };
+    expect(shouldCloseFileDiffPanel(gitStatus, PATH)).toBe(false);
+  });
+
+  it("is not affected by unrelated files in gitStatus.files", () => {
+    const gitStatus = { files: { "other/file.ts": { diff: "diff content" } } };
+    expect(shouldCloseFileDiffPanel(gitStatus, PATH)).toBe(true);
+  });
+});
+
+function file(path: string, source: ReviewFile["source"]): ReviewFile {
+  return {
+    path,
+    diff: "@@@@",
+    status: "modified",
+    additions: 0,
+    deletions: 0,
+    staged: false,
+    source,
+  };
+}
+
+type FilterOpts = Parameters<typeof filterVisibleFiles>[1];
+
+function allOpts(sourceFilter: FilterOpts["sourceFilter"]): FilterOpts {
+  return { mode: "all", filePath: undefined, fileRepositoryName: undefined, sourceFilter };
+}
+
+function fileOpts(
+  filePath: string,
+  sourceFilter: FilterOpts["sourceFilter"],
+  fileRepositoryName?: string,
+  extra?: Partial<FilterOpts>,
+): FilterOpts {
+  return { mode: "file", filePath, fileRepositoryName, sourceFilter, ...extra };
+}
+
+describe("filterVisibleFiles", () => {
+  const files: ReviewFile[] = [
+    file("a.ts", "uncommitted"),
+    file("b.ts", "committed"),
+    file("c.ts", "pr"),
+  ];
+
+  it("returns all files when mode=all and sourceFilter=all", () => {
+    expect(filterVisibleFiles(files, allOpts("all"))).toHaveLength(3);
+  });
+
+  it("filters by uncommitted source", () => {
+    const result = filterVisibleFiles(files, allOpts("uncommitted"));
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("a.ts");
+  });
+
+  it("filters by pr source", () => {
+    const result = filterVisibleFiles(files, allOpts("pr"));
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("c.ts");
+  });
+
+  it("filters by committed source", () => {
+    const result = filterVisibleFiles(files, allOpts("committed"));
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("b.ts");
+  });
+
+  it("file-mode + sourceFilter intersect (file present in source)", () => {
+    const result = filterVisibleFiles(files, fileOpts("a.ts", "uncommitted"));
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("a.ts");
+  });
+
+  it("file-mode + sourceFilter intersect (file absent from source)", () => {
+    expect(filterVisibleFiles(files, fileOpts("a.ts", "pr"))).toHaveLength(0);
+  });
+
+  it("file-mode opened from PR row should show PR diff even when path exists in uncommitted", () => {
+    const prFile = file("shared.ts", "pr");
+    const allFiles = [file("shared.ts", "uncommitted")]; // deduped — pr entry removed
+    const rawPRFiles = [prFile]; // raw, not deduplicated
+    const result = filterVisibleFiles(
+      allFiles,
+      fileOpts("shared.ts", "pr", undefined, { rawPRFiles }),
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].source).toBe("pr");
+  });
+
+  it("file-mode falls through to allFiles when file not found in rawPRFiles", () => {
+    // rawPRFiles has entries (non-empty) but not for the requested path.
+    // Should fall through and find the file via the normal allFiles path.
+    const rawPRFiles = [file("other.ts", "pr")];
+    const allFiles = [file("a.ts", "pr")];
+    const result = filterVisibleFiles(allFiles, fileOpts("a.ts", "pr", undefined, { rawPRFiles }));
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("a.ts");
+  });
+
+  it("returns empty list when no files match", () => {
+    expect(filterVisibleFiles([], allOpts("all"))).toEqual([]);
+  });
+
+  it("file-mode filters by repository name when provided", () => {
+    const samePathMultiRepo: ReviewFile[] = [
+      { ...file("README.md", "uncommitted"), repository_name: "frontend" },
+      { ...file("README.md", "uncommitted"), repository_name: "backend" },
+    ];
+    const result = filterVisibleFiles(
+      samePathMultiRepo,
+      fileOpts("README.md", "uncommitted", "frontend"),
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].repository_name).toBe("frontend");
+  });
+
+  it("rawPRFiles bypass applies repository name filter in multi-repo scenario", () => {
+    const frontendPR = { ...file("README.md", "pr"), repository_name: "frontend" };
+    const backendPR = { ...file("README.md", "pr"), repository_name: "backend" };
+    const rawPRFiles = [frontendPR, backendPR];
+    // allFiles only has uncommitted — PR entry was shadowed by deduplication
+    const allFiles = [{ ...file("README.md", "uncommitted"), repository_name: "frontend" }];
+    const result = filterVisibleFiles(
+      allFiles,
+      fileOpts("README.md", "pr", "frontend", { rawPRFiles }),
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].repository_name).toBe("frontend");
+    expect(result[0].source).toBe("pr");
+  });
+
+  it("exact PR identity wins when the timeline group label is not the repository name", () => {
+    const rawPRFiles = [{ ...file("README.md", "pr"), repository_name: "widgets" }];
+    const result = filterVisibleFiles(
+      [],
+      fileOpts("README.md", "pr", "widgets · feat/second", {
+        rawPRFiles,
+        prKey: "acme/widgets/42",
+      }),
+    );
+
+    expect(result).toEqual(rawPRFiles);
+  });
+});
+
+describe("shouldDeferReviewStateForPR", () => {
+  it("defers review marks while the visible source is waiting for PR files", () => {
+    expect(shouldDeferReviewStateForPR(true, true, "all")).toBe(true);
+    expect(shouldDeferReviewStateForPR(true, true, "pr")).toBe(true);
+  });
+
+  it("keeps local review marks stable during an unrelated PR fetch", () => {
+    expect(shouldDeferReviewStateForPR(true, true, "uncommitted")).toBe(false);
+    expect(shouldDeferReviewStateForPR(true, true, "committed")).toBe(false);
+  });
+});
+
+describe("shouldBlockChangesForPR", () => {
+  it("keeps local files visible while the selected PR is loading or failed", () => {
+    expect(shouldBlockChangesForPR("all", [file("local.ts", "uncommitted")])).toBe(false);
+  });
+
+  it("blocks an all-source view when only PR files are visible", () => {
+    expect(shouldBlockChangesForPR("all", [file("pr.ts", "pr")])).toBe(true);
+  });
+
+  it("blocks a PR-only view until the selected PR is ready", () => {
+    expect(shouldBlockChangesForPR("pr", [])).toBe(true);
+  });
+});
+
+describe("resolveSelectedFileRepositoryName", () => {
+  it("uses the selected PR file identity instead of a timeline group label", () => {
+    expect(
+      resolveSelectedFileRepositoryName(
+        "pr",
+        "acme/widgets/42",
+        "widgets · feature/second",
+        "widgets-feature-second",
+      ),
+    ).toBe("widgets-feature-second");
+  });
+
+  it("falls back to the router repository name for non-PR source views", () => {
+    expect(resolveSelectedFileRepositoryName("uncommitted", undefined, "backend", "widgets")).toBe(
+      "backend",
+    );
+  });
+});
+
+describe("useAutoCloseWhenEmpty", () => {
+  it("keeps a PR-backed panel open across a loading-to-empty transition", () => {
+    const onBecameEmpty = vi.fn();
+    const initialProps = {
+      mode: "all" as const,
+      filePath: undefined,
+      sourceFilter: "all" as const,
+      gitStatus: undefined,
+      visibleCount: 1,
+      prDiffLoading: false,
+      onBecameEmpty,
+    };
+    const { rerender } = renderHook((props) => useAutoCloseWhenEmpty(props), {
+      initialProps,
+    });
+
+    rerender({ ...initialProps, visibleCount: 0, prDiffLoading: true });
+    rerender({ ...initialProps, visibleCount: 0, prDiffLoading: false });
+
+    expect(onBecameEmpty).not.toHaveBeenCalled();
+  });
+});
+
+describe("scrollToFileAndClear", () => {
+  const rafCallbacks: Array<FrameRequestCallback> = [];
+
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCallbacks.push(cb);
+      return 0;
+    });
+  });
+
+  afterEach(() => {
+    rafCallbacks.length = 0;
+    vi.unstubAllGlobals();
+  });
+
+  it("defers onClearSelected into rAF when ref has a DOM element", () => {
+    const el = document.createElement("div");
+    el.scrollIntoView = vi.fn();
+    const ref = { current: el };
+    const fileRefs = new Map([["src/pr.ts", ref]]);
+    const onClearSelected = vi.fn();
+
+    scrollToFileAndClear("src/pr.ts", fileRefs, onClearSelected);
+
+    expect(onClearSelected).not.toHaveBeenCalled();
+    expect(rafCallbacks).toHaveLength(1);
+
+    rafCallbacks[0](0);
+
+    expect(el.scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+    expect(onClearSelected).toHaveBeenCalledOnce();
+  });
+
+  it("calls onClearSelected immediately when ref has no DOM element", () => {
+    const ref = { current: null };
+    const fileRefs = new Map([["src/pr.ts", ref]]);
+    const onClearSelected = vi.fn();
+
+    scrollToFileAndClear("src/pr.ts", fileRefs, onClearSelected);
+
+    expect(onClearSelected).toHaveBeenCalledOnce();
+    expect(rafCallbacks).toHaveLength(0);
+  });
+
+  it("calls onClearSelected immediately when path not in fileRefs", () => {
+    const fileRefs = new Map<string, { current: HTMLDivElement | null }>();
+    const onClearSelected = vi.fn();
+
+    scrollToFileAndClear("src/missing.ts", fileRefs, onClearSelected);
+
+    expect(onClearSelected).toHaveBeenCalledOnce();
+    expect(rafCallbacks).toHaveLength(0);
+  });
+});

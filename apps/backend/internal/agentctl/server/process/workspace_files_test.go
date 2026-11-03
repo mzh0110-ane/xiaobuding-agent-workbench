@@ -1,0 +1,762 @@
+package process
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/workspacepath"
+	storageworkspaces "github.com/kandev/kandev/internal/system/storage/workspaces"
+	"go.uber.org/zap"
+)
+
+func TestResolveNonExistentPath(t *testing.T) {
+	// Create a real temp dir as the existing ancestor
+	tmpDir := t.TempDir()
+
+	t.Run("fully existing path returns resolved path", func(t *testing.T) {
+		existingFile := filepath.Join(tmpDir, "existing.txt")
+		if err := os.WriteFile(existingFile, []byte(""), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		result, err := resolveNonExistentPath(existingFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected, _ := filepath.EvalSymlinks(existingFile)
+		if result != expected {
+			t.Errorf("got %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("non-existent leaf with existing parent", func(t *testing.T) {
+		nonExistent := filepath.Join(tmpDir, "noexist.txt")
+		result, err := resolveNonExistentPath(nonExistent)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resolvedParent, _ := filepath.EvalSymlinks(tmpDir)
+		expected := filepath.Join(resolvedParent, "noexist.txt")
+		if result != expected {
+			t.Errorf("got %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("non-existent nested directories", func(t *testing.T) {
+		deep := filepath.Join(tmpDir, "a", "b", "c", "file.txt")
+		result, err := resolveNonExistentPath(deep)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resolvedBase, _ := filepath.EvalSymlinks(tmpDir)
+		expected := filepath.Join(resolvedBase, "a", "b", "c", "file.txt")
+		if result != expected {
+			t.Errorf("got %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("existing intermediate directory", func(t *testing.T) {
+		subDir := filepath.Join(tmpDir, "sub")
+		if err := os.Mkdir(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		deep := filepath.Join(subDir, "deep", "file.txt")
+		result, err := resolveNonExistentPath(deep)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resolvedSub, _ := filepath.EvalSymlinks(subDir)
+		expected := filepath.Join(resolvedSub, "deep", "file.txt")
+		if result != expected {
+			t.Errorf("got %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("symlinked ancestor resolves correctly", func(t *testing.T) {
+		realDir := filepath.Join(tmpDir, "real")
+		if err := os.Mkdir(realDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := filepath.Join(tmpDir, "link")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Skip("symlinks not supported")
+		}
+		path := filepath.Join(linkDir, "new", "file.txt")
+		result, err := resolveNonExistentPath(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// realDir itself may be under a symlink (e.g. /var -> /private/var on macOS)
+		resolvedReal, _ := filepath.EvalSymlinks(realDir)
+		expected := filepath.Join(resolvedReal, "new", "file.txt")
+		if result != expected {
+			t.Errorf("got %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("permission error is propagated", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod 0o000 does not block traversal on Windows the way POSIX does")
+		}
+		if os.Getuid() == 0 {
+			t.Skip("skipping permission test: root bypasses filesystem permission checks")
+		}
+		// Create a directory, then make it unreadable
+		restrictedDir := filepath.Join(tmpDir, "restricted")
+		if err := os.Mkdir(restrictedDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		innerDir := filepath.Join(restrictedDir, "inner")
+		if err := os.Mkdir(innerDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Remove read+execute permission on the parent
+		if err := os.Chmod(restrictedDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(restrictedDir, 0o755) })
+
+		if _, probeErr := filepath.EvalSymlinks(innerDir); probeErr == nil {
+			t.Skip("chmod 0o000 did not block path resolution in this environment")
+		}
+		path := filepath.Join(innerDir, "file.txt")
+		_, err := resolveNonExistentPath(path)
+		if err == nil {
+			t.Error("expected error for permission-denied path, got nil")
+		}
+	})
+}
+
+func TestReadFileContent_PermissionErrorIsNotMissing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 0o000 does not block filesystem checks on Windows")
+	}
+	if os.Getuid() == 0 {
+		t.Skip("skipping permission test: root bypasses filesystem permission checks")
+	}
+
+	restrictedDir := t.TempDir()
+	if err := os.Chmod(restrictedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restrictedDir, 0o755) })
+
+	_, _, _, err := readFileContent(filepath.Join(restrictedDir, "missing.txt"))
+	if err == nil {
+		t.Fatal("expected permission error, got nil")
+	}
+	if errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("error = %v, want permission error, not ErrFileNotFound", err)
+	}
+	if strings.Contains(err.Error(), "file not found") {
+		t.Fatalf("error = %v, want no missing-file classification", err)
+	}
+}
+
+func TestWorkspaceFileOperationsAllowRegisteredLinkedSource(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace, logger: log}
+	wt.SetAllowedSourceRoots([]string{source})
+	resolved, err := wt.resolveSafePath(filepath.Join("linked", "created.txt"))
+	if err != nil {
+		t.Fatalf("resolveSafePath through registered link: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != filepath.Join(want, "created.txt") {
+		t.Errorf("resolved path = %q, want %q", resolved, filepath.Join(want, "created.txt"))
+	}
+	if err := wt.CreateFile(filepath.Join("linked", "created.txt")); err != nil {
+		t.Fatalf("CreateFile through registered link: %v", err)
+	}
+	if _, _, err := wt.ApplyFileDiff(context.Background(), filepath.Join("linked", "created.txt"), "", "not a diff", stringPtr("updated")); err != nil {
+		t.Fatalf("ApplyFileDiff through registered link: %v", err)
+	}
+	content, _, _, _, err := wt.GetFileContent(filepath.Join("linked", "created.txt"))
+	if err != nil || content != "updated" {
+		t.Fatalf("GetFileContent through registered link = %q, %v", content, err)
+	}
+	if err := wt.RenameFile(filepath.Join("linked", "created.txt"), filepath.Join("linked", "renamed.txt")); err != nil {
+		t.Fatalf("RenameFile through registered link: %v", err)
+	}
+	if err := wt.DeleteFile(filepath.Join("linked", "renamed.txt")); err != nil {
+		t.Fatalf("DeleteFile through registered link: %v", err)
+	}
+
+	escape := t.TempDir()
+	if err := os.Remove(filepath.Join(workspace, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(escape, filepath.Join(workspace, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.CreateFile(filepath.Join("linked", "escape.txt")); err == nil {
+		t.Fatal("CreateFile through mutated link unexpectedly succeeded")
+	}
+}
+
+// TestWorkspaceFileOperationsWithNoAllowedSourceRootsFailClosed pins the
+// AC-EXECUTORS-SURVIVAL-002.14 recovery contract: when the adopted instance
+// reports zero workspace source roots (nil/empty), the tracker must reject
+// every durable-source symlink escape rather than treating "no roots
+// configured" as "no restriction". Ordinary in-workspace file operations are
+// unaffected, since they never need the allowlist.
+func TestWorkspaceFileOperationsWithNoAllowedSourceRootsFailClosed(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace, logger: log}
+	// Deliberately never call SetAllowedSourceRoots, reproducing the
+	// zero-value state a freshly recovered tracker has before any roots are
+	// (re)applied from the adopted instance.
+
+	if err := wt.CreateFile(filepath.Join("linked", "escape.txt")); err == nil {
+		t.Fatal("CreateFile through an unregistered symlink unexpectedly succeeded with no allowed source roots")
+	}
+	if _, err := os.Stat(filepath.Join(source, "escape.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file leaked into the symlink target despite no allowed source roots: %v", err)
+	}
+
+	if err := wt.CreateFile("plain.txt"); err != nil {
+		t.Fatalf("CreateFile for an ordinary in-workspace path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "plain.txt")); err != nil {
+		t.Fatalf("in-workspace file was not created: %v", err)
+	}
+}
+
+func TestWorkspaceFileMutationsRejectDescendantSymlinkSwap(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, workspace, external string, wt *WorkspaceTracker) error
+		assert  func(t *testing.T, workspace, external string)
+	}{
+		{
+			name: "create",
+			prepare: func(_ *testing.T, _ string, _ string, wt *WorkspaceTracker) error {
+				return wt.CreateFile(filepath.Join("switchable", "created.txt"))
+			},
+			assert: func(t *testing.T, _ string, external string) {
+				if _, err := os.Stat(filepath.Join(external, "created.txt")); !os.IsNotExist(err) {
+					t.Fatalf("create escaped through swapped symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "write",
+			prepare: func(t *testing.T, workspace, _ string, wt *WorkspaceTracker) error {
+				path := filepath.Join(workspace, "switchable", "file.txt")
+				if err := os.WriteFile(path, []byte("original"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				_, _, err := wt.ApplyFileDiff(context.Background(), filepath.Join("switchable", "file.txt"), "", "invalid diff", stringPtr("updated"))
+				return err
+			},
+			assert: func(t *testing.T, _ string, external string) {
+				content, err := os.ReadFile(filepath.Join(external, "file.txt"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(content) != "external" {
+					t.Fatalf("write escaped through swapped symlink = %q", content)
+				}
+			},
+		},
+		{
+			name: "delete",
+			prepare: func(t *testing.T, workspace, _ string, wt *WorkspaceTracker) error {
+				if err := os.WriteFile(filepath.Join(workspace, "switchable", "file.txt"), []byte("original"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return wt.DeleteFile(filepath.Join("switchable", "file.txt"))
+			},
+			assert: func(t *testing.T, _ string, external string) {
+				if _, err := os.Stat(filepath.Join(external, "file.txt")); err != nil {
+					t.Fatalf("delete escaped through swapped symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "rename",
+			prepare: func(t *testing.T, workspace, external string, wt *WorkspaceTracker) error {
+				if err := os.WriteFile(filepath.Join(workspace, "switchable", "from.txt"), []byte("original"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(external, "from.txt"), []byte("external"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return wt.RenameFile(filepath.Join("switchable", "from.txt"), filepath.Join("switchable", "to.txt"))
+			},
+			assert: func(t *testing.T, _ string, external string) {
+				if _, err := os.Stat(filepath.Join(external, "from.txt")); err != nil {
+					t.Fatalf("rename escaped through swapped symlink: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(external, "to.txt")); !os.IsNotExist(err) {
+					t.Fatalf("rename escaped through swapped symlink: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			external := t.TempDir()
+			switchable := filepath.Join(workspace, "switchable")
+			if err := os.Mkdir(switchable, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(external, "file.txt"), []byte("external"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wt := &WorkspaceTracker{workDir: workspace}
+			workspaceMutationBarrier.Store(func() {
+				if err := os.Rename(switchable, filepath.Join(workspace, "original")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(external, switchable); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Cleanup(func() { workspaceMutationBarrier.Store((func())(nil)) })
+
+			if err := tc.prepare(t, workspace, external, wt); err == nil {
+				t.Fatal("mutation unexpectedly succeeded after descendant directory became an external symlink")
+			}
+			tc.assert(t, workspace, external)
+		})
+	}
+}
+
+func TestRenameFileRejectsCrossRootFileMove(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+	if err := os.WriteFile(filepath.Join(source, "source.txt"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace}
+	wt.SetAllowedSourceRoots([]string{source})
+
+	if err := wt.RenameFile(filepath.Join("linked", "source.txt"), "workspace.txt"); err == nil || !strings.Contains(err.Error(), "across workspace roots") {
+		t.Fatalf("RenameFile cross-root error = %v", err)
+	}
+	assertFileContent(t, filepath.Join(source, "source.txt"), "source")
+	if _, err := os.Stat(filepath.Join(workspace, "workspace.txt")); !os.IsNotExist(err) {
+		t.Fatalf("cross-root move created destination: %v", err)
+	}
+}
+
+func TestRenameFileRejectsCrossRootSameRelativePath(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+	if err := os.WriteFile(filepath.Join(source, "foo"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace}
+	wt.SetAllowedSourceRoots([]string{source})
+
+	if err := wt.RenameFile(filepath.Join("linked", "foo"), "foo"); err == nil || !strings.Contains(err.Error(), "across workspace roots") {
+		t.Fatalf("RenameFile cross-root same-relative error = %v", err)
+	}
+	assertFileContent(t, filepath.Join(source, "foo"), "source")
+	if _, err := os.Stat(filepath.Join(workspace, "foo")); !os.IsNotExist(err) {
+		t.Fatalf("cross-root same-relative move created destination: %v", err)
+	}
+}
+
+func TestRenameFileRejectsCrossRootDirectoryMove(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+	if err := os.MkdirAll(filepath.Join(source, "directory", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "directory", "nested", "file.txt"), []byte("content"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace}
+	wt.SetAllowedSourceRoots([]string{source})
+
+	if err := wt.RenameFile(filepath.Join("linked", "directory"), "moved"); err == nil || !strings.Contains(err.Error(), "across workspace roots") {
+		t.Fatalf("RenameFile cross-root directory error = %v", err)
+	}
+	assertFileContent(t, filepath.Join(source, "directory", "nested", "file.txt"), "content")
+	if _, err := os.Stat(filepath.Join(workspace, "moved")); !os.IsNotExist(err) {
+		t.Fatalf("cross-root directory move created destination: %v", err)
+	}
+}
+
+func TestRenameFileCrossRootCollisionLeavesBothPathsUntouched(t *testing.T) {
+	workspace := t.TempDir()
+	source := t.TempDir()
+	if err := os.Symlink(source, filepath.Join(workspace, "linked")); err != nil {
+		t.Skip("symlinks not supported")
+	}
+	if err := os.WriteFile(filepath.Join(source, "source.txt"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "destination.txt"), []byte("destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := &WorkspaceTracker{workDir: workspace}
+	wt.SetAllowedSourceRoots([]string{source})
+
+	err := wt.RenameFile(filepath.Join("linked", "source.txt"), "destination.txt")
+	if err == nil || !strings.Contains(err.Error(), "across workspace roots") {
+		t.Fatalf("RenameFile collision error = %v", err)
+	}
+	assertFileContent(t, filepath.Join(source, "source.txt"), "source")
+	assertFileContent(t, filepath.Join(workspace, "destination.txt"), "destination")
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != want {
+		t.Fatalf("file %q = %q, %v", path, content, err)
+	}
+}
+
+func stringPtr(value string) *string { return &value }
+
+// requireChild finds a child node by name in the tree, failing the test if not found.
+func requireChild(t *testing.T, node *types.FileTreeNode, name string) *types.FileTreeNode {
+	t.Helper()
+	for _, c := range node.Children {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("%s not found in tree children", name)
+	return nil // unreachable, but satisfies staticcheck
+}
+
+func findChild(node *types.FileTreeNode, name string) *types.FileTreeNode {
+	for _, c := range node.Children {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+func createOwnershipMarkerFixture(t *testing.T) string {
+	t.Helper()
+	taskRoot := t.TempDir()
+	repositoryDir := filepath.Join(taskRoot, "repository")
+	if err := os.Mkdir(repositoryDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(taskRoot, storageworkspaces.OwnershipMarkerFilename),
+		filepath.Join(taskRoot, "visible.txt"),
+		filepath.Join(repositoryDir, storageworkspaces.OwnershipMarkerFilename),
+	} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return taskRoot
+}
+
+func TestGetFileTree_HidesOnlyRootOwnershipMarker(t *testing.T) {
+	taskRoot := createOwnershipMarkerFixture(t)
+
+	tree, err := (&WorkspaceTracker{workDir: taskRoot}).GetFileTree("", 2)
+	if err != nil {
+		t.Fatalf("GetFileTree failed: %v", err)
+	}
+	if findChild(tree, storageworkspaces.OwnershipMarkerFilename) != nil {
+		t.Errorf("root ownership marker %q should be hidden", storageworkspaces.OwnershipMarkerFilename)
+	}
+	if findChild(tree, "visible.txt") == nil {
+		t.Error("ordinary root file should remain visible")
+	}
+	repository := requireChild(t, tree, "repository")
+	if findChild(repository, storageworkspaces.OwnershipMarkerFilename) == nil {
+		t.Errorf("nested repository file %q should remain visible", storageworkspaces.OwnershipMarkerFilename)
+	}
+}
+
+func TestGetFileTree_RejectsAbsolutePathBeforeFilesystemAccess(t *testing.T) {
+	workspace := t.TempDir()
+	external := t.TempDir()
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = (&WorkspaceTracker{workDir: workspace, logger: log}).GetFileTree(external, 1)
+	if !errors.Is(err, workspacepath.ErrTreePathNotRelative) {
+		t.Fatalf("GetFileTree error = %v, want %v", err, workspacepath.ErrTreePathNotRelative)
+	}
+}
+
+func TestGetFileTree_AllowsLiteralColonInRelativePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not permit literal colons in path components")
+	}
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "config:dev")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "settings.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := (&WorkspaceTracker{workDir: workspace}).GetFileTree("config:dev", 1)
+	if err != nil {
+		t.Fatalf("GetFileTree failed: %v", err)
+	}
+	if tree.Path != "config:dev" {
+		t.Fatalf("GetFileTree root path = %q, want %q", tree.Path, "config:dev")
+	}
+	if findChild(tree, "settings.json") == nil {
+		t.Fatal("file beneath colon-containing directory should be visible")
+	}
+}
+
+func TestGetFileList_HidesOnlyRootOwnershipMarker(t *testing.T) {
+	taskRoot := createOwnershipMarkerFixture(t)
+	initGitRepoAt(t, taskRoot)
+
+	files, err := (&WorkspaceTracker{workDir: taskRoot}).getFileList(context.Background())
+	if err != nil {
+		t.Fatalf("getFileList failed: %v", err)
+	}
+	paths := make(map[string]bool, len(files.Files))
+	for _, file := range files.Files {
+		paths[filepath.ToSlash(file.Path)] = true
+	}
+	if paths[storageworkspaces.OwnershipMarkerFilename] {
+		t.Errorf("root ownership marker %q should be hidden", storageworkspaces.OwnershipMarkerFilename)
+	}
+	if !paths["visible.txt"] {
+		t.Error("ordinary root file should remain visible")
+	}
+	if !paths["repository/"+storageworkspaces.OwnershipMarkerFilename] {
+		t.Errorf("nested repository file %q should remain visible", storageworkspaces.OwnershipMarkerFilename)
+	}
+}
+
+func TestSearchFiles_HidesOnlyRootOwnershipMarker(t *testing.T) {
+	marker := storageworkspaces.OwnershipMarkerFilename
+	wt := &WorkspaceTracker{currentFiles: types.FileListUpdate{Files: []types.FileEntry{
+		{Path: marker},
+		{Path: filepath.Join("repository", marker)},
+	}}}
+
+	matches := wt.SearchFiles("kandev-workspace", 20)
+	if len(matches) != 1 || matches[0] != filepath.Join("repository", marker) {
+		t.Fatalf("SearchFiles matches = %v, want only nested marker", matches)
+	}
+}
+
+func TestSearchFileCandidatesDoesNotMatchRepositoryName(t *testing.T) {
+	results := searchFileCandidates([]fileSearchCandidate{
+		{
+			path:           "web/docs/unrelated.txt",
+			repositoryName: "web",
+			matchPath:      "docs/unrelated.txt",
+		},
+		{
+			path:           "backend/src/web-client.ts",
+			repositoryName: "backend",
+			matchPath:      "src/web-client.ts",
+		},
+	}, "web", 20)
+
+	if len(results) != 1 || results[0].Path != "backend/src/web-client.ts" {
+		t.Fatalf("search results = %#v, want only the repo-relative filename match", results)
+	}
+}
+
+func TestSearchFileCandidatesBreaksTiesByRepositoryRelativePathLength(t *testing.T) {
+	results := searchFileCandidates([]fileSearchCandidate{
+		{
+			path:           "long-repository-name/a/query.go",
+			repositoryName: "long-repository-name",
+			matchPath:      "a/query.go",
+		},
+		{
+			path:           "x/much-longer/query.go",
+			repositoryName: "x",
+			matchPath:      "much-longer/query.go",
+		},
+	}, "query.go", 20)
+
+	if len(results) != 2 || results[0].Path != "long-repository-name/a/query.go" {
+		t.Fatalf("search results = %#v, want shortest repo-relative path first", results)
+	}
+}
+
+// A caller-supplied limit reaches searchFileCandidates straight from the
+// `limit` query parameter, so an absurd value must not drive the result
+// slice's pre-allocation.
+func TestSearchFileCandidatesClampsCallerSuppliedLimit(t *testing.T) {
+	candidates := make([]fileSearchCandidate, 0, fileSearchMaxLimit+50)
+	for i := range fileSearchMaxLimit + 50 {
+		candidates = append(candidates, fileSearchCandidate{
+			path:      fmt.Sprintf("src/query-%d.go", i),
+			matchPath: fmt.Sprintf("src/query-%d.go", i),
+		})
+	}
+
+	results := searchFileCandidates(candidates, "query", math.MaxInt32)
+
+	if len(results) != fileSearchMaxLimit {
+		t.Fatalf("len(results) = %d, want the clamped %d", len(results), fileSearchMaxLimit)
+	}
+	if cap(results) > fileSearchMaxLimit {
+		t.Fatalf("cap(results) = %d, want no more than the clamped %d", cap(results), fileSearchMaxLimit)
+	}
+}
+
+// The result slice must be sized from the matches we collected, never from the
+// caller-supplied limit, so a workspace with a handful of files cannot be made
+// to reserve a large slice by a single request.
+func TestSearchFileCandidatesSizesResultFromMatchCount(t *testing.T) {
+	candidates := []fileSearchCandidate{
+		{path: "src/query-a.go", matchPath: "src/query-a.go"},
+		{path: "src/query-b.go", matchPath: "src/query-b.go"},
+		{path: "src/unrelated.go", matchPath: "src/unrelated.go"},
+	}
+
+	results := searchFileCandidates(candidates, "query", math.MaxInt32)
+
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want the 2 matching candidates", len(results))
+	}
+	if cap(results) > len(candidates) {
+		t.Fatalf("cap(results) = %d, want no more than the %d candidates searched",
+			cap(results), len(candidates))
+	}
+}
+
+func TestSearchFileCandidatesDefaultsNonPositiveLimit(t *testing.T) {
+	candidates := make([]fileSearchCandidate, 0, fileSearchDefaultLimit+5)
+	for i := range fileSearchDefaultLimit + 5 {
+		candidates = append(candidates, fileSearchCandidate{
+			path:      fmt.Sprintf("src/query-%d.go", i),
+			matchPath: fmt.Sprintf("src/query-%d.go", i),
+		})
+	}
+
+	for _, limit := range []int{0, -1} {
+		results := searchFileCandidates(candidates, "query", limit)
+
+		if len(results) != fileSearchDefaultLimit {
+			t.Fatalf("limit %d: len(results) = %d, want the default %d",
+				limit, len(results), fileSearchDefaultLimit)
+		}
+	}
+}
+
+func TestGetFileTree_Symlinks(t *testing.T) {
+	tmpDir := t.TempDir()
+	wt := &WorkspaceTracker{workDir: tmpDir}
+
+	t.Run("symlink to file shows as file with IsSymlink", func(t *testing.T) {
+		content := []byte("target content")
+		if err := os.WriteFile(filepath.Join(tmpDir, "target.txt"), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("target.txt", filepath.Join(tmpDir, "link.txt")); err != nil {
+			t.Skip("symlinks not supported")
+		}
+
+		tree, err := wt.GetFileTree("", 1)
+		if err != nil {
+			t.Fatalf("GetFileTree failed: %v", err)
+		}
+
+		node := requireChild(t, tree, "link.txt")
+		if node.IsDir {
+			t.Error("symlink to file should not be a directory")
+		}
+		if !node.IsSymlink {
+			t.Error("symlink entry should have IsSymlink=true")
+		}
+		if node.Size != int64(len(content)) {
+			t.Errorf("size = %d, want %d", node.Size, len(content))
+		}
+	})
+
+	t.Run("symlink to directory shows as directory with IsSymlink", func(t *testing.T) {
+		realDir := filepath.Join(tmpDir, "realdir")
+		if err := os.Mkdir(realDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(realDir, "child.txt"), []byte("hi"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("realdir", filepath.Join(tmpDir, "linkdir")); err != nil {
+			t.Skip("symlinks not supported")
+		}
+
+		tree, err := wt.GetFileTree("", 2)
+		if err != nil {
+			t.Fatalf("GetFileTree failed: %v", err)
+		}
+
+		node := requireChild(t, tree, "linkdir")
+		if !node.IsDir {
+			t.Error("symlink to directory should have IsDir=true")
+		}
+		if !node.IsSymlink {
+			t.Error("symlink entry should have IsSymlink=true")
+		}
+		child := findChild(node, "child.txt")
+		if child == nil {
+			t.Error("child.txt not found inside symlinked directory")
+		}
+	})
+
+	t.Run("broken symlink is skipped", func(t *testing.T) {
+		if err := os.Symlink("/nonexistent-target", filepath.Join(tmpDir, "broken")); err != nil {
+			t.Skip("symlinks not supported")
+		}
+
+		tree, err := wt.GetFileTree("", 1)
+		if err != nil {
+			t.Fatalf("GetFileTree failed: %v", err)
+		}
+
+		if findChild(tree, "broken") != nil {
+			t.Error("broken symlink should be skipped in tree")
+		}
+	})
+}

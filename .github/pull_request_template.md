@@ -1,0 +1,81 @@
+<!--
+AGENT INSTRUCTIONS — read this before filling in the template below.
+
+Generate each section using the rules below. Remove a section entirely if it adds no value for the size of the change. Remove all agent instruction comments from the final output.
+
+SUMMARY (required)
+  1–2 sentences max. Do not include a "Summary" heading — write directly as prose.
+  Lead with the problem or goal, end with the outcome.
+  Say WHY, not what. No filler phrases ("This PR...", "In order to...", "As part of...").
+
+LANGUAGE
+  Write the PR title, body, captions, and review-facing prose in English.
+  Translate non-English task text before recording it. Do not include the original wording in the PR body.
+  Keep non-English text only for intentional product localization or exact product data required by the diff.
+  Keep the surrounding explanation in English.
+
+ARCHITECTURE AND SCOPE
+  For contributors without repository write access, if the change is large or architectural, require a linked issue with maintainer discussion before opening the PR. Maintainers and collaborators with `push`, `maintain`, or `admin` permission may open the PR directly; verify the authenticated actor's repository permission before applying this gate.
+  Large changes include new subsystems, public API or protocol changes, persistence changes, new execution boundaries,
+  authentication or permission-model changes, and cross-cutting changes across subsystems.
+  If a non-write contributor is missing the issue or discussion, stop and report the blocker. Do not open a PR to start the discussion.
+  Prefer one logical change and the smallest practical diff. Split unrelated cleanup, refactoring, and feature work.
+
+IMPORTANT CHANGES (optional)
+  Include only for significant architectural changes. Skip for small or straightforward changes.
+  Very short bullet list. Each bullet says WHAT changed and why (very short).
+
+VALIDATION (required)
+  How this was tested or verified. List commands or checks run (e.g. `go test ./...`, `make lint`).
+
+DIAGRAM (optional)
+  Include a Mermaid diagram only when it genuinely helps the reader understand a non-obvious flow,
+  architecture change, or component relationship. Skip if the change is self-explanatory.
+
+POSSIBLE IMPROVEMENTS (optional)
+  One line: risk level + what could go wrong or be improved. Skip if negligible.
+
+DOCUMENTATION COVERAGE
+  The `PR documentation coverage` status uses a deterministic path and artifact
+  check. Runtime, workflow, configuration, and other non-exempt changes need a
+  changed work order linked to its plan, requirements, acceptance criteria, and
+  system design. The exact `no-docs-allow` label is a maintainer exception. The
+  check does not claim semantic completeness or require planning before coding.
+
+RELATED ISSUES
+  Use "Closes #N" if this resolves an issue. Remove the line if there is no related issue.
+
+RULES
+  - Do not add "🤖 Generated with..." or any tool attribution footer.
+  - Do not leave placeholder text or unfilled sections in the output.
+  - Render the final PR body without any of these instruction comments.
+  - Always keep the Checklist section as-is; do not remove or pre-fill its items.
+-->
+
+<!-- Summary: replace this comment with 1–2 sentences of prose, no heading -->
+
+## Important Changes
+
+<!-- Optional: bullet list of significant architectural changes. Remove section if not needed. -->
+
+## Validation
+
+<!-- List commands run or manual steps taken to verify the change. -->
+
+## Diagram
+
+<!-- Optional: Mermaid diagram for non-obvious flows. Remove section if not needed. -->
+
+## Possible Improvements
+
+<!-- Optional: one line on risk level and what could go wrong. Remove section if not needed. -->
+
+## Checklist
+
+- [ ] If I do not have repository write access and this is a large architectural change, I discussed the direction in a linked issue before opening this PR.
+- [ ] This PR contains one logical change; unrelated work is split into separate PRs.
+- [ ] I have performed a self-review of my code.
+- [ ] I have manually tested my changes and they work as expected.
+- [ ] My changes have tests that cover the new functionality and edge cases.
+- [ ] If my change touches UI files (`apps/web/`), I have added or updated Playwright e2e tests in `apps/web/e2e/` and verified them with `make test-e2e`.
+- [ ] I checked whether this affects public docs in `docs/public/**` and updated them or noted why no docs change is needed.

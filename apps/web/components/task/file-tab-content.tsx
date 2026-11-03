@@ -1,0 +1,99 @@
+"use client";
+
+import { TabsContent } from "@kandev/ui/tabs";
+import { FileEditorContent } from "./file-editor-content";
+import { FileImageViewer } from "./file-image-viewer";
+import { FileBinaryViewer } from "./file-binary-viewer";
+import type { OpenFileTab } from "@/lib/types/backend";
+import { getFileCategory, getFilePreviewKind } from "@/lib/utils/file-types";
+import { getSessionWorkspacePath } from "@/lib/session-workspace-path";
+import { FileViewerExternalLink } from "./file-viewer-header";
+import { getFileTabKey } from "./task-center-panel-file-tabs";
+
+function resolveTabCategory(tab: OpenFileTab): "image" | "binary" | "text" {
+  if (!tab.isBinary) return "text";
+  return getFileCategory(tab.path) === "image" ? "image" : "binary";
+}
+
+export function FileTabContent({
+  tab,
+  activeSession,
+  activeSessionId,
+  taskId,
+  isSaving,
+  onFileChange,
+  onFileSave,
+  onFileDelete,
+  onTogglePreview,
+}: {
+  tab: OpenFileTab;
+  activeSession: {
+    workspace_path?: string | null;
+    worktree_path?: string | null;
+    repository_id?: string | null;
+  } | null;
+  activeSessionId: string | null;
+  taskId?: string | null;
+  isSaving: boolean;
+  onFileChange: (path: string, content: string, repo?: string) => void;
+  onFileSave: (path: string, repo?: string) => void;
+  onFileDelete: (path: string, repo?: string) => void;
+  onTogglePreview?: () => void;
+}) {
+  const category = resolveTabCategory(tab);
+  const previewKind = getFilePreviewKind(tab.path, !!tab.isBinary);
+  const workspacePath = getSessionWorkspacePath(activeSession);
+  const externalLink = (
+    <FileViewerExternalLink
+      path={tab.path}
+      sessionId={activeSessionId}
+      taskId={taskId}
+      repositoryId={activeSession?.repository_id}
+      repositoryName={tab.repo}
+    />
+  );
+
+  return (
+    <TabsContent value={`file:${getFileTabKey(tab)}`} className="flex-1 min-h-0">
+      {category === "image" && (
+        <FileImageViewer
+          isSymlink={!!tab.resolvedPath}
+          path={tab.path}
+          content={tab.content}
+          worktreePath={workspacePath}
+          headerActions={externalLink}
+        />
+      )}
+      {category === "binary" && (
+        <FileBinaryViewer
+          isSymlink={!!tab.resolvedPath}
+          path={tab.path}
+          worktreePath={workspacePath}
+          headerActions={externalLink}
+        />
+      )}
+      {category === "text" && (
+        <FileEditorContent
+          isSymlink={!!tab.resolvedPath}
+          path={tab.path}
+          content={tab.content}
+          originalContent={tab.originalContent}
+          isDirty={tab.isDirty}
+          isSaving={isSaving}
+          sessionId={activeSessionId || undefined}
+          taskId={taskId}
+          repositoryId={activeSession?.repository_id ?? undefined}
+          worktreePath={workspacePath}
+          repo={tab.repo}
+          enableComments={!!activeSessionId}
+          previewKind={previewKind}
+          renderedPreview={previewKind === "markdown" && !!tab.renderedPreview}
+          onTogglePreview={previewKind === "markdown" ? onTogglePreview : undefined}
+          onChange={(newContent) => onFileChange(tab.path, newContent, tab.repo)}
+          onSave={() => onFileSave(tab.path, tab.repo)}
+          onDelete={() => onFileDelete(tab.path, tab.repo)}
+        />
+      )}
+    </TabsContent>
+  );
+}

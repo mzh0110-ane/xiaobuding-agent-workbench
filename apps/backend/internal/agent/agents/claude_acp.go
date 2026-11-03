@@ -1,0 +1,226 @@
+package agents
+
+import (
+	"context"
+	_ "embed"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+//go:embed logos/claude_code_light.svg
+var claudeACPLogoLight []byte
+
+//go:embed logos/claude_code_dark.svg
+var claudeACPLogoDark []byte
+
+const claudeACPPackage = "@agentclientprotocol/claude-agent-acp"
+
+// claudeACPPermSettings maps the profile DangerouslySkipPermissions toggle to
+// the Claude Code CLI's --dangerously-skip-permissions flag in passthrough mode.
+// ACP (non-passthrough) Claude does not consume this flag; permission bypass
+// there goes through agentctl's auto-approve channel.
+var claudeACPPermSettings = map[string]PermissionSetting{
+	PermissionKeyDangerouslySkipPermissions: {
+		Supported:       true,
+		Default:         false,
+		Label:           "Skip permission prompts",
+		Description:     "Pass --dangerously-skip-permissions so Claude Code does not prompt for tool approvals.",
+		ApplyMethod:     PermissionApplyMethodCLIFlag,
+		CLIFlag:         "--dangerously-skip-permissions",
+		PassthroughOnly: true,
+		ACPEquivalent:   "the profile's permission mode (Bypass permissions)",
+	},
+}
+
+var (
+	_ Agent                  = (*ClaudeACP)(nil)
+	_ PassthroughAgent       = (*ClaudeACP)(nil)
+	_ InferenceAgent         = (*ClaudeACP)(nil)
+	_ ManagedNPMRuntimeAgent = (*ClaudeACP)(nil)
+)
+
+// ClaudeACP implements Agent for the agentclientprotocol claude-agent-acp package.
+// It speaks the ACP protocol (JSON-RPC 2.0 over stdin/stdout) and wraps the
+// Claude Agent SDK. Used for A/B comparison against the stream-json Claude Code agent.
+type ClaudeACP struct {
+	StandardPassthrough
+}
+
+func NewClaudeACP() *ClaudeACP {
+	return &ClaudeACP{
+		StandardPassthrough: StandardPassthrough{
+			PermSettings: claudeACPPermSettings,
+			Cfg: PassthroughConfig{
+				Supported:         true,
+				Label:             "CLI Passthrough",
+				Description:       "Show terminal directly instead of chat interface",
+				PassthroughCmd:    NewCommand("npx", "-y", "@anthropic-ai/claude-code"),
+				ModelFlag:         NewParam("--model", "{model}"),
+				IdleTimeout:       3 * time.Second,
+				BufferMaxBytes:    DefaultBufferMaxBytes,
+				ResumeFlag:        NewParam("-c"),
+				SessionResumeFlag: NewParam("--resume"),
+				MCPStrategy:       mcpconfig.ClaudeStrategy{},
+				AutoInjectPrompt:  true,
+				SubmitSequence:    "\r",
+				// Claude Code's Ink TUI coalesces multi-byte stdin reads into a
+				// paste burst, absorbing a trailing "\r" into the input rather
+				// than dispatching Enter. A short delay before the submit byte
+				// makes it arrive as a discrete keystroke; 150ms is just over
+				// Ink's paste-detection window and still feels instant. Because
+				// the submit byte is its own write, the body travels as a
+				// bracketed paste, which the TUI absorbs whole at any length.
+				SubmitDelay: 150 * time.Millisecond,
+			},
+		},
+	}
+}
+
+func (a *ClaudeACP) ID() string          { return "claude-acp" }
+func (a *ClaudeACP) Name() string        { return "Claude ACP Agent" }
+func (a *ClaudeACP) DisplayName() string { return "Claude" }
+func (a *ClaudeACP) Description() string {
+	return "Anthropic Claude coding agent using the ACP protocol via the agentclientprotocol bridge."
+}
+func (a *ClaudeACP) Enabled() bool     { return true }
+func (a *ClaudeACP) DisplayOrder() int { return 1 }
+
+func (a *ClaudeACP) Logo(v LogoVariant) []byte {
+	if v == LogoDark {
+		return claudeACPLogoDark
+	}
+	return claudeACPLogoLight
+}
+
+func (a *ClaudeACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+	// Check for the Claude Code CLI on PATH. Auth state is surfaced later by
+	// the ACP probe, not by the presence of ~/.claude.json.
+	result, err := Detect(ctx, WithCommand("claude"))
+	if err != nil {
+		return result, err
+	}
+	result.SupportsMCP = true
+	result.Capabilities = DiscoveryCapabilities{
+		SupportsSessionResume: true,
+	}
+	return result, nil
+}
+
+func (a *ClaudeACP) BuildCommand(opts CommandOptions) Command {
+	return a.ManagedNPMRuntime().ACPCommand(opts.ManagedRuntimeVersion)
+}
+
+func (a *ClaudeACP) ManagedNPMRuntime() ManagedNPMRuntimeSpec {
+	return newManagedNPMRuntimeSpec(claudeACPPackage)
+}
+
+func (a *ClaudeACP) Runtime() *RuntimeConfig {
+	canRecover := true
+	return &RuntimeConfig{
+		Image:       "kandev/multi-agent",
+		Tag:         "latest",
+		Cmd:         a.ManagedNPMRuntime().CachedACPCommand(),
+		WorkingDir:  "{workspace}",
+		RequiredEnv: []string{}, // Auth via ANTHROPIC_API_KEY or OAuth credentials file (see RemoteAuth)
+		Env: map[string]string{
+			// MCP_TIMEOUT remains at the CLI default because it also controls the
+			// first-turn MCP wait. MCP_TOOL_TIMEOUT provides the long budget for
+			// blocking calls. ask_user_question stays active through the MCP
+			// server's progress keepalive. See
+			// docs/specs/agents/system-design/mcp-timeout-budgets.md.
+			"MCP_TIMEOUT":      "30000",
+			"MCP_TOOL_TIMEOUT": "7200000",
+		},
+		ContainerEnv: map[string]string{
+			// Claude's ACP bridge limits bypass mode for root unless the process
+			// runs in a declared sandbox. Executor isolation makes this available;
+			// it does not select a session mode.
+			"IS_SANDBOX": "1",
+		},
+		Mounts: []MountTemplate{
+			{Source: "{workspace}", Target: "/workspace"},
+		},
+		ResourceLimits:  ResourceLimits{MemoryMB: 4096, CPUCores: 2.0, Timeout: time.Hour},
+		Protocol:        agent.ProtocolACP,
+		ProjectSkillDir: ".claude/skills",
+		UserSkillDir:    ".claude/skills",
+		SessionConfig: SessionConfig{
+			NativeSessionResume: true,
+			CanRecover:          &canRecover,
+			SessionDirTemplate:  "{home}/.claude",
+			SessionDirTarget:    "/root/.claude",
+		},
+	}
+}
+
+func (a *ClaudeACP) RemoteAuth() *RemoteAuth {
+	return &RemoteAuth{
+		Methods: []RemoteAuthMethod{
+			{
+				Type:      "env",
+				EnvVar:    "CLAUDE_CODE_OAUTH_TOKEN",
+				SetupHint: "Run `claude setup-token` to generate a long-lived OAuth token",
+				SetupScript: `config_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+mkdir -p "$config_dir"
+umask 077
+cat > "$config_dir/.credentials.json" <<CREDS
+{"claudeAiOauth":{"accessToken":"${CLAUDE_CODE_OAUTH_TOKEN}","expiresAt":4102444800000}}
+CREDS
+cat > "${HOME}/.claude.json" <<'JSON'
+{"hasCompletedOnboarding":true}
+JSON
+chmod 600 "$config_dir/.credentials.json"
+chmod 600 "${HOME}/.claude.json"`,
+			},
+		},
+	}
+}
+
+func (a *ClaudeACP) PortableConfig() *PortableConfig {
+	return &PortableConfig{Bundles: []PortableConfigBundle{
+		{
+			ID:    "claude.settings",
+			Label: "Copy Claude settings",
+			Files: []PortableConfigFile{
+				{SourcePaths: map[string]string{
+					"darwin":  ".claude/settings.json",
+					"linux":   ".claude/settings.json",
+					"windows": ".claude/settings.json",
+				}, TargetPath: ".claude/settings.json"},
+			},
+		},
+	}}
+}
+
+// Verified: `claude --help` documents `claude auth login` as the dedicated
+// sign-in subcommand (also `claude auth logout` / `claude auth status`).
+// Source: https://code.claude.com/docs/en/cli-reference
+func (a *ClaudeACP) LoginCommand() *LoginCommand {
+	return &LoginCommand{
+		Cmd:         []string{"claude", "auth", "login"},
+		Description: "Sign in with your Anthropic account.",
+	}
+}
+
+func (a *ClaudeACP) InstallScript() string {
+	// Install both the user-facing Anthropic CLI (which IsInstalled probes for
+	// and which `claude /login` runs against) and the ACP bridge package.
+	return "npm install -g @anthropic-ai/claude-code " + claudeACPPackage
+}
+
+func (a *ClaudeACP) BillingType() usage.BillingType { return claudeBillingType() }
+
+func (a *ClaudeACP) PermissionSettings() map[string]PermissionSetting {
+	return claudeACPPermSettings
+}
+
+// InferenceConfig returns configuration for one-shot inference using ACP.
+func (a *ClaudeACP) InferenceConfig() *InferenceConfig {
+	return &InferenceConfig{
+		Supported: true,
+		Command:   a.ManagedNPMRuntime().CachedACPCommand(),
+	}
+}

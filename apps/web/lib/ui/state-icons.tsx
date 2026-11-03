@@ -1,0 +1,568 @@
+import type { ComponentType } from "react";
+import { useTranslation } from "react-i18next";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import {
+  IconAlertCircle,
+  IconAlertTriangle,
+  IconCheck,
+  IconCircleCheck,
+  IconCircleDashed,
+  IconCircleFilled,
+  IconFolderOff,
+  IconLoader,
+  IconLoader2,
+  IconMessageQuestion,
+  IconPlayerPause,
+  IconShieldQuestion,
+  IconX,
+} from "@tabler/icons-react";
+import type { ForegroundActivity, TaskSessionState, TaskState } from "@/lib/types/http";
+import { CompositorSpin } from "@kandev/ui/compositor-spin";
+import { cn } from "@/lib/utils";
+
+type IconConfig = {
+  Icon: ComponentType<{ className?: string }>;
+  className: string;
+  animated?: boolean;
+};
+
+const STYLE_MUTED = "text-muted-foreground";
+const STYLE_LOADING = "text-blue-500";
+const STYLE_WARNING = "text-yellow-500";
+const STYLE_PERMISSION = "text-amber-500";
+const STYLE_ERROR = "text-red-500";
+const STYLE_DISABLED = "text-slate-500";
+const WAITING_FOR_INPUT = "WAITING_FOR_INPUT";
+
+const TASK_STATE_ICONS: Record<TaskState, IconConfig> = {
+  CREATED: { Icon: IconAlertCircle, className: STYLE_MUTED },
+  SCHEDULING: { Icon: IconLoader2, className: STYLE_LOADING, animated: true },
+  IN_PROGRESS: { Icon: IconLoader2, className: STYLE_LOADING, animated: true },
+  REVIEW: { Icon: IconCheck, className: STYLE_WARNING },
+  BLOCKED: { Icon: IconAlertCircle, className: STYLE_WARNING },
+  WAITING_FOR_INPUT: { Icon: IconMessageQuestion, className: STYLE_WARNING },
+  COMPLETED: { Icon: IconCheck, className: "text-green-500" },
+  FAILED: { Icon: IconX, className: STYLE_ERROR },
+  CANCELLED: { Icon: IconX, className: STYLE_ERROR },
+  TODO: { Icon: IconAlertCircle, className: STYLE_MUTED },
+};
+
+const SESSION_STATE_ICONS: Record<TaskSessionState, IconConfig> = {
+  CREATED: { Icon: IconAlertCircle, className: STYLE_MUTED },
+  STARTING: { Icon: IconLoader2, className: STYLE_LOADING, animated: true },
+  // (a) generating: the foreground agent is actively producing output. This is
+  // the established "session is running" indicator and is deliberately left
+  // unchanged — the fine-grained busy signal only ADDS a distinct
+  // background-work indicator (below); it does not restyle foreground running.
+  RUNNING: { Icon: IconCircleFilled, className: "text-emerald-500" },
+  // Office sessions: agent process torn down, conversation paused. Use the
+  // pause icon — visually distinct from RUNNING and from terminal states.
+  IDLE: { Icon: IconPlayerPause, className: STYLE_MUTED },
+  WAITING_FOR_INPUT: { Icon: IconMessageQuestion, className: STYLE_WARNING },
+  COMPLETED: { Icon: IconCircleCheck, className: "text-green-500" },
+  FAILED: { Icon: IconAlertTriangle, className: STYLE_ERROR },
+  CANCELLED: { Icon: IconPlayerPause, className: STYLE_MUTED },
+};
+
+// (b) background-running: the foreground turn has yielded to spawned background
+// work (ADR-0049). A spinner — the operator can see the
+// agent is not done — visually separate from the static "generating" dot (a) by
+// its motion AND shape, and from the done checkmark (c) by its motion AND shape,
+// so the three read apart even in a grayscale/desaturated scan (not hue alone,
+// not by color alone. The spinner (work in motion) reads as "something is
+// still running in the background" while the foreground is idle; the solid dot
+// stays reserved for the foreground actively generating.
+//
+// This is the single source for the background-running affordance: every
+// session-level surface (session switcher, session-reopen menu, sidebar running
+// indicator) renders it by calling getSessionStateIcon with the session's
+// foreground_activity rather than re-deriving its own icon.
+const SESSION_BACKGROUND_ICON: IconConfig = {
+  Icon: IconLoader2,
+  className: "text-emerald-500",
+  animated: true,
+};
+
+// The task-level generating affordance — the established running spinner
+// (IconLoader2, smooth arc). Rendered when the task-level MOST-ACTIVE-WINS
+// aggregate is "generating"; kept identical to the existing card spinner so the
+// generating look is unchanged.
+const TASK_GENERATING_ICON: IconConfig = {
+  Icon: IconLoader2,
+  className: STYLE_LOADING,
+  animated: true,
+};
+
+// The task-level background-running affordance:
+// spawned background work is running while the foreground turns are idle. It is a
+// violet segmented spinner (IconLoader) — distinct from the generating spinner
+// (IconLoader2, a blue smooth arc) by BOTH shape AND hue, and from the done check
+// (IconCheck, green) by shape, motion, AND hue. The compact scanning surfaces
+// (board card, task-list row, graph/swimlane node) are dense, so the extra hue
+// separation makes background read apart from generating at a glance, while the
+// shape difference still carries the distinction in a grayscale/desaturated scan
+// Violet is otherwise unused by the task states (blue =
+// generating/loading, green = done, yellow = waiting, red = error), so it reads as
+// its own "still working in the background" state; the motion (a spinner) keeps it
+// from ever being mistaken for the done check.
+const TASK_BACKGROUND_ICON: IconConfig = {
+  Icon: IconLoader,
+  className: "text-violet-500",
+  animated: true,
+};
+
+const PENDING_PERMISSION_ICON: IconConfig = {
+  Icon: IconShieldQuestion,
+  className: STYLE_PERMISSION,
+};
+
+// The task-level interrupted affordance: the session was mid-turn when the
+// backend died and the task has not been resumed. Use the shared warning
+// triangle styling so this durable marker reads as attention-needed state.
+const TASK_INTERRUPTED_ICON: IconConfig = {
+  Icon: IconAlertTriangle,
+  className: STYLE_WARNING,
+};
+
+// The task-level auto-start-failed affordance: a workflow step's
+// auto_start_agent on_enter action ran but could not launch a run (kanban
+// StartTask error, or an Office task with no queue adapter wired / no
+// resolvable agent). A triangle — same error hue as the interrupted circle,
+// but a distinct shape so the two failure causes never read as one marker.
+const TASK_AUTO_START_FAILED_ICON: IconConfig = {
+  Icon: IconAlertTriangle,
+  className: STYLE_ERROR,
+};
+
+// Sentinel for the task-level parked-on-background-work affordance (spec:
+// docs/specs/disambiguate-waiting/spec.md). getTaskStateIcon special-cases
+// this sentinel to render the shared, tooltip-carrying BackgroundWorkTaskIcon
+// component instead of a bare icon, mirroring TASK_INTERRUPTED_ICON's own
+// special case below — the Icon/className fields are never read once
+// special-cased, but IconConfig requires them.
+const TASK_PARKED_ICON: IconConfig = {
+  Icon: IconCircleDashed,
+  className: "text-violet-500 animate-spin",
+};
+
+// The task-level workspace-orphaned affordance: this task inherits an
+// archived parent's workspace, so it can no longer materialize or start. A
+// muted slashed-folder glyph, distinct in both hue and shape from the two
+// STYLE_ERROR red markers above — this reads as "cannot run" rather than
+// "run failed".
+const TASK_WORKSPACE_ORPHANED_ICON: IconConfig = {
+  Icon: IconFolderOff,
+  className: STYLE_DISABLED,
+};
+
+const DEFAULT_TASK_ICON: IconConfig = {
+  Icon: IconAlertCircle,
+  className: STYLE_MUTED,
+};
+
+const DEFAULT_SESSION_ICON: IconConfig = {
+  Icon: IconAlertCircle,
+  className: STYLE_MUTED,
+};
+
+export function isWaitingForInputState(state?: TaskState): boolean {
+  return state === WAITING_FOR_INPUT;
+}
+
+export function shouldUseQuestionTaskIcon(
+  state?: TaskState,
+  hasPendingClarification = false,
+): boolean {
+  return isWaitingForInputState(state) || hasPendingClarification;
+}
+
+// Session states where the agent is actively running work. Anything outside
+// this set (CREATED, WAITING_FOR_INPUT, IDLE, COMPLETED, FAILED, CANCELLED) is
+// not-yet-started, paused, or terminal and must not drive the spinner on its
+// own — even when the task is still in the IN_PROGRESS workflow column.
+const ACTIVE_SESSION_STATES: ReadonlySet<string> = new Set<TaskSessionState>([
+  "STARTING",
+  "RUNNING",
+]);
+
+// Terminal task states whose own icon (done check, failure X, cancel pause)
+// always wins over the interrupted marker.
+const TERMINAL_TASK_STATES: ReadonlySet<TaskState | undefined> = new Set([
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+]);
+
+/**
+ * True when the task or its primary session is in a terminal state whose own
+ * icon (done check, failure X, cancel pause) must win over the interrupted
+ * marker.
+ */
+export function isTerminalInterruptedState(
+  state?: TaskState,
+  sessionState?: TaskSessionState,
+): boolean {
+  return (
+    state === "COMPLETED" ||
+    state === "FAILED" ||
+    state === "CANCELLED" ||
+    sessionState === "COMPLETED" ||
+    sessionState === "FAILED" ||
+    sessionState === "CANCELLED"
+  );
+}
+
+/**
+ * Shared warning affordance for a task whose session was mid-turn when the
+ * backend died. Carries the accessible "Interrupted by restart" label and
+ * tooltip, so every surface that renders the interrupted state (sidebar rows,
+ * board cards, graph nodes, open-task header) presents it consistently.
+ */
+export function InterruptedTaskIcon({ className }: { className?: string }) {
+  const { t } = useTranslation();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={t("common:interruptedByRestart")}
+          tabIndex={0}
+          className="flex shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-500 focus-visible:ring-offset-1"
+        >
+          <IconAlertTriangle
+            aria-hidden="true"
+            data-testid="task-state-interrupted"
+            className={cn(STYLE_WARNING, className)}
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("common:interruptedByRestart")}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Shared red alert-triangle affordance for a task whose auto_start_agent
+ * on_enter action failed to launch a run. Carries the accessible "Auto-start
+ * failed" label and tooltip, so every surface that renders this state
+ * presents it consistently.
+ */
+export function AutoStartFailedTaskIcon({ className }: { className?: string }) {
+  const { t } = useTranslation();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={t("common:autoStartFailed")}
+          tabIndex={0}
+          className="flex shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-1"
+        >
+          <IconAlertTriangle
+            aria-hidden="true"
+            data-testid="task-state-auto-start-failed"
+            className={cn("text-red-500", className)}
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("common:autoStartFailed")}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Shared violet-spinner affordance for a task/session parked on background
+ * work (spec: docs/specs/disambiguate-waiting/spec.md) — the operator's
+ * turn ended but a positively-sampled background process is still live.
+ * Promoted from task-item.tsx (was private there) unchanged, so every
+ * surface that renders it presents the same icon, tooltip, and accessible
+ * label. Follows the InterruptedTaskIcon precedent above.
+ */
+export function BackgroundWorkTaskIcon() {
+  const { t } = useTranslation();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={t("task:backgroundWorkIsRunning")}
+          tabIndex={0}
+          className="mt-[1px] flex shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-1"
+        >
+          <IconCircleDashed
+            aria-hidden="true"
+            data-testid="task-state-background-running"
+            className="h-3.5 w-3.5 shrink-0 animate-spin text-violet-500"
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("task:backgroundWorkIsRunning")}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Shared muted slashed-folder affordance for a task that inherits an
+ * archived parent's workspace and can no longer materialize or start.
+ * Carries the accessible "Workspace orphaned" label and tooltip, so every
+ * surface that renders this state presents it consistently.
+ */
+export function WorkspaceOrphanedTaskIcon({ className }: { className?: string }) {
+  const { t } = useTranslation();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={t("common:workspaceOrphaned")}
+          tabIndex={0}
+          className="flex shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-1"
+        >
+          <IconFolderOff
+            aria-hidden="true"
+            data-testid="task-state-workspace-orphaned"
+            className={cn(STYLE_DISABLED, className)}
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("common:workspaceOrphaned")}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Returns true when the kanban card should show the spinning loader. The task
+ * workflow state and the primary session's runtime state are decoupled — the
+ * workflow can keep a task in `IN_PROGRESS` after the agent has finished, or
+ * move it to `REVIEW` while the current primary session is still running — so
+ * an explicit primary session state takes precedence.
+ *
+ * When no primary session is attached yet (task just created / scheduling),
+ * we still show the spinner so users see the imminent work; otherwise we
+ * require an active session state.
+ *
+ * `CREATED` means the session row exists but the agent has not started. During
+ * a genuine launch the task state is SCHEDULING/IN_PROGRESS, so we defer to the
+ * task state; but an orphaned/resting CREATED session on an otherwise inactive
+ * task (e.g. task CREATED, sitting in a Waiting column) must not spin.
+ *
+ * Exception: `TODO` is the queued/not-started column. Any active session
+ * state reported there is stale (task moved back from IN_PROGRESS, session
+ * still alive) or transient, and the spinner would mislead — suppress it.
+ */
+export function shouldShowTaskRunningSpinner(
+  taskState?: TaskState,
+  primarySessionState?: string | null,
+): boolean {
+  if (taskState === "TODO") return false;
+  const sessionIsKnownAndNotCreated =
+    primarySessionState != null && primarySessionState !== "CREATED";
+  if (sessionIsKnownAndNotCreated) {
+    return ACTIVE_SESSION_STATES.has(primarySessionState);
+  }
+  return taskState === "IN_PROGRESS" || taskState === "SCHEDULING";
+}
+
+export function shouldUsePermissionTaskIcon(hasPendingPermission = false): boolean {
+  return hasPendingPermission;
+}
+
+export function isTaskInFlight(foregroundActivity?: ForegroundActivity | null): boolean {
+  return foregroundActivity === "generating" || foregroundActivity === "background";
+}
+
+type TaskStateIconOptions = {
+  hasPendingClarification?: boolean;
+  foregroundActivity?: ForegroundActivity | null;
+  hasPendingPermission?: boolean;
+  /** True when the task's session was mid-turn when the backend died. */
+  interrupted?: boolean;
+  /** True when a workflow step's auto_start_agent action failed to launch a run. */
+  autoStartFailed?: boolean;
+  /**
+   * True when the task is waiting on the operator to notice, not on the
+   * operator to act — a settled session with a positively-sampled background
+   * process still live (spec: docs/specs/disambiguate-waiting/spec.md).
+   * Outranked by pending-input (permission/clarification) and by an active
+   * foregroundActivity.
+   */
+  parkedOnBackgroundWork?: boolean;
+  /** True when this task inherits an archived parent's workspace and can no
+   *  longer materialize or start. */
+  workspaceOrphaned?: boolean;
+};
+
+// Interrupted (startup reconciliation marker), auto-start-failed (on_enter
+// action that never launched a run), and workspace-orphaned (inherited an
+// archived parent's workspace) all replace the idle/done affordances but
+// never override terminal states, which keep their own icons (done check,
+// failure X, cancel pause). Interrupted takes precedence over
+// auto-start-failed, which takes precedence over workspace-orphaned, when
+// more than one happens to be set.
+function getMarkerIconOverride(
+  state: TaskState | undefined,
+  interrupted: boolean,
+  autoStartFailed: boolean,
+  workspaceOrphaned: boolean,
+): IconConfig | null {
+  if (TERMINAL_TASK_STATES.has(state)) return null;
+  if (interrupted) return TASK_INTERRUPTED_ICON;
+  if (autoStartFailed) return TASK_AUTO_START_FAILED_ICON;
+  if (workspaceOrphaned) return TASK_WORKSPACE_ORPHANED_ICON;
+  return null;
+}
+
+// Pending-input and any live/parked activity signal, in precedence order.
+// Explicit pending input wins first; without it, the task-level
+// MOST-ACTIVE-WINS aggregate (including the parked affordance) sits above the
+// coarse task state, including a stale WAITING_FOR_INPUT state.
+function getPendingOrActiveTaskIcon(
+  state: TaskState | undefined,
+  options: Pick<
+    TaskStateIconOptions,
+    | "hasPendingClarification"
+    | "foregroundActivity"
+    | "hasPendingPermission"
+    | "parkedOnBackgroundWork"
+  >,
+): IconConfig | undefined {
+  const {
+    hasPendingClarification,
+    foregroundActivity,
+    hasPendingPermission,
+    parkedOnBackgroundWork,
+  } = options;
+  if (shouldUsePermissionTaskIcon(hasPendingPermission)) {
+    return PENDING_PERMISSION_ICON;
+  }
+  if (hasPendingClarification) {
+    return TASK_STATE_ICONS.WAITING_FOR_INPUT;
+  }
+  if (foregroundActivity === "generating") return TASK_GENERATING_ICON;
+  if (foregroundActivity === "background") return TASK_BACKGROUND_ICON;
+  // Parked-on-background-work (AC-23): a settled session whose only
+  // remaining life is a positively-sampled background process. Pending-input
+  // and any live foregroundActivity (above) still outrank it (AC-34).
+  if (parkedOnBackgroundWork) return TASK_PARKED_ICON;
+  if (isWaitingForInputState(state)) return TASK_STATE_ICONS.WAITING_FOR_INPUT;
+  return undefined;
+}
+
+function getTaskStateIconConfig(state?: TaskState, options: TaskStateIconOptions = {}): IconConfig {
+  const {
+    hasPendingClarification = false,
+    foregroundActivity,
+    hasPendingPermission = false,
+    interrupted = false,
+    autoStartFailed = false,
+    parkedOnBackgroundWork = false,
+    workspaceOrphaned = false,
+  } = options;
+  const pendingOrActive = getPendingOrActiveTaskIcon(state, {
+    hasPendingClarification,
+    foregroundActivity,
+    hasPendingPermission,
+    parkedOnBackgroundWork,
+  });
+  if (pendingOrActive) return pendingOrActive;
+  const markerOverride = getMarkerIconOverride(
+    state,
+    interrupted,
+    autoStartFailed,
+    workspaceOrphaned,
+  );
+  if (markerOverride) return markerOverride;
+  if (!state) return DEFAULT_TASK_ICON;
+  return TASK_STATE_ICONS[state] ?? DEFAULT_TASK_ICON;
+}
+
+function renderConfiguredIcon(config: IconConfig, className?: string) {
+  const wrapperClassName = cn("h-4 w-4", config.className, className);
+  if (!config.animated) {
+    return <config.Icon className={wrapperClassName} />;
+  }
+  return (
+    <CompositorSpin className={wrapperClassName}>
+      <config.Icon className="size-full" />
+    </CompositorSpin>
+  );
+}
+
+export function getTaskStateIcon(
+  state?: TaskState,
+  className?: string,
+  options: TaskStateIconOptions = {},
+) {
+  const config = getTaskStateIconConfig(state, options);
+  // The interrupted, auto-start-failed, parked, and workspace-orphaned
+  // affordances all carry their own tooltip and accessible label, so they
+  // must render through their shared component rather than a bare icon.
+  if (config === TASK_INTERRUPTED_ICON) {
+    return <InterruptedTaskIcon className={cn("h-4 w-4", className)} />;
+  }
+  if (config === TASK_AUTO_START_FAILED_ICON) {
+    return <AutoStartFailedTaskIcon className={cn("h-4 w-4", className)} />;
+  }
+  if (config === TASK_PARKED_ICON) {
+    return <BackgroundWorkTaskIcon />;
+  }
+  if (config === TASK_WORKSPACE_ORPHANED_ICON) {
+    return <WorkspaceOrphanedTaskIcon className={cn("h-4 w-4", className)} />;
+  }
+  return renderConfiguredIcon(config, className);
+}
+
+type SessionStateIconOptions = {
+  foregroundActivity?: ForegroundActivity | null;
+  hasPendingClarification?: boolean;
+  hasPendingPermission?: boolean;
+  /**
+   * True when the session is waiting on the operator to notice, not on the
+   * operator to act — a settled session with a positively-sampled background
+   * process still live (spec: docs/specs/disambiguate-waiting/spec.md).
+   * Outranked by pending-input and any live foregroundActivity.
+   */
+  parkedOnBackgroundWork?: boolean;
+};
+
+// Pending-input and any live/parked activity signal, in precedence order —
+// mirrors getPendingOrActiveTaskIcon's structure for the task-level resolver.
+function getPendingOrActiveSessionIcon(
+  canRequestInput: boolean,
+  options: SessionStateIconOptions,
+): IconConfig | undefined {
+  if (!canRequestInput) return undefined;
+  const {
+    foregroundActivity,
+    hasPendingClarification,
+    hasPendingPermission,
+    parkedOnBackgroundWork,
+  } = options;
+  if (hasPendingPermission) return PENDING_PERMISSION_ICON;
+  if (hasPendingClarification) return SESSION_STATE_ICONS.WAITING_FOR_INPUT;
+  // Without pending input, background-running wins over the coarse foreground
+  // state so the session never reads as done while detached work remains live.
+  if (foregroundActivity === "background") return SESSION_BACKGROUND_ICON;
+  // Parked-on-background-work (AC-51): a settled session whose only remaining
+  // life is a positively-sampled background process reads identically to a
+  // live foregroundActivity=background session — pending-input above still
+  // outranks it.
+  if (parkedOnBackgroundWork) return SESSION_BACKGROUND_ICON;
+  return undefined;
+}
+
+function getSessionStateIconConfig(
+  state?: TaskSessionState,
+  options: SessionStateIconOptions = {},
+): IconConfig {
+  const canRequestInput = state === "RUNNING" || state === "WAITING_FOR_INPUT";
+  const pendingOrActive = getPendingOrActiveSessionIcon(canRequestInput, options);
+  if (pendingOrActive) return pendingOrActive;
+  if (!state) return DEFAULT_SESSION_ICON;
+  return SESSION_STATE_ICONS[state] ?? DEFAULT_SESSION_ICON;
+}
+
+export function getSessionStateIcon(
+  state?: TaskSessionState,
+  className?: string,
+  options: SessionStateIconOptions = {},
+) {
+  const config = getSessionStateIconConfig(state, options);
+  return renderConfiguredIcon(config, className);
+}

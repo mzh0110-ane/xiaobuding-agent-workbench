@@ -1,0 +1,203 @@
+import { useEffect, useRef } from "react";
+import { fetchWorkflowSnapshot } from "@/lib/api";
+import { snapshotToState } from "@/lib/ssr/mapper";
+import { useAppStore, useAppStoreApi } from "@/components/state-provider";
+import { isCurrentWorkspaceContext } from "@/lib/state/workspace-context";
+import type { KanbanState } from "@/lib/state/slices/kanban/types";
+import { reconcileTaskOverviewRead } from "@/lib/state/slices/task-overview-merge";
+
+type KanbanTask = KanbanState["tasks"][number];
+
+function preserveLiveAutoStartFailed(
+  snapshotTasks: KanbanTask[],
+  fetchStartTasks: KanbanTask[],
+  currentTasks: KanbanTask[],
+) {
+  const fetchStartByID = new Map(fetchStartTasks.map((task) => [task.id, task]));
+  const currentByID = new Map(currentTasks.map((task) => [task.id, task]));
+  return snapshotTasks.map((task) => {
+    const current = currentByID.get(task.id);
+    if (!current) return task;
+    const fetchStart = fetchStartByID.get(task.id);
+    if (
+      task.autoStartFailed === undefined ||
+      fetchStart === undefined ||
+      current.autoStartFailed !== fetchStart.autoStartFailed
+    ) {
+      return { ...task, autoStartFailed: current.autoStartFailed };
+    }
+    return task;
+  });
+}
+
+function preserveLiveWorkspaceOrphaned(
+  snapshotTasks: KanbanTask[],
+  fetchStartTasks: KanbanTask[],
+  currentTasks: KanbanTask[],
+) {
+  const fetchStartByID = new Map(fetchStartTasks.map((task) => [task.id, task]));
+  const currentByID = new Map(currentTasks.map((task) => [task.id, task]));
+  return snapshotTasks.map((task) => {
+    const current = currentByID.get(task.id);
+    if (!current) return task;
+    const fetchStart = fetchStartByID.get(task.id);
+    if (
+      task.workspaceOrphaned === undefined ||
+      fetchStart === undefined ||
+      current.workspaceOrphaned !== fetchStart.workspaceOrphaned
+    ) {
+      return { ...task, workspaceOrphaned: current.workspaceOrphaned };
+    }
+    return task;
+  });
+}
+
+/**
+ * A REST workflow-snapshot fetch can resolve after a live parked-projection
+ * transition (task.updated) has already moved the store ahead, and the two
+ * requests race independently of any "fetch start" bookkeeping. Apply the
+ * same (parked_epoch, parked_revision) lexicographic discard rule as
+ * mergeTaskParkedFields (spec D1) so a REST response can never roll a fresher
+ * live reading back to a stale one.
+ */
+function preserveLiveParkedFields(snapshotTasks: KanbanTask[], currentTasks: KanbanTask[]) {
+  const currentByID = new Map(currentTasks.map((task) => [task.id, task]));
+  return snapshotTasks.map((task) => {
+    const current = currentByID.get(task.id);
+    if (!current) return task;
+    const snapshotEpoch = task.parkedEpoch;
+    const currentEpoch = current.parkedEpoch;
+    const snapshotRevision = task.parkedRevision;
+    const currentRevision = current.parkedRevision;
+    const snapshotIsCurrent =
+      snapshotEpoch !== undefined &&
+      snapshotRevision !== undefined &&
+      (currentEpoch === undefined ||
+        currentRevision === undefined ||
+        snapshotEpoch > currentEpoch ||
+        (snapshotEpoch === currentEpoch && snapshotRevision >= currentRevision));
+    if (snapshotIsCurrent) return task;
+    return {
+      ...task,
+      parkedOnBackgroundWork: current.parkedOnBackgroundWork,
+      parkedRevision: currentRevision,
+      parkedEpoch: currentEpoch,
+    };
+  });
+}
+
+function reconcileFetchedOverview(
+  store: ReturnType<typeof useAppStoreApi>,
+  nextState: ReturnType<typeof snapshotToState>,
+  readId: string | undefined,
+  snapshot: Awaited<ReturnType<typeof fetchWorkflowSnapshot>>,
+): boolean {
+  if (!readId || !nextState.kanban) return true;
+  const state = store.getState();
+  const tasks = reconcileTaskOverviewRead(state.taskOverview, nextState.kanban.tasks, readId, true);
+  if (!tasks) return false;
+  const workflowId = snapshot.workflow.id;
+  nextState.kanban.tasks = tasks.filter(
+    (task) => task.workflowId === workflowId && !task.isArchived,
+  );
+  const coverage = nextState.kanban.taskCoverage;
+  if (coverage)
+    nextState.kanban.taskCoverage = { ...coverage, total: nextState.kanban.tasks.length };
+  nextState.kanbanMulti = {
+    ...state.kanbanMulti,
+    snapshots: {
+      ...state.kanbanMulti.snapshots,
+      [workflowId]: {
+        workflowId,
+        workflowName: snapshot.workflow.name,
+        steps: nextState.kanban.steps,
+        tasks: nextState.kanban.tasks,
+        taskCoverage: nextState.kanban.taskCoverage,
+      },
+    },
+  };
+  state.finishTaskOverviewRead(readId);
+  return true;
+}
+
+export function useWorkflowSnapshot(workflowId: string | null) {
+  const store = useAppStoreApi();
+  const connectionStatus = useAppStore((state) => state.connection.status);
+  const skippedInitialHydratedRef = useRef(false);
+
+  useEffect(() => {
+    if (!workflowId) return;
+    let cancelled = false;
+    const requestState = store.getState();
+    const requestedWorkspaceId = requestState.workspaces.activeId;
+    const requestedGeneration = requestState.workspaceContextGeneration;
+    const existing = requestState.kanban;
+    if (
+      !skippedInitialHydratedRef.current &&
+      existing.workflowId === workflowId &&
+      (existing.steps.length > 0 || existing.tasks.length > 0)
+    ) {
+      skippedInitialHydratedRef.current = true;
+      return;
+    }
+    const setLoading = store.getState().kanban.workflowId !== workflowId;
+    if (setLoading) {
+      store.setState((state) => ({ ...state, kanban: { ...state.kanban, isLoading: true } }));
+    }
+    const overviewRead = store.getState().beginTaskOverviewRead?.();
+    fetchWorkflowSnapshot(workflowId, { cache: "no-store" })
+      .then((snapshot) => {
+        if (
+          cancelled ||
+          !isCurrentWorkspaceContext(store.getState(), requestedWorkspaceId, requestedGeneration)
+        ) {
+          return;
+        }
+        const nextState = snapshotToState(snapshot);
+        if (nextState.kanban) {
+          const currentTasks = store.getState().kanban.tasks;
+          const fetchedAtStartTasks = existing.tasks;
+          nextState.kanban.tasks = preserveLiveParkedFields(
+            preserveLiveWorkspaceOrphaned(
+              preserveLiveAutoStartFailed(
+                nextState.kanban.tasks,
+                fetchedAtStartTasks,
+                currentTasks,
+              ),
+              fetchedAtStartTasks,
+              currentTasks,
+            ),
+            currentTasks,
+          );
+          if (!reconcileFetchedOverview(store, nextState, overviewRead, snapshot)) return;
+        }
+        store.getState().hydrate(nextState);
+      })
+      .catch((error) => {
+        // Suppress superseded-fetch noise; retry happens on WS reconnect.
+        if (
+          cancelled ||
+          !isCurrentWorkspaceContext(store.getState(), requestedWorkspaceId, requestedGeneration)
+        ) {
+          return;
+        }
+        console.warn("[useWorkflowSnapshot] failed to load snapshot:", error);
+      })
+      .finally(() => {
+        if (overviewRead) store.getState().finishTaskOverviewRead(overviewRead);
+        // Only clear the flag this effect raised; skip when cancelled or when a concurrent caller owns it.
+        if (
+          cancelled ||
+          !setLoading ||
+          !isCurrentWorkspaceContext(store.getState(), requestedWorkspaceId, requestedGeneration)
+        ) {
+          return;
+        }
+        store.setState((state) => ({ ...state, kanban: { ...state.kanban, isLoading: false } }));
+      });
+    return () => {
+      cancelled = true;
+      if (overviewRead) store.getState().finishTaskOverviewRead(overviewRead);
+    };
+  }, [workflowId, store, connectionStatus]);
+}

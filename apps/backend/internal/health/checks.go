@@ -1,0 +1,327 @@
+package health
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"time"
+)
+
+// GitHubStatusProvider abstracts the GitHub service status check.
+type GitHubStatusProvider interface {
+	GitHubConnectionHealth(context.Context) (GitHubConnectionHealth, error)
+}
+
+// GitHubConnectionHealth is an aggregate of persisted workspace-owned
+// connections. It intentionally contains no process-global auth state.
+//
+// Every field counts connection rows, never workspaces. A workspace with no
+// connection at all appears nowhere here: it uses Azure DevOps, or no code
+// host, and never had a GitHub connection to lose. Counting those as
+// "disconnected" is what made this warning permanent for anyone using GitHub
+// in some workspaces but not all, so the type no longer carries a field that
+// could be folded back into a degraded tally.
+type GitHubConnectionHealth struct {
+	Active    int
+	Invalid   int
+	Suspended int
+	Revoked   int
+}
+
+// GitHubRateLimitProvider exposes per-resource exhaustion state so the health
+// dialog can surface "GitHub API rate limit exhausted" alongside other setup
+// issues. Implemented by *github.Service.
+type GitHubRateLimitProvider interface {
+	ExhaustedRateLimits() []GitHubRateLimitStatus
+}
+
+// GitHubRateLimitStatus is a minimal DTO so the health package does not have
+// to import the github package (which would create a cycle).
+type GitHubRateLimitStatus struct {
+	Resource string
+	ResetAt  time.Time
+}
+
+// GitHubChecker checks GitHub CLI/auth availability and rate-limit health.
+type GitHubChecker struct {
+	provider     GitHubStatusProvider
+	rateProvider GitHubRateLimitProvider
+}
+
+// NewGitHubChecker creates a checker for GitHub integration status.
+// The provider may be nil if the GitHub service was not initialized.
+func NewGitHubChecker(provider GitHubStatusProvider) *GitHubChecker {
+	return &GitHubChecker{provider: provider}
+}
+
+// WithRateLimitProvider attaches a provider so the checker also surfaces
+// rate-limit exhaustion. Optional — when nil the rate-limit issue is omitted.
+func (c *GitHubChecker) WithRateLimitProvider(p GitHubRateLimitProvider) *GitHubChecker {
+	c.rateProvider = p
+	return c
+}
+
+// Name returns the user-facing label for this check.
+func (c *GitHubChecker) Name() string { return "GitHub integration" }
+
+// Category returns the issue category this checker emits issues under.
+func (c *GitHubChecker) Category() string { return "github" }
+
+func (c *GitHubChecker) Check(ctx context.Context) []Issue {
+	if c.provider == nil {
+		return append([]Issue{{
+			ID:       "github_unavailable",
+			Category: "github",
+			Title:    "GitHub integration unavailable",
+			Message:  "Configure a GitHub connection for a workspace.",
+			Severity: SeverityWarning,
+			FixURL:   "/settings/integrations/github",
+			FixLabel: "Configure GitHub",
+		}}, c.rateLimitIssues()...)
+	}
+	health, err := c.provider.GitHubConnectionHealth(ctx)
+	if err != nil {
+		return append([]Issue{{
+			ID:       "github_status_unavailable",
+			Category: "github",
+			Title:    "GitHub connection status unavailable",
+			Message:  "Kandev could not read workspace GitHub connection status.",
+			Severity: SeverityWarning,
+			FixURL:   "/settings/integrations/github",
+			FixLabel: "View status",
+		}}, c.rateLimitIssues()...)
+	}
+	issues := make([]Issue, 0, 1)
+	degraded := health.Invalid + health.Suspended + health.Revoked
+	// Active is the question that decides which issue to emit, because a
+	// non-active connection cannot authenticate anything: the credential
+	// resolver rejects it outright. Zero active connections therefore means
+	// "no usable GitHub credential", whether that is because none was ever
+	// configured or because every one of them broke. Callers gating a flow on
+	// GitHub access key off this issue, so folding both cases into it keeps
+	// them from proceeding with credentials that will fail later.
+	if health.Active == 0 {
+		issues = append(issues, Issue{
+			ID:       "github_not_authenticated",
+			Category: "github",
+			Title:    "GitHub not authenticated",
+			Message:  noActiveConnectionMessage(health, degraded),
+			Severity: SeverityWarning,
+			FixURL:   "/settings/integrations/github",
+			FixLabel: "Configure GitHub",
+		})
+	} else if degraded > 0 {
+		// At least one connection works, so this is advisory: it names the
+		// broken ones without blocking flows the working one can serve.
+		issues = append(issues, Issue{
+			ID:       "github_workspace_connections_unhealthy",
+			Category: "github",
+			Title:    "GitHub workspace connections need attention",
+			Message: fmt.Sprintf(
+				"%d of %d configured GitHub workspace connections need attention (%d invalid, %d suspended, %d revoked).",
+				degraded, health.Active+degraded, health.Invalid, health.Suspended, health.Revoked,
+			),
+			Severity: SeverityWarning,
+			FixURL:   "/settings/integrations/github",
+			FixLabel: "Configure GitHub",
+		})
+	}
+	return append(issues, c.rateLimitIssues()...)
+}
+
+// noActiveConnectionMessage distinguishes the two ways a deployment ends up
+// with no usable credential. Both block the same flows, but only one of them
+// is fixed by reconnecting an existing connection rather than creating one.
+func noActiveConnectionMessage(health GitHubConnectionHealth, degraded int) string {
+	if degraded == 0 {
+		return "Configure a GitHub connection for a workspace."
+	}
+	return fmt.Sprintf(
+		"No working GitHub connection: all %d configured connections need attention "+
+			"(%d invalid, %d suspended, %d revoked).",
+		degraded, health.Invalid, health.Suspended, health.Revoked,
+	)
+}
+
+// rateLimitIssues materializes one Issue per exhausted resource bucket.
+// Returns nil when the rate-limit provider is missing or every bucket has
+// quota — the issue auto-clears as soon as that happens.
+func (c *GitHubChecker) rateLimitIssues() []Issue {
+	if c.rateProvider == nil {
+		return nil
+	}
+	exhausted := c.rateProvider.ExhaustedRateLimits()
+	if len(exhausted) == 0 {
+		return nil
+	}
+	issues := make([]Issue, 0, len(exhausted))
+	for _, status := range exhausted {
+		issues = append(issues, Issue{
+			ID:       fmt.Sprintf("github_rate_limit_%s", status.Resource),
+			Category: "github",
+			Title:    fmt.Sprintf("GitHub API rate limit exhausted (%s)", status.Resource),
+			Message:  rateLimitMessage(status),
+			Severity: SeverityWarning,
+			FixURL:   "/settings/integrations/github",
+			FixLabel: "View status",
+		})
+	}
+	return issues
+}
+
+func rateLimitMessage(status GitHubRateLimitStatus) string {
+	if status.ResetAt.IsZero() {
+		return "PR/issue checks are paused until the limit resets."
+	}
+	wait := time.Until(status.ResetAt).Round(time.Minute)
+	if wait <= 0 {
+		return "PR/issue checks are paused until the limit resets."
+	}
+	return fmt.Sprintf("PR/issue checks are paused; resets in %s.", wait)
+}
+
+// WorkflowSyncChecker checks whether any configured workflow-sync target has
+// an open auth/config circuit (internal/common/authcircuit) — a credential
+// or repository/branch/path that will keep failing until a human fixes it,
+// as opposed to a transient blip that resolves on its own.
+type WorkflowSyncChecker struct {
+	provider WorkflowSyncStatusProvider
+}
+
+// NewWorkflowSyncChecker creates a checker for workflow-sync circuit health.
+// The provider may be nil if the workflow-sync service was not initialized;
+// the checker then produces no issues (workflow sync is optional).
+func NewWorkflowSyncChecker(provider WorkflowSyncStatusProvider) *WorkflowSyncChecker {
+	return &WorkflowSyncChecker{provider: provider}
+}
+
+// Name returns the user-facing label for this check.
+func (c *WorkflowSyncChecker) Name() string { return "Workflow sync" }
+
+// Category returns the issue category this checker emits issues under.
+func (c *WorkflowSyncChecker) Category() string { return "workflow_sync" }
+
+func (c *WorkflowSyncChecker) Check(ctx context.Context) []Issue {
+	if c.provider == nil {
+		return nil
+	}
+	summary, err := c.provider.WorkflowSyncCircuitSummary(ctx)
+	if err != nil {
+		return []Issue{{
+			ID:       "workflow_sync_status_unavailable",
+			Category: "workflow_sync",
+			Title:    "Workflow sync status unavailable",
+			Message:  "Kandev could not read workflow sync circuit status.",
+			Severity: SeverityWarning,
+			FixURL:   "/settings/system/status",
+			FixLabel: "View status",
+		}}
+	}
+	degraded := summary.OpenAuth + summary.OpenConfig
+	if degraded == 0 {
+		return nil
+	}
+	return []Issue{{
+		ID:       "workflow_sync_circuit_open",
+		Category: "workflow_sync",
+		Title:    "Workflow sync needs attention",
+		Message: fmt.Sprintf(
+			"%d of %d workflow sync targets are paused pending a fix (%d auth, %d config).",
+			degraded, summary.Total, summary.OpenAuth, summary.OpenConfig,
+		),
+		Severity: SeverityWarning,
+		FixURL:   "/settings/system/status",
+		FixLabel: "View status",
+	}}
+}
+
+// GitExecutableChecker checks whether the host git executable is available.
+type GitExecutableChecker struct {
+	lookPath func(string) (string, error)
+}
+
+// NewGitExecutableChecker creates a checker for the required host git binary.
+func NewGitExecutableChecker() *GitExecutableChecker {
+	return &GitExecutableChecker{lookPath: exec.LookPath}
+}
+
+// Name returns the user-facing label for this check.
+func (c *GitExecutableChecker) Name() string { return "Git executable" }
+
+// Category returns the issue category this checker emits issues under.
+func (c *GitExecutableChecker) Category() string { return "system_requirements" }
+
+func (c *GitExecutableChecker) Check(_ context.Context) []Issue {
+	if _, err := c.lookPath("git"); err == nil {
+		return nil
+	}
+	return []Issue{{
+		ID:       "git_executable_missing",
+		Category: c.Category(),
+		Title:    "Git executable is required",
+		Message:  "Install Git and ensure the git executable is available on PATH.",
+		Severity: SeverityError,
+		FixURL:   "/settings/system/status",
+		FixLabel: "View system status",
+	}}
+}
+
+// AgentDiscoveryProvider abstracts the agent discovery check.
+type AgentDiscoveryProvider interface {
+	HasAvailableAgents(ctx context.Context) (bool, error)
+}
+
+// AgentChecker checks whether any AI agents are detected.
+type AgentChecker struct {
+	provider AgentDiscoveryProvider
+}
+
+// NewAgentChecker creates a checker for agent availability.
+func NewAgentChecker(provider AgentDiscoveryProvider) *AgentChecker {
+	return &AgentChecker{provider: provider}
+}
+
+const agentCheckTimeout = 10 * time.Second
+
+// Name returns the user-facing label for this check.
+func (c *AgentChecker) Name() string { return "AI agent availability" }
+
+// Category returns the issue category this checker emits issues under.
+func (c *AgentChecker) Category() string { return "agents" }
+
+func (c *AgentChecker) Check(ctx context.Context) []Issue {
+	if c.provider == nil {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, agentCheckTimeout)
+	defer cancel()
+	available, err := c.provider.HasAvailableAgents(checkCtx)
+	if err != nil {
+		title := "Agent detection failed"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			title = "Agent detection timed out"
+		}
+		return []Issue{{
+			ID:       "agent_detection_failed",
+			Category: "agents",
+			Title:    title,
+			Message:  "Could not verify agent installations. Check Settings > Agents for details.",
+			Severity: SeverityWarning,
+			FixURL:   "/settings/agents",
+			FixLabel: "Check Agents",
+		}}
+	}
+	if !available {
+		return []Issue{{
+			ID:       "no_agents",
+			Category: "agents",
+			Title:    "No AI agents detected",
+			Message:  "Install an AI coding agent (e.g. Claude Code, Codex) to start using Kandev.",
+			Severity: SeverityWarning,
+			FixURL:   "/settings/agents",
+			FixLabel: "Configure Agents",
+		}}
+	}
+	return nil
+}

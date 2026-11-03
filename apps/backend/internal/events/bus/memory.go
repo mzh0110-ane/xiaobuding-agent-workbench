@@ -1,0 +1,423 @@
+package bus
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+// MemoryEventBus implements EventBus using in-memory channels
+type MemoryEventBus struct {
+	subscriptions map[string][]*memorySubscription
+	queues        map[string]*queueGroup // For queue subscriptions
+	mu            sync.RWMutex
+	logger        *logger.Logger
+	closed        bool
+}
+
+// memorySubscription represents an in-memory subscription
+type memorySubscription struct {
+	bus     *MemoryEventBus
+	subject string
+	pattern *regexp.Regexp // For wildcard matching
+	handler EventHandler
+	queue   string // Empty for regular subscriptions
+	active  bool
+	mu      sync.Mutex
+}
+
+type memoryDelivery struct {
+	pattern      string
+	subscription *memorySubscription
+	queue        *queueGroup
+	queueKey     string
+}
+
+// queueGroup manages load balancing for queue subscriptions
+type queueGroup struct {
+	subscribers []*memorySubscription
+	nextIndex   int
+	mu          sync.Mutex
+}
+
+// Unsubscribe removes the subscription
+func (s *memorySubscription) Unsubscribe() error {
+	s.mu.Lock()
+	s.active = false
+	s.mu.Unlock()
+
+	// Remove from bus subscriptions
+	s.bus.mu.Lock()
+	defer s.bus.mu.Unlock()
+
+	if subs, ok := s.bus.subscriptions[s.subject]; ok {
+		for i, sub := range subs {
+			if sub == s {
+				s.bus.subscriptions[s.subject] = append(subs[:i], subs[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Remove from queue group if applicable
+	if s.queue != "" {
+		queueKey := s.queue + ":" + s.subject
+		if qg, ok := s.bus.queues[queueKey]; ok {
+			qg.mu.Lock()
+			for i, sub := range qg.subscribers {
+				if sub == s {
+					qg.subscribers = append(qg.subscribers[:i], qg.subscribers[i+1:]...)
+					break
+				}
+			}
+			qg.mu.Unlock()
+		}
+	}
+
+	return nil
+}
+
+// IsValid returns whether the subscription is still active
+func (s *memorySubscription) IsValid() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active
+}
+
+// NewMemoryEventBus creates a new in-memory event bus
+func NewMemoryEventBus(log *logger.Logger) *MemoryEventBus {
+	return &MemoryEventBus{
+		subscriptions: make(map[string][]*memorySubscription),
+		queues:        make(map[string]*queueGroup),
+		logger:        log,
+	}
+}
+
+// Publish sends an event to all matching subscribers.
+//
+// The concrete subject is stamped onto event.Subject before dispatch so
+// handlers can tell which subject actually matched — event.Type alone is
+// not enough for the per-session/per-run suffixed subjects (see Event.Subject).
+func (b *MemoryEventBus) Publish(ctx context.Context, subject string, event *Event) error {
+	b.mu.RLock()
+	if b.closed {
+		b.mu.RUnlock()
+		return fmt.Errorf("event bus is closed")
+	}
+
+	if event != nil {
+		event.Subject = subject
+	}
+
+	// Snapshot matching subscriptions before invoking handlers. A handler may
+	// publish another event or register a subscription. Holding the bus read
+	// lock while invoking it would block that nested operation and can deadlock
+	// when a subscriber-registration writer is waiting for the same lock.
+	deliveries := make([]memoryDelivery, 0)
+	deliveredQueues := make(map[string]bool)
+	for pattern, subs := range b.subscriptions {
+		for _, sub := range subs {
+			sub.mu.Lock()
+			active := sub.active
+			sub.mu.Unlock()
+
+			if !active {
+				continue
+			}
+
+			if !b.matches(subject, pattern, sub.pattern) {
+				continue
+			}
+
+			// If it's a queue subscription, use the queue group (only once per group)
+			if sub.queue != "" {
+				queueKey := sub.queue + ":" + pattern
+				if !deliveredQueues[queueKey] {
+					deliveredQueues[queueKey] = true
+					deliveries = append(deliveries, memoryDelivery{
+						pattern:      pattern,
+						subscription: sub,
+						queue:        b.queues[queueKey],
+						queueKey:     queueKey,
+					})
+				}
+				continue
+			}
+
+			deliveries = append(deliveries, memoryDelivery{
+				pattern:      pattern,
+				subscription: sub,
+			})
+		}
+	}
+	b.mu.RUnlock()
+
+	for _, delivery := range deliveries {
+		if delivery.subscription.queue != "" {
+			// Queue subscriptions select their target under the queue lock, then
+			// invoke the selected handler without holding the bus lock.
+			b.publishToQueue(ctx, delivery.queue, delivery.queueKey, subject, event)
+			continue
+		}
+		if !delivery.subscription.IsValid() {
+			continue
+		}
+
+		// Regular subscriptions are delivered synchronously to preserve ordering.
+		if err := invokeHandler(ctx, b.logger, "regular", subject, delivery.pattern, event, delivery.subscription.handler); err != nil {
+			b.logger.Error("Event handler error",
+				zap.String("subject", subject),
+				zap.Error(err))
+		}
+	}
+
+	b.logger.Debug("Published event",
+		zap.String("subject", subject),
+		zap.String("event_id", event.ID),
+		zap.String("event_type", event.Type))
+
+	return nil
+}
+
+// Subscribe creates a subscription to a subject pattern
+func (b *MemoryEventBus) Subscribe(subject string, handler EventHandler) (Subscription, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return nil, fmt.Errorf("event bus is closed")
+	}
+
+	sub := &memorySubscription{
+		bus:     b,
+		subject: subject,
+		pattern: compilePattern(subject),
+		handler: handler,
+		active:  true,
+	}
+
+	b.subscriptions[subject] = append(b.subscriptions[subject], sub)
+
+	b.logger.Debug("Subscribed to subject", zap.String("subject", subject))
+	return sub, nil
+}
+
+// QueueSubscribe creates a queue subscription for load balancing
+// Only one subscriber in the queue group receives each message
+func (b *MemoryEventBus) QueueSubscribe(subject, queue string, handler EventHandler) (Subscription, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return nil, fmt.Errorf("event bus is closed")
+	}
+
+	sub := &memorySubscription{
+		bus:     b,
+		subject: subject,
+		pattern: compilePattern(subject),
+		handler: handler,
+		queue:   queue,
+		active:  true,
+	}
+
+	b.subscriptions[subject] = append(b.subscriptions[subject], sub)
+
+	// Add to queue group
+	queueKey := queue + ":" + subject
+	if _, ok := b.queues[queueKey]; !ok {
+		b.queues[queueKey] = &queueGroup{
+			subscribers: make([]*memorySubscription, 0),
+		}
+	}
+	b.queues[queueKey].subscribers = append(b.queues[queueKey].subscribers, sub)
+
+	b.logger.Debug("Queue subscribed to subject",
+		zap.String("subject", subject),
+		zap.String("queue", queue))
+	return sub, nil
+}
+
+// Request sends a request and waits for a response
+func (b *MemoryEventBus) Request(ctx context.Context, subject string, event *Event, timeout time.Duration) (*Event, error) {
+	// For in-memory bus, we implement a simple request-reply pattern
+	// Create a unique reply subject
+	replySubject := fmt.Sprintf("_INBOX.%s", event.ID)
+
+	// Channel to receive the response
+	responseChan := make(chan *Event, 1)
+	errChan := make(chan error, 1)
+
+	// Subscribe to the reply subject
+	sub, err := b.Subscribe(replySubject, func(ctx context.Context, e *Event) error {
+		responseChan <- e
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reply subscription: %w", err)
+	}
+	defer func() {
+		_ = sub.Unsubscribe()
+	}()
+
+	// Add reply subject to event data
+	// We need to handle the case where Data is a struct or a map
+	switch data := event.Data.(type) {
+	case map[string]interface{}:
+		if data == nil {
+			data = make(map[string]interface{})
+		}
+		data["_reply"] = replySubject
+		event.Data = data
+	case nil:
+		event.Data = map[string]interface{}{"_reply": replySubject}
+	default:
+		// For struct types, wrap in a map with the original data and reply subject
+		event.Data = map[string]interface{}{
+			"data":   data,
+			"_reply": replySubject,
+		}
+	}
+
+	// Publish the request
+	if err := b.Publish(ctx, subject, event); err != nil {
+		return nil, fmt.Errorf("failed to publish request: %w", err)
+	}
+
+	// Wait for response with timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	select {
+	case response := <-responseChan:
+		return response, nil
+	case err := <-errChan:
+		return nil, err
+	case <-timeoutCtx.Done():
+		return nil, fmt.Errorf("request timeout after %v", timeout)
+	}
+}
+
+// Close closes the event bus
+func (b *MemoryEventBus) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.closed = true
+
+	// Deactivate all subscriptions
+	for _, subs := range b.subscriptions {
+		for _, sub := range subs {
+			sub.mu.Lock()
+			sub.active = false
+			sub.mu.Unlock()
+		}
+	}
+
+	b.subscriptions = make(map[string][]*memorySubscription)
+	b.queues = make(map[string]*queueGroup)
+
+	b.logger.Info("Memory event bus closed")
+}
+
+// IsConnected returns true (always connected for in-memory)
+func (b *MemoryEventBus) IsConnected() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return !b.closed
+}
+
+// matches checks if a subject matches a pattern
+// Supports NATS-style wildcards: * (single token) and > (multiple tokens)
+func (b *MemoryEventBus) matches(subject, pattern string, regex *regexp.Regexp) bool {
+	// If no wildcards, do exact match
+	if !strings.Contains(pattern, "*") && !strings.Contains(pattern, ">") {
+		return subject == pattern
+	}
+
+	// Use the compiled regex
+	if regex != nil {
+		return regex.MatchString(subject)
+	}
+
+	return false
+}
+
+// compilePattern converts NATS-style pattern to regex
+func compilePattern(pattern string) *regexp.Regexp {
+	// If no wildcards, no need for regex
+	if !strings.Contains(pattern, "*") && !strings.Contains(pattern, ">") {
+		return nil
+	}
+
+	// Escape special regex characters except * and >
+	escaped := regexp.QuoteMeta(pattern)
+
+	// Replace escaped \* with regex for single token (anything except .)
+	escaped = strings.ReplaceAll(escaped, `\*`, `[^.]+`)
+
+	// regexp.QuoteMeta does not escape > because it has no special meaning in
+	// regular expressions. Replace it directly with a multi-token matcher.
+	escaped = strings.ReplaceAll(escaped, `>`, `.+`)
+
+	// Anchor the pattern
+	escaped = "^" + escaped + "$"
+
+	regex, err := regexp.Compile(escaped)
+	if err != nil {
+		return nil
+	}
+
+	return regex
+}
+
+// publishToQueue delivers to one subscriber in the queue group (round-robin)
+func (b *MemoryEventBus) publishToQueue(ctx context.Context, qg *queueGroup, queueKey, subject string, event *Event) {
+	if qg == nil {
+		return
+	}
+
+	// Select the target subscriber under queue lock, then invoke handler after unlock.
+	// Holding qg.mu during handler execution can block all subsequent messages for
+	// the same queue key if a handler is slow or blocked.
+	var selected *memorySubscription
+
+	qg.mu.Lock()
+	if len(qg.subscribers) > 0 {
+		startIndex := qg.nextIndex
+		for i := 0; i < len(qg.subscribers); i++ {
+			idx := (startIndex + i) % len(qg.subscribers)
+			sub := qg.subscribers[idx]
+
+			sub.mu.Lock()
+			active := sub.active
+			sub.mu.Unlock()
+
+			if active {
+				qg.nextIndex = (idx + 1) % len(qg.subscribers)
+				selected = sub
+				break
+			}
+		}
+	}
+	qg.mu.Unlock()
+
+	if selected == nil {
+		return
+	}
+
+	// Deliver synchronously to preserve ordering.
+	if err := invokeHandler(ctx, b.logger, "queue", subject, selected.subject, event, selected.handler); err != nil {
+		b.logger.Error("Queue event handler error",
+			zap.String("subject", subject),
+			zap.String("queue", queueKey),
+			zap.Error(err))
+	}
+}

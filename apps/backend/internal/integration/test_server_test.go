@@ -1,0 +1,626 @@
+// Package integration provides end-to-end integration tests for the Kandev backend.
+package integration
+
+import (
+	"context"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/events/bus"
+	gateways "github.com/kandev/kandev/internal/gateway/websocket"
+	"github.com/kandev/kandev/internal/orchestrator"
+	orchestratorhandlers "github.com/kandev/kandev/internal/orchestrator/handlers"
+	taskhandlers "github.com/kandev/kandev/internal/task/handlers"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository"
+	sqliterepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	taskservice "github.com/kandev/kandev/internal/task/service"
+	"github.com/kandev/kandev/internal/workflow"
+	workflowcontroller "github.com/kandev/kandev/internal/workflow/controller"
+	workflowhandlers "github.com/kandev/kandev/internal/workflow/handlers"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	workflowservice "github.com/kandev/kandev/internal/workflow/service"
+	"github.com/kandev/kandev/internal/worktree"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// OrchestratorTestServer extends TestServer with orchestrator components
+type OrchestratorTestServer struct {
+	Server          *httptest.Server
+	Gateway         *gateways.Gateway
+	TaskRepo        *sqliterepo.Repository
+	TaskSvc         *taskservice.Service
+	WorkflowSvc     *workflowservice.Service
+	EventBus        bus.EventBus
+	OrchestratorSvc *orchestrator.Service
+	AgentManager    *SimulatedAgentManagerClient
+	Logger          *logger.Logger
+	ctx             context.Context
+	cancelFunc      context.CancelFunc
+}
+
+// taskRepositoryAdapter adapts the task repository for the orchestrator
+type taskRepositoryAdapter struct {
+	repo *sqliterepo.Repository
+	svc  *taskservice.Service
+}
+
+type orchestratorWorkflowStepGetter struct {
+	svc *workflowservice.Service
+}
+
+type integrationWorkflowProvider struct {
+	svc *taskservice.Service
+}
+
+func (a *integrationWorkflowProvider) ListWorkflows(ctx context.Context, workspaceID string, includeHidden bool) ([]*models.Workflow, error) {
+	return a.svc.ListWorkflows(ctx, workspaceID, includeHidden)
+}
+
+func (a *integrationWorkflowProvider) GetWorkflow(ctx context.Context, id string) (*models.Workflow, error) {
+	return a.svc.GetWorkflow(ctx, id)
+}
+
+func (a *integrationWorkflowProvider) CreateWorkflow(ctx context.Context, workspaceID, name, description string) (*models.Workflow, error) {
+	return a.svc.CreateWorkflow(ctx, &taskservice.CreateWorkflowRequest{
+		WorkspaceID: workspaceID,
+		Name:        name,
+		Description: description,
+	})
+}
+
+func (a *integrationWorkflowProvider) UpdateWorkflow(ctx context.Context, workflow *models.Workflow) error {
+	prompt := workflow.Prompt
+	_, err := a.svc.UpdateWorkflow(ctx, workflow.ID, &taskservice.UpdateWorkflowRequest{
+		Name:           &workflow.Name,
+		Description:    &workflow.Description,
+		Prompt:         &prompt,
+		AgentProfileID: &workflow.AgentProfileID,
+	})
+	return err
+}
+
+func (a orchestratorWorkflowStepGetter) GetStep(ctx context.Context, stepID string) (*wfmodels.WorkflowStep, error) {
+	return a.svc.GetStep(ctx, stepID)
+}
+
+func (a orchestratorWorkflowStepGetter) GetNextStepByPosition(ctx context.Context, workflowID string, position int) (*wfmodels.WorkflowStep, error) {
+	return a.svc.GetNextStepByPosition(ctx, workflowID, position)
+}
+
+func (a orchestratorWorkflowStepGetter) GetPreviousStepByPosition(ctx context.Context, workflowID string, position int) (*wfmodels.WorkflowStep, error) {
+	return a.svc.GetPreviousStepByPosition(ctx, workflowID, position)
+}
+
+func (a orchestratorWorkflowStepGetter) GetWorkflowMeta(ctx context.Context, workflowID string) (orchestrator.WorkflowMeta, error) {
+	meta, err := a.svc.GetWorkflowMeta(ctx, workflowID)
+	if err != nil {
+		return orchestrator.WorkflowMeta{}, err
+	}
+	return orchestrator.WorkflowMeta{AgentProfileID: meta.AgentProfileID, Prompt: meta.Prompt}, nil
+}
+
+func (a *taskRepositoryAdapter) GetTask(ctx context.Context, taskID string) (*v1.Task, error) {
+	task, err := a.repo.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return task.ToAPI(), nil
+}
+
+func (a *taskRepositoryAdapter) UpdateTaskState(ctx context.Context, taskID string, state v1.TaskState) error {
+	_, err := a.svc.UpdateTaskState(ctx, taskID, state)
+	return err
+}
+
+func (a *taskRepositoryAdapter) UpdateTaskStateIfCurrentIn(
+	ctx context.Context, taskID string, state v1.TaskState, allowed []v1.TaskState,
+) (bool, error) {
+	return a.svc.UpdateTaskStateIfCurrentIn(ctx, taskID, state, allowed)
+}
+
+func (a *taskRepositoryAdapter) UpdateTaskStateIfNotArchived(
+	ctx context.Context, taskID string, state v1.TaskState,
+) (bool, error) {
+	return a.svc.UpdateTaskStateIfNotArchived(ctx, taskID, state)
+}
+
+func (a *taskRepositoryAdapter) UpdateTaskStateIfSessionState(
+	ctx context.Context,
+	taskID, sessionID string,
+	expectedSessionState models.TaskSessionState,
+	state v1.TaskState,
+) (bool, error) {
+	return a.svc.UpdateTaskStateIfSessionState(ctx, taskID, sessionID, expectedSessionState, state)
+}
+
+// testMessageCreatorAdapter adapts the task service to the orchestrator.MessageCreator interface for tests
+type testMessageCreatorAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *testMessageCreatorAdapter) CreateAgentMessage(ctx context.Context, taskID, content, agentSessionID, turnID string) error {
+	_, err := a.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "agent",
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreateUserMessage(ctx context.Context, taskID, content, agentSessionID, turnID string, metadata map[string]interface{}) error {
+	_, err := a.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "user",
+		Metadata:      metadata,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreateUserMessageIdempotent(
+	ctx context.Context,
+	messageID, taskID, content, agentSessionID, turnID string,
+	metadata map[string]interface{},
+) error {
+	_, err := a.svc.CreateMessageIdempotent(ctx, messageID, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "user",
+		Metadata:      metadata,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreateToolCallMessage(ctx context.Context, taskID, toolCallID, parentToolCallID, title, status, agentSessionID, turnID string, normalized *streams.NormalizedPayload) error {
+	metadata := map[string]interface{}{
+		"tool_call_id": toolCallID,
+		"title":        title,
+		"status":       status,
+	}
+	if parentToolCallID != "" {
+		metadata["parent_tool_call_id"] = parentToolCallID
+	}
+	if normalized != nil {
+		metadata["normalized"] = normalized
+	}
+	_, err := a.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       title,
+		AuthorType:    "agent",
+		Type:          "tool_call",
+		Metadata:      metadata,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) UpdateToolCallMessage(ctx context.Context, taskID, toolCallID, parentToolCallID, status, result, agentSessionID, title, turnID, msgType string, normalized *streams.NormalizedPayload) error {
+	return a.svc.UpdateToolCallMessageWithCreate(ctx, agentSessionID, toolCallID, parentToolCallID, status, result, title, normalized, taskID, turnID, msgType)
+}
+
+func (a *testMessageCreatorAdapter) UpsertAgentPlanMessage(
+	ctx context.Context,
+	taskID, sourceToolCallID, agentSessionID, content, turnID string,
+) error {
+	return a.svc.UpsertAgentPlanMessage(
+		ctx, taskID, sourceToolCallID, agentSessionID, content, turnID,
+	)
+}
+
+func (a *testMessageCreatorAdapter) CreateSessionMessage(ctx context.Context, taskID, content, agentSessionID, messageType, turnID string, metadata map[string]interface{}, requestsInput bool) error {
+	_, err := a.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "agent",
+		Type:          messageType,
+		Metadata:      metadata,
+		RequestsInput: requestsInput,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreateSessionMessageIdempotent(ctx context.Context, messageID, taskID, content, agentSessionID, messageType, turnID string, metadata map[string]interface{}, requestsInput bool) error {
+	_, err := a.svc.CreateMessageIdempotent(ctx, messageID, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "agent",
+		Type:          messageType,
+		Metadata:      metadata,
+		RequestsInput: requestsInput,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreateLifecycleSessionMessage(ctx context.Context, taskID, content, agentSessionID, messageType string, metadata map[string]interface{}) error {
+	_, err := a.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		CompletedTurn: true,
+		Content:       content,
+		AuthorType:    "agent",
+		Type:          messageType,
+		Metadata:      metadata,
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) CreatePermissionRequestMessage(ctx context.Context, taskID, sessionID, requestID, pendingID, toolCallID, title, turnID string, options []map[string]interface{}, actionType string, actionDetails map[string]interface{}, decision *models.PermissionDecision) (string, error) {
+	metadata := map[string]interface{}{
+		"request_id":     requestID,
+		"pending_id":     pendingID,
+		"tool_call_id":   toolCallID,
+		"options":        options,
+		"action_type":    actionType,
+		"action_details": actionDetails,
+	}
+	if decision != nil {
+		metadata["permission_decision"] = decision
+		metadata["status"] = string(models.PermissionStatusApproved)
+	}
+	request := &taskservice.CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       title,
+		AuthorType:    "agent",
+		Type:          "permission_request",
+		Metadata:      metadata,
+	}
+	var msg *models.Message
+	var err error
+	if requestID == "" {
+		msg, err = a.svc.CreateMessage(ctx, request)
+	} else {
+		messageID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("permission:"+taskID+":"+sessionID+":"+requestID)).String()
+		msg, err = a.svc.CreateMessageIdempotent(ctx, messageID, request)
+	}
+	if err != nil {
+		return "", err
+	}
+	return msg.ID, nil
+}
+
+func (a *testMessageCreatorAdapter) UpdatePermissionMessage(ctx context.Context, taskID, sessionID, requestID, pendingID string, status models.PermissionStatus) error {
+	return a.svc.UpdatePermissionMessage(ctx, taskID, sessionID, requestID, pendingID, status)
+}
+
+func (a *testMessageCreatorAdapter) ClaimPermissionResolution(ctx context.Context, request models.PermissionResolutionClaimRequest) (*models.PermissionResolutionClaimResult, error) {
+	return a.svc.ClaimPermissionResolution(ctx, request)
+}
+
+func (a *testMessageCreatorAdapter) FinalizePermissionResolution(ctx context.Context, request models.PermissionResolutionFinalizeRequest) (*models.PermissionResolutionFinalizeResult, error) {
+	return a.svc.FinalizePermissionResolution(ctx, request)
+}
+
+func (a *testMessageCreatorAdapter) GetPermissionResolutionAudit(ctx context.Context, taskID, sessionID, requestID, pendingID string) (*models.PermissionResolutionAudit, error) {
+	return a.svc.GetPermissionResolutionAudit(ctx, taskID, sessionID, requestID, pendingID)
+}
+
+func (a *testMessageCreatorAdapter) CreateAgentMessageStreaming(ctx context.Context, messageID, taskID, content, agentSessionID, turnID string) error {
+	_, err := a.svc.CreateMessageWithID(ctx, messageID, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "agent",
+		Type:          "content",
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) AppendAgentMessage(ctx context.Context, messageID, additionalContent string) error {
+	return a.svc.AppendMessageContent(ctx, messageID, additionalContent)
+}
+
+func (a *testMessageCreatorAdapter) CreateThinkingMessageStreaming(ctx context.Context, messageID, taskID, content, agentSessionID, turnID string) error {
+	_, err := a.svc.CreateMessageWithID(ctx, messageID, &taskservice.CreateMessageRequest{
+		TaskSessionID: agentSessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       "",
+		AuthorType:    "agent",
+		Type:          "thinking",
+		Metadata: map[string]interface{}{
+			"thinking": content,
+		},
+	})
+	return err
+}
+
+func (a *testMessageCreatorAdapter) AppendThinkingMessage(ctx context.Context, messageID, additionalContent string) error {
+	return a.svc.AppendThinkingContent(ctx, messageID, additionalContent)
+}
+func (a *testMessageCreatorAdapter) InvalidateModelCache(string) {}
+
+// testTurnServiceAdapter adapts the task service to the orchestrator.TurnService interface for tests
+type testTurnServiceAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *testTurnServiceAdapter) StartTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return a.svc.StartTurn(ctx, sessionID)
+}
+
+func (a *testTurnServiceAdapter) ReserveTurn(
+	ctx context.Context,
+	sessionID string,
+	recovery *models.PromptDispatchRecovery,
+) (*models.Turn, error) {
+	return a.svc.ReserveTurn(ctx, sessionID, recovery)
+}
+
+func (a *testTurnServiceAdapter) PublishReservedTurn(ctx context.Context, turn *models.Turn) error {
+	return a.svc.PublishReservedTurn(ctx, turn)
+}
+
+func (a *testTurnServiceAdapter) MarkReservedTurnDispatchAttempted(ctx context.Context, turn *models.Turn) error {
+	return a.svc.MarkReservedTurnDispatchAttempted(ctx, turn)
+}
+
+func (a *testTurnServiceAdapter) RollbackReservedTurn(
+	ctx context.Context,
+	sessionID, turnID string,
+) (bool, error) {
+	return a.svc.RollbackReservedTurn(ctx, sessionID, turnID)
+}
+
+func (a *testTurnServiceAdapter) ReconcileUnpublishedPromptTurns(ctx context.Context) (int, error) {
+	return a.svc.ReconcileUnpublishedPromptTurns(ctx)
+}
+
+func (a *testTurnServiceAdapter) CompleteTurn(ctx context.Context, turnID string) error {
+	return a.svc.CompleteTurn(ctx, turnID)
+}
+
+func (a *testTurnServiceAdapter) GetTurn(ctx context.Context, turnID string) (*models.Turn, error) {
+	return a.svc.GetTurn(ctx, turnID)
+}
+
+func (a *testTurnServiceAdapter) GetActiveTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return a.svc.GetActiveTurn(ctx, sessionID)
+}
+
+func (a *testTurnServiceAdapter) UpdateTurn(ctx context.Context, turn *models.Turn) error {
+	return a.svc.UpdateTurn(ctx, turn)
+}
+
+func (a *testTurnServiceAdapter) PatchTurnMetadata(
+	ctx context.Context,
+	sessionID, turnID string,
+	updates map[string]interface{},
+) error {
+	return a.svc.PatchTurnMetadata(ctx, sessionID, turnID, updates)
+}
+
+func (a *testTurnServiceAdapter) AbandonOpenTurns(ctx context.Context, sessionID string) error {
+	return a.svc.AbandonOpenTurns(ctx, sessionID)
+}
+
+// NewOrchestratorTestServer creates a test server with full orchestrator support
+func NewOrchestratorTestServer(t *testing.T) *OrchestratorTestServer {
+	t.Helper()
+
+	// Initialize logger (quiet for tests)
+	log, err := logger.NewLogger(logger.LoggingConfig{
+		Level:  "error",
+		Format: "console",
+	})
+	require.NoError(t, err)
+
+	// Create context
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Initialize event bus
+	eventBus := bus.NewMemoryEventBus(log)
+
+	tmpDir := t.TempDir()
+	dbConn, err := db.OpenSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	sqlxDB := sqlx.NewDb(dbConn, "sqlite3")
+	taskRepoImpl, cleanup, err := repository.Provide(sqlxDB, sqlxDB, nil)
+	require.NoError(t, err)
+	taskRepo := taskRepoImpl
+	t.Cleanup(func() {
+		if err := sqlxDB.Close(); err != nil {
+			t.Errorf("failed to close sqlite db: %v", err)
+		}
+		if cleanup != nil {
+			if err := cleanup(); err != nil {
+				t.Errorf("failed to close task repo: %v", err)
+			}
+		}
+	})
+	if _, err := worktree.NewSQLiteStore(sqlxDB, sqlxDB); err != nil {
+		t.Fatalf("failed to init worktree store: %v", err)
+	}
+
+	// Initialize workflow service
+	_, workflowSvc, _, err := workflow.Provide(sqlxDB, sqlxDB, log)
+	require.NoError(t, err)
+
+	// Initialize task service and wire workflow step creator
+	taskSvc := taskservice.NewService(taskservice.Repos{
+		Workspaces: taskRepo, Tasks: taskRepo, TaskRepos: taskRepo,
+		Workflows: taskRepo, Messages: taskRepo, Turns: taskRepo,
+		Sessions: taskRepo, GitSnapshots: taskRepo, RepoEntities: taskRepo,
+		Executors: taskRepo, Environments: taskRepo, TaskEnvironments: taskRepo,
+		Reviews: taskRepo,
+	}, eventBus, log, taskservice.RepositoryDiscoveryConfig{})
+	taskSvc.SetWorkflowStepCreator(workflowSvc)
+	taskSvc.SetWorkflowStepGetter(workflowSvc)
+	taskSvc.SetWorkspaceBootstrapper(taskRepo)
+	workflowSvc.SetWorkflowProvider(&integrationWorkflowProvider{svc: taskSvc})
+
+	// Create simulated agent manager
+	agentManager := NewSimulatedAgentManager(eventBus, log)
+
+	// Create task repository adapter
+	taskRepoAdapter := &taskRepositoryAdapter{repo: taskRepo, svc: taskSvc}
+
+	// Create orchestrator service
+	cfg := orchestrator.DefaultServiceConfig()
+	cfg.Scheduler.ProcessInterval = 50 * time.Millisecond // Faster for tests
+	orchestratorSvc := orchestrator.NewService(cfg, eventBus, agentManager, taskRepoAdapter, taskRepo, nil, nil, nil, log)
+
+	// Wire message creator for message persistence (similar to cmd/kandev/orchestrator.go)
+	msgCreator := &testMessageCreatorAdapter{svc: taskSvc}
+	orchestratorSvc.SetMessageCreator(msgCreator)
+	orchestratorSvc.SetTurnService(&testTurnServiceAdapter{svc: taskSvc})
+	orchestratorSvc.SetWorkflowStepGetter(orchestratorWorkflowStepGetter{svc: workflowSvc})
+
+	// Create WebSocket gateway
+	gateway := gateways.NewGateway(log)
+
+	// Register orchestrator handlers (Pattern A)
+	orchestratorHandlers := orchestratorhandlers.NewHandlers(orchestratorSvc, log)
+	orchestratorHandlers.RegisterHandlers(gateway.Dispatcher)
+
+	// Start hub
+	go gateway.Hub.Run(ctx)
+
+	// Register task notifications to broadcast events to WebSocket clients
+	gateways.RegisterTaskNotifications(ctx, eventBus, gateway.Hub, log)
+
+	// Start orchestrator
+	require.NoError(t, orchestratorSvc.Start(ctx))
+
+	// Create router
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	gateway.SetupRoutes(router)
+
+	// Register handlers (HTTP + WS)
+	workflowCtrl := workflowcontroller.NewController(workflowSvc)
+	taskhandlers.RegisterWorkspaceRoutes(router, gateway.Dispatcher, taskSvc, log)
+	taskhandlers.RegisterWorkflowRoutes(router, gateway.Dispatcher, taskSvc, workflowSvc, log)
+	planService := taskservice.NewPlanService(taskRepo, eventBus, log)
+	taskhandlers.RegisterTaskRoutes(router, gateway.Dispatcher, taskSvc, nil, taskRepo, planService, log)
+	taskhandlers.RegisterRepositoryRoutes(router, gateway.Dispatcher, taskSvc, log)
+	taskhandlers.RegisterExecutorRoutes(router, gateway.Dispatcher, taskSvc, log)
+	taskhandlers.RegisterEnvironmentRoutes(router, gateway.Dispatcher, taskSvc, log)
+	workflowhandlers.RegisterRoutes(router, gateway.Dispatcher, workflowCtrl, eventBus, log)
+
+	// Create test server
+	server := httptest.NewServer(router)
+
+	return &OrchestratorTestServer{
+		Server:          server,
+		Gateway:         gateway,
+		TaskRepo:        taskRepo,
+		TaskSvc:         taskSvc,
+		WorkflowSvc:     workflowSvc,
+		EventBus:        eventBus,
+		OrchestratorSvc: orchestratorSvc,
+		AgentManager:    agentManager,
+		Logger:          log,
+		ctx:             ctx,
+		cancelFunc:      cancel,
+	}
+}
+
+// Close shuts down the test server
+func (ts *OrchestratorTestServer) Close() {
+	if err := ts.OrchestratorSvc.Stop(); err != nil {
+		ts.Logger.Warn("failed to stop orchestrator", zap.Error(err))
+	}
+	ts.AgentManager.Close()
+	ts.cancelFunc()
+	ts.Server.Close()
+	if err := ts.TaskRepo.Close(); err != nil {
+		ts.Logger.Warn("failed to close task repo", zap.Error(err))
+	}
+	ts.EventBus.Close()
+}
+
+// CreateTestTask creates a task for testing.
+func (ts *OrchestratorTestServer) CreateTestTask(t *testing.T, agentProfileID string, priority int) string {
+	t.Helper()
+
+	workspace, err := ts.TaskSvc.CreateWorkspace(context.Background(), &taskservice.CreateWorkspaceRequest{
+		Name: "Test Workspace",
+	})
+	require.NoError(t, err)
+
+	// Create workflow first (workflow steps are created automatically via default template)
+	defaultTemplateID := "simple"
+	wf, err := ts.TaskSvc.CreateWorkflow(context.Background(), &taskservice.CreateWorkflowRequest{
+		WorkspaceID:        workspace.ID,
+		Name:               "Test Workflow",
+		Description:        "Test workflow for orchestrator",
+		WorkflowTemplateID: &defaultTemplateID,
+	})
+	require.NoError(t, err)
+
+	// Get first workflow step from workflow
+	steps, err := ts.WorkflowSvc.ListStepsByWorkflow(context.Background(), wf.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, steps, "workflow should have workflow steps")
+	workflowStepID := steps[0].ID
+
+	// Create task with agent profile ID
+	repository, err := ts.TaskSvc.CreateRepository(context.Background(), &taskservice.CreateRepositoryRequest{
+		WorkspaceID: workspace.ID,
+		Name:        "Test Repo",
+		LocalPath:   createTempRepoDir(t),
+	})
+	require.NoError(t, err)
+
+	taskResult, err := ts.TaskSvc.CreateTask(context.Background(), &taskservice.CreateTaskRequest{
+		WorkspaceID:    workspace.ID,
+		WorkflowID:     wf.ID,
+		WorkflowStepID: workflowStepID,
+		Title:          "Test Task",
+		Description:    "This is a test task for the orchestrator",
+		Priority:       intPriorityForTest(priority),
+		Repositories: []taskservice.TaskRepositoryInput{
+			{
+				RepositoryID: repository.ID,
+				BaseBranch:   "main",
+			},
+		},
+	})
+	task := taskResult.Task
+	require.NoError(t, err)
+
+	return task.ID
+}
+
+// intPriorityForTest maps a legacy integer priority to the TEXT priority
+// label form used after the priority column migration.
+func intPriorityForTest(p int) string {
+	switch {
+	case p >= 8:
+		return "critical"
+	case p >= 4:
+		return "high"
+	case p >= 2:
+		return "medium"
+	case p >= 1:
+		return "low"
+	default:
+		return "medium"
+	}
+}

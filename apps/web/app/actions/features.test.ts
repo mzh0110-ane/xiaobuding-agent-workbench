@@ -1,0 +1,89 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/config", () => ({
+  getBackendConfig: () => ({ apiBaseUrl: "http://backend.test" }),
+}));
+
+import { getRuntimeDebugModeAction } from "./features";
+import { getFeatureFlagsAction } from "./features";
+import { defaultFeatureFlags } from "@/lib/state/slices/features/types";
+import type { FeatureFlags } from "@/lib/state/slices/features/types";
+
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchInit = Parameters<typeof fetch>[1];
+
+const fetchSpy = vi.fn<(...args: [FetchInput, FetchInit?]) => Promise<Response>>();
+
+beforeEach(() => {
+  fetchSpy.mockReset();
+  vi.stubGlobal("fetch", fetchSpy);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function flagsWith(value: boolean): FeatureFlags {
+  return Object.fromEntries(
+    Object.keys(defaultFeatureFlags).map((name) => [name, value]),
+  ) as FeatureFlags;
+}
+
+describe("getFeatureFlagsAction", () => {
+  it("normalizes declared backend flags and ignores unknown keys", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ ...flagsWith(true), unknown: true }));
+
+    await expect(getFeatureFlagsAction()).resolves.toEqual(flagsWith(true));
+  });
+
+  it("fails closed for missing and non-boolean backend values", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ office: "true", appStatusBar: true }));
+
+    await expect(getFeatureFlagsAction()).resolves.toEqual(flagsWith(false));
+  });
+
+  it("falls back to all-off defaults when the backend is unavailable", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 503 }));
+
+    await expect(getFeatureFlagsAction()).resolves.toEqual(flagsWith(false));
+  });
+});
+
+describe("getRuntimeDebugModeAction", () => {
+  it("returns true when the effective debug runtime flag is enabled", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({
+        flags: [{ key: "debug.devMode", effective_value: true }],
+      }),
+    );
+
+    await expect(getRuntimeDebugModeAction()).resolves.toBe(true);
+
+    expect(fetchSpy).toHaveBeenCalledWith("http://backend.test/api/v1/runtime-flags", {
+      cache: "no-store",
+    });
+  });
+
+  it("falls back to false when runtime flags cannot be loaded", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 503 }));
+
+    await expect(getRuntimeDebugModeAction()).resolves.toBe(false);
+  });
+
+  it("returns false when the debug runtime flag is absent", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({
+        flags: [{ key: "features.office", effective_value: true }],
+      }),
+    );
+
+    await expect(getRuntimeDebugModeAction()).resolves.toBe(false);
+  });
+});

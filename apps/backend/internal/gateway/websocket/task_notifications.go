@@ -1,0 +1,430 @@
+package websocket
+
+import (
+	"context"
+	"sync"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/task/models"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+type TaskEventBroadcaster struct {
+	hub           *Hub
+	subscriptions []bus.Subscription
+	logger        *logger.Logger
+	closeMu       sync.Mutex
+	closed        bool
+}
+
+func RegisterTaskNotifications(ctx context.Context, eventBus bus.EventBus, hub *Hub, log *logger.Logger) *TaskEventBroadcaster {
+	b := &TaskEventBroadcaster{
+		hub:    hub,
+		logger: log.WithFields(zap.String("component", "ws-task-broadcaster")),
+	}
+	if eventBus == nil {
+		return b
+	}
+
+	b.subscribe(eventBus, events.WorkspaceCreated, ws.ActionWorkspaceCreated)
+	b.subscribe(eventBus, events.WorkspaceUpdated, ws.ActionWorkspaceUpdated)
+	b.subscribe(eventBus, events.WorkspaceDeleted, ws.ActionWorkspaceDeleted)
+	b.subscribe(eventBus, events.WorkflowCreated, ws.ActionWorkflowCreated)
+	b.subscribe(eventBus, events.WorkflowUpdated, ws.ActionWorkflowUpdated)
+	b.subscribe(eventBus, events.WorkflowDeleted, ws.ActionWorkflowDeleted)
+	b.subscribe(eventBus, events.WorkflowStepCreated, ws.ActionWorkflowStepCreated)
+	b.subscribe(eventBus, events.WorkflowStepUpdated, ws.ActionWorkflowStepUpdated)
+	b.subscribe(eventBus, events.WorkflowStepDeleted, ws.ActionWorkflowStepDeleted)
+	b.subscribe(eventBus, events.PromptsChanged, ws.ActionPromptsChanged)
+	b.subscribe(eventBus, events.AgentProfileCreated, ws.ActionAgentProfileCreated)
+	b.subscribe(eventBus, events.AgentProfileUpdated, ws.ActionAgentProfileUpdated)
+	b.subscribe(eventBus, events.AgentProfileDeleted, ws.ActionAgentProfileDeleted)
+	b.subscribe(eventBus, events.TaskCreated, ws.ActionTaskCreated)
+	b.subscribe(eventBus, events.TaskUpdated, ws.ActionTaskUpdated)
+	b.subscribe(eventBus, events.TaskReordered, ws.ActionTaskReordered)
+	b.subscribe(eventBus, events.SessionWorkspaceSourcesUpdated, ws.ActionSessionWorkspaceSourcesUpdated)
+	b.subscribe(eventBus, events.TaskDeleted, ws.ActionTaskDeleted)
+	b.subscribeLifecycleStateEvents(eventBus)
+	b.subscribe(eventBus, events.TaskPlanCreated, ws.ActionTaskPlanCreated)
+	b.subscribe(eventBus, events.TaskPlanUpdated, ws.ActionTaskPlanUpdated)
+	b.subscribe(eventBus, events.TaskPlanDeleted, ws.ActionTaskPlanDeleted)
+	b.subscribe(eventBus, events.TaskPlanRevisionCreated, ws.ActionTaskPlanRevisionCreated)
+	b.subscribe(eventBus, events.TaskPlanReverted, ws.ActionTaskPlanReverted)
+	b.subscribe(eventBus, events.TaskPlanCommentsChanged, ws.ActionTaskPlanCommentsChanged)
+	b.subscribe(eventBus, events.TaskPreviewFeedbackChanged, ws.ActionTaskPreviewFeedbackChanged)
+	b.subscribe(eventBus, events.TaskWalkthroughCreated, ws.ActionTaskWalkthroughCreated)
+	b.subscribe(eventBus, events.TaskWalkthroughUpdated, ws.ActionTaskWalkthroughUpdated)
+	b.subscribe(eventBus, events.TaskWalkthroughDeleted, ws.ActionTaskWalkthroughDeleted)
+	b.subscribe(eventBus, events.TaskReviewRunUpdated, ws.ActionTaskReviewRunUpdated)
+	b.subscribe(eventBus, events.TaskReviewFindingsPublished, ws.ActionTaskReviewFindingsPublished)
+	b.subscribe(eventBus, events.TaskReviewFindingUpdated, ws.ActionTaskReviewFindingUpdated)
+	b.subscribe(eventBus, events.TaskReviewCleared, ws.ActionTaskReviewCleared)
+	b.subscribe(eventBus, events.RepositoryCreated, ws.ActionRepositoryCreated)
+	b.subscribe(eventBus, events.RepositoryUpdated, ws.ActionRepositoryUpdated)
+	b.subscribe(eventBus, events.RepositoryDeleted, ws.ActionRepositoryDeleted)
+	b.subscribe(eventBus, events.RepositorySetCreated, ws.ActionRepositorySetCreated)
+	b.subscribe(eventBus, events.RepositorySetUpdated, ws.ActionRepositorySetUpdated)
+	b.subscribe(eventBus, events.RepositorySetDeleted, ws.ActionRepositorySetDeleted)
+	b.subscribe(eventBus, events.RepositoryBranchPolicyCreated, ws.ActionRepositoryBranchPolicyCreated)
+	b.subscribe(eventBus, events.RepositoryBranchPolicyUpdated, ws.ActionRepositoryBranchPolicyUpdated)
+	b.subscribe(eventBus, events.RepositoryBranchPolicyDeleted, ws.ActionRepositoryBranchPolicyDeleted)
+	b.subscribe(eventBus, events.RepositoryScriptCreated, ws.ActionRepositoryScriptCreated)
+	b.subscribe(eventBus, events.RepositoryScriptUpdated, ws.ActionRepositoryScriptUpdated)
+	b.subscribe(eventBus, events.RepositoryScriptDeleted, ws.ActionRepositoryScriptDeleted)
+	b.subscribe(eventBus, events.ExecutorCreated, ws.ActionExecutorCreated)
+	b.subscribe(eventBus, events.ExecutorUpdated, ws.ActionExecutorUpdated)
+	b.subscribe(eventBus, events.ExecutorDeleted, ws.ActionExecutorDeleted)
+	b.subscribe(eventBus, events.ExecutorReachabilityChanged, ws.ActionExecutorReachabilityChanged)
+	b.subscribe(eventBus, events.ExecutorProfileCreated, ws.ActionExecutorProfileCreated)
+	b.subscribe(eventBus, events.ExecutorProfileUpdated, ws.ActionExecutorProfileUpdated)
+	b.subscribe(eventBus, events.ExecutorProfileDeleted, ws.ActionExecutorProfileDeleted)
+	b.subscribe(eventBus, events.ExecutorPrepareProgress, ws.ActionExecutorPrepareProgress)
+	b.subscribe(eventBus, events.ExecutorPrepareCompleted, ws.ActionExecutorPrepareCompleted)
+	b.subscribe(eventBus, events.EnvironmentCreated, ws.ActionEnvironmentCreated)
+	b.subscribe(eventBus, events.EnvironmentUpdated, ws.ActionEnvironmentUpdated)
+	b.subscribe(eventBus, events.EnvironmentDeleted, ws.ActionEnvironmentDeleted)
+	b.subscribe(eventBus, events.TaskSessionActivityChanged, ws.ActionSessionActivityChanged)
+	b.subscribe(eventBus, events.TaskSessionCancellationChanged, ws.ActionSessionCancellationChanged)
+	b.subscribe(eventBus, events.SessionPendingActionChanged, ws.ActionSessionPendingActionChanged)
+	b.subscribe(eventBus, events.TaskStatusSummaryUpdated, ws.ActionTaskStatusSummaryUpdated)
+	b.subscribeOrderedMessageEvents(eventBus)
+	b.subscribe(eventBus, events.AgentctlStarting, ws.ActionSessionAgentctlStarting)
+	b.subscribe(eventBus, events.AgentctlReady, ws.ActionSessionAgentctlReady)
+	b.subscribe(eventBus, events.AgentctlError, ws.ActionSessionAgentctlError)
+	b.subscribe(eventBus, events.TurnStarted, ws.ActionSessionTurnStarted)
+	b.subscribe(eventBus, events.TurnCompleted, ws.ActionSessionTurnCompleted)
+	b.subscribe(eventBus, events.TurnRemoved, ws.ActionSessionTurnRemoved)
+	b.subscribe(eventBus, events.SessionRemoved, ws.ActionSessionRemoved)
+	b.subscribe(eventBus, events.MessageQueueStatusChanged, ws.ActionMessageQueueStatusChanged)
+	b.subscribe(eventBus, events.GitHubTaskPRUpdated, ws.ActionGitHubTaskPRUpdated)
+	b.subscribe(eventBus, events.GitHubTaskPRDeleted, ws.ActionGitHubTaskPRDeleted)
+	b.subscribe(eventBus, events.GitHubTaskCIOptionsUpdated, ws.ActionGitHubTaskCIOptionsUpdated)
+	b.subscribe(eventBus, events.GitHubRateLimitUpdated, ws.ActionGitHubRateLimitUpdated)
+	b.subscribe(eventBus, events.GitHubPRDiscoveryHealthUpdated, ws.ActionGitHubPRDiscoveryHealthUpdated)
+	b.subscribe(eventBus, events.GitLabTaskMRUpdated, ws.ActionGitLabTaskMRUpdated)
+	b.subscribe(eventBus, events.GitLabTaskMRDeleted, ws.ActionGitLabTaskMRDeleted)
+	b.subscribe(eventBus, events.GitLabTaskMROptionsUpdated, ws.ActionGitLabTaskMRAutomationUpdated)
+
+	go func() {
+		<-ctx.Done()
+		b.Close()
+	}()
+
+	return b
+}
+
+func (b *TaskEventBroadcaster) Close() {
+	b.closeMu.Lock()
+	if b.closed {
+		b.closeMu.Unlock()
+		return
+	}
+	b.closed = true
+	subscriptions := b.subscriptions
+	b.subscriptions = nil
+	b.closeMu.Unlock()
+
+	for _, sub := range subscriptions {
+		if sub != nil && sub.IsValid() {
+			_ = sub.Unsubscribe()
+		}
+	}
+}
+
+func (b *TaskEventBroadcaster) subscribe(eventBus bus.EventBus, subject, action string) {
+	b.subscribeWithResolver(eventBus, subject, func(*bus.Event) string { return action })
+}
+
+// subscribeLifecycleStateEvents uses one NATS subscription so task and session
+// state notifications remain ordered for clients when the event bus is remote.
+func (b *TaskEventBroadcaster) subscribeLifecycleStateEvents(eventBus bus.EventBus) {
+	b.subscribeWithResolver(eventBus, ">", func(event *bus.Event) string {
+		switch event.EffectiveSubject() {
+		case events.TaskStateChanged:
+			return ws.ActionTaskStateChanged
+		case events.TaskSessionStateChanged:
+			return ws.ActionSessionStateChanged
+		default:
+			return ""
+		}
+	})
+}
+
+// subscribeOrderedMessageEvents carries every transcript mutation through one
+// NATS callback queue. Separate subject subscriptions can run concurrently and
+// invert a deletion and its replacement before journal or client fan-out.
+func (b *TaskEventBroadcaster) subscribeOrderedMessageEvents(eventBus bus.EventBus) {
+	b.subscribeWithResolver(eventBus, ">", func(event *bus.Event) string {
+		switch event.EffectiveSubject() {
+		case events.MessageAdded:
+			return ws.ActionSessionMessageAdded
+		case events.MessageUpdated:
+			return ws.ActionSessionMessageUpdated
+		case events.MessageDeleted:
+			return ws.ActionSessionMessageDeleted
+		default:
+			return ""
+		}
+	})
+}
+
+func (b *TaskEventBroadcaster) subscribeWithResolver(
+	eventBus bus.EventBus,
+	subject string,
+	resolveAction func(*bus.Event) string,
+) {
+	sub, err := eventBus.Subscribe(subject, func(ctx context.Context, event *bus.Event) error {
+		action := resolveAction(event)
+		if action == "" {
+			return nil
+		}
+		return b.broadcastEvent(ctx, event, action)
+	})
+	if err != nil {
+		b.logger.Error("failed to subscribe to events", zap.String("subject", subject), zap.Error(err))
+		return
+	}
+	b.closeMu.Lock()
+	if b.closed {
+		b.closeMu.Unlock()
+		if sub.IsValid() {
+			_ = sub.Unsubscribe()
+		}
+		return
+	}
+	b.subscriptions = append(b.subscriptions, sub)
+	b.closeMu.Unlock()
+}
+
+func (b *TaskEventBroadcaster) broadcastEvent(ctx context.Context, event *bus.Event, action string) error {
+	msg, err := ws.NewNotification(action, event.Data)
+	if err != nil {
+		b.logger.Error("failed to build websocket notification", zap.String("action", action), zap.Error(err))
+		return nil
+	}
+	sessionID := extractSessionID(event.Data)
+	b.logSessionStateMetadata(action, sessionID, event.Data)
+	if data, ok := event.Data.(map[string]interface{}); ok {
+		b.logLifecycleBroadcast(action, data, sessionID)
+	}
+
+	return b.routeBroadcast(action, event.Data, sessionID, extractWorkspaceID(event.Data), msg)
+}
+
+func (b *TaskEventBroadcaster) logSessionStateMetadata(action, sessionID string, data interface{}) {
+	if action != ws.ActionSessionStateChanged {
+		return
+	}
+	payload, ok := data.(map[string]interface{})
+	if !ok {
+		return
+	}
+	metadata, ok := payload["metadata"]
+	if !ok {
+		return
+	}
+	b.logger.Debug("received session.state_changed with metadata",
+		zap.String("action", action),
+		zap.String("session_id", sessionID),
+		// RemediationURL is deliberately excluded from the wholesale metadata
+		// echo (ADR-2026-08-07-allowlisted-provider-action-links): the link is
+		// a user-visible destination, not a log field.
+		zap.Any("metadata", redactRemediationURL(metadata)))
+}
+
+// redactRemediationURL returns a copy of the metadata with the
+// last_agent_error.remediation_url key removed, so the debug echo never
+// mutates the event payload that is broadcast to clients.
+func redactRemediationURL(metadata interface{}) interface{} {
+	m, ok := metadata.(map[string]interface{})
+	if !ok {
+		return metadata
+	}
+	lastErr, ok := m["last_agent_error"].(map[string]interface{})
+	if !ok {
+		return metadata
+	}
+	copyLastErr := make(map[string]interface{}, len(lastErr))
+	for key, value := range lastErr {
+		copyLastErr[key] = value
+	}
+	delete(copyLastErr, "remediation_url")
+	copyMetadata := make(map[string]interface{}, len(m))
+	for key, value := range m {
+		copyMetadata[key] = value
+	}
+	copyMetadata["last_agent_error"] = copyLastErr
+	return copyMetadata
+}
+
+func (b *TaskEventBroadcaster) routeBroadcast(
+	action string,
+	data interface{},
+	sessionID string,
+	workspaceID string,
+	msg *ws.Message,
+) error {
+	switch action {
+	case ws.ActionTaskPlanCommentsChanged, ws.ActionTaskPreviewFeedbackChanged:
+		taskID := extractStringField(data, "task_id")
+		if snapshot, ok := data.(*models.TaskPlanCommentSnapshot); ok {
+			taskID = snapshot.TaskID
+		}
+		if snapshot, ok := data.(*models.TaskPreviewFeedbackSnapshot); ok {
+			taskID = snapshot.TaskID
+		}
+		if taskID != "" {
+			b.hub.BroadcastToTask(taskID, msg)
+		}
+		return nil
+	case ws.ActionWorkspaceCreated, ws.ActionWorkspaceUpdated, ws.ActionWorkspaceDeleted:
+		// Workspace event payloads are the workspace DTO itself: the
+		// workspace ID lives under "id", not "workspace_id". Without this
+		// the extract comes back empty and the event would broadcast to
+		// every user (caught by the auth E2E segregation spec).
+		if workspaceID == "" {
+			workspaceID = extractStringField(data, "id")
+		}
+		b.hub.BroadcastToWorkspace(workspaceID, msg)
+		return nil
+	case ws.ActionSessionAgentctlStarting, ws.ActionSessionAgentctlReady, ws.ActionSessionAgentctlError:
+		if sessionID != "" {
+			b.hub.BroadcastToSession(sessionID, msg)
+			return nil
+		}
+	case ws.ActionSessionStateChanged:
+		if sessionID != "" && extractStringField(data, "new_state") == string(models.TaskSessionStateRunning) {
+			b.hub.clearSessionLaunchWarning(sessionID)
+		}
+		// Broadcast beyond the session subscribers so the sidebar task
+		// switcher can track state changes for all tasks — but scoped to
+		// the owning workspace's user when auth is enabled.
+		b.hub.BroadcastToWorkspace(workspaceID, msg)
+		return nil
+	case ws.ActionSessionMessageAdded, ws.ActionSessionMessageUpdated, ws.ActionSessionMessageDeleted,
+		ws.ActionSessionTurnStarted, ws.ActionSessionTurnCompleted, ws.ActionSessionTurnRemoved:
+		if sessionID != "" {
+			b.hub.BroadcastConversationMutation(data)
+			b.hub.BroadcastToSession(sessionID, msg)
+			return nil
+		}
+	case ws.ActionSessionRemoved:
+		if sessionID != "" {
+			b.hub.clearSessionLaunchWarning(sessionID)
+			if _, hasReceipt := conversationReceiptFromData(data); hasReceipt {
+				b.hub.BroadcastConversationMutation(data)
+			}
+			b.hub.BroadcastToSession(sessionID, msg)
+			return nil
+		}
+	case ws.ActionSessionWorkspaceSourcesUpdated:
+		if sessionID != "" {
+			b.hub.BroadcastToSession(sessionID, msg)
+			return nil
+		}
+	case ws.ActionSessionCancellationChanged:
+		if sessionID != "" {
+			b.hub.BroadcastToSession(sessionID, msg)
+			return nil
+		}
+	case ws.ActionSessionPendingActionChanged:
+		// Pending action is a compact workspace projection. It must reach
+		// inactive session selectors, but an unattributed event must never
+		// fall back to a global broadcast when authentication is enforced.
+		b.hub.BroadcastToWorkspaceOrDrop(workspaceID, msg)
+		return nil
+	case ws.ActionMessageQueueStatusChanged:
+		// Queue status is session-scoped. An unscoped event cannot be safely
+		// attributed after a session is deleted, so fail closed rather than
+		// falling through to the global broadcast path.
+		if sessionID == "" {
+			return nil
+		}
+		b.hub.BroadcastToSession(sessionID, msg)
+		return nil
+	case ws.ActionExecutorPrepareProgress, ws.ActionExecutorPrepareCompleted:
+		// Broadcast to the owning workspace's clients so prepare
+		// progress/warnings are available when the user navigates to the
+		// session page after task creation.
+		b.hub.BroadcastToWorkspace(workspaceID, msg)
+		return nil
+	case ws.ActionGitHubTaskPRUpdated, ws.ActionGitHubTaskPRDeleted,
+		ws.ActionGitHubTaskCIOptionsUpdated, ws.ActionGitHubPRDiscoveryHealthUpdated,
+		ws.ActionGitLabTaskMRUpdated, ws.ActionGitLabTaskMRDeleted, ws.ActionGitLabTaskMRAutomationUpdated:
+		// These payloads carry per-task PR/MR automation and lifecycle state. Fail closed
+		// (drop, don't fall back to a global broadcast) when workspace
+		// resolution came back empty and auth is enforced — an unattributed
+		// GitHub PR or GitLab MR update must never cross workspace boundaries.
+		b.hub.BroadcastToWorkspaceOrDrop(workspaceID, msg)
+		return nil
+	case ws.ActionAgentProfileCreated, ws.ActionAgentProfileUpdated, ws.ActionAgentProfileDeleted:
+		// Profile payloads wrap the profile DTO under "profile"; office-scoped
+		// profiles (nested workspace_id) must never cross workspace
+		// boundaries — route them fail-closed. Kanban profiles (empty
+		// workspace) are instance-wide and fall through to the global path.
+		if workspaceID != "" {
+			b.hub.BroadcastToWorkspaceOrDrop(workspaceID, msg)
+			return nil
+		}
+	}
+	// Workspace-carrying events (task/workflow/repository/…) route to the
+	// owner's clients; events without workspace context (executors,
+	// environments, agent profiles — instance-wide resources) stay global.
+	b.hub.BroadcastToWorkspace(workspaceID, msg)
+	return nil
+}
+
+// extractWorkspaceID pulls a workspace ID from event payloads (map- or
+// struct-shaped, nested included). Profile events wrap the profile DTO under
+// "profile": the wrapper may be a map (JSON round-tripped bus) or a struct
+// (in-process bus, e.g. *dto.AgentProfileDTO from the MCP publisher), so the
+// nested value is inspected recursively and structs expose their ID via the
+// GetWorkspaceID interface. Empty means "no workspace context" — the event is
+// treated as instance-wide and broadcast to everyone.
+func extractWorkspaceID(data interface{}) string {
+	if id := extractStringField(data, "workspace_id"); id != "" {
+		return id
+	}
+	if profile, ok := data.(map[string]interface{}); ok {
+		if id := extractWorkspaceID(profile["profile"]); id != "" {
+			return id
+		}
+	}
+	if provider, ok := data.(interface{ GetWorkspaceID() string }); ok {
+		return provider.GetWorkspaceID()
+	}
+	return ""
+}
+
+func extractStringField(data interface{}, key string) string {
+	if m, ok := data.(map[string]interface{}); ok {
+		if value, ok := m[key].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func (b *TaskEventBroadcaster) logLifecycleBroadcast(action string, data map[string]interface{}, sessionID string) {
+	switch action {
+	case ws.ActionTaskCreated, ws.ActionTaskUpdated, ws.ActionTaskStateChanged,
+		ws.ActionTaskDeleted, ws.ActionSessionStateChanged:
+	default:
+		return
+	}
+	b.logger.Debug("ws lifecycle broadcast",
+		zap.String("action", action),
+		zap.Any("task_id", data["task_id"]),
+		zap.String("session_id", sessionID),
+		zap.Any("state", data["state"]),
+		zap.Any("old_state", data["old_state"]),
+		zap.Any("new_state", data["new_state"]),
+		zap.Any("primary_session_id", data["primary_session_id"]),
+		zap.Any("primary_session_state", data["primary_session_state"]),
+		zap.Any("updated_at", data["updated_at"]),
+		zap.Int("connected_clients", b.hub.GetClientCount()),
+	)
+}

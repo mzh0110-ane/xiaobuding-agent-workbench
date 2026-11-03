@@ -1,0 +1,184 @@
+"use client";
+
+import { useCallback, useRef, useState } from "react";
+import { Dialog, DialogContent, DialogTitle } from "@kandev/ui/dialog";
+import { useReviewSidebarResize } from "@/hooks/use-review-sidebar-resize";
+import type { TaskPR } from "@/lib/types/github";
+import type { ReviewDialogViewState } from "./review-dialog";
+import { ReviewDiffList } from "./review-diff-list";
+import { ReviewFileTree } from "./review-file-tree";
+import { ReviewPRDiffBoundary, shouldBlockReviewForPR } from "./review-dialog-pr-state";
+import { ReviewTopBar } from "./review-top-bar";
+import { useTranslation } from "react-i18next";
+
+type ReviewDialogSurfaceProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  sessionId: string;
+  baseBranch?: string;
+  onOpenFile?: (filePath: string, repo?: string) => void;
+  prs: TaskPR[];
+  selectedPR: TaskPR | null;
+  onSelectPR?: (pr: TaskPR) => void;
+  prDiffLoading: boolean;
+  prDiffError: string | null;
+  onRetryPRDiff?: () => void;
+  onRequestWalkthrough: () => void;
+  state: ReviewDialogViewState;
+};
+
+function ReviewDialogDiffContent({
+  sessionId,
+  onOpenFile,
+  selectedPR,
+  prDiffLoading,
+  prDiffError,
+  onRetryPRDiff,
+  state,
+}: Pick<
+  ReviewDialogSurfaceProps,
+  | "sessionId"
+  | "onOpenFile"
+  | "selectedPR"
+  | "prDiffLoading"
+  | "prDiffError"
+  | "onRetryPRDiff"
+  | "state"
+>) {
+  const { t } = useTranslation();
+  // Diff refreshes can unmount file rows; keep their preview choice for this dialog.
+  const [previewedFiles, setPreviewedFiles] = useState<Set<string>>(() => new Set());
+  const toggleMarkdownPreview = useCallback((fileKey: string) => {
+    setPreviewedFiles((current) => {
+      const next = new Set(current);
+      if (next.has(fileKey)) next.delete(fileKey);
+      else next.add(fileKey);
+      return next;
+    });
+  }, []);
+  const blockReviewForPR = shouldBlockReviewForPR(state.allFiles);
+  return (
+    <ReviewPRDiffBoundary
+      selectedPR={blockReviewForPR ? selectedPR : null}
+      loading={blockReviewForPR && prDiffLoading}
+      error={blockReviewForPR ? prDiffError : null}
+      onRetry={onRetryPRDiff}
+    >
+      {state.filteredFiles.length > 0 ? (
+        <ReviewDiffList
+          files={state.filteredFiles}
+          selectedFile={state.selectedFile}
+          reviewedFiles={state.reviewedFiles}
+          staleFiles={state.staleFiles}
+          sessionId={sessionId}
+          autoMarkOnScroll={state.autoMarkOnScroll}
+          wordWrap={state.wordWrap}
+          enableWalkthroughAnnotations={false}
+          onToggleReviewed={state.handleToggleReviewed}
+          onDiscard={state.handleDiscard}
+          onOpenFile={onOpenFile}
+          previewedFiles={previewedFiles}
+          onToggleMarkdownPreview={toggleMarkdownPreview}
+          fileRefs={state.fileRefs}
+        />
+      ) : (
+        <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+          {state.filter.trim() ? t("review:noFilesMatchTheFilter") : t("review:noChangesToReview")}
+        </div>
+      )}
+    </ReviewPRDiffBoundary>
+  );
+}
+
+export function ReviewDialogSurface(props: ReviewDialogSurfaceProps) {
+  const { t } = useTranslation();
+  const { open, onOpenChange, sessionId, state } = props;
+  const splitRowRef = useRef<HTMLDivElement>(null);
+  const sidebar = useReviewSidebarResize(splitRowRef, open, state.reviewSourceKey);
+
+  // Clear the sidebar filter before selecting a finding's file: a finding may
+  // belong to a file the current filter hides, and ReviewDiffList only renders
+  // filtered files, so the target section would never mount to scroll to.
+  const { setFilter, handleSelectFile } = state;
+  const navigateToFindingFile = useCallback(
+    (fileKey: string) => {
+      setFilter("");
+      handleSelectFile(fileKey);
+    },
+    [setFilter, handleSelectFile],
+  );
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="!max-w-[100vw] !w-[100vw] md:!max-w-[80vw] md:!w-[80vw] max-h-[85vh] h-[85vh] p-0 gap-0 flex flex-col shadow-2xl"
+        onEscapeKeyDown={(event) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest('[data-testid="review-file-comments"]')?.querySelector("textarea")
+          ) {
+            event.preventDefault();
+          }
+        }}
+        showCloseButton={false}
+        overlayClassName="bg-black/40"
+      >
+        <DialogTitle className="sr-only">{t("review:reviewChangesTitle")}</DialogTitle>
+        <ReviewTopBar
+          sessionId={sessionId}
+          reviewedCount={state.reviewedFiles.size}
+          totalCount={state.allFiles.length}
+          commentCount={state.totalCommentCount}
+          baseBranch={props.baseBranch}
+          splitView={state.splitView}
+          onToggleSplitView={state.handleToggleSplitView}
+          wordWrap={state.wordWrap}
+          onToggleWordWrap={state.setWordWrap}
+          onSendComments={state.handleSendComments}
+          onClose={() => onOpenChange(false)}
+          onSelectFile={navigateToFindingFile}
+          onRequestWalkthrough={props.onRequestWalkthrough}
+          requestWalkthroughDisabled={state.allFiles.length === 0}
+          getPendingComments={state.getPendingComments}
+          markCommentsSent={state.markCommentsSent}
+          prs={props.prs}
+          selectedPR={props.selectedPR}
+          onSelectPR={props.onSelectPR}
+          prDiffLoading={props.prDiffLoading}
+        />
+        <div key={state.reviewSourceKey} ref={splitRowRef} className="flex min-h-0 flex-1">
+          <div
+            data-testid="review-dialog-sidebar"
+            className="hidden flex-shrink-0 flex-col overflow-hidden border-r border-border md:flex"
+            style={{ width: `${sidebar.width}px` }}
+          >
+            <ReviewFileTree
+              files={state.filteredFiles}
+              reviewedFiles={state.reviewedFiles}
+              staleFiles={state.staleFiles}
+              commentCountByFile={state.commentCountByFile}
+              selectedFile={state.selectedFile}
+              filter={state.filter}
+              onFilterChange={state.setFilter}
+              onSelectFile={state.handleSelectFile}
+              onToggleReviewed={state.handleToggleReviewed}
+            />
+          </div>
+          <button
+            data-testid="review-dialog-sidebar-resize"
+            type="button"
+            tabIndex={-1}
+            aria-label={t("review:resizeFileList")}
+            className="group relative hidden w-1 flex-shrink-0 cursor-col-resize bg-border p-0 transition-colors hover:bg-primary md:block"
+            {...sidebar.resizeHandleProps}
+          >
+            <span className="absolute inset-y-0 -left-1 -right-1" />
+          </button>
+          <div className="min-w-0 flex-1 overflow-hidden">
+            <ReviewDialogDiffContent {...props} />
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

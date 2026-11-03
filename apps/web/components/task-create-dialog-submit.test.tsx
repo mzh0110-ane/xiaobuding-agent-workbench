@@ -1,0 +1,1121 @@
+/* eslint-disable max-lines -- submit lifecycle regressions share one fixture. */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+import { createRef } from "react";
+import { ApiError } from "@/lib/api/client";
+import { WebSocketRequestError } from "@/lib/ws/client";
+
+// All external module mocks must be declared with vi.mock before the import of
+// the unit under test so vitest hoists them. The mocks below capture the
+// arguments passed to the createTask / launchSession boundaries so we can
+// assert that handleCreateSubmit honours CLI-mode parity: empty prompt → no
+// create call; non-empty prompt → call with that prompt in the payload.
+
+let autoFocusNewTasks = true;
+const ensureFreshBranchConsentMock = vi.hoisted(() => vi.fn(async () => [] as string[] | null));
+const pushMock = vi.fn();
+const TASK_ID = "task-1";
+const RENAMED_TITLE = "Renamed task";
+const ORIGINAL_PROMPT = "Original prompt";
+const UPDATED_PROMPT = "Updated prompt";
+const CREATE_TASK_PROMPT = "create this task";
+const ORIGINAL_TITLE = "Original title";
+const RAW_REPOSITORY_PROVIDER_FAILURE = "raw repository provider failure";
+const MAIN_BRANCH = "main";
+const TODO_STATE = "TODO" as const;
+vi.mock("@/lib/routing/client-router", () => ({
+  useRouter: () => ({ push: pushMock, replace: vi.fn(), back: vi.fn() }),
+}));
+
+const toastMock = vi.fn();
+vi.mock("@/components/toast-provider", () => ({
+  useToast: () => ({ toast: toastMock }),
+}));
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (s: unknown) => unknown) =>
+    selector({
+      userSettings: { autoFocusNewTasks },
+      setActiveDocument: vi.fn(),
+      setPlanMode: vi.fn(),
+      applyAgentProfileRecentUse: vi.fn(),
+    }),
+}));
+
+const recordRecentUseMock = vi.fn();
+vi.mock("@/lib/agent-profile-recent-use", () => ({
+  recordAgentProfileRecentUseBestEffort: (...args: unknown[]) => recordRecentUseMock(...args),
+}));
+
+const updateTaskMock = vi.fn();
+vi.mock("@/lib/api", () => ({
+  updateTask: (...args: unknown[]) => updateTaskMock(...args),
+}));
+
+const launchSessionMock = vi.fn(async (..._args: unknown[]) => ({ session_id: "session-1" }));
+vi.mock("@/lib/services/session-launch-service", () => ({
+  launchSession: (...args: unknown[]) => launchSessionMock(...args),
+}));
+
+vi.mock("@/lib/services/session-launch-helpers", () => ({
+  buildStartRequest: () => ({ request: { taskId: "t", agentProfileId: "a" } }),
+}));
+
+type BuildCreateTaskPayloadCall = {
+  repositoriesPayload?: Array<{
+    repository_id?: string;
+    base_branch?: string;
+    checkout_branch?: string;
+    fresh_branch?: boolean;
+  }>;
+  agentProfileId: string;
+  executorId: string;
+  executorProfileId: string;
+  withAgent: boolean;
+  trimmedDescription: string;
+};
+
+const buildCreateTaskPayloadMock = vi.fn((args: BuildCreateTaskPayloadCall) => ({
+  repositories: args.repositoriesPayload,
+  agent_profile_id: args.agentProfileId || undefined,
+  executor_id: args.executorId || undefined,
+  executor_profile_id: args.executorProfileId || undefined,
+}));
+const validateCreateInputsMock = vi.fn((..._args: unknown[]) => true);
+const buildRepositoriesPayloadMock = vi.fn(
+  (_args: unknown) => [] as Array<{ repository_id: string; base_branch?: string }>,
+);
+vi.mock("@/components/task-create-dialog-helpers", () => ({
+  activatePlanMode: vi.fn(),
+  buildCreateTaskPayload: (args: BuildCreateTaskPayloadCall) => buildCreateTaskPayloadMock(args),
+  buildRepositoriesPayload: (args: unknown) => buildRepositoriesPayloadMock(args),
+  computeIsTaskStarted: (isEditMode: boolean, editingTask?: { state?: string } | null) =>
+    Boolean(
+      isEditMode &&
+      editingTask?.state &&
+      editingTask.state !== TODO_STATE &&
+      editingTask.state !== "CREATED",
+    ),
+  findDuplicateRemoteRepo: () => null,
+  hasPendingAttachmentUploads: () => false,
+  validateCreateInputs: (...args: unknown[]) => validateCreateInputsMock(...args),
+  toMessageAttachments: () => [],
+  RUNNER_INELIGIBLE_REASON_KEYS: {
+    session_exists: "task:runnerReasonSessionExists",
+  },
+}));
+
+const switchTaskRunnerMock = vi.fn(async (..._args: unknown[]) => ({ id: TASK_ID }));
+vi.mock("@/lib/api/domains/task-runner-api", () => ({
+  switchTaskRunner: (...args: unknown[]) => switchTaskRunnerMock(...args),
+}));
+
+const createTaskRetryMock = vi.fn(async (buildPayload: (consented: string[]) => unknown) => {
+  // Invoke the build function so payload-construction side effects (and
+  // assertions on it) run as they would in production.
+  buildPayload([]);
+  return { id: TASK_ID, session_id: "session-1" };
+});
+vi.mock("@/components/task-create-dialog-fresh-branch-consent", () => ({
+  useFreshBranchConsent: (options: {
+    createTask?: (payload: unknown) => Promise<{ id: string; session_id?: string }>;
+  }) => ({
+    pendingDiscard: null,
+    ensureFreshBranchConsent: ensureFreshBranchConsentMock,
+    createTaskWithFreshBranchRetry: (...args: unknown[]) => {
+      const buildPayload = args[0] as (consented: string[]) => unknown;
+      return options.createTask
+        ? options.createTask(buildPayload([]))
+        : createTaskRetryMock(buildPayload);
+    },
+  }),
+}));
+
+import { taskSubmitErrorMessage, useTaskSubmitHandlers } from "./task-create-dialog-submit";
+import {
+  readQueuedTaskCreateLastUsedState,
+  resetTaskCreateLastUsedSync,
+  syncTaskCreateLastUsed,
+} from "./task-create-dialog-handlers";
+import type { SubmitHandlersDeps, TaskFormInputsHandle } from "./task-create-dialog-types";
+
+function makeRef(value: string): React.RefObject<TaskFormInputsHandle | null> {
+  const ref = createRef<TaskFormInputsHandle>();
+  ref.current = {
+    getValue: () => value,
+    setValue: () => {},
+    getAttachments: () => [],
+  };
+  return ref;
+}
+
+function makeDeps(overrides: Partial<SubmitHandlersDeps>): SubmitHandlersDeps {
+  return {
+    isSessionMode: false,
+    isEditMode: false,
+    autopilot: false,
+    priority: "medium",
+    workflowAgentOverrides: {},
+    isPassthroughProfile: false,
+    taskName: "My CLI task",
+    workspaceId: "ws-1",
+    workflowId: "wf-1",
+    effectiveWorkflowId: "wf-1",
+    repositories: [],
+    repositoriesDirty: false,
+    discoveredRepositories: [],
+    workspaceRepositories: [],
+    useRemote: false,
+    remoteRepos: [],
+    prInfoByUrl: {
+      info: () => undefined,
+      loading: () => false,
+      settled: () => true,
+      error: () => undefined,
+      ensure: () => undefined,
+      clear: () => undefined,
+    },
+    agentProfileId: "agent-1",
+    executorId: "exec-1",
+    executorProfileId: "execp-1",
+    seededExecutorProfileId: null,
+    editingTask: null,
+    onSuccess: vi.fn(),
+    onOpenChange: vi.fn(),
+    refreshBranchPolicies: vi.fn(async () => undefined),
+    taskId: null,
+    descriptionInputRef: makeRef(""),
+    setIsCreatingSession: vi.fn(),
+    setIsCreatingTask: vi.fn(),
+    setHasTitle: vi.fn(),
+    setHasDescription: vi.fn(),
+    setTaskName: vi.fn(),
+    setRepositories: vi.fn(),
+    setRemoteRepos: vi.fn(),
+    setAgentProfileId: vi.fn(),
+    setExecutorId: vi.fn(),
+    setSelectedWorkflowId: vi.fn(),
+    setFetchedSteps: vi.fn(),
+    clearDraft: vi.fn(),
+    freshBranchEnabled: false,
+    isLocalExecutor: false,
+    repositoryLocalPath: "",
+    noRepository: true,
+    workspacePath: "",
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  autoFocusNewTasks = true;
+  resetTaskCreateLastUsedSync({ clearQueued: true });
+  buildCreateTaskPayloadMock.mockClear();
+  buildRepositoriesPayloadMock.mockReset();
+  buildRepositoriesPayloadMock.mockReturnValue([]);
+  validateCreateInputsMock.mockClear();
+  ensureFreshBranchConsentMock.mockReset();
+  ensureFreshBranchConsentMock.mockResolvedValue([]);
+  createTaskRetryMock.mockClear();
+  updateTaskMock.mockReset();
+  updateTaskMock.mockResolvedValue({ id: TASK_ID, title: RENAMED_TITLE });
+  launchSessionMock.mockClear();
+  pushMock.mockClear();
+  toastMock.mockClear();
+  recordRecentUseMock.mockClear();
+  switchTaskRunnerMock.mockClear();
+  switchTaskRunnerMock.mockResolvedValue({ id: TASK_ID });
+});
+
+// eslint-disable-next-line max-lines-per-function -- grouped edit regressions share one fixture.
+describe("useTaskSubmitHandlers — started task edits", () => {
+  it("preserves a legacy overlong title when it was not edited", async () => {
+    const legacyTitle = "x".repeat(80);
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: legacyTitle,
+      editingTask: {
+        id: TASK_ID,
+        title: legacyTitle,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: "IN_PROGRESS",
+      },
+      descriptionInputRef: makeRef(""),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, {});
+  });
+
+  it("updates only the title so a locked prompt cannot be cleared", async () => {
+    buildRepositoriesPayloadMock.mockReturnValue([
+      { repository_id: "repo-1", base_branch: MAIN_BRANCH },
+    ]);
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: "IN_PROGRESS",
+      },
+      descriptionInputRef: makeRef(""),
+      noRepository: false,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, { title: RENAMED_TITLE });
+    expect(buildRepositoriesPayloadMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps repository updates for tasks that have not started", async () => {
+    const repositories = [{ repository_id: "repo-1", base_branch: MAIN_BRANCH }];
+    buildRepositoriesPayloadMock.mockReturnValue(repositories);
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: TODO_STATE,
+      },
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      noRepository: false,
+      repositoriesDirty: true,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, {
+      title: RENAMED_TITLE,
+      description: UPDATED_PROMPT,
+      repositories,
+    });
+  });
+
+  it("preserves a policy snapshot during an ordinary unstarted-task edit", async () => {
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: TODO_STATE,
+      },
+      repositories: [
+        {
+          key: "row-0",
+          repositoryId: "repo-1",
+          branch: MAIN_BRANCH,
+          branchPolicyId: "policy-1",
+        },
+      ],
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      noRepository: false,
+      repositoriesDirty: false,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, {
+      title: RENAMED_TITLE,
+      description: UPDATED_PROMPT,
+    });
+    expect(buildRepositoriesPayloadMock).not.toHaveBeenCalled();
+  });
+
+  it("sends an explicit empty repository list when a policy-backed row is removed", async () => {
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: TODO_STATE,
+      },
+      repositories: [],
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      noRepository: false,
+      repositoriesDirty: true,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, {
+      description: ORIGINAL_PROMPT,
+      repositories: [],
+    });
+    expect(buildRepositoriesPayloadMock).toHaveBeenCalled();
+  });
+
+  it("uses the update-only path when the started edit form is submitted", async () => {
+    const onSuccess = vi.fn();
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: "IN_PROGRESS",
+      },
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      onSuccess,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, { title: RENAMED_TITLE });
+    expect(launchSessionMock).not.toHaveBeenCalled();
+    expect(onSuccess).toHaveBeenCalledWith({ id: TASK_ID, title: RENAMED_TITLE }, "edit");
+  });
+
+  it("replaces edited dependencies after task fields and closes on success", async () => {
+    const save = vi.fn(async () => undefined);
+    const onOpenChange = vi.fn();
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: TODO_STATE,
+      },
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      onOpenChange,
+      editDependencies: { isDirty: true, ready: true, save },
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(updateTaskMock).toHaveBeenCalledWith(TASK_ID, {
+      title: RENAMED_TITLE,
+      description: UPDATED_PROMPT,
+    });
+    expect(save).toHaveBeenCalledOnce();
+    expect(save.mock.invocationCallOrder[0]).toBeGreaterThan(
+      updateTaskMock.mock.invocationCallOrder[0]!,
+    );
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps the edit dialog open and restores task fields when dependencies fail", async () => {
+    const setValue = vi.fn();
+    const setTaskName = vi.fn();
+    const setHasDescription = vi.fn();
+    const onOpenChange = vi.fn();
+    const cycleError = new ApiError("would create a dependency cycle", 409, {
+      cycle: [TASK_ID, "task-2", TASK_ID],
+    });
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: {
+        id: TASK_ID,
+        title: ORIGINAL_TITLE,
+        description: ORIGINAL_PROMPT,
+        workflowStepId: "step-1",
+        state: TODO_STATE,
+      },
+      descriptionInputRef: {
+        current: { ...makeRef(UPDATED_PROMPT).current!, setValue },
+      },
+      onOpenChange,
+      setTaskName,
+      setHasDescription,
+      editDependencies: {
+        isDirty: true,
+        ready: true,
+        save: vi.fn().mockRejectedValue({ dependencyUpdate: true, cause: cycleError }),
+      },
+    });
+    updateTaskMock.mockResolvedValueOnce({
+      id: TASK_ID,
+      title: RENAMED_TITLE,
+      description: "Server description",
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(setTaskName).toHaveBeenCalledWith(RENAMED_TITLE);
+    expect(setValue).toHaveBeenCalledWith("Server description");
+    expect(setHasDescription).toHaveBeenCalledWith(true);
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({ description: "Dependency cycle: task-1 -> task-2 -> task-1" }),
+    );
+  });
+});
+
+// eslint-disable-next-line max-lines-per-function -- runner-switch ordering regressions share one fixture.
+describe("useTaskSubmitHandlers — runner switch (REQ-TASKS-RUNNER-SWITCH-004)", () => {
+  const EXISTING_PROFILE = "execp-seeded";
+  const CHOSEN_PROFILE = "execp-chosen";
+
+  function editingTaskFixture() {
+    return {
+      id: TASK_ID,
+      title: ORIGINAL_TITLE,
+      description: ORIGINAL_PROMPT,
+      workflowStepId: "step-1",
+      state: TODO_STATE,
+    };
+  }
+
+  it("issues no switch when the final selection matches what was seeded", async () => {
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      executorProfileId: EXISTING_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).not.toHaveBeenCalled();
+    expect(updateTaskMock).toHaveBeenCalled();
+  });
+
+  it("issues no switch while nothing has been seeded yet", async () => {
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: null,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).not.toHaveBeenCalled();
+  });
+
+  it("issues the switch before the field update when the selection changed (AC-004.4a)", async () => {
+    const callOrder: string[] = [];
+    switchTaskRunnerMock.mockImplementationOnce(async () => {
+      callOrder.push("switch");
+      return { id: TASK_ID };
+    });
+    updateTaskMock.mockImplementationOnce(async () => {
+      callOrder.push("update");
+      return { id: TASK_ID, title: ORIGINAL_TITLE };
+    });
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).toHaveBeenCalledWith(TASK_ID, CHOSEN_PROFILE);
+    expect(callOrder).toEqual(["switch", "update"]);
+  });
+
+  it("saves nothing and issues no launch when the switch is rejected (AC-004.4a/4d)", async () => {
+    const onOpenChange = vi.fn();
+    switchTaskRunnerMock.mockRejectedValueOnce(
+      new WebSocketRequestError("conflict", "CONFLICT", { error_code: "session_exists" }),
+    );
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      agentProfileId: "agent-1",
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+      onOpenChange,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(updateTaskMock).not.toHaveBeenCalled();
+    expect(launchSessionMock).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: "The runner can't be changed because this task already has a session.",
+      }),
+    );
+  });
+
+  it("reports an unrecognized outcome class for a not-found switch rejection (AC-004.4b)", async () => {
+    switchTaskRunnerMock.mockRejectedValueOnce(new WebSocketRequestError("gone", "NOT_FOUND"));
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({ description: "This task could not be found." }),
+    );
+  });
+
+  it("reports a truthful partial save when the field update fails after the switch committed (AC-004.4c)", async () => {
+    const onOpenChange = vi.fn();
+    updateTaskMock.mockRejectedValueOnce(new Error("network blip"));
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+      onOpenChange,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).toHaveBeenCalledWith(TASK_ID, CHOSEN_PROFILE);
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description:
+          "The runner was switched, but the rest of your changes couldn't be saved. Your other edits are still shown below: try saving again.",
+      }),
+    );
+  });
+
+  it("switches back to the user's selection after retrying a partial save", async () => {
+    const onOpenChange = vi.fn();
+    updateTaskMock.mockRejectedValueOnce(new Error("network blip"));
+    updateTaskMock.mockResolvedValueOnce({ id: TASK_ID, title: ORIGINAL_TITLE });
+    const initialDeps = makeDeps({
+      isEditMode: true,
+      taskName: ORIGINAL_TITLE,
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+      onOpenChange,
+    });
+    const { result, rerender } = renderHook(
+      ({ deps }: { deps: SubmitHandlersDeps }) => useTaskSubmitHandlers(deps),
+      { initialProps: { deps: initialDeps } },
+    );
+
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).toHaveBeenCalledWith(TASK_ID, CHOSEN_PROFILE);
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    rerender({
+      deps: {
+        ...initialDeps,
+        executorProfileId: EXISTING_PROFILE,
+      },
+    });
+    await act(async () => {
+      await result.current.handleUpdateWithoutAgent();
+    });
+
+    expect(switchTaskRunnerMock).toHaveBeenNthCalledWith(2, TASK_ID, EXISTING_PROFILE);
+    expect(updateTaskMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a truthful partial save when the launch fails after the save committed (AC-004.4c/4d)", async () => {
+    const onOpenChange = vi.fn();
+    const onSuccess = vi.fn();
+    launchSessionMock.mockRejectedValueOnce(new Error("agent process crashed"));
+    const deps = makeDeps({
+      isEditMode: true,
+      taskName: RENAMED_TITLE,
+      agentProfileId: "agent-1",
+      editingTask: editingTaskFixture(),
+      descriptionInputRef: makeRef(UPDATED_PROMPT),
+      executorProfileId: CHOSEN_PROFILE,
+      seededExecutorProfileId: EXISTING_PROFILE,
+      onOpenChange,
+      onSuccess,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(switchTaskRunnerMock).toHaveBeenCalledWith(TASK_ID, CHOSEN_PROFILE);
+    expect(updateTaskMock).toHaveBeenCalled();
+    expect(launchSessionMock).toHaveBeenCalled();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(toastMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description:
+          "Your changes were saved, but the agent could not be started. Try starting it again.",
+      }),
+    );
+  });
+});
+
+describe("useTaskSubmitHandlers — repository selection edit failures", () => {
+  const failures = [
+    {
+      code: "repository_selection_invalid",
+      description: "The selected repository could not be verified.",
+    },
+    {
+      code: "repository_selection_not_found",
+      description: "The selected repository was not found.",
+    },
+    {
+      code: "repository_selection_unavailable",
+      description: "The repository provider is unavailable. Check the connection and try again.",
+    },
+  ] as const;
+
+  for (const failure of failures) {
+    it(`keeps the dialog open for ${failure.code} in the edit submit handler`, async () => {
+      const onOpenChange = vi.fn();
+      updateTaskMock.mockRejectedValueOnce(
+        new ApiError(RAW_REPOSITORY_PROVIDER_FAILURE, 400, {
+          error: RAW_REPOSITORY_PROVIDER_FAILURE,
+          error_code: failure.code,
+        }),
+      );
+      const deps = makeDeps({
+        isEditMode: true,
+        taskName: ORIGINAL_TITLE,
+        editingTask: {
+          id: TASK_ID,
+          title: ORIGINAL_TITLE,
+          description: ORIGINAL_PROMPT,
+          workflowStepId: "step-1",
+          state: TODO_STATE,
+        },
+        descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+        onOpenChange,
+      });
+      const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+      await act(async () => {
+        await result.current.handleSubmit({ preventDefault: () => {} } as never);
+      });
+
+      expect(onOpenChange).not.toHaveBeenCalled();
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ description: failure.description }),
+      );
+    });
+
+    it(`keeps the dialog open for ${failure.code} in the update-only handler`, async () => {
+      const onOpenChange = vi.fn();
+      updateTaskMock.mockRejectedValueOnce(
+        new ApiError(RAW_REPOSITORY_PROVIDER_FAILURE, 400, {
+          error: RAW_REPOSITORY_PROVIDER_FAILURE,
+          error_code: failure.code,
+        }),
+      );
+      const deps = makeDeps({
+        isEditMode: true,
+        taskName: ORIGINAL_TITLE,
+        editingTask: {
+          id: TASK_ID,
+          title: ORIGINAL_TITLE,
+          description: ORIGINAL_PROMPT,
+          workflowStepId: "step-1",
+          state: TODO_STATE,
+        },
+        descriptionInputRef: makeRef(ORIGINAL_PROMPT),
+        onOpenChange,
+      });
+      const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+      await act(async () => {
+        await result.current.handleUpdateWithoutAgent();
+      });
+
+      expect(onOpenChange).not.toHaveBeenCalled();
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ description: failure.description }),
+      );
+    });
+  }
+});
+
+// eslint-disable-next-line max-lines-per-function -- create-mode parity cases share transport setup.
+describe("useTaskSubmitHandlers — handleCreateSubmit (CLI-mode parity)", () => {
+  it("does not call the success handler when task creation fails", async () => {
+    const onSuccess = vi.fn();
+    const createTask = vi.fn().mockRejectedValue(new Error("request failed"));
+    const deps = makeDeps({
+      createTask,
+      onSuccess,
+      descriptionInputRef: makeRef(CREATE_TASK_PROMPT),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("does not call the success handler when fresh-branch consent is canceled", async () => {
+    const onSuccess = vi.fn();
+    const createTask = vi.fn().mockResolvedValue({ id: TASK_ID });
+    ensureFreshBranchConsentMock.mockResolvedValueOnce(null);
+    const deps = makeDeps({
+      createTask,
+      onSuccess,
+      freshBranchEnabled: true,
+      isLocalExecutor: true,
+      repositoryLocalPath: "/repo",
+      descriptionInputRef: makeRef(CREATE_TASK_PROMPT),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(createTask).not.toHaveBeenCalled();
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("refreshes stale policy options and keeps the dialog open", async () => {
+    const refreshBranchPolicies = vi.fn(async () => undefined);
+    const onOpenChange = vi.fn();
+    const createTask = vi.fn().mockRejectedValue(
+      new ApiError("invalid repository branch policy", 400, {
+        error: "invalid repository branch policy",
+        error_code: "branch_policy_stale",
+      }),
+    );
+    const deps = makeDeps({
+      createTask,
+      refreshBranchPolicies,
+      onOpenChange,
+      descriptionInputRef: makeRef("create with a policy"),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(refreshBranchPolicies).toHaveBeenCalledTimes(1);
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("uses the create-mode transport override", async () => {
+    const createTask = vi.fn().mockResolvedValue({
+      id: TASK_ID,
+      session_id: "session-plugin",
+      agent_profile_id: "agent-effective",
+    });
+    const deps = makeDeps({
+      createTask,
+      descriptionInputRef: makeRef("inspect the pull request"),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent_profile_id: "agent-1",
+        executor_id: "exec-1",
+      }),
+    );
+    expect(createTaskRetryMock).not.toHaveBeenCalled();
+    expect(recordRecentUseMock).not.toHaveBeenCalledWith(
+      "task_create",
+      expect.anything(),
+      expect.any(Function),
+    );
+  });
+
+  it("skips create when prompt is empty even with cli_passthrough=true (prompt is now required)", async () => {
+    const deps = makeDeps({
+      isPassthroughProfile: true,
+      descriptionInputRef: makeRef(""),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    // The plan-mode fallback (handleCreatePlanMode) is what runs when there's
+    // no description; verify it was the only path exercised by inspecting the
+    // build payload — handleCreatePlanMode builds with withAgent:false, while
+    // a passthrough-with-prompt path would build with withAgent:true.
+    const calls = buildCreateTaskPayloadMock.mock.calls;
+    expect(calls.length).toBe(1);
+    expect((calls[0]![0] as { withAgent: boolean }).withAgent).toBe(false);
+  });
+
+  it("creates the task with the user's prompt when cli_passthrough=true and prompt is provided", async () => {
+    const preserveLastUsed = vi.fn();
+    const onOpenChange = vi.fn();
+    const deps = makeDeps({
+      isPassthroughProfile: true,
+      descriptionInputRef: makeRef("run npm test"),
+      onOpenChange,
+      preserveTaskCreateLastUsedOnClose: preserveLastUsed,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(buildCreateTaskPayloadMock).toHaveBeenCalledTimes(1);
+    const payloadArg = buildCreateTaskPayloadMock.mock.calls[0]![0] as {
+      withAgent: boolean;
+      trimmedDescription: string;
+    };
+    expect(payloadArg.withAgent).toBe(true);
+    expect(payloadArg.trimmedDescription).toBe("run npm test");
+    expect(preserveLastUsed).toHaveBeenCalledTimes(1);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(preserveLastUsed.mock.invocationCallOrder[0]).toBeLessThan(
+      onOpenChange.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("still creates the task in ACP mode when prompt is provided", async () => {
+    const deps = makeDeps({
+      isPassthroughProfile: false,
+      descriptionInputRef: makeRef("refactor module"),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    const payloadArg = buildCreateTaskPayloadMock.mock.calls[0]![0] as {
+      withAgent: boolean;
+      trimmedDescription: string;
+    };
+    expect(payloadArg.withAgent).toBe(true);
+    expect(payloadArg.trimmedDescription).toBe("refactor module");
+  });
+
+  it("replaces the queued last-used overlay with the final create payload", async () => {
+    syncTaskCreateLastUsed({
+      repository_id: null,
+      branch: null,
+      agent_profile_id: "agent-before-workflow",
+      executor_profile_id: null,
+    });
+    const deps = makeDeps({
+      agentProfileId: "agent-from-workflow",
+      executorProfileId: "execp-autopick",
+      descriptionInputRef: makeRef("run tests"),
+      noRepository: true,
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault: () => {} } as never);
+    });
+
+    expect(readQueuedTaskCreateLastUsedState()).toEqual({
+      agentProfileId: "agent-from-workflow",
+      executorProfileId: "execp-autopick",
+    });
+  });
+});
+
+describe("useTaskSubmitHandlers — handleCreateWithoutAgent", () => {
+  // "Create without starting agent" must leave the destination to the backend,
+  // which parks the task in the workflow's start step. Sending a step from the
+  // dialog pinned it to whatever the caller happened to pass as defaultStepId
+  // (uniformly "first step by position"), so a workflow whose start step was
+  // moved elsewhere was ignored.
+  it("sends no workflow_step_id, leaving the start step to the backend", async () => {
+    const createTask = vi.fn().mockResolvedValue({ id: TASK_ID });
+    const deps = makeDeps({
+      createTask,
+      descriptionInputRef: makeRef("park this for later"),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleCreateWithoutAgent();
+    });
+
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(createTask.mock.calls[0][0]).not.toHaveProperty("workflow_step_id");
+    expect(buildCreateTaskPayloadMock).toHaveBeenCalledWith(
+      expect.objectContaining({ withAgent: false }),
+    );
+  });
+});
+
+describe("useTaskSubmitHandlers — workflow override submit guard", () => {
+  it("blocks keyboard submit when an executor change makes the replacement invalid", async () => {
+    const createTask = vi.fn().mockResolvedValue({ id: TASK_ID });
+    const deps = makeDeps({
+      createTask,
+      executorId: "remote-executor",
+      workflowAgentOverridesBlockedReason: "replacement profile is unavailable",
+      descriptionInputRef: makeRef(CREATE_TASK_PROMPT),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault() {} } as never);
+    });
+
+    expect(createTask).not.toHaveBeenCalled();
+    expect(buildCreateTaskPayloadMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks keyboard submit while the workflow snapshot read has failed", async () => {
+    const createTask = vi.fn().mockResolvedValue({ id: TASK_ID });
+    const deps = makeDeps({
+      createTask,
+      workflowAgentOverridesBlockedReason: "workflow agents could not be loaded",
+      descriptionInputRef: makeRef(CREATE_TASK_PROMPT),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+
+    await act(async () => {
+      await result.current.handleSubmit({ preventDefault() {} } as never);
+    });
+
+    expect(createTask).not.toHaveBeenCalled();
+    expect(buildCreateTaskPayloadMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("taskSubmitErrorMessage", () => {
+  it("uses localized copy for repository selection error codes", () => {
+    expect(
+      taskSubmitErrorMessage(
+        new ApiError("raw upstream provider failure", 503, {
+          error: "raw upstream provider failure",
+          error_code: "repository_selection_unavailable",
+        }),
+      ),
+    ).toBe("The repository provider is unavailable. Check the connection and try again.");
+  });
+
+  it("preserves non-repository error messages", () => {
+    expect(taskSubmitErrorMessage(new Error("ordinary failure"))).toBe("ordinary failure");
+  });
+});
+
+// @covers AC-TASKS-CREATION-AUTO-FOCUS-001.2, AC-TASKS-CREATION-AUTO-FOCUS-001.3
+describe("creation auto-focus policy", () => {
+  it.each([false, true])(
+    "keeps passthrough navigation gated by %s while completing creation",
+    async (enabled) => {
+      autoFocusNewTasks = enabled;
+      const deps = makeDeps({
+        isPassthroughProfile: true,
+        descriptionInputRef: makeRef("Start this task"),
+        createTask: vi.fn().mockResolvedValue({ id: TASK_ID, session_id: "new-session" }),
+      });
+      const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+      await act(async () => {
+        await result.current.handleSubmit({ preventDefault() {} } as never);
+      });
+      expect(deps.onSuccess).toHaveBeenCalledWith(
+        expect.objectContaining({ id: TASK_ID }),
+        "create",
+        expect.objectContaining({ autoFocus: enabled, willNavigate: enabled }),
+      );
+      expect(deps.onOpenChange).toHaveBeenCalledWith(false);
+      expect(deps.clearDraft).toHaveBeenCalled();
+      expect(pushMock).toHaveBeenCalledTimes(enabled ? 1 : 0);
+    },
+  );
+  it("propagates disabled focus for creation without an agent", async () => {
+    autoFocusNewTasks = false;
+    const deps = makeDeps({
+      descriptionInputRef: makeRef("Create only"),
+      createTask: vi.fn().mockResolvedValue({ id: TASK_ID }),
+    });
+    const { result } = renderHook(() => useTaskSubmitHandlers(deps));
+    await act(async () => {
+      await result.current.handleCreateWithoutAgent();
+    });
+    expect(deps.onSuccess).toHaveBeenCalledWith(
+      expect.objectContaining({ id: TASK_ID }),
+      "create",
+      expect.objectContaining({ autoFocus: false }),
+    );
+    expect(deps.onOpenChange).toHaveBeenCalledWith(false);
+    expect(pushMock).not.toHaveBeenCalled();
+  });
+});

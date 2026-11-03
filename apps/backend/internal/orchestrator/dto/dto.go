@@ -1,0 +1,103 @@
+// Package dto provides Data Transfer Objects for the orchestrator module.
+package dto
+
+import "github.com/kandev/kandev/internal/agentruntime"
+
+// GetStatusRequest is the request for orchestrator.status
+type GetStatusRequest struct{}
+
+// StatusResponse is the response for orchestrator.status
+type StatusResponse struct {
+	Running      bool `json:"running"`
+	ActiveAgents int  `json:"active_agents"`
+	QueuedTasks  int  `json:"queued_tasks"`
+}
+
+// GetQueueRequest is the request for orchestrator.queue
+type GetQueueRequest struct{}
+
+// QueuedTaskDTO represents a task in the queue
+type QueuedTaskDTO struct {
+	TaskID   string `json:"task_id"`
+	Priority int    `json:"priority"`
+	QueuedAt string `json:"queued_at"`
+}
+
+// QueueResponse is the response for orchestrator.queue
+type QueueResponse struct {
+	Tasks []QueuedTaskDTO `json:"tasks"`
+	Total int             `json:"total"`
+}
+
+// TaskSessionCapabilities describes the launch features supported by the
+// current session executor. It is backend-owned so clients never infer runtime
+// support from an executor name or browser platform.
+type TaskSessionCapabilities struct {
+	EmbeddedVscode bool `json:"embedded_vscode"`
+}
+
+// TaskSessionStatusResponse is the response for task.session.status
+type TaskSessionStatusResponse struct {
+	// Session metadata
+	SessionID      string `json:"session_id"`
+	TaskID         string `json:"task_id"`
+	State          string `json:"state"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
+	AgentProfileID string `json:"agent_profile_id,omitempty"`
+
+	// Runtime status
+	IsAgentRunning          bool   `json:"is_agent_running"`    // Agent process is currently running
+	IsResumable             bool   `json:"is_resumable"`        // Session can be resumed
+	NeedsResume             bool   `json:"needs_resume"`        // Session needs resumption (page reload scenario)
+	IsIdleSuspended         bool   `json:"is_idle_suspended"`   // Workspace policy parked this session
+	AutoResumeAllowed       bool   `json:"auto_resume_allowed"` // Passive inspection may resume this session
+	AutoResumeBlockedReason string `json:"auto_resume_blocked_reason,omitempty"`
+	NeedsWorkspaceRestore   bool   `json:"needs_workspace_restore"` // Session workspace can be restored (terminal state)
+	ResumeReason            string `json:"resume_reason,omitempty"` // Why resume is needed (e.g., "agent_not_running")
+
+	// ACP session info
+	ACPSessionID string `json:"acp_session_id,omitempty"`
+
+	// Executor/runtime info
+	ExecutorID       string                  `json:"executor_id,omitempty"`
+	ExecutorType     string                  `json:"executor_type,omitempty"`
+	ExecutorName     string                  `json:"executor_name,omitempty"`
+	Runtime          agentruntime.Runtime    `json:"runtime,omitempty"`
+	IsRemoteExecutor bool                    `json:"is_remote_executor"`
+	Capabilities     TaskSessionCapabilities `json:"capabilities"`
+	RemoteState      string                  `json:"remote_state,omitempty"`
+	RemoteName       string                  `json:"remote_name,omitempty"`
+	RemoteCreatedAt  string                  `json:"remote_created_at,omitempty"`
+	RemoteCheckedAt  string                  `json:"remote_checked_at,omitempty"`
+	RemoteStatusErr  string                  `json:"remote_status_error,omitempty"`
+
+	// Worktree info
+	WorktreePath   *string `json:"worktree_path,omitempty"`
+	WorktreeBranch *string `json:"worktree_branch,omitempty"`
+
+	// Error info
+	Error string `json:"error,omitempty"`
+}
+
+// SuccessResponse is a generic success response
+type SuccessResponse struct {
+	Success bool `json:"success"`
+}
+
+// PermissionRespondResponse is the response for permission.respond
+type PermissionRespondResponse struct {
+	Success   bool   `json:"success"`
+	SessionID string `json:"session_id"`
+	PendingID string `json:"pending_id"`
+}
+
+// CancelAgentRequest is the payload for the agent.cancel WebSocket action.
+type CancelAgentRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// CancelAgentResponse is the response for the agent.cancel WebSocket action.
+type CancelAgentResponse struct {
+	Success   bool   `json:"success"`
+	SessionID string `json:"session_id"`
+}

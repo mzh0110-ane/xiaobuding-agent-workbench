@@ -1,0 +1,219 @@
+"use client";
+
+import { useState, useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { executeUtilityPrompt, type ExecutePromptRequest } from "@/lib/api/domains/utility-api";
+import { useToast } from "@/components/toast-provider";
+import { useSessionGitStatus } from "@/hooks/domains/session/use-session-git-status";
+import type { FileInfo } from "@/lib/state/slices";
+
+const ENHANCE_PROMPT = "enhance-prompt" as const;
+
+type GeneratorType =
+  | "commit-message"
+  | "commit-description"
+  | "pr-title"
+  | "pr-description"
+  | typeof ENHANCE_PROMPT;
+
+const UTILITY_AGENT_IDS: Record<GeneratorType, string> = {
+  "commit-message": "builtin-commit-message",
+  "commit-description": "builtin-commit-description",
+  "pr-title": "builtin-pr-title",
+  "pr-description": "builtin-pr-description",
+  [ENHANCE_PROMPT]: "builtin-enhance-prompt",
+};
+
+type UseUtilityAgentGeneratorOptions = {
+  sessionId: string | null;
+  taskTitle?: string;
+  taskDescription?: string;
+};
+
+export type UtilityGenerationResult = {
+  content: string;
+  callId?: string;
+  durationMs?: number;
+};
+
+type ResultDelivery = (result: UtilityGenerationResult) => boolean | Promise<boolean>;
+
+type GenerateOptions = {
+  onSuccess?: ResultDelivery;
+  // Additional context for PR description
+  commitLog?: string;
+  diffSummary?: string;
+  // User's original prompt for enhancement
+  userPrompt?: string;
+};
+
+export function useUtilityAgentGenerator({
+  sessionId,
+  taskTitle,
+  taskDescription,
+}: UseUtilityAgentGeneratorOptions) {
+  const [generating, setGenerating] = useState<Set<GeneratorType>>(new Set());
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const gitStatus = useSessionGitStatus(sessionId);
+
+  const collectGitContext = useCallback(() => {
+    const changedFiles = gitStatus?.files ? Object.keys(gitStatus.files) : [];
+    const diffs = gitStatus?.files
+      ? Object.values(gitStatus.files as Record<string, FileInfo>)
+          .filter((f) => f.diff)
+          .map((f) => f.diff)
+          .join("\n\n")
+      : undefined;
+    return { changedFiles, diffs };
+  }, [gitStatus]);
+
+  const clearType = useCallback(
+    (type: GeneratorType) =>
+      setGenerating((prev) => {
+        const next = new Set(prev);
+        next.delete(type);
+        return next;
+      }),
+    [],
+  );
+
+  const buildRequest = useCallback(
+    (type: GeneratorType, options?: GenerateOptions): ExecutePromptRequest => {
+      const sessionless = type === ENHANCE_PROMPT && !sessionId;
+      const { changedFiles, diffs } = sessionless
+        ? { changedFiles: [] as string[], diffs: undefined }
+        : collectGitContext();
+      return {
+        utility_agent_id: UTILITY_AGENT_IDS[type],
+        session_id: sessionId ?? "",
+        task_title: taskTitle,
+        task_description: taskDescription,
+        git_diff: diffs || undefined,
+        changed_files: changedFiles.join("\n") || undefined,
+        commit_log: options?.commitLog,
+        diff_summary: options?.diffSummary,
+        user_prompt: options?.userPrompt,
+      };
+    },
+    [sessionId, taskTitle, taskDescription, collectGitContext],
+  );
+
+  const generate = useCallback(
+    async (type: GeneratorType, options?: GenerateOptions) => {
+      // enhance-prompt can run sessionless via the host utility manager.
+      // Other generators need git context from an active session.
+      if (!sessionId && type !== ENHANCE_PROMPT) {
+        toast({
+          title: t("task:noActiveSession"),
+          description: t("task:noActiveSessionDescription"),
+          variant: "error",
+        });
+        return;
+      }
+
+      setGenerating((prev) => new Set(prev).add(type));
+      try {
+        const resp = await executeUtilityPrompt(buildRequest(type, options));
+        if (!resp.success || !resp.response) {
+          toast({
+            title: t("task:generationFailed"),
+            description: resp.error || t("task:failedToGenerateContent"),
+            variant: "error",
+          });
+          return;
+        }
+        await options?.onSuccess?.({
+          content: resp.response,
+          callId: resp.call_id,
+          durationMs: resp.duration_ms,
+        });
+      } catch (error) {
+        toast({
+          title: t("task:generationFailed"),
+          description: error instanceof Error ? error.message : t("task:unknownError"),
+          variant: "error",
+        });
+      } finally {
+        clearType(type);
+      }
+    },
+    [sessionId, buildRequest, clearType, t, toast],
+  );
+
+  return useGeneratorCallbacks(generate, generating);
+}
+
+function useGeneratorCallbacks(
+  generate: (type: GeneratorType, options?: GenerateOptions) => Promise<void>,
+  generating: Set<GeneratorType>,
+) {
+  const generateCommitMessage = useCallback(
+    (onSuccess: (message: string) => void) =>
+      generate("commit-message", {
+        onSuccess: (result) => {
+          onSuccess(result.content);
+          return true;
+        },
+      }),
+    [generate],
+  );
+
+  const generateCommitDescription = useCallback(
+    (onSuccess: (description: string) => void) =>
+      generate("commit-description", {
+        onSuccess: (result) => {
+          onSuccess(result.content);
+          return true;
+        },
+      }),
+    [generate],
+  );
+
+  const generatePRTitle = useCallback(
+    (onSuccess: (title: string) => void, extra?: { commitLog?: string; diffSummary?: string }) =>
+      generate("pr-title", {
+        ...extra,
+        onSuccess: (result) => {
+          onSuccess(result.content);
+          return true;
+        },
+      }),
+    [generate],
+  );
+
+  const generatePRDescription = useCallback(
+    (
+      onSuccess: (description: string) => void,
+      extra?: { commitLog?: string; diffSummary?: string },
+    ) =>
+      generate("pr-description", {
+        ...extra,
+        onSuccess: (result) => {
+          onSuccess(result.content);
+          return true;
+        },
+      }),
+    [generate],
+  );
+
+  const enhancePrompt = useCallback(
+    (userPrompt: string, onSuccess: ResultDelivery) =>
+      generate(ENHANCE_PROMPT, { onSuccess, userPrompt }),
+    [generate],
+  );
+
+  return {
+    isGenerating: generating.size > 0,
+    isGeneratingCommitMessage: generating.has("commit-message"),
+    isGeneratingCommitDescription: generating.has("commit-description"),
+    isGeneratingPRTitle: generating.has("pr-title"),
+    isGeneratingPRDescription: generating.has("pr-description"),
+    isEnhancingPrompt: generating.has(ENHANCE_PROMPT),
+    generateCommitMessage,
+    generateCommitDescription,
+    generatePRTitle,
+    generatePRDescription,
+    enhancePrompt,
+  };
+}

@@ -1,0 +1,207 @@
+import path from "node:path";
+import type { Page } from "@playwright/test";
+import { expect, test } from "../../fixtures/test-base";
+import {
+  captureAppStatusBarSettings,
+  restoreAppStatusBarSettings,
+  setAppStatusBarEnabled,
+  type AppStatusBarSettingsBaseline,
+} from "../../helpers/app-status-bar-settings";
+
+const PLUGIN_ID = "kandev-plugin-e2e";
+const PACKAGE_PATH = path.resolve(
+  __dirname,
+  "../../../../../apps/backend/.build/kandev-plugin-e2e-1.0.0.tar.gz",
+);
+let statusBarBaseline: AppStatusBarSettingsBaseline | undefined;
+let metricsBaseline: { show_in_topbar: boolean; simplified?: boolean } | undefined;
+
+async function installFixture(page: Page) {
+  await page.goto("/settings/plugins");
+  await page.getByTestId("install-plugin-trigger").click();
+  await page.getByTestId("install-plugin-tab-upload").click();
+  await page.getByTestId("install-plugin-file-input").setInputFiles(PACKAGE_PATH);
+  await page.getByTestId("install-plugin-upload-submit").click();
+  await expect(page.getByTestId(`plugin-row-${PLUGIN_ID}`)).toBeVisible({ timeout: 15_000 });
+}
+
+test.describe("Mobile Status drawer", () => {
+  test.beforeEach(async ({ apiClient }) => {
+    statusBarBaseline = await captureAppStatusBarSettings(apiClient);
+    const { settings } = await apiClient.getUserSettings();
+    metricsBaseline = (settings.system_metrics_display as
+      | { show_in_topbar: boolean; simplified?: boolean }
+      | undefined) ?? { show_in_topbar: false };
+    await setAppStatusBarEnabled(apiClient, true);
+  });
+
+  test.afterEach(async ({ apiClient }) => {
+    try {
+      await apiClient.rawRequest("DELETE", `/api/plugins/${PLUGIN_ID}`).catch(() => undefined);
+    } finally {
+      try {
+        if (metricsBaseline) {
+          const restoreResponse = await apiClient.rawRequest("PATCH", "/api/v1/user/settings", {
+            system_metrics_display: metricsBaseline,
+          });
+          expect(restoreResponse.ok).toBe(true);
+          const restored = await apiClient.getUserSettings();
+          expect(restored.settings.system_metrics_display).toMatchObject(metricsBaseline);
+        }
+      } finally {
+        await restoreAppStatusBarSettings(apiClient, statusBarBaseline);
+        statusBarBaseline = undefined;
+        metricsBaseline = undefined;
+      }
+    }
+  });
+
+  test("keeps a single status signal compact", async ({ testPage, apiClient }) => {
+    const settingsResponse = await apiClient.rawRequest("PATCH", "/api/v1/user/settings", {
+      system_metrics_display: { show_in_topbar: false },
+    });
+    expect(settingsResponse.ok).toBe(true);
+
+    await testPage.goto("/stats");
+    await testPage.getByTestId("app-status-drawer-trigger").click();
+
+    const drawer = testPage.getByTestId("app-status-drawer");
+    await expect(drawer).toBeVisible();
+    await expect(drawer.locator("[data-status-item-id]")).toHaveCount(1);
+    const dialog = testPage.getByRole("dialog", { name: "Status" });
+    const dialogBox = await dialog.boundingBox();
+    if (!dialogBox) throw new Error("single-signal Status drawer has no geometry");
+    expect(dialogBox.height).toBeLessThan(300);
+  });
+
+  test("opens native Status paths without a persistent phone footer", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(90_000);
+    await installFixture(testPage);
+    const leftOrderingId = `plugin:${PLUGIN_ID}:app-status-bar-left:0`;
+    const rightOrderingId = `plugin:${PLUGIN_ID}:app-status-bar-right:0`;
+    const orderResponse = await apiClient.rawRequest("PATCH", "/api/v1/user/settings", {
+      system_metrics_display: { show_in_topbar: true },
+      app_status_bar_order: {
+        left_item_ids: [rightOrderingId, "builtin:metrics"],
+        right_item_ids: ["builtin:connection", leftOrderingId],
+      },
+    });
+    expect(orderResponse.ok).toBe(true);
+    await testPage.goto("/");
+    await testPage.reload();
+
+    await testPage.getByTestId("app-nav-trigger").click();
+    const statusTrigger = testPage.getByTestId("mobile-home-status-button");
+    await expect(statusTrigger).toBeVisible();
+    const triggerBox = await statusTrigger.boundingBox();
+    expect(triggerBox?.height).toBeGreaterThanOrEqual(44);
+    await statusTrigger.click();
+
+    const drawer = testPage.getByTestId("app-status-drawer");
+    await expect(drawer).toBeVisible();
+    const summary = drawer.getByTestId("app-status-drawer-summary");
+    await expect(summary.getByRole("heading", { name: "Status" })).toBeVisible();
+    await expect(summary).not.toContainText("Connection, system health, and workspace signals.");
+    await expect(drawer.getByTestId("app-status-drawer-scroll-region")).toBeVisible();
+    await expect(drawer.getByTestId("app-status-connection")).toBeVisible();
+    await expect(testPage.locator("#hello-status-left")).toContainText("mobile-drawer no-task");
+    await expect(testPage.getByTestId("app-status-bar")).toHaveCount(0);
+    const statusRows = drawer.locator("[data-status-item-id]");
+    await expect(statusRows).toHaveCount(4);
+    expect(
+      await statusRows.evaluateAll((rows) => rows.map((row) => row.dataset.statusItemId)),
+    ).toEqual([rightOrderingId, "builtin:metrics", "builtin:connection", leftOrderingId]);
+    for (const row of await statusRows.all()) {
+      const rowHeight = (await row.boundingBox())?.height;
+      expect(rowHeight).not.toBeNull();
+      // Chromium can expose the computed 44px minimum as 43.9999... after
+      // the drawer's fractional mobile layout has been applied.
+      expect(Math.round(rowHeight!)).toBeGreaterThanOrEqual(44);
+    }
+    const pluginRow = drawer.locator(`[data-status-item-id="${leftOrderingId}"]`);
+    const drawerAction = pluginRow.getByTestId("e2e-status-drawer-action");
+    const busyAction = pluginRow.getByTestId("e2e-status-busy-action");
+    const disabledAction = pluginRow.getByTestId("e2e-status-disabled-action");
+    await expect(drawerAction).toHaveAttribute("data-surface", "status-drawer");
+    await expect(drawerAction).toBeEnabled();
+    await expect(busyAction).toHaveAttribute("aria-busy", "true");
+    await expect(busyAction).toBeEnabled();
+    await expect(disabledAction).toBeDisabled();
+    await drawerAction.tap();
+    await expect(drawerAction).toHaveAttribute("aria-pressed", "true");
+    await busyAction.tap();
+    await expect(testPage.getByRole("tooltip")).toHaveCount(0);
+    let orderPatchCount = 0;
+    testPage.on("request", (request) => {
+      if (request.method() === "PATCH" && request.url().endsWith("/api/v1/user/settings")) {
+        orderPatchCount += 1;
+      }
+    });
+    const [firstRowBox, lastRowBox] = await Promise.all([
+      statusRows.first().boundingBox(),
+      statusRows.last().boundingBox(),
+    ]);
+    if (!firstRowBox || !lastRowBox) throw new Error("mobile status row geometry unavailable");
+    await testPage.keyboard.down("Control");
+    await testPage.mouse.move(
+      firstRowBox.x + firstRowBox.width / 2,
+      firstRowBox.y + firstRowBox.height / 2,
+    );
+    await testPage.mouse.down();
+    await testPage.mouse.move(
+      lastRowBox.x + lastRowBox.width / 2,
+      lastRowBox.y + lastRowBox.height / 2,
+      { steps: 6 },
+    );
+    await testPage.mouse.up();
+    await testPage.keyboard.up("Control");
+    expect(orderPatchCount).toBe(0);
+    expect(
+      await statusRows.evaluateAll((rows) => rows.map((row) => row.dataset.statusItemId)),
+    ).toEqual([rightOrderingId, "builtin:metrics", "builtin:connection", leftOrderingId]);
+    expect(await drawer.locator("[class*='overflow-y-auto']").count()).toBe(1);
+    expect(await testPage.evaluate(() => document.documentElement.scrollWidth)).toBe(
+      await testPage.evaluate(() => document.documentElement.clientWidth),
+    );
+    // A vertical modifier drag can resolve as Vaul's native swipe-to-dismiss.
+    // Either dismissal path must leave phone ordering untouched.
+    const overlay = testPage.locator('[data-slot="drawer-overlay"][data-state="open"]');
+    if (await overlay.isVisible()) {
+      await overlay.click({ position: { x: 4, y: 4 } });
+    }
+    await expect(drawer).toBeHidden();
+
+    await testPage.setViewportSize({ width: 800, height: 900 });
+    await testPage.goto("/tasks");
+    const compactStatusBar = testPage.getByTestId("app-status-bar");
+    await expect(compactStatusBar).toBeVisible();
+    const compactStatusAction = compactStatusBar
+      .locator(`[data-status-item-id="${leftOrderingId}"]`)
+      .getByTestId("e2e-status-bar-action");
+    const compactActionBox = await compactStatusAction.boundingBox();
+    expect(compactActionBox).not.toBeNull();
+    expect(compactActionBox!.height).toBe(24);
+    await testPage.setViewportSize({ width: 393, height: 851 });
+
+    const task = await apiClient.createTask(seedData.workspaceId, "Mobile status task", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await testPage.goto(`/t/${task.id}`);
+    await testPage.getByRole("button", { name: "Status", exact: true }).click();
+    await expect(testPage.locator("#hello-status-left")).toContainText(`mobile-drawer ${task.id}`);
+    await testPage.keyboard.press("Escape");
+
+    await testPage.goto("/stats");
+    const pageTopbarStatus = testPage.getByTestId("app-status-drawer-trigger");
+    await expect(pageTopbarStatus).toBeVisible();
+    await pageTopbarStatus.click();
+    await expect(drawer).toBeVisible();
+    await testPage.keyboard.press("Escape");
+    await expect(pageTopbarStatus).toBeFocused();
+  });
+});

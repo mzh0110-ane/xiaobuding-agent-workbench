@@ -1,0 +1,1027 @@
+// Package handlers provides WebSocket and HTTP handlers for agent operations.
+package handlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/common/logger"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+// singleflightComputeTimeout bounds the detached context used for the
+// shared body of session.git.commits / session.cumulative_diff. The body
+// runs in a goroutine spawned by singleflight that is NOT tied to any
+// single waiter's request ctx — see wsGitCommits — so it needs its own
+// timeout floor. Generous enough to survive a slow agentctl round-trip
+// under git-pool contention, short enough that a wedged execution can't
+// pin the singleflight slot indefinitely.
+const singleflightComputeTimeout = 60 * time.Second
+
+// PRCreatedCallback is called after a PR is successfully created. `repo` is
+// the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+// The callback uses it to scope the resulting TaskPR / PRWatch rows to the
+// owning repository so the second repo's PR doesn't overwrite the first.
+// Parameters: ctx, sessionID, taskID, prURL, branch.
+type PRCreatedCallback func(ctx context.Context, sessionID, taskID, provider, prURL, branch, repo string)
+
+// GitOperationFailedCallback is called when a git operation fails.
+// Parameters: ctx, sessionID, taskID, operation name, error output.
+type GitOperationFailedCallback func(ctx context.Context, sessionID, taskID, operation, errorOutput string)
+
+// BranchRenamedCallback is called after a branch is successfully renamed.
+// Parameters: ctx, sessionID, new branch name, repo subpath.
+type BranchRenamedCallback func(ctx context.Context, sessionID, newName, repo string)
+
+// ExecutionLookup provides access to running agent executions by session ID.
+type ExecutionLookup interface {
+	GetExecutionBySessionID(sessionID string) (*lifecycle.AgentExecution, bool)
+	// GetOrEnsureExecution returns an existing execution or creates one on-demand.
+	// Use this for workspace-oriented operations that should survive backend restarts.
+	GetOrEnsureExecution(ctx context.Context, sessionID string) (*lifecycle.AgentExecution, error)
+}
+
+// SessionReader is a minimal interface for reading session metadata.
+// This is needed because git operations need to know the session's base commit SHA
+// to filter commits to only those made during the session.
+type SessionReader interface {
+	// GetSessionBaseCommit returns the base commit SHA for a session.
+	// Returns empty string if not set or on error.
+	GetSessionBaseCommit(ctx context.Context, sessionID string) string
+
+	// GetSessionBaseBranch returns the target branch for a session (e.g., "origin/main").
+	// Used for computing merge-base to filter commits accurately after rebases.
+	// Returns empty string if not set or on error.
+	GetSessionBaseBranch(ctx context.Context, sessionID string) string
+}
+
+// GitHandlers provides WebSocket handlers for git worktree operations.
+// Operations are executed via agentctl which runs in the worktree context.
+//
+// commitsGroup / diffGroup deduplicate concurrent identical requests
+// (same session, same params) so a frontend re-render storm doesn't fan
+// out into N agentctl HTTP calls that each spawn a git subprocess under
+// the agentctl-side throttle. Reproduced in PR #1216 trace: ~10
+// session.git.commits arrived for the same sessionID inside 30ms.
+type GitHandlers struct {
+	lifecycleMgr         ExecutionLookup
+	sessionReader        SessionReader
+	logger               *logger.Logger
+	onPRCreated          PRCreatedCallback
+	onGitOperationFailed GitOperationFailedCallback
+	onBranchRenamed      BranchRenamedCallback
+	commitsGroup         singleflight.Group
+	diffGroup            singleflight.Group
+}
+
+// NewGitHandlers creates a new GitHandlers instance.
+// sessionReader is required to look up session metadata (e.g., base commit SHA).
+func NewGitHandlers(lifecycleMgr ExecutionLookup, sessionReader SessionReader, log *logger.Logger) *GitHandlers {
+	return &GitHandlers{
+		lifecycleMgr:  lifecycleMgr,
+		sessionReader: sessionReader,
+		logger:        log.WithFields(zap.String("component", "git_handlers")),
+	}
+}
+
+// SetOnPRCreated sets a callback invoked after a PR is successfully created.
+func (h *GitHandlers) SetOnPRCreated(cb PRCreatedCallback) {
+	h.onPRCreated = cb
+}
+
+// isGitHubPRURL reports whether prURL is a GitHub pull request link. Azure Repos
+// (/pullrequest/) and GitLab (/-/merge_requests/) are excluded so onPRCreated only
+// wires GitHub TaskPR / PRWatch rows (Azure association is a separate follow-up).
+func isGitHubPRURL(prURL string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(prURL)), "/pull/")
+}
+
+func shouldAssociateCreatedChange(provider, changeURL string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "github":
+		return isGitHubPRURL(changeURL)
+	case "gitlab":
+		return strings.Contains(strings.ToLower(strings.TrimSpace(changeURL)), "/-/merge_requests/")
+	default:
+		return provider == "" && isGitHubPRURL(changeURL)
+	}
+}
+
+// SetOnGitOperationFailed sets a callback invoked when a git operation fails.
+func (h *GitHandlers) SetOnGitOperationFailed(cb GitOperationFailedCallback) {
+	h.onGitOperationFailed = cb
+}
+
+// SetOnBranchRenamed sets a callback invoked after a branch is successfully renamed.
+func (h *GitHandlers) SetOnBranchRenamed(cb BranchRenamedCallback) {
+	h.onBranchRenamed = cb
+}
+
+// notifyGitOperationFailed fires the failure callback asynchronously if the result indicates failure.
+func (h *GitHandlers) notifyGitOperationFailed(sessionID, operation string, result *client.GitOperationResult) {
+	if result == nil || result.Success || h.onGitOperationFailed == nil {
+		return
+	}
+	execution, ok := h.lifecycleMgr.GetExecutionBySessionID(sessionID)
+	if !ok || execution.TaskID == "" {
+		return
+	}
+	taskID := execution.TaskID
+	errorOutput := result.Error
+	if errorOutput == "" {
+		errorOutput = result.Output
+	}
+	go func() {
+		callbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		h.onGitOperationFailed(callbackCtx, sessionID, taskID, operation, errorOutput)
+	}()
+}
+
+// RegisterHandlers registers git handlers with the WebSocket dispatcher
+func (h *GitHandlers) RegisterHandlers(d *ws.Dispatcher) {
+	d.RegisterFunc(ws.ActionWorktreePull, h.wsPull)
+	d.RegisterFunc(ws.ActionWorktreePush, h.wsPush)
+	d.RegisterFunc(ws.ActionWorktreeReplaceContribution, h.wsReplaceContribution)
+	d.RegisterFunc(ws.ActionWorktreeUseContribution, h.wsUseContribution)
+	d.RegisterFunc(ws.ActionWorktreeContributionHistoryExplanation, h.wsContributionHistoryExplanation)
+	d.RegisterFunc(ws.ActionWorktreeRebase, h.wsRebase)
+	d.RegisterFunc(ws.ActionWorktreeMerge, h.wsMerge)
+	d.RegisterFunc(ws.ActionWorktreeAbort, h.wsAbort)
+	d.RegisterFunc(ws.ActionWorktreeCommit, h.wsCommit)
+	d.RegisterFunc(ws.ActionWorktreeStage, h.wsStage)
+	d.RegisterFunc(ws.ActionWorktreeUnstage, h.wsUnstage)
+	d.RegisterFunc(ws.ActionWorktreeDiscard, h.wsDiscard)
+	d.RegisterFunc(ws.ActionWorktreeCreatePR, h.wsCreatePR)
+	d.RegisterFunc(ws.ActionWorktreeRevertCommit, h.wsRevertCommit)
+	d.RegisterFunc(ws.ActionWorktreeRenameBranch, h.wsRenameBranch)
+	d.RegisterFunc(ws.ActionWorktreeReset, h.wsReset)
+	d.RegisterFunc(ws.ActionSessionCommitDiff, h.wsCommitDiff)
+	d.RegisterFunc(ws.ActionSessionGitCommits, h.wsGitCommits)
+	d.RegisterFunc(ws.ActionSessionCumulativeDiff, h.wsCumulativeDiff)
+}
+
+// GitPullRequest for worktree.pull action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+type GitPullRequest struct {
+	SessionID string `json:"session_id"`
+	Rebase    bool   `json:"rebase"`
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitPushRequest for worktree.push action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+type GitPushRequest struct {
+	SessionID   string `json:"session_id"`
+	Force       bool   `json:"force"`
+	SetUpstream bool   `json:"set_upstream"`
+	Repo        string `json:"repo,omitempty"`
+	// Remote and ExpectedBranch are optional and forwarded uninterpreted; the
+	// workspace git operator owns every destination decision.
+	Remote         string `json:"remote,omitempty"`
+	ExpectedBranch string `json:"expected_branch,omitempty"`
+}
+
+// GitContributionRequest carries the provider-head lease for a managed
+// contribution operation. Repo scopes one destructive action to one checkout.
+type GitContributionRequest struct {
+	SessionID          string `json:"session_id"`
+	ExpectedRemoteHead string `json:"expected_remote_head"`
+	Repo               string `json:"repo,omitempty"`
+}
+
+// GitContributionHistoryExplanationRequest carries the selected branch and
+// both immutable heads for a read-only contribution history observation.
+type GitContributionHistoryExplanationRequest struct {
+	SessionID          string `json:"session_id"`
+	Repo               string `json:"repo,omitempty"`
+	Branch             string `json:"branch"`
+	ExpectedLocalHead  string `json:"expected_local_head"`
+	ExpectedRemoteHead string `json:"expected_remote_head"`
+}
+
+// GitRebaseRequest for worktree.rebase action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+type GitRebaseRequest struct {
+	SessionID  string `json:"session_id"`
+	BaseBranch string `json:"base_branch"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitMergeRequest for worktree.merge action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+type GitMergeRequest struct {
+	SessionID  string `json:"session_id"`
+	BaseBranch string `json:"base_branch"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitAbortRequest for worktree.abort action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+type GitAbortRequest struct {
+	SessionID string `json:"session_id"`
+	Operation string `json:"operation"` // "merge" or "rebase"
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitCommitRequest for worktree.commit action
+type GitCommitRequest struct {
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
+	StageAll  bool   `json:"stage_all"`
+	Amend     bool   `json:"amend"`
+	// Multi-repo: subpath of the repo to commit in (e.g. "kandev"). Empty for
+	// single-repo workspaces. Required for multi-repo — committing at the task
+	// root fails because it isn't itself a git repo.
+	Repo string `json:"repo,omitempty"`
+}
+
+// GitRenameBranchRequest for worktree.rename_branch action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo.
+type GitRenameBranchRequest struct {
+	SessionID string `json:"session_id"`
+	NewName   string `json:"new_name"`
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitStageRequest for worktree.stage action
+type GitStageRequest struct {
+	SessionID string   `json:"session_id"`
+	Paths     []string `json:"paths"`          // Empty = stage all
+	Repo      string   `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// GitUnstageRequest for worktree.unstage action
+type GitUnstageRequest struct {
+	SessionID string   `json:"session_id"`
+	Paths     []string `json:"paths"`          // Empty = unstage all
+	Repo      string   `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// GitDiscardRequest for worktree.discard action
+type GitDiscardRequest struct {
+	SessionID string   `json:"session_id"`
+	Paths     []string `json:"paths"`          // Required - files to discard
+	Repo      string   `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// GitCreatePRRequest for worktree.create_pr action.
+// Repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo
+// workspaces. Without it, agentctl falls back to the workspace root which
+// for multi-repo task workspaces isn't a git repo, so PR creation fails.
+type GitCreatePRRequest struct {
+	SessionID  string `json:"session_id"`
+	Title      string `json:"title"`
+	Body       string `json:"body"`
+	BaseBranch string `json:"base_branch"`
+	Draft      bool   `json:"draft"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitRevertCommitRequest for worktree.revert_commit action
+type GitRevertCommitRequest struct {
+	SessionID string `json:"session_id"`
+	CommitSHA string `json:"commit_sha"`
+	Repo      string `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// GitResetRequest for worktree.reset action
+type GitResetRequest struct {
+	SessionID string `json:"session_id"`
+	CommitSHA string `json:"commit_sha"`
+	Mode      string `json:"mode"`           // "soft", "mixed", or "hard"
+	Repo      string `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// GitShowCommitRequest for session.commit_diff action
+type GitShowCommitRequest struct {
+	SessionID string `json:"session_id"`
+	CommitSHA string `json:"commit_sha"`
+	Repo      string `json:"repo,omitempty"` // Multi-repo subpath; empty for single-repo
+}
+
+// wsPull handles worktree.pull action
+func (h *GitHandlers) wsPull(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitPullRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitPull(ctx, req.Rebase, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("pull failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "pull", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsPush handles worktree.push action
+func (h *GitHandlers) wsPush(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitPushRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+
+	agentClient, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := agentClient.GitPush(ctx, req.Repo, client.PushOptions{
+		Force:          req.Force,
+		SetUpstream:    req.SetUpstream,
+		Remote:         req.Remote,
+		ExpectedBranch: req.ExpectedBranch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("push failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "push", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+func (h *GitHandlers) wsReplaceContribution(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.wsContribution(ctx, msg, "replace_remote_contribution", func(agentClient *client.Client, expectedHead, repo string) (*client.GitOperationResult, error) {
+		return agentClient.GitReplaceRemoteContribution(ctx, expectedHead, repo)
+	})
+}
+
+func (h *GitHandlers) wsUseContribution(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.wsContribution(ctx, msg, "use_remote_contribution", func(agentClient *client.Client, expectedHead, repo string) (*client.GitOperationResult, error) {
+		return agentClient.GitUseRemoteContribution(ctx, expectedHead, repo)
+	})
+}
+
+func (h *GitHandlers) wsContributionHistoryExplanation(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitContributionHistoryExplanationRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	for field, value := range map[string]string{
+		"branch":               req.Branch,
+		"expected_local_head":  req.ExpectedLocalHead,
+		"expected_remote_head": req.ExpectedRemoteHead,
+	} {
+		if value == "" {
+			return nil, fmt.Errorf("%s is required", field)
+		}
+	}
+
+	agentClient, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+	result, err := agentClient.GitContributionHistoryExplanation(
+		ctx, req.Branch, req.ExpectedLocalHead, req.ExpectedRemoteHead, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("contribution history explanation failed: %w", err)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+func (h *GitHandlers) wsContribution(ctx context.Context, msg *ws.Message, operation string, action func(*client.Client, string, string) (*client.GitOperationResult, error)) (*ws.Message, error) {
+	var req GitContributionRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.ExpectedRemoteHead == "" {
+		return nil, fmt.Errorf("expected_remote_head is required")
+	}
+
+	agentClient, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+	result, err := action(agentClient, req.ExpectedRemoteHead, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("%s failed: %w", operation, err)
+	}
+	h.notifyGitOperationFailed(req.SessionID, operation, result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsRebase handles worktree.rebase action
+func (h *GitHandlers) wsRebase(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitRebaseRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.BaseBranch == "" {
+		return nil, fmt.Errorf("base_branch is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitRebase(ctx, req.BaseBranch, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("rebase failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "rebase", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsMerge handles worktree.merge action
+func (h *GitHandlers) wsMerge(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitMergeRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.BaseBranch == "" {
+		return nil, fmt.Errorf("base_branch is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitMerge(ctx, req.BaseBranch, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("merge failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "merge", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsAbort handles worktree.abort action
+func (h *GitHandlers) wsAbort(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitAbortRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.Operation != "merge" && req.Operation != "rebase" {
+		return nil, fmt.Errorf("operation must be 'merge' or 'rebase'")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitAbort(ctx, req.Operation, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("abort failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsCommit handles worktree.commit action
+func (h *GitHandlers) wsCommit(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitCommitRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.Message == "" {
+		return nil, fmt.Errorf("message is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitCommit(ctx, req.Message, req.StageAll, req.Amend, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("commit failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "commit", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsRenameBranch handles worktree.rename_branch action
+func (h *GitHandlers) wsRenameBranch(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitRenameBranchRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.NewName == "" {
+		return nil, fmt.Errorf("new_name is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitRenameBranch(ctx, req.NewName, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("rename branch failed: %w", err)
+	}
+	if result.Success && h.onBranchRenamed != nil {
+		h.onBranchRenamed(ctx, req.SessionID, req.NewName, req.Repo)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsReset handles worktree.reset action
+func (h *GitHandlers) wsReset(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitResetRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.CommitSHA == "" {
+		return nil, fmt.Errorf("commit_sha is required")
+	}
+	if req.Mode == "" {
+		req.Mode = "mixed"
+	}
+	validModes := map[string]bool{"soft": true, "mixed": true, "hard": true}
+	if !validModes[req.Mode] {
+		return nil, fmt.Errorf("invalid reset mode: %s (must be soft, mixed, or hard)", req.Mode)
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitReset(ctx, req.CommitSHA, req.Mode, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("reset failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsStage handles worktree.stage action
+func (h *GitHandlers) wsStage(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitStageRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitStage(ctx, req.Paths, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("stage failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsUnstage handles worktree.unstage action
+func (h *GitHandlers) wsUnstage(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitUnstageRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitUnstage(ctx, req.Paths, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("unstage failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsDiscard handles worktree.discard action
+func (h *GitHandlers) wsDiscard(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitDiscardRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+
+	if len(req.Paths) == 0 {
+		return nil, fmt.Errorf("paths are required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitDiscard(ctx, req.Paths, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("discard failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsCreatePR handles worktree.create_pr action
+func (h *GitHandlers) wsCreatePR(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitCreatePRRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.Title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitCreatePR(ctx, req.Title, req.Body, req.BaseBranch, req.Draft, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("create PR failed: %w", err)
+	}
+
+	// On success, notify callback to associate PR with task. The repo subpath
+	// flows through so the orchestrator can scope the resulting TaskPR /
+	// PRWatch rows to the per-task repository_id.
+	// Use a timeout-bound context so a stuck callback doesn't leak the goroutine.
+	if result.Success && result.PRURL != "" && h.onPRCreated != nil && shouldAssociateCreatedChange(result.Provider, result.PRURL) {
+		execution, ok := h.lifecycleMgr.GetExecutionBySessionID(req.SessionID)
+		if ok && execution.TaskID != "" {
+			sessionID := req.SessionID
+			taskID := execution.TaskID
+			prURL := result.PRURL
+			provider := result.Provider
+			repo := req.Repo
+			go func() {
+				callbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				h.onPRCreated(callbackCtx, sessionID, taskID, provider, prURL, "", repo)
+			}()
+		}
+	}
+
+	return newCreatePRResponse(msg, result)
+}
+
+func newCreatePRResponse(msg *ws.Message, result *client.PRCreateResult) (*ws.Message, error) {
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsRevertCommit handles worktree.revert_commit action
+func (h *GitHandlers) wsRevertCommit(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitRevertCommitRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.CommitSHA == "" {
+		return nil, fmt.Errorf("commit_sha is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := client.GitRevertCommit(ctx, req.CommitSHA, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("revert commit failed: %w", err)
+	}
+
+	h.notifyGitOperationFailed(req.SessionID, "revert", result)
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// wsCommitDiff handles session.commit_diff action
+func (h *GitHandlers) wsCommitDiff(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitShowCommitRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	if req.CommitSHA == "" {
+		return nil, fmt.Errorf("commit_sha is required")
+	}
+
+	client, releaseClient, err := h.getAgentCtlClient(ctx, req.SessionID)
+	defer releaseClient()
+	if err != nil {
+		if isSessionNotReadyError(err) {
+			return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+				"success":        false,
+				"ready":          false,
+				"reason":         "agent_starting",
+				"retry_after_ms": 500,
+			})
+		}
+		return nil, err
+	}
+
+	result, err := client.GitShowCommit(ctx, req.CommitSHA, req.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("show commit failed: %w", err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+func isSessionNotReadyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no agent running for session") ||
+		strings.Contains(msg, "agent client not available for session")
+}
+
+// getAgentCtlClient gets the agentctl client for a session.
+// Uses GetOrEnsureExecution so git operations survive backend restarts —
+// they're workspace-oriented and don't require a running agent process.
+func (h *GitHandlers) getAgentCtlClient(ctx context.Context, sessionID string) (*client.Client, func(), error) {
+	noRelease := func() {}
+	execution, err := h.lifecycleMgr.GetOrEnsureExecution(ctx, sessionID)
+	if err != nil {
+		return nil, noRelease, fmt.Errorf("no agent running for session %s: %w", sessionID, err)
+	}
+
+	c, releaseClient := execution.AcquireAgentCtlClient()
+	if c == nil {
+		return nil, releaseClient, fmt.Errorf("agent client not available for session %s", sessionID)
+	}
+
+	return c, releaseClient, nil
+}
+
+// GitCommitsRequest for session.git.commits action
+type GitCommitsRequest struct {
+	SessionID string `json:"session_id"`
+	Limit     int    `json:"limit"` // Max commits to return
+}
+
+// wsGitCommits handles session.git.commits action
+// The base commit SHA is always looked up from the session metadata in the database.
+// This ensures commits are filtered to only those made during the session.
+// When a target branch is available, we use dynamic merge-base calculation for accuracy.
+//
+// Concurrent identical requests (same sessionID + limit) collapse onto a
+// single in-flight computeGitCommits call via singleflight; each waiter
+// still wraps the shared payload in its own ws.Response using its own
+// msg.ID so the WS layer sees N replies for N requests.
+//
+// The shared body uses a detached, bounded context — NOT the per-request
+// ctx — so a single waiter's WS disconnect or timeout doesn't cancel the
+// in-flight computation for the other waiters. Each caller still selects
+// on its own ctx via DoChan so an individual waiter can give up without
+// blocking on the shared result.
+func (h *GitHandlers) wsGitCommits(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req GitCommitsRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	key := req.SessionID + ":" + strconv.Itoa(req.Limit)
+	ch := h.commitsGroup.DoChan(key, func() (interface{}, error) {
+		detached, cancel := context.WithTimeout(context.Background(), singleflightComputeTimeout)
+		defer cancel()
+		return h.computeGitCommits(detached, &req)
+	})
+	select {
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return ws.NewResponse(msg.ID, msg.Action, r.Val)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sessionTerminalReason is the ready:false reason clients use to stop
+// retrying. Transient not-ready paths leave reason unset (or use another
+// code); a terminal session will never gain an execution.
+const sessionTerminalReason = "session_terminal"
+
+// computeGitCommits is the singleflight body for wsGitCommits. Returns
+// a JSON-ready payload — the not-ready / agent-client-nil cases return
+// the same `{commits:[], ready:false}` envelope as before, just packaged
+// as a value so all waiters can share it.
+func (h *GitHandlers) computeGitCommits(ctx context.Context, req *GitCommitsRequest) (interface{}, error) {
+	execution, err := h.lifecycleMgr.GetOrEnsureExecution(ctx, req.SessionID)
+	if err != nil {
+		// Terminal sessions will never recover an execution — return a
+		// distinct reason so clients stop retrying instead of polling forever.
+		if errors.Is(err, lifecycle.ErrSessionTerminal) {
+			return map[string]any{
+				"commits": []any{},
+				"ready":   false,
+				"reason":  sessionTerminalReason,
+			}, nil
+		}
+		// "Not ready" errors map to ready:false so the client retries.
+		// Any other error (DB failure, etc.) propagates as a real error.
+		if errors.Is(err, lifecycle.ErrSessionWorkspaceNotReady) || isSessionNotReadyError(err) {
+			return map[string]any{"commits": []any{}, "ready": false}, nil
+		}
+		return nil, fmt.Errorf("failed to get execution for session %s: %w", req.SessionID, err)
+	}
+	agentClient, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if agentClient == nil {
+		return map[string]any{"commits": []any{}, "ready": false}, nil
+	}
+	var baseCommit, targetBranch string
+	if h.sessionReader != nil {
+		baseCommit = h.sessionReader.GetSessionBaseCommit(ctx, req.SessionID)
+		targetBranch = h.sessionReader.GetSessionBaseBranch(ctx, req.SessionID)
+	}
+	// Fallback: if base_commit_sha is not stored in the session, use the
+	// merge-base from git status. Applies to sessions created before the
+	// base-commit capture feature, or when that capture failed.
+	if baseCommit == "" {
+		status, statusErr := agentClient.GetGitStatusWithDetails(ctx)
+		if statusErr == nil && status != nil && status.BaseCommit != "" {
+			baseCommit = status.BaseCommit
+			h.logger.Debug("using git status base commit as fallback",
+				zap.String("session_id", req.SessionID),
+				zap.String("base_commit", baseCommit))
+		}
+	}
+	result, err := agentClient.GitLog(ctx, baseCommit, req.Limit, targetBranch, "")
+	if err != nil {
+		return nil, fmt.Errorf("git log failed: %w", err)
+	}
+	return result, nil
+}
+
+// CumulativeDiffRequest for session.cumulative_diff action
+type CumulativeDiffRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// wsCumulativeDiff handles session.cumulative_diff action.
+// The base commit SHA is always looked up from the session metadata in the database.
+// Concurrent identical requests collapse via singleflight — see wsGitCommits
+// for the detached-ctx / DoChan rationale.
+func (h *GitHandlers) wsCumulativeDiff(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req CumulativeDiffRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return nil, fmt.Errorf("invalid payload: %w", err)
+	}
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	ch := h.diffGroup.DoChan(req.SessionID, func() (interface{}, error) {
+		detached, cancel := context.WithTimeout(context.Background(), singleflightComputeTimeout)
+		defer cancel()
+		return h.computeCumulativeDiff(detached, &req)
+	})
+	select {
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return ws.NewResponse(msg.ID, msg.Action, r.Val)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// computeCumulativeDiff is the singleflight body for wsCumulativeDiff.
+// Returns a JSON-ready payload — not-ready / no-base-commit cases keep
+// the same response envelope shape as before.
+func (h *GitHandlers) computeCumulativeDiff(ctx context.Context, req *CumulativeDiffRequest) (interface{}, error) {
+	execution, err := h.lifecycleMgr.GetOrEnsureExecution(ctx, req.SessionID)
+	if err != nil {
+		// Distinct terminal reason: clients must not treat this as an
+		// authoritative empty diff (that would clear a previously cached
+		// snapshot) and should not retry.
+		if errors.Is(err, lifecycle.ErrSessionTerminal) {
+			return map[string]any{
+				"cumulative_diff": nil,
+				"ready":           false,
+				"reason":          sessionTerminalReason,
+			}, nil
+		}
+		if errors.Is(err, lifecycle.ErrSessionWorkspaceNotReady) || isSessionNotReadyError(err) {
+			return map[string]any{"cumulative_diff": nil, "ready": false}, nil
+		}
+		return nil, fmt.Errorf("failed to get execution for session %s: %w", req.SessionID, err)
+	}
+	agentClient, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if agentClient == nil {
+		return map[string]any{"cumulative_diff": nil, "ready": false}, nil
+	}
+	var baseCommit, targetBranch string
+	if h.sessionReader != nil {
+		baseCommit = h.sessionReader.GetSessionBaseCommit(ctx, req.SessionID)
+		targetBranch = h.sessionReader.GetSessionBaseBranch(ctx, req.SessionID)
+	}
+	if baseCommit == "" {
+		status, statusErr := agentClient.GetGitStatusWithDetails(ctx)
+		if statusErr == nil && status != nil && status.BaseCommit != "" {
+			baseCommit = status.BaseCommit
+			h.logger.Debug("using git status base commit as fallback for cumulative diff",
+				zap.String("session_id", req.SessionID),
+				zap.String("base_commit", baseCommit))
+		} else {
+			// Repo-less tasks (no git workspace) have no base commit — return
+			// an empty diff instead of erroring so the frontend's polling
+			// doesn't spam the logs.
+			return map[string]any{"cumulative_diff": nil}, nil
+		}
+	}
+	result, err := agentClient.GetCumulativeDiff(ctx, baseCommit, targetBranch)
+	if err != nil {
+		return nil, fmt.Errorf("cumulative diff failed: %w", err)
+	}
+	return map[string]interface{}{"cumulative_diff": result}, nil
+}

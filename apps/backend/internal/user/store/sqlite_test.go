@@ -1,0 +1,1519 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/kandev/kandev/internal/testutil"
+	"github.com/kandev/kandev/internal/user/models"
+)
+
+type settingsScanner struct {
+	raw      string
+	revision int64
+}
+
+// @covers AC-UI-LIST-STEP-GROUPING-001.5
+func TestTasksListGroupLegacySettingsRoundTrip(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: `{"tasks_list_group":"state","tasks_list_sort":"title_asc"}`, revision: 7}, DefaultUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.TasksListGroup != "workflow_step" || settings.Revision != 7 || settings.TasksListSort != "title_asc" {
+		t.Fatalf("legacy settings = (%q, %d, %q)", settings.TasksListGroup, settings.Revision, settings.TasksListSort)
+	}
+	raw, err := marshalUserSettingsPayload(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["tasks_list_group"] != "workflow_step" {
+		t.Fatalf("persisted group = %v", payload["tasks_list_group"])
+	}
+}
+
+// upsertUserSettingsForTest writes settings via UpsertUserSettingsPreservingTaskCreateLastUsed at the current stored revision.
+func upsertUserSettingsForTest(t *testing.T, repo *sqliteRepository, ctx context.Context, settings *models.UserSettings) {
+	t.Helper()
+	current, err := repo.GetUserSettings(ctx, settings.UserID)
+	if err != nil {
+		t.Fatalf("read current settings: %v", err)
+	}
+	var patch *models.TaskCreateLastUsed
+	if !reflect.DeepEqual(settings.TaskCreateLastUsed, models.TaskCreateLastUsed{}) {
+		patch = &settings.TaskCreateLastUsed
+	}
+	if _, err := repo.UpsertUserSettingsPreservingTaskCreateLastUsed(ctx, settings, patch, current.Revision); err != nil {
+		t.Fatalf("upsert settings: %v", err)
+	}
+}
+
+// Scan copies the scanner's raw settings string, zero time, and revision into dest.
+func (s settingsScanner) Scan(dest ...any) error {
+	*(dest[0].(*string)) = s.raw
+	*(dest[1].(*time.Time)) = time.Time{}
+	*(dest[2].(*int64)) = s.revision
+	return nil
+}
+
+// TestSQLiteRepositoryMigratesLegacySettingsRevision verifies the legacy settings revision migration against an in-memory SQLite database.
+func TestSQLiteRepositoryMigratesLegacySettingsRevision(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	assertLegacySettingsRevisionMigration(t, conn)
+}
+
+// TestPostgresRepositoryMigratesLegacySettingsRevision verifies the legacy settings revision migration against Postgres.
+func TestPostgresRepositoryMigratesLegacySettingsRevision(t *testing.T) {
+	conn := testutil.OpenIsolatedPostgres(t, testutil.PostgresDSNFromEnv(t))
+	assertLegacySettingsRevisionMigration(t, conn)
+}
+
+// assertLegacySettingsRevisionMigration verifies a legacy settings blob migrates to revision 0, bumps to 1 on write, and survives a migration replay.
+func assertLegacySettingsRevisionMigration(t *testing.T, conn *sqlx.DB) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, err := conn.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			settings TEXT NOT NULL DEFAULT '{}',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create legacy users table: %v", err)
+	}
+	if _, err := conn.Exec(
+		conn.Rebind(`INSERT INTO users (id, email, settings, created_at, updated_at) VALUES (?, ?, '{}', ?, ?)`),
+		DefaultUserID,
+		DefaultUserEmail,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy user: %v", err)
+	}
+
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("read migrated settings: %v", err)
+	}
+	if settings.Revision != 0 {
+		t.Fatalf("migrated revision = %d, want 0", settings.Revision)
+	}
+	settings.AppStatusBarEnabled = true
+	settings.UpdatedAt = now.Add(time.Second)
+	updated, err := repo.UpsertUserSettingsPreservingTaskCreateLastUsed(ctx, settings, nil, settings.Revision)
+	if err != nil {
+		t.Fatalf("write migrated settings: %v", err)
+	}
+	if updated.Revision != 1 {
+		t.Fatalf("updated revision = %d, want 1", updated.Revision)
+	}
+
+	replayedRepo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("reinitialize migrated repo: %v", err)
+	}
+	replayed, err := replayedRepo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("read settings after migration replay: %v", err)
+	}
+	if replayed.Revision != 1 {
+		t.Fatalf("revision after migration replay = %d, want 1", replayed.Revision)
+	}
+	if !replayed.AppStatusBarEnabled {
+		t.Fatal("status bar preference was not preserved across migration replay")
+	}
+}
+
+// TestScanUserSettingsStartupPage verifies startup_page defaults to task_overview and preserves an explicit last_task value.
+func TestScanUserSettingsStartupPage(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty settings default to task overview", raw: "{}", want: "task_overview"},
+		{name: "missing setting defaults to task overview", raw: `{"chat_submit_key":"cmd_enter"}`, want: "task_overview"},
+		{name: "unknown setting defaults to task overview", raw: `{"startup_page":"future_value"}`, want: "task_overview"},
+		{name: "last task is preserved", raw: `{"startup_page":"last_task"}`, want: "last_task"},
+		{name: "threads is preserved", raw: `{"startup_page":"threads"}`, want: "threads"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			encoded, err := marshalUserSettingsPayload(settings)
+			if err != nil {
+				t.Fatalf("marshal settings payload: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatalf("decode normalized settings: %v", err)
+			}
+			if got := payload["startup_page"]; got != tt.want {
+				t.Fatalf("startup_page = %#v, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsSidebarDefaults verifies the canonical default sidebar view and that explicit sidebar settings are preserved.
+func TestScanUserSettingsSidebarDefaults(t *testing.T) {
+	defaultView := models.SidebarView{
+		ID:              "view-all-tasks",
+		Name:            "All tasks",
+		Filters:         []models.SidebarViewClause{},
+		Sort:            models.SidebarViewSort{Key: "state", Direction: "asc"},
+		Group:           "repository",
+		CollapsedGroups: []string{},
+		TaskRow:         models.DefaultSidebarTaskRowPresentation(),
+	}
+
+	tests := []struct {
+		name          string
+		raw           string
+		wantDefaults  bool
+		wantViewCount int
+	}{
+		{name: "empty settings use canonical sidebar default", raw: "{}", wantDefaults: true, wantViewCount: 1},
+		{name: "unrelated settings retain canonical sidebar default", raw: `{"workspace_id":"workspace-1"}`, wantDefaults: true, wantViewCount: 1},
+		{name: "explicit sidebar settings are preserved", raw: `{"sidebar_views":[{"id":"custom","name":"Custom"}],"sidebar_active_view_id":"custom"}`, wantDefaults: false, wantViewCount: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if len(settings.SidebarViews) != tt.wantViewCount {
+				t.Fatalf("sidebar view count = %d, want %d", len(settings.SidebarViews), tt.wantViewCount)
+			}
+			if tt.wantDefaults {
+				if !reflect.DeepEqual(settings.SidebarViews[0], defaultView) {
+					t.Fatalf("sidebar default = %+v, want %+v", settings.SidebarViews[0], defaultView)
+				}
+				if settings.SidebarActiveViewID != defaultView.ID {
+					t.Fatalf("active sidebar view = %q, want %q", settings.SidebarActiveViewID, defaultView.ID)
+				}
+				return
+			}
+			if settings.SidebarViews[0].ID != "custom" || settings.SidebarActiveViewID != "custom" {
+				t.Fatalf("explicit sidebar settings were not preserved: views=%+v active=%q", settings.SidebarViews, settings.SidebarActiveViewID)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsPreservesExplicitEmptySidebarSettings verifies explicitly empty sidebar view lists survive scanning.
+func TestScanUserSettingsPreservesExplicitEmptySidebarSettings(t *testing.T) {
+	for _, raw := range []string{
+		`{"sidebar_views":[],"sidebar_active_view_id":""}`,
+		`{"sidebar_views":null,"sidebar_active_view_id":null}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if len(settings.SidebarViews) != 0 {
+				t.Fatalf("sidebar views = %+v, want an explicit empty list", settings.SidebarViews)
+			}
+			if settings.SidebarActiveViewID != "" {
+				t.Fatalf("active sidebar view = %q, want an explicit empty ID", settings.SidebarActiveViewID)
+			}
+		})
+	}
+}
+
+func TestSidebarTaskColorAutomationStorageRoundTripAndMalformedFallback(t *testing.T) {
+	raw := `{"sidebar_task_color_automation":{"enabled":true,"rules":[{"id":"blocked","enabled":true,"condition":{"dimension":"task_state","value":"BLOCKED","label":"Blocked"},"output":{"kind":"fixed","color":"red"}}]}}`
+	settings, err := scanUserSettings(settingsScanner{raw: raw}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan automatic colors: %v", err)
+	}
+	if !settings.SidebarTaskColorAutomation.Enabled || len(settings.SidebarTaskColorAutomation.Rules) != 1 {
+		t.Fatalf("automatic colors = %#v, want enabled rule", settings.SidebarTaskColorAutomation)
+	}
+	encoded, err := marshalUserSettingsPayload(settings)
+	if err != nil {
+		t.Fatalf("marshal automatic colors: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("decode normalized settings: %v", err)
+	}
+	if got := payload["sidebar_task_color_automation"].(map[string]any)["enabled"]; got != true {
+		t.Fatalf("stored automatic colors enabled = %#v, want true", got)
+	}
+
+	for _, malformed := range []string{
+		`{"sidebar_task_color_automation":null}`,
+		`{"sidebar_task_color_automation":{"enabled":true,"rules":"bad"}}`,
+		`{"sidebar_task_color_automation":{"enabled":true,"rules":[{"id":"bad","enabled":true,"condition":{"dimension":"task_state","value":null},"output":{"kind":"fixed","color":"red"}}]}}`,
+	} {
+		settings, err := scanUserSettings(settingsScanner{raw: malformed}, DefaultUserID)
+		if err != nil {
+			t.Fatalf("scan malformed automatic colors %q: %v", malformed, err)
+		}
+		if settings.SidebarTaskColorAutomation.Enabled || len(settings.SidebarTaskColorAutomation.Rules) != 0 {
+			t.Fatalf("malformed automatic colors = %#v, want disabled empty default", settings.SidebarTaskColorAutomation)
+		}
+	}
+}
+
+// TestScanUserSettingsChangesPanelLayoutDefault verifies changes_panel_layout defaults to tree and preserves an explicit flat value.
+func TestScanUserSettingsChangesPanelLayoutDefault(t *testing.T) {
+	t.Run("empty settings default to tree", func(t *testing.T) {
+		settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settings.ChangesPanelLayout != "tree" {
+			t.Fatalf("expected ChangesPanelLayout=tree, got %q", settings.ChangesPanelLayout)
+		}
+	})
+
+	t.Run("missing layout defaults to tree", func(t *testing.T) {
+		settings, err := scanUserSettings(settingsScanner{raw: `{"chat_submit_key":"cmd_enter"}`}, DefaultUserID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settings.ChangesPanelLayout != "tree" {
+			t.Fatalf("expected ChangesPanelLayout=tree, got %q", settings.ChangesPanelLayout)
+		}
+	})
+
+	t.Run("explicit flat is preserved", func(t *testing.T) {
+		settings, err := scanUserSettings(settingsScanner{raw: `{"changes_panel_layout":"flat"}`}, DefaultUserID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settings.ChangesPanelLayout != "flat" {
+			t.Fatalf("expected ChangesPanelLayout=flat, got %q", settings.ChangesPanelLayout)
+		}
+	})
+}
+
+// TestScanUserSettingsConfirmTaskArchiveDefault verifies confirm_task_archive defaults to true and preserves an explicit false.
+func TestScanUserSettingsConfirmTaskArchiveDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty settings require confirmation", raw: `{}`, want: true},
+		{name: "missing setting requires confirmation", raw: `{"chat_submit_key":"enter"}`, want: true},
+		{name: "explicit false skips confirmation", raw: `{"confirm_task_archive":false}`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if settings.ConfirmTaskArchive != tt.want {
+				t.Fatalf("ConfirmTaskArchive = %v, want %v", settings.ConfirmTaskArchive, tt.want)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsUnreadDividerDefault verifies unread_divider defaults to false and honors explicit values.
+func TestScanUserSettingsUnreadDividerDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty settings disable the divider", raw: `{}`, want: false},
+		{name: "missing setting disables the divider", raw: `{"chat_submit_key":"enter"}`, want: false},
+		{name: "explicit false disables the divider", raw: `{"unread_divider":false}`, want: false},
+		{name: "explicit true enables the divider", raw: `{"unread_divider":true}`, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if settings.UnreadDivider != tt.want {
+				t.Fatalf("UnreadDivider = %v, want %v", settings.UnreadDivider, tt.want)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsAgentGeneratedTaskTitlesDefault verifies agent_generated_task_titles defaults to true and honors explicit values.
+func TestScanUserSettingsAgentGeneratedTaskTitlesDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty settings enable title generation", raw: `{}`, want: true},
+		{name: "missing setting enables title generation", raw: `{"chat_submit_key":"enter"}`, want: true},
+		{name: "explicit false disables title generation", raw: `{"agent_generated_task_titles":false}`, want: false},
+		{name: "explicit true enables title generation", raw: `{"agent_generated_task_titles":true}`, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if settings.AgentGeneratedTaskTitles != tt.want {
+				t.Fatalf("AgentGeneratedTaskTitles = %v, want %v", settings.AgentGeneratedTaskTitles, tt.want)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsMCPTaskAgentProfileDefault verifies mcp_task_agent_profile_default defaults to current_task and preserves workspace_default.
+func TestScanUserSettingsMCPTaskAgentProfileDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty settings use current task", raw: `{}`, want: "current_task"},
+		{name: "missing setting uses current task", raw: `{"chat_submit_key":"enter"}`, want: "current_task"},
+		{name: "unknown setting uses current task", raw: `{"mcp_task_agent_profile_default":"future_value"}`, want: "current_task"},
+		{name: "workspace default is preserved", raw: `{"mcp_task_agent_profile_default":"workspace_default"}`, want: "workspace_default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			raw, err := json.Marshal(settings)
+			if err != nil {
+				t.Fatalf("marshal normalized settings: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatalf("decode normalized settings: %v", err)
+			}
+			if got := payload["mcp_task_agent_profile_default"]; got != tt.want {
+				t.Fatalf("mcp_task_agent_profile_default = %#v, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsShowAnchoredPromptBarDefault verifies show_anchored_prompt_bar defaults to false.
+func TestScanUserSettingsShowAnchoredPromptBarDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = true, want false (default)")
+	}
+
+	settings, err = scanUserSettings(settingsScanner{raw: `{"show_anchored_prompt_bar":false}`}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = true, want false (stored)")
+	}
+}
+
+// TestScanUserSettingsTranscriptNavigationDefaults verifies transcript navigation control defaults and stored preferences.
+func TestScanUserSettingsTranscriptNavigationDefaults(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if !settings.ShowScrollToLastPrompt || settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (true, false)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_scroll_to_last_prompt":false,"show_scroll_to_start":false}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan stored preferences: %v", err)
+	}
+	if settings.ShowScrollToLastPrompt || settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (false, false)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
+	if settings.ShowTranscriptAutoScrollControl {
+		t.Fatal("ShowTranscriptAutoScrollControl = true, want false (default)")
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_transcript_auto_scroll_control":true}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan stored auto-scroll-control preference: %v", err)
+	}
+	if !settings.ShowTranscriptAutoScrollControl {
+		t.Fatal("ShowTranscriptAutoScrollControl = false, want true (stored)")
+	}
+}
+
+// TestScanUserSettingsDefaultsTranscriptAutoScrollControlToHidden verifies the transcript auto-scroll control defaults to hidden.
+func TestScanUserSettingsDefaultsTranscriptAutoScrollControlToHidden(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if settings.ShowTranscriptAutoScrollControl {
+		t.Fatal("ShowTranscriptAutoScrollControl = true, want false (default)")
+	}
+}
+
+// TestTranscriptNavigationSettingsRoundTripThroughMarshalAndScan verifies transcript navigation settings survive a marshal and scan round trip.
+func TestTranscriptNavigationSettingsRoundTripThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{
+		ShowScrollToLastPrompt:          false,
+		ShowScrollToStart:               false,
+		ShowTranscriptAutoScrollControl: false,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if settings.ShowScrollToLastPrompt || settings.ShowScrollToStart || settings.ShowTranscriptAutoScrollControl {
+		t.Fatalf(
+			"transcript controls = (%t, %t, %t), want (false, false, false)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+			settings.ShowTranscriptAutoScrollControl,
+		)
+	}
+}
+
+// TestScanUserSettingsTodoListPanelDefault verifies show_todo_list_panel defaults to false and honors explicit values.
+func TestScanUserSettingsTodoListPanelDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if settings.ShowTodoListPanel {
+		t.Fatal("ShowTodoListPanel = true, want false (default)")
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_todo_list_panel":true}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan stored preference: %v", err)
+	}
+	if !settings.ShowTodoListPanel {
+		t.Fatal("ShowTodoListPanel = false, want true (stored)")
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_todo_list_panel":false}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan explicit false: %v", err)
+	}
+	if settings.ShowTodoListPanel {
+		t.Fatal("ShowTodoListPanel = true, want false (explicit)")
+	}
+}
+
+// TestScanUserSettingsTodoListPanelOnlyWhenNotEmptyDefault verifies show_todo_list_panel_only_when_not_empty defaults to false and honors explicit values.
+func TestScanUserSettingsTodoListPanelOnlyWhenNotEmptyDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if settings.ShowTodoListPanelOnlyWhenNotEmpty {
+		t.Fatal("ShowTodoListPanelOnlyWhenNotEmpty = true, want false (default)")
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_todo_list_panel_only_when_not_empty":true}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan stored preference: %v", err)
+	}
+	if !settings.ShowTodoListPanelOnlyWhenNotEmpty {
+		t.Fatal("ShowTodoListPanelOnlyWhenNotEmpty = false, want true (stored)")
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_todo_list_panel_only_when_not_empty":false}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan explicit false: %v", err)
+	}
+	if settings.ShowTodoListPanelOnlyWhenNotEmpty {
+		t.Fatal("ShowTodoListPanelOnlyWhenNotEmpty = true, want false (explicit)")
+	}
+}
+
+// TestTodoListPanelSettingRoundTripThroughMarshalAndScan verifies the todo list panel setting survives a marshal and scan round trip.
+func TestTodoListPanelSettingRoundTripThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{ShowTodoListPanel: true})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if !settings.ShowTodoListPanel {
+		t.Fatal("ShowTodoListPanel = false, want true (round-tripped)")
+	}
+}
+
+// TestTodoListPanelOnlyWhenNotEmptyRoundTripThroughMarshalAndScan verifies the todo list panel visibility setting survives a marshal and scan round trip.
+func TestTodoListPanelOnlyWhenNotEmptyRoundTripThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{
+		ShowTodoListPanelOnlyWhenNotEmpty: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if !settings.ShowTodoListPanelOnlyWhenNotEmpty {
+		t.Fatal("ShowTodoListPanelOnlyWhenNotEmpty = false, want true (round-tripped)")
+	}
+}
+
+// TestMarshalUserSettingsPersistsDisabledArchiveConfirmation verifies marshaling preserves an explicit false confirm_task_archive.
+func TestMarshalUserSettingsPersistsDisabledArchiveConfirmation(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{ConfirmTaskArchive: false})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got, ok := payload["confirm_task_archive"].(bool); !ok || got {
+		t.Fatalf("confirm_task_archive = %#v, want false", payload["confirm_task_archive"])
+	}
+}
+
+// TestShowAnchoredPromptBarRoundTripsThroughMarshalAndScan verifies show_anchored_prompt_bar survives a marshal and scan round trip.
+func TestShowAnchoredPromptBarRoundTripsThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{ShowAnchoredPromptBar: true})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if !settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = false after round trip, want true")
+	}
+}
+
+// TestMarshalUserSettingsPersistsTasksListShowDetails verifies marshaling preserves tasks_list_show_details true.
+func TestMarshalUserSettingsPersistsTasksListShowDetails(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{TasksListShowDetails: true})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got, ok := payload["tasks_list_show_details"].(bool); !ok || !got {
+		t.Fatalf("tasks_list_show_details = %#v, want true", payload["tasks_list_show_details"])
+	}
+}
+
+// TestScanUserSettingsTasksListShowDetailsDefaultsAndLoads verifies tasks_list_show_details defaults to false and loads a stored true.
+func TestScanUserSettingsTasksListShowDetailsDefaultsAndLoads(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if settings.TasksListShowDetails {
+		t.Fatal("TasksListShowDetails = true, want false")
+	}
+
+	settings, err = scanUserSettings(settingsScanner{raw: `{"tasks_list_show_details":true}`}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan stored settings: %v", err)
+	}
+	if !settings.TasksListShowDetails {
+		t.Fatal("TasksListShowDetails = false, want true")
+	}
+}
+
+// TestMarshalUserSettingsPersistsMCPTaskAgentProfileDefault verifies marshaling preserves the workspace_default MCP task agent profile.
+func TestMarshalUserSettingsPersistsMCPTaskAgentProfileDefault(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{
+		MCPTaskAgentProfileDefault: models.MCPTaskAgentProfileDefaultWorkspaceDefault,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got := payload["mcp_task_agent_profile_default"]; got != models.MCPTaskAgentProfileDefaultWorkspaceDefault {
+		t.Fatalf("mcp_task_agent_profile_default = %#v, want workspace_default", got)
+	}
+}
+
+// TestSQLiteRepositoryMCPTaskAgentProfileDefaultRoundTrip verifies the MCP task agent profile default round-trips through the SQLite repository.
+func TestSQLiteRepositoryMCPTaskAgentProfileDefaultRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.MCPTaskAgentProfileDefault = models.MCPTaskAgentProfileDefaultWorkspaceDefault
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get saved settings: %v", err)
+	}
+	if got.MCPTaskAgentProfileDefault != models.MCPTaskAgentProfileDefaultWorkspaceDefault {
+		t.Fatalf("MCPTaskAgentProfileDefault = %q, want workspace_default", got.MCPTaskAgentProfileDefault)
+	}
+}
+
+// TestScanUserSettingsLspStatusLocationDefaultsAndLoads verifies lsp_status_location defaults to toolbar and preserves stored values.
+func TestScanUserSettingsLspStatusLocationDefaultsAndLoads(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty settings use toolbar", raw: `{}`, want: models.LspStatusLocationToolbar},
+		{name: "unknown setting uses toolbar", raw: `{"lsp_status_location":"sidebar"}`, want: models.LspStatusLocationToolbar},
+		{name: "toolbar is preserved", raw: `{"lsp_status_location":"toolbar"}`, want: models.LspStatusLocationToolbar},
+		{name: "status bar is preserved", raw: `{"lsp_status_location":"status_bar"}`, want: models.LspStatusLocationStatusBar},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings: %v", err)
+			}
+			if settings.LspStatusLocation != tt.want {
+				t.Fatalf("LspStatusLocation = %q, want %q", settings.LspStatusLocation, tt.want)
+			}
+		})
+	}
+}
+
+// TestMarshalUserSettingsLspStatusLocation verifies marshaling preserves the stored LSP status location.
+func TestMarshalUserSettingsLspStatusLocation(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{
+		LspStatusLocation: models.LspStatusLocationStatusBar,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got := payload["lsp_status_location"]; got != models.LspStatusLocationStatusBar {
+		t.Fatalf("lsp_status_location = %#v, want status_bar", got)
+	}
+}
+
+// TestSQLiteRepositoryLspStatusLocationRoundTrip verifies the LSP status location round-trips through the SQLite repository.
+func TestSQLiteRepositoryLspStatusLocationRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.LspStatusLocation = models.LspStatusLocationStatusBar
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get saved settings: %v", err)
+	}
+	if got.LspStatusLocation != models.LspStatusLocationStatusBar {
+		t.Fatalf("LspStatusLocation = %q, want status_bar", got.LspStatusLocation)
+	}
+}
+
+// TestScanUserSettingsSystemMetricsDisplayDefault verifies the system metrics display defaults to disabled and honors stored preferences.
+func TestScanUserSettingsSystemMetricsDisplayDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if settings.SystemMetricsDisplay.ShowInTopbar {
+		t.Fatal("system metrics display should default to disabled")
+	}
+	encoded, err := json.Marshal(settings.SystemMetricsDisplay)
+	if err != nil {
+		t.Fatalf("marshal system metrics display: %v", err)
+	}
+	if string(encoded) != `{"show_in_topbar":false,"simplified":false}` {
+		t.Fatalf("default system metrics display = %s, want detailed preference", encoded)
+	}
+
+	settings, err = scanUserSettings(settingsScanner{raw: `{"system_metrics_display":{"show_in_topbar":true,"simplified":true}}`}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !settings.SystemMetricsDisplay.ShowInTopbar {
+		t.Fatal("expected stored system metrics display preference")
+	}
+	encoded, err = json.Marshal(settings.SystemMetricsDisplay)
+	if err != nil {
+		t.Fatalf("marshal stored system metrics display: %v", err)
+	}
+	if string(encoded) != `{"show_in_topbar":true,"simplified":true}` {
+		t.Fatalf("stored system metrics display = %s, want simplified preference", encoded)
+	}
+}
+
+// TestSQLiteRepositorySystemMetricsDisplayRoundTrip verifies the system metrics display preference round-trips through the SQLite repository.
+func TestSQLiteRepositorySystemMetricsDisplayRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.SystemMetricsDisplay = models.SystemMetricsDisplaySettings{ShowInTopbar: true, Simplified: true}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if !got.SystemMetricsDisplay.ShowInTopbar || !got.SystemMetricsDisplay.Simplified {
+		t.Fatal("expected system metrics display preference to round-trip")
+	}
+}
+
+// TestSQLiteRepositoryAppStatusBarOrderDefaultAndRoundTrip verifies the status bar order defaults to non-nil empty arrays and round-trips through the SQLite repository.
+func TestSQLiteRepositoryAppStatusBarOrderDefaultAndRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if settings.AppStatusBarOrder.LeftItemIDs == nil || settings.AppStatusBarOrder.RightItemIDs == nil {
+		t.Fatalf("default AppStatusBarOrder = %#v, want non-nil empty arrays", settings.AppStatusBarOrder)
+	}
+	settings.AppStatusBarOrder = models.AppStatusBarOrder{
+		LeftItemIDs:  []string{"builtin:connection", "plugin:left"},
+		RightItemIDs: []string{"builtin:metrics", "plugin:right"},
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if !reflect.DeepEqual(got.AppStatusBarOrder, settings.AppStatusBarOrder) {
+		t.Fatalf("AppStatusBarOrder = %#v, want %#v", got.AppStatusBarOrder, settings.AppStatusBarOrder)
+	}
+}
+
+// TestSQLiteRepositoryKanbanHiddenStepIDsDefaultAndRoundTrip verifies kanban hidden step IDs default to empty and round-trip through the SQLite repository.
+func TestSQLiteRepositoryKanbanHiddenStepIDsDefaultAndRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if len(settings.KanbanHiddenStepIDs) != 0 {
+		t.Fatalf("default KanbanHiddenStepIDs = %#v, want empty", settings.KanbanHiddenStepIDs)
+	}
+	settings.KanbanHiddenStepIDs = map[string][]string{
+		"wf-1": {"step-a", "step-b"},
+		"wf-2": {"step-c"},
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if !reflect.DeepEqual(got.KanbanHiddenStepIDs, settings.KanbanHiddenStepIDs) {
+		t.Fatalf("KanbanHiddenStepIDs = %#v, want %#v", got.KanbanHiddenStepIDs, settings.KanbanHiddenStepIDs)
+	}
+}
+
+func TestSQLiteRepositoryWorkflowIDsWithAutoHideEmptyStepsDefaultAndRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if settings.WorkflowIDsWithAutoHideEmptySteps == nil || len(settings.WorkflowIDsWithAutoHideEmptySteps) != 0 {
+		t.Fatalf("default WorkflowIDsWithAutoHideEmptySteps = %#v, want non-nil empty", settings.WorkflowIDsWithAutoHideEmptySteps)
+	}
+	settings.WorkflowIDsWithAutoHideEmptySteps = []string{"wf-a", "wf-b"}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if !reflect.DeepEqual(got.WorkflowIDsWithAutoHideEmptySteps, settings.WorkflowIDsWithAutoHideEmptySteps) {
+		t.Fatalf("WorkflowIDsWithAutoHideEmptySteps = %#v, want %#v", got.WorkflowIDsWithAutoHideEmptySteps, settings.WorkflowIDsWithAutoHideEmptySteps)
+	}
+}
+
+func TestDecodeWorkflowIDsWithAutoHideEmptyStepsFallsBackToEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "missing", raw: nil},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "non-array", raw: json.RawMessage(`{"workflow":"wf-a"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := decodeStringIDs(tt.raw)
+			if got == nil || len(got) != 0 {
+				t.Fatalf("decodeStringIDs(%s) = %#v, want non-nil empty", tt.raw, got)
+			}
+		})
+	}
+}
+
+// TestScanUserSettingsKanbanHiddenStepIDsCorruptFallsBackToEmpty verifies corrupt kanban_hidden_step_ids values fall back to empty while sibling fields still load.
+func TestScanUserSettingsKanbanHiddenStepIDsCorruptFallsBackToEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			// A top-level shape mismatch: the whole field is a JSON string,
+			// not an object. json.Unmarshal never allocates the destination
+			// map in this case, so a `decoded == nil` check alone happens to
+			// catch it.
+			name: "top-level value is not an object",
+			raw:  `{"kanban_hidden_step_ids":"not-an-object","workspace_id":"ws-1"}`,
+		},
+		{
+			// A NESTED shape mismatch: the field is a valid object, but one
+			// of its per-workflow VALUES has the wrong type. Unlike the
+			// top-level case, json.Unmarshal still allocates and partially
+			// populates the map here (e.g. {"wf-1": nil}) while returning a
+			// non-nil error, so a decode path that ignores the error and
+			// only checks for a nil map would incorrectly return that
+			// partial/garbage map instead of falling back to {}. This is
+			// the exact shape a real corruption (e.g. an interrupted
+			// partial write) is more likely to produce than a top-level
+			// type swap.
+			name: "nested per-workflow value is not an array",
+			raw:  `{"kanban_hidden_step_ids":{"wf-1":"not-an-array"},"workspace_id":"ws-1"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := scanUserSettings(settingsScanner{raw: tt.raw}, DefaultUserID)
+			if err != nil {
+				t.Fatalf("scan settings with corrupt kanban_hidden_step_ids: %v", err)
+			}
+			if len(settings.KanbanHiddenStepIDs) != 0 {
+				t.Fatalf("KanbanHiddenStepIDs = %#v, want empty on corrupt value", settings.KanbanHiddenStepIDs)
+			}
+			// Corruption in this one field must not take the rest of the
+			// settings blob down with it.
+			if settings.WorkspaceID != "ws-1" {
+				t.Fatalf("WorkspaceID = %q, want %q (sibling fields must still load)", settings.WorkspaceID, "ws-1")
+			}
+		})
+	}
+}
+
+// TestSQLiteRepositoryKanbanSortAndPriorityFilterTokensDefaultAndRoundTrip verifies both new
+// fields default correctly and round-trip through the SQLite repository.
+func TestSQLiteRepositoryKanbanSortAndPriorityFilterTokensDefaultAndRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if settings.KanbanSort != models.KanbanSortDefault {
+		t.Fatalf("default KanbanSort = %q, want %q", settings.KanbanSort, models.KanbanSortDefault)
+	}
+	if settings.KanbanPriorityFilterTokens == nil || len(settings.KanbanPriorityFilterTokens) != 0 {
+		t.Fatalf("default KanbanPriorityFilterTokens = %#v, want non-nil empty", settings.KanbanPriorityFilterTokens)
+	}
+
+	settings.KanbanSort = models.KanbanSortPriorityDesc
+	settings.KanbanPriorityFilterTokens = []string{"critical", "high"}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if got.KanbanSort != models.KanbanSortPriorityDesc {
+		t.Fatalf("KanbanSort = %q, want %q", got.KanbanSort, models.KanbanSortPriorityDesc)
+	}
+	if !reflect.DeepEqual(got.KanbanPriorityFilterTokens, settings.KanbanPriorityFilterTokens) {
+		t.Fatalf("KanbanPriorityFilterTokens = %#v, want %#v", got.KanbanPriorityFilterTokens, settings.KanbanPriorityFilterTokens)
+	}
+}
+
+// TestDecodeKanbanPriorityFilterTokensFallsBackToEmpty verifies a stored value that is not a
+// list at all resolves to the empty selection (AC-004.4) instead of erroring.
+func TestDecodeKanbanPriorityFilterTokensFallsBackToEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "missing", raw: nil},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "bare string", raw: json.RawMessage(`"critical"`)},
+		{name: "object", raw: json.RawMessage(`{"token":"critical"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := decodeKanbanPriorityFilterTokens(tt.raw)
+			if got == nil || len(got) != 0 {
+				t.Fatalf("decodeKanbanPriorityFilterTokens(%s) = %#v, want non-nil empty", tt.raw, got)
+			}
+		})
+	}
+}
+
+// TestDecodeKanbanPriorityFilterTokensDropsInvalidMembers verifies an out-of-vocabulary member in
+// an otherwise-valid list is dropped, keeping the remaining valid tokens, per AC-004.4's read-side
+// rule for legacy rows this capability's write-side validation (AC-004.9) did not produce.
+func TestDecodeKanbanPriorityFilterTokensDropsInvalidMembers(t *testing.T) {
+	got := decodeKanbanPriorityFilterTokens(json.RawMessage(`["critical","urgent","low"]`))
+	want := []string{"critical", "low"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decodeKanbanPriorityFilterTokens = %#v, want %#v", got, want)
+	}
+}
+
+// TestDecodeKanbanPriorityFilterTokensDropsNonStringMembers verifies a member that isn't even a
+// string (a row written directly, bypassing this capability's write-side validation) is dropped
+// like any other invalid member, keeping the remaining valid tokens rather than discarding the
+// whole list because one element failed to type-assert as a string.
+func TestDecodeKanbanPriorityFilterTokensDropsNonStringMembers(t *testing.T) {
+	got := decodeKanbanPriorityFilterTokens(json.RawMessage(`["critical",42,"low",{"x":1},null,true]`))
+	want := []string{"critical", "low"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decodeKanbanPriorityFilterTokens = %#v, want %#v", got, want)
+	}
+}
+
+// TestDecodeKanbanPriorityFilterTokensTrimsWhitespace verifies a legacy row with surrounding
+// whitespace around an otherwise-valid token is returned trimmed, not just validated as if
+// trimmed: the board compares tokens for exact equality, so an untrimmed member would validate
+// but then silently fail every downstream match.
+func TestDecodeKanbanPriorityFilterTokensTrimsWhitespace(t *testing.T) {
+	got := decodeKanbanPriorityFilterTokens(json.RawMessage(`[" critical","low "]`))
+	want := []string{"critical", "low"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decodeKanbanPriorityFilterTokens = %#v, want %#v", got, want)
+	}
+}
+
+// TestScanUserSettingsKanbanSortCorruptFallsBackToDefault verifies a corrupt kanban_sort value
+// falls back to the default while sibling fields still load.
+func TestScanUserSettingsKanbanSortCorruptFallsBackToDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{
+		raw: `{"kanban_sort":"garbage","workspace_id":"ws-1"}`,
+	}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings with corrupt kanban_sort: %v", err)
+	}
+	if settings.KanbanSort != models.KanbanSortDefault {
+		t.Fatalf("KanbanSort = %q, want %q", settings.KanbanSort, models.KanbanSortDefault)
+	}
+	if settings.WorkspaceID != "ws-1" {
+		t.Fatalf("WorkspaceID = %q, want %q (sibling fields must still load)", settings.WorkspaceID, "ws-1")
+	}
+}
+
+// TestSQLiteRepositoryUpdateTaskCreateLastUsedPatchesNonEmptyFields verifies updating task-create last-used patches only non-empty fields.
+func TestSQLiteRepositoryUpdateTaskCreateLastUsedPatchesNonEmptyFields(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.SidebarActiveViewID = "view-1"
+	settings.TaskCreateLastUsed = models.TaskCreateLastUsed{
+		RepositoryID:      "repo-1",
+		Branch:            "main",
+		AgentProfileID:    "agent-1",
+		ExecutorProfileID: "exec-1",
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+
+	got, err := repo.UpdateTaskCreateLastUsed(ctx, DefaultUserID, models.TaskCreateLastUsed{
+		Branch:         "feature",
+		AgentProfileID: "agent-2",
+	})
+	if err != nil {
+		t.Fatalf("update task-create last-used: %v", err)
+	}
+
+	if got.TaskCreateLastUsed.RepositoryID != "repo-1" {
+		t.Fatalf("repository id should be preserved, got %q", got.TaskCreateLastUsed.RepositoryID)
+	}
+	if got.TaskCreateLastUsed.Branch != "feature" {
+		t.Fatalf("branch should update, got %q", got.TaskCreateLastUsed.Branch)
+	}
+	if got.TaskCreateLastUsed.AgentProfileID != "agent-2" {
+		t.Fatalf("agent profile should update, got %q", got.TaskCreateLastUsed.AgentProfileID)
+	}
+	if got.TaskCreateLastUsed.ExecutorProfileID != "exec-1" {
+		t.Fatalf("executor profile should be preserved, got %q", got.TaskCreateLastUsed.ExecutorProfileID)
+	}
+	if got.SidebarActiveViewID != "view-1" {
+		t.Fatalf("unrelated settings should be preserved, got active view %q", got.SidebarActiveViewID)
+	}
+}
+
+// TestSQLiteRepositoryUpdateTaskCreateLastUsedPreservesWorkflowHistory verifies workflow history entries are merged rather than replaced.
+func TestSQLiteRepositoryUpdateTaskCreateLastUsedPreservesWorkflowHistory(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.TaskCreateLastUsed = models.TaskCreateLastUsed{
+		RepositoryID: "repo-1",
+		WorkflowIDsByWorkspace: map[string]string{
+			"workspace-1": "workflow-1",
+			"workspace-2": "workflow-2",
+		},
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+
+	got, err := repo.UpdateTaskCreateLastUsed(ctx, DefaultUserID, models.TaskCreateLastUsed{
+		WorkflowIDsByWorkspace: map[string]string{"workspace-3": "workflow-3"},
+	})
+	if err != nil {
+		t.Fatalf("update task-create workflow history: %v", err)
+	}
+
+	if got.TaskCreateLastUsed.RepositoryID != "repo-1" {
+		t.Fatalf("repository id should be preserved, got %q", got.TaskCreateLastUsed.RepositoryID)
+	}
+	want := map[string]string{
+		"workspace-1": "workflow-1",
+		"workspace-2": "workflow-2",
+		"workspace-3": "workflow-3",
+	}
+	if !reflect.DeepEqual(got.TaskCreateLastUsed.WorkflowIDsByWorkspace, want) {
+		t.Fatalf("workflow history = %#v, want %#v", got.TaskCreateLastUsed.WorkflowIDsByWorkspace, want)
+	}
+}
+
+// TestSQLiteRepositoryUpdateTaskCreateLastUsedClearsBranchOnRepositoryChange verifies the branch is cleared when the repository changes.
+func TestSQLiteRepositoryUpdateTaskCreateLastUsedClearsBranchOnRepositoryChange(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.TaskCreateLastUsed = models.TaskCreateLastUsed{
+		RepositoryID:      "repo-before",
+		Branch:            "main",
+		AgentProfileID:    "agent-1",
+		ExecutorProfileID: "exec-1",
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+
+	got, err := repo.UpdateTaskCreateLastUsed(ctx, DefaultUserID, models.TaskCreateLastUsed{
+		RepositoryID: "repo-after",
+	})
+	if err != nil {
+		t.Fatalf("update task-create last-used: %v", err)
+	}
+
+	if got.TaskCreateLastUsed.RepositoryID != "repo-after" {
+		t.Fatalf("repository id should update, got %q", got.TaskCreateLastUsed.RepositoryID)
+	}
+	if got.TaskCreateLastUsed.Branch != "" {
+		t.Fatalf("branch should clear on repository change, got %q", got.TaskCreateLastUsed.Branch)
+	}
+	if got.TaskCreateLastUsed.AgentProfileID != "agent-1" {
+		t.Fatalf("agent profile should be preserved, got %q", got.TaskCreateLastUsed.AgentProfileID)
+	}
+	if got.TaskCreateLastUsed.ExecutorProfileID != "exec-1" {
+		t.Fatalf("executor profile should be preserved, got %q", got.TaskCreateLastUsed.ExecutorProfileID)
+	}
+}
+
+// TestBuildPostgresTaskCreateLastUsedUpdatePatchesNonEmptyFields verifies the generated Postgres update patches task-create fields with jsonb_set.
+func TestBuildPostgresTaskCreateLastUsedUpdatePatchesNonEmptyFields(t *testing.T) {
+	query, args := buildPostgresTaskCreateLastUsedUpdate(models.TaskCreateLastUsed{
+		RepositoryID:      "repo-1",
+		Branch:            "feature",
+		AgentProfileID:    "agent-1",
+		ExecutorProfileID: "exec-1",
+	})
+
+	if strings.Contains(query, "json(") || strings.Contains(query, "json_extract") {
+		t.Fatalf("postgres update must not use sqlite JSON functions: %s", query)
+	}
+	if !strings.Contains(query, "jsonb_set") {
+		t.Fatalf("postgres update should use jsonb_set: %s", query)
+	}
+	if !strings.Contains(query, "settings_revision = settings_revision + 1") ||
+		!strings.Contains(query, "RETURNING settings, updated_at, settings_revision") {
+		t.Fatalf("postgres update should atomically return its settings revision: %s", query)
+	}
+	if !strings.Contains(query, "{task_create_last_used,repository_id}") ||
+		!strings.Contains(query, "{task_create_last_used,branch}") ||
+		!strings.Contains(query, "{task_create_last_used,agent_profile_id}") ||
+		!strings.Contains(query, "{task_create_last_used,executor_profile_id}") {
+		t.Fatalf("postgres update should patch task-create fields: %s", query)
+	}
+	if len(args) != 4 {
+		t.Fatalf("expected one arg per task-create field, got %d", len(args))
+	}
+}
+
+// TestBuildPostgresTaskCreateLastUsedUpdatePatchesWorkflowHistoryEntries verifies the generated Postgres update patches workflow history entries.
+func TestBuildPostgresTaskCreateLastUsedUpdatePatchesWorkflowHistoryEntries(t *testing.T) {
+	query, args := buildPostgresTaskCreateLastUsedUpdate(models.TaskCreateLastUsed{
+		WorkflowIDsByWorkspace: map[string]string{
+			"workspace-1": "workflow-1",
+			"workspace-2": "workflow-2",
+		},
+	})
+
+	for _, workspaceID := range []string{"workspace-1", "workspace-2"} {
+		path := "ARRAY['task_create_last_used','workflow_ids_by_workspace',?::text]"
+		if !strings.Contains(query, path) {
+			t.Fatalf("postgres update should patch workflow path %q for %s: %s", path, workspaceID, query)
+		}
+	}
+	if !strings.Contains(query, "{workflow_ids_by_workspace}") {
+		t.Fatalf("postgres update should initialize the workflow history object: %s", query)
+	}
+	if len(args) != 4 {
+		t.Fatalf("expected workspace and workflow args per entry, got %d", len(args))
+	}
+}
+
+// TestMakeTaskCreateLastUsedJSONSetArgsRejectsUnsafeWorkspacePathKeys verifies unsafe workspace keys are excluded from JSON set arguments.
+func TestMakeTaskCreateLastUsedJSONSetArgsRejectsUnsafeWorkspacePathKeys(t *testing.T) {
+	args := makeTaskCreateLastUsedJSONSetArgs(models.TaskCreateLastUsed{
+		WorkflowIDsByWorkspace: map[string]string{
+			"workspace-safe":     "workflow-safe",
+			"workspace.with.dot": "workflow-dot",
+			"workspace[bracket]": "workflow-bracket",
+		},
+	})
+
+	if len(args) != 2 {
+		t.Fatalf("expected only the safe workspace entry, got %#v", args)
+	}
+	if args[0] != "$.task_create_last_used.workflow_ids_by_workspace.workspace-safe" ||
+		args[1] != "workflow-safe" {
+		t.Fatalf("unexpected safe workspace args: %#v", args)
+	}
+}
+
+// TestBuildPostgresTaskCreateLastUsedUpdateClearsBranchOnRepositoryChange verifies the generated Postgres update clears the branch when the repository changes.
+func TestBuildPostgresTaskCreateLastUsedUpdateClearsBranchOnRepositoryChange(t *testing.T) {
+	query, args := buildPostgresTaskCreateLastUsedUpdate(models.TaskCreateLastUsed{
+		RepositoryID: "repo-after",
+	})
+
+	if !strings.Contains(query, "{task_create_last_used,repository_id}") ||
+		!strings.Contains(query, "{task_create_last_used,branch}") {
+		t.Fatalf("postgres update should patch repository and clear branch: %s", query)
+	}
+	if strings.Contains(query, "{task_create_last_used,agent_profile_id}") ||
+		strings.Contains(query, "{task_create_last_used,executor_profile_id}") {
+		t.Fatalf("postgres update should not patch profile fields: %s", query)
+	}
+	if len(args) != 2 {
+		t.Fatalf("expected repository and empty branch args, got %d", len(args))
+	}
+	if args[0] != "repo-after" || args[1] != "" {
+		t.Fatalf("expected repo-after and empty branch args, got %#v", args)
+	}
+}
+
+// TestBuildPostgresUserSettingsPreservingTaskCreateLastUsedUpdateUsesJSONB verifies the generated Postgres preserving update merges the payload with jsonb_set.
+func TestBuildPostgresUserSettingsPreservingTaskCreateLastUsedUpdateUsesJSONB(t *testing.T) {
+	patch := models.TaskCreateLastUsed{
+		RepositoryID:      "repo-1",
+		Branch:            "feature",
+		AgentProfileID:    "agent-1",
+		ExecutorProfileID: "exec-1",
+	}
+	query, args := buildPostgresUserSettingsPreservingTaskCreateLastUsedUpdate(&patch)
+
+	if strings.Contains(query, "json(") || strings.Contains(query, "json_extract") {
+		t.Fatalf("postgres update must not use sqlite JSON functions: %s", query)
+	}
+	if !strings.Contains(query, "?::jsonb") || !strings.Contains(query, "jsonb_set") {
+		t.Fatalf("postgres update should merge payload with jsonb_set: %s", query)
+	}
+	if !strings.Contains(query, "settings_revision = settings_revision + 1") ||
+		!strings.Contains(query, "RETURNING settings, updated_at, settings_revision") {
+		t.Fatalf("postgres update should atomically return its settings revision: %s", query)
+	}
+	if !strings.Contains(query, "{task_create_last_used,repository_id}") ||
+		!strings.Contains(query, "{task_create_last_used,branch}") ||
+		!strings.Contains(query, "{task_create_last_used,agent_profile_id}") ||
+		!strings.Contains(query, "{task_create_last_used,executor_profile_id}") {
+		t.Fatalf("postgres update missing task-create paths: %s", query)
+	}
+	if len(args) != 4 {
+		t.Fatalf("expected one arg per task-create field, got %d", len(args))
+	}
+}
+
+// TestSQLiteRepositorySidebarViewStateRoundTrip verifies sidebar view state round-trips through the SQLite repository.
+func TestSQLiteRepositorySidebarViewStateRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	settings.SidebarActiveViewID = "view-1"
+	settings.SidebarViews = []models.SidebarView{{
+		ID:              "view-1",
+		Name:            "Custom",
+		Filters:         []models.SidebarViewClause{},
+		Sort:            models.SidebarViewSort{Key: "updatedAt", Direction: "desc"},
+		Group:           "workflow",
+		CollapsedGroups: []string{},
+		TaskRow: &models.SidebarTaskRowPresentation{
+			DetailsEnabled: false,
+			DetailOrder:    []string{"repository", "relative_time", "pull_request_number"},
+			VisibleDetails: []string{"repository"},
+			Trailing:       "none",
+		},
+	}}
+	settings.SidebarTaskPrefs = models.SidebarTaskPrefs{
+		PinnedTaskIDs:          []string{"task-1"},
+		OrderedTaskIDs:         []string{"task-2", "task-1"},
+		SubtaskOrderByParentID: map[string][]string{"task-1": {"sub-1"}},
+	}
+	settings.TaskCreateLastUsed = models.TaskCreateLastUsed{
+		RepositoryID:      "repo-1",
+		Branch:            "main",
+		AgentProfileID:    "agent-1",
+		ExecutorProfileID: "exec-1",
+	}
+	settings.JiraSavedViews = json.RawMessage(`[{"id":"view-1"}]`)
+	settings.JiraDefaultViewID = "view-1"
+	settings.GitLabSavedPresets = json.RawMessage(`[{"id":"preset-1"}]`)
+	settings.SidebarDraft = &models.SidebarViewDraft{
+		BaseViewID: "view-1",
+		Filters: []models.SidebarViewClause{{
+			ID:        "clause-1",
+			Dimension: "titleMatch",
+			Op:        "matches",
+			Value:     json.RawMessage(`"bug"`),
+		}},
+		Sort:  models.SidebarViewSort{Key: "updatedAt", Direction: "desc"},
+		Group: "workflow",
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if got.SidebarActiveViewID != "view-1" {
+		t.Fatalf("expected active view to round-trip, got %q", got.SidebarActiveViewID)
+	}
+	if got.SidebarViews[0].TaskRow == nil || got.SidebarViews[0].TaskRow.Trailing != "none" {
+		t.Fatalf("expected sidebar view task row to round-trip, got %+v", got.SidebarViews)
+	}
+	if got.SidebarDraft == nil || got.SidebarDraft.Group != "workflow" {
+		t.Fatalf("expected sidebar draft to round-trip, got %+v", got.SidebarDraft)
+	}
+	if got.SidebarTaskPrefs.PinnedTaskIDs[0] != "task-1" {
+		t.Fatalf("expected sidebar task prefs to round-trip, got %+v", got.SidebarTaskPrefs)
+	}
+	if got.TaskCreateLastUsed.Branch != "main" {
+		t.Fatalf("expected task-create prefs to round-trip, got %+v", got.TaskCreateLastUsed)
+	}
+	if string(got.JiraSavedViews) != `[{"id":"view-1"}]` {
+		t.Fatalf("expected Jira saved views to round-trip, got %s", string(got.JiraSavedViews))
+	}
+	if got.JiraDefaultViewID != "view-1" {
+		t.Fatalf("expected Jira default view ID to round-trip, got %q", got.JiraDefaultViewID)
+	}
+	if string(got.GitLabSavedPresets) != `[{"id":"preset-1"}]` {
+		t.Fatalf("expected GitLab presets to round-trip, got %s", string(got.GitLabSavedPresets))
+	}
+}

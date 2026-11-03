@@ -1,0 +1,61 @@
+import type {
+  DiskUsageResponse,
+  DatabaseStats,
+  SnapshotInfo,
+  UpdatesResponse,
+  SystemJob,
+  SystemMetricsSnapshot,
+  StorageMaintenanceRun,
+  StorageDiskCapacityResponse,
+  StorageOverviewResponse,
+  StoragePolicyResponse,
+  StorageQuarantineEntry,
+  RetentionStatus,
+} from "@/lib/types/system";
+
+export type SystemBackupsState = {
+  items: SnapshotInfo[];
+  loaded: boolean;
+};
+
+export type SystemJobsMap = Record<string, SystemJob>;
+
+export type SystemSliceState = {
+  system: {
+    diskUsage: DiskUsageResponse | null;
+    database: DatabaseStats | null;
+    retention: RetentionStatus | null;
+    backups: SystemBackupsState;
+    updates: UpdatesResponse | null;
+    jobs: SystemJobsMap;
+    metrics: SystemMetricsSnapshot | null;
+    storage: {
+      policy: StoragePolicyResponse | null;
+      overview: StorageOverviewResponse | null;
+      analysisRevision: number;
+      disk: StorageDiskCapacityResponse | null;
+      diskIdentity: string | null;
+      runs: StorageMaintenanceRun[];
+      quarantine: StorageQuarantineEntry[];
+    };
+  };
+};
+
+export type SystemSliceActions = {
+  setSystemDiskUsage: (usage: DiskUsageResponse) => void;
+  setSystemDatabase: (stats: DatabaseStats) => void;
+  setSystemRetention: (status: RetentionStatus) => void;
+  setSystemBackups: (items: SnapshotInfo[]) => void;
+  setSystemUpdates: (updates: UpdatesResponse) => void;
+  upsertSystemJob: (job: SystemJob) => void;
+  clearSystemJob: (jobId: string) => void;
+  setSystemMetricsSnapshot: (snapshot: SystemMetricsSnapshot) => void;
+  setSystemStoragePolicy: (policy: StoragePolicyResponse) => void;
+  setSystemStorageOverview: (overview: StorageOverviewResponse) => void;
+  bumpSystemStorageAnalysisRevision: () => void;
+  setSystemStorageDisk: (disk: StorageDiskCapacityResponse | null, identity: string | null) => void;
+  setSystemStorageRuns: (runs: StorageMaintenanceRun[]) => void;
+  setSystemStorageQuarantine: (entries: StorageQuarantineEntry[]) => void;
+};
+
+export type SystemSlice = SystemSliceState & SystemSliceActions;

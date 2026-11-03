@@ -1,0 +1,459 @@
+package routines
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/office/shared"
+)
+
+// fieldError/fieldPaused/fieldWorkspaceID/fieldReason mirror the response
+// field names already used throughout this handler's other gin.H literals;
+// named here so writeDispatchError's occurrences don't trip goconst's
+// repeated-string threshold on their own.
+const (
+	fieldError       = "error"
+	fieldPaused      = "paused"
+	fieldWorkspaceID = "workspace_id"
+	fieldReason      = "reason"
+)
+
+// writeDispatchError maps a routine-dispatch error to its HTTP status.
+// A confirmed pause is a 409 (the request is understood but the
+// workspace is stopped); a gate-read error is a 503 (retryable — the
+// pause state itself couldn't be determined). A confirmed pause also
+// carries the blocking pause's workspace id and reason
+// (AC-OFFICE-KILL-SWITCH-002.3) when checkPauseGate attached them via
+// *pausedDispatchError; a gate-read error carries neither, since the pause
+// state itself is unknown.
+func writeDispatchError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, shared.ErrWorkspacePaused):
+		body := gin.H{fieldError: err.Error(), fieldPaused: true}
+		var pausedErr *pausedDispatchError
+		if errors.As(err, &pausedErr) {
+			body[fieldWorkspaceID] = pausedErr.workspaceID
+			body[fieldReason] = pausedErr.reason
+		}
+		c.JSON(http.StatusConflict, body)
+	case errors.Is(err, shared.ErrPauseGateUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{fieldError: err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{fieldError: err.Error()})
+	}
+}
+
+// Handler provides HTTP handlers for routine routes.
+type Handler struct {
+	svc *RoutineService
+}
+
+// NewHandler creates a new Handler backed by the given RoutineService.
+func NewHandler(svc *RoutineService) *Handler {
+	return &Handler{svc: svc}
+}
+
+// RegisterRoutes registers routine HTTP routes on the given router group.
+func RegisterRoutes(api *gin.RouterGroup, h *Handler) {
+	api.GET("/workspaces/:wsId/routines", h.listRoutines)
+	api.POST("/workspaces/:wsId/routines", h.createRoutine)
+	api.GET("/workspaces/:wsId/routine-runs", h.listAllRuns)
+	api.GET("/routines/:id", h.getRoutine)
+	api.PATCH("/routines/:id", h.updateRoutine)
+	api.DELETE("/routines/:id", h.deleteRoutine)
+	api.POST("/routines/:id/run", h.runRoutine)
+	api.GET("/routines/:id/triggers", h.listTriggers)
+	api.POST("/routines/:id/triggers", h.createTrigger)
+	api.DELETE("/routine-triggers/:triggerId", h.deleteTrigger)
+	api.GET("/routines/:id/runs", h.listRuns)
+	api.POST("/routine-triggers/:publicId/fire", h.fireWebhookTrigger)
+}
+
+func (h *Handler) listRoutines(c *gin.Context) {
+	ctx := c.Request.Context()
+	routines, err := h.svc.ListRoutinesFromConfig(ctx, c.Param("wsId"))
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	withSchedule, err := h.svc.AttachScheduleState(ctx, routines)
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, RoutineListResponse{Routines: withSchedule})
+}
+
+// withScheduleState classifies a single routine's schedule state, for the
+// single-routine response shapes (create/get/update).
+func (h *Handler) withScheduleState(c *gin.Context, routine *Routine) (*RoutineWithSchedule, error) {
+	withSchedule, err := h.svc.AttachScheduleState(c.Request.Context(), []*Routine{routine})
+	if err != nil {
+		return nil, err
+	}
+	return withSchedule[0], nil
+}
+
+// jsonErrorKey is the JSON body key used for error responses in this package.
+const jsonErrorKey = "error"
+
+// respondInternalError writes a 500 response carrying err's message.
+func respondInternalError(c *gin.Context, err error) {
+	c.JSON(http.StatusInternalServerError, gin.H{jsonErrorKey: err.Error()})
+}
+
+func (h *Handler) createRoutine(c *gin.Context) {
+	var req CreateRoutineRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Apply server defaults when the client omits the policy fields, then
+	// validate. Empty string in either field means "use default" — the
+	// agentctl CLI and several internal call sites POST without setting them.
+	concurrencyPolicy := models.RoutineConcurrencyPolicy(req.ConcurrencyPolicy)
+	if concurrencyPolicy == "" {
+		concurrencyPolicy = models.ConcurrencyPolicySkipIfActive
+	}
+	catchUpPolicy := models.RoutineCatchUpPolicy(req.CatchUpPolicy)
+	if catchUpPolicy == "" {
+		catchUpPolicy = models.CatchUpPolicySummarizeMissed
+	}
+	if !concurrencyPolicy.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid concurrency_policy: " + req.ConcurrencyPolicy})
+		return
+	}
+	if !catchUpPolicy.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid catch_up_policy: " + req.CatchUpPolicy})
+		return
+	}
+	routine := &Routine{
+		WorkspaceID:            c.Param("wsId"),
+		Name:                   req.Name,
+		Description:            req.Description,
+		TaskTemplate:           req.TaskTemplate,
+		AssigneeAgentProfileID: req.AssigneeAgentProfileID,
+		Status:                 "active",
+		ConcurrencyPolicy:      concurrencyPolicy,
+		CatchUpPolicy:          catchUpPolicy,
+		CatchUpMax:             req.CatchUpMax,
+		Variables:              req.Variables,
+	}
+	if err := h.svc.CreateRoutine(c.Request.Context(), routine); err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	withSchedule, err := h.withScheduleState(c, routine)
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, RoutineResponse{Routine: withSchedule})
+}
+
+func (h *Handler) getRoutine(c *gin.Context) {
+	routine, err := h.svc.GetRoutineFromConfig(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	withSchedule, err := h.withScheduleState(c, routine)
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, RoutineResponse{Routine: withSchedule})
+}
+
+func (h *Handler) updateRoutine(c *gin.Context) {
+	routine, statusCode, err := h.doUpdateRoutine(c)
+	if err != nil {
+		c.JSON(statusCode, gin.H{"error": err.Error()})
+		return
+	}
+	withSchedule, err := h.withScheduleState(c, routine)
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, RoutineResponse{Routine: withSchedule})
+}
+
+func (h *Handler) doUpdateRoutine(c *gin.Context) (*Routine, int, error) {
+	ctx := c.Request.Context()
+	routine, err := h.svc.GetRoutineFromConfig(ctx, c.Param("id"))
+	if err != nil {
+		return nil, http.StatusNotFound, err
+	}
+	var req UpdateRoutineRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	if req.ConcurrencyPolicy != nil && !models.RoutineConcurrencyPolicy(*req.ConcurrencyPolicy).Valid() {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid concurrency_policy: %s", *req.ConcurrencyPolicy)
+	}
+	if req.CatchUpPolicy != nil && !models.RoutineCatchUpPolicy(*req.CatchUpPolicy).Valid() {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid catch_up_policy: %s", *req.CatchUpPolicy)
+	}
+	applyRoutineUpdates(routine, &req)
+	if err := h.svc.UpdateRoutine(ctx, routine); err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	return routine, http.StatusOK, nil
+}
+
+func (h *Handler) deleteRoutine(c *gin.Context) {
+	if err := h.svc.DeleteRoutine(c.Request.Context(), c.Param("id")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handler) runRoutine(c *gin.Context) {
+	var req RunRoutineRequest
+	// Body is optional for manual trigger.
+	_ = c.ShouldBindJSON(&req)
+	run, err := h.svc.FireManual(c.Request.Context(), c.Param("id"), req.Variables)
+	if err != nil {
+		var notFiring *RoutineNotFiringError
+		if errors.As(err, &notFiring) {
+			c.JSON(http.StatusConflict, routineNotFiringBody(notFiring.Status))
+			return
+		}
+		writeDispatchError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, RoutineRunResponse{Run: run})
+}
+
+func (h *Handler) listTriggers(c *gin.Context) {
+	triggers, err := h.svc.ListRoutineTriggers(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	redactTriggerSecrets(triggers)
+	c.JSON(http.StatusOK, TriggerListResponse{Triggers: triggers})
+}
+
+func (h *Handler) createTrigger(c *gin.Context) {
+	var req CreateTriggerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	trigger := &RoutineTrigger{
+		RoutineID:      c.Param("id"),
+		Kind:           req.Kind,
+		CronExpression: req.CronExpression,
+		Timezone:       req.Timezone,
+		PublicID:       req.PublicID,
+		SigningMode:    req.SigningMode,
+		Secret:         req.Secret,
+		Enabled:        true,
+	}
+	if err := h.svc.CreateRoutineTrigger(c.Request.Context(), trigger); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrInvalidTrigger) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	trigger.Secret = "" // redact before sending response
+	c.JSON(http.StatusCreated, TriggerResponse{Trigger: trigger})
+}
+
+func (h *Handler) deleteTrigger(c *gin.Context) {
+	if err := h.svc.DeleteRoutineTrigger(c.Request.Context(), c.Param("triggerId")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handler) listRuns(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	runs, err := h.svc.ListRoutineRuns(c.Request.Context(), c.Param("id"), limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, RunListResponse{Runs: runs})
+}
+
+func (h *Handler) listAllRuns(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	runs, err := h.svc.ListAllRoutineRuns(c.Request.Context(), c.Param("wsId"), limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, RunListResponse{Runs: runs})
+}
+
+func (h *Handler) fireWebhookTrigger(c *gin.Context) {
+	publicID := c.Param("publicId")
+	ctx := c.Request.Context()
+
+	trigger, err := h.svc.GetTriggerByPublicID(ctx, publicID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trigger not found"})
+		return
+	}
+	if !trigger.Enabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "trigger is disabled"})
+		return
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read body"})
+		return
+	}
+
+	if !verifySignature(trigger.SigningMode, trigger.Secret, c.Request, body) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "signature verification failed"})
+		return
+	}
+
+	vars := parseWebhookPayload(body)
+
+	routine, err := h.svc.GetRoutine(ctx, trigger.RoutineID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "routine not found"})
+		return
+	}
+	if !models.RoutineStatus(routine.Status).CanFire() {
+		c.JSON(http.StatusConflict, routineNotFiringBody(routine.Status))
+		return
+	}
+
+	run, err := h.svc.DispatchRoutineRunWithIdempotencyKey(
+		ctx, routine, trigger, "webhook", vars, c.GetHeader("Idempotency-Key"))
+	if err != nil {
+		writeDispatchError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"run_id": run.ID, "status": run.Status})
+}
+
+// routineNotFiringBody is the shared 409 body for a fire refused on
+// routine status, returned identically by the manual and webhook routes.
+// `error` is a human-readable fallback for a caller with no localized
+// copy; `error_code` is what a surface recognizes to select its own
+// localized message; `status` is the observed value, verbatim, so the
+// surface can interpolate it.
+func routineNotFiringBody(status string) gin.H {
+	return gin.H{
+		"error":      fmt.Sprintf("routine cannot fire: status is %q", status),
+		"error_code": RoutineNotFiringErrorCode,
+		"status":     status,
+	}
+}
+
+// redactTriggerSecrets clears the Secret field on each trigger to prevent
+// plaintext webhook secrets from leaking in API responses.
+// NOTE: Webhook secrets are stored as plaintext because HMAC verification
+// requires the raw value; bcrypt-style hashing is not feasible here.
+// Generation uses crypto/rand (see service layer).
+func redactTriggerSecrets(triggers []*RoutineTrigger) {
+	for _, t := range triggers {
+		t.Secret = ""
+	}
+}
+
+func applyRoutineUpdates(routine *Routine, req *UpdateRoutineRequest) {
+	if req.Name != nil {
+		routine.Name = *req.Name
+	}
+	if req.Description != nil {
+		routine.Description = *req.Description
+	}
+	if req.TaskTemplate != nil {
+		routine.TaskTemplate = *req.TaskTemplate
+	}
+	if req.AssigneeAgentProfileID != nil {
+		routine.AssigneeAgentProfileID = *req.AssigneeAgentProfileID
+	}
+	if req.Status != nil {
+		routine.Status = *req.Status
+	}
+	if req.ConcurrencyPolicy != nil {
+		routine.ConcurrencyPolicy = models.RoutineConcurrencyPolicy(*req.ConcurrencyPolicy)
+	}
+	if req.CatchUpPolicy != nil {
+		routine.CatchUpPolicy = models.RoutineCatchUpPolicy(*req.CatchUpPolicy)
+	}
+	if req.CatchUpMax != nil {
+		routine.CatchUpMax = *req.CatchUpMax
+	}
+	if req.Variables != nil {
+		routine.Variables = *req.Variables
+	}
+}
+
+// verifySignature checks the request against the configured signing mode.
+func verifySignature(mode, secret string, r *http.Request, body []byte) bool {
+	switch mode {
+	case "none", "":
+		return true
+	case "bearer":
+		return verifyBearer(r, secret)
+	case "hmac_sha256":
+		return verifyHMAC(r, body, secret)
+	default:
+		return false
+	}
+}
+
+func verifyBearer(r *http.Request, secret string) bool {
+	auth := r.Header.Get("Authorization")
+	return hmac.Equal([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(secret))
+}
+
+func verifyHMAC(r *http.Request, body []byte, secret string) bool {
+	sig := r.Header.Get("X-Signature-256")
+	if sig == "" {
+		return false
+	}
+	sig = strings.TrimPrefix(sig, "sha256=")
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(sig), []byte(expected))
+}
+
+func parseWebhookPayload(body []byte) map[string]string {
+	vars := make(map[string]string)
+	if len(body) == 0 {
+		return vars
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return vars
+	}
+	for k, v := range raw {
+		switch val := v.(type) {
+		case string:
+			vars[k] = val
+		default:
+			b, _ := json.Marshal(v)
+			vars[k] = string(b)
+		}
+	}
+	return vars
+}

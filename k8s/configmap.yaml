@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kandev-config
+  labels:
+    app: kandev
+data:
+  # Kandev home directory on the PV. Everything kandev persists — the DB
+  # (under data/), tasks, worktrees, repos, sessions, and LSP servers — lives
+  # under this root. Mount the PV at /data. Set KANDEV_DATABASE_DRIVER=postgres
+  # for production to move the DB off the PV.
+  KANDEV_HOME_DIR: /data
+
+  # Disable Docker runtime (no Docker-in-Docker in K8s)
+  KANDEV_DOCKER_ENABLED: "false"
+
+  # Logging — auto-detects K8s and uses JSON format
+  KANDEV_LOG_LEVEL: info

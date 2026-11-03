@@ -1,0 +1,690 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { collectPhantomSessionIdsForEnv, tryRestoreLayout } from "./dockview-layout-restore";
+import { sanitizeSerializedLayout } from "@/lib/state/layout-manager/sanitize-serialized-layout";
+import { useDockviewStore } from "@/lib/state/dockview-store";
+import * as localStorage from "@/lib/local-storage";
+
+const VALID_COMPONENTS = new Set<string>(["chat", "files", "shell", "git", "terminal"]);
+const PHANTOM_PANEL_ID = "session:phantom";
+const ALIVE_PANEL_ID = "session:alive-1";
+
+/**
+ * Build a minimal valid SerializedDockview-shaped object — matches what
+ * dockview's api.toJSON() produces for a 3-column layout (sidebar | center | right).
+ */
+function buildLayout(opts?: { centerSize?: number; sidebarSize?: number; rightSize?: number }) {
+  return {
+    grid: {
+      root: {
+        type: "branch" as const,
+        size: 600,
+        data: [
+          {
+            type: "leaf" as const,
+            size: opts?.sidebarSize ?? 350,
+            data: { id: "g-sidebar", views: ["files"], activeView: "files" },
+          },
+          {
+            type: "leaf" as const,
+            size: opts?.centerSize ?? 800,
+            data: { id: "g-center", views: ["chat"], activeView: "chat" },
+          },
+          {
+            type: "leaf" as const,
+            size: opts?.rightSize ?? 450,
+            data: { id: "g-right", views: ["git", "shell"], activeView: "git" },
+          },
+        ],
+      },
+      height: 600,
+      width: 1600,
+      orientation: "HORIZONTAL" as const,
+    },
+    panels: {
+      files: { id: "files", contentComponent: "files" },
+      chat: { id: "chat", contentComponent: "chat" },
+      git: { id: "git", contentComponent: "git" },
+      shell: { id: "shell", contentComponent: "shell" },
+    },
+    activeGroup: "g-center",
+  };
+}
+
+function makeFakeRestoreApi() {
+  return {
+    fromJSON: vi.fn(),
+    layout: vi.fn(),
+    width: 1600,
+    height: 600,
+    groups: [],
+    panels: [],
+    activeGroup: { id: "g-center" },
+    getPanel: vi.fn(() => null),
+    onDidActiveGroupChange: vi.fn(() => ({ dispose: vi.fn() })),
+    onDidLayoutChange: vi.fn(() => ({ dispose: vi.fn() })),
+  } as unknown as Parameters<typeof tryRestoreLayout>[0];
+}
+
+describe("sanitizeSerializedLayout - size validation", () => {
+  it("returns the layout unchanged when all sizes are positive", () => {
+    const layout = buildLayout();
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).not.toBeNull();
+    expect(result.grid.root.data).toHaveLength(3);
+  });
+
+  it("returns null when a leaf node has size 0", () => {
+    const layout = buildLayout({ centerSize: 0 });
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when a leaf node has negative size", () => {
+    const layout = buildLayout({ sidebarSize: -50 });
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when a branch node has size 0", () => {
+    const layout = buildLayout();
+    layout.grid.root.size = 0;
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when nested branch has invalid size", () => {
+    const layout = {
+      grid: {
+        root: {
+          type: "branch" as const,
+          size: 800,
+          data: [
+            {
+              type: "leaf" as const,
+              size: 350,
+              data: { id: "g-sidebar", views: ["files"], activeView: "files" },
+            },
+            {
+              type: "branch" as const,
+              size: 0,
+              data: [
+                {
+                  type: "leaf" as const,
+                  size: 800,
+                  data: { id: "g-center", views: ["chat"], activeView: "chat" },
+                },
+              ],
+            },
+          ],
+        },
+        height: 600,
+        width: 1600,
+        orientation: "HORIZONTAL" as const,
+      },
+      panels: {
+        files: { id: "files", contentComponent: "files" },
+        chat: { id: "chat", contentComponent: "chat" },
+      },
+      activeGroup: "g-center",
+    };
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when grid.width is 0", () => {
+    const layout = buildLayout();
+    layout.grid.width = 0;
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when grid.height is 0", () => {
+    const layout = buildLayout();
+    layout.grid.height = 0;
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).toBeNull();
+  });
+
+  it("preserves existing component-validation behavior alongside size checks", () => {
+    const layout = buildLayout();
+    // Add an unknown panel — sanitizer should remove it but keep the rest.
+    layout.panels = {
+      ...layout.panels,
+      // @ts-expect-error - injecting an extra unknown panel
+      unknown: { id: "unknown", contentComponent: "unknown-component" },
+    };
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+    expect(result).not.toBeNull();
+    expect(Object.keys(result.panels)).not.toContain("unknown");
+  });
+});
+
+describe("sanitizeSerializedLayout - session panel handling", () => {
+  const SESSION_PANEL_ID = "session:abc-123";
+
+  function buildLayoutWithSession() {
+    const layout = buildLayout();
+    layout.grid.root.data[1].data.views = ["chat", SESSION_PANEL_ID];
+    layout.panels = {
+      ...layout.panels,
+      // @ts-expect-error - injecting a session panel without a matching valid component
+      [SESSION_PANEL_ID]: { id: SESSION_PANEL_ID, contentComponent: "session-panel" },
+    };
+    return layout;
+  }
+
+  it("keeps session:* panels by default (per-env restore)", () => {
+    const result = sanitizeSerializedLayout(buildLayoutWithSession(), VALID_COMPONENTS);
+    expect(result).not.toBeNull();
+    expect(Object.keys(result.panels)).toContain(SESSION_PANEL_ID);
+  });
+
+  it("strips session:* panels when stripSessionPanels=true (global fallback)", () => {
+    const result = sanitizeSerializedLayout(buildLayoutWithSession(), VALID_COMPONENTS, {
+      stripSessionPanels: true,
+    });
+    expect(result).not.toBeNull();
+    expect(Object.keys(result.panels)).not.toContain(SESSION_PANEL_ID);
+    // The non-session panels stay so the rest of the layout is still usable.
+    expect(Object.keys(result.panels)).toContain("chat");
+    expect(Object.keys(result.panels)).toContain("files");
+  });
+
+  it("strips session:* panels even when contentComponent is a valid component (e.g. 'chat')", () => {
+    // dockview serializes panels added via api.addPanel({ component: "chat" })
+    // with contentComponent: "chat", which is in VALID_COMPONENTS. The strip
+    // logic must key off the panel id, not the component name.
+    const layout = buildLayout();
+    layout.grid.root.data[1].data.views = ["chat", SESSION_PANEL_ID];
+    layout.panels = {
+      ...layout.panels,
+      // @ts-expect-error - injecting a session panel with the chat component
+      [SESSION_PANEL_ID]: { id: SESSION_PANEL_ID, contentComponent: "chat" },
+    };
+    const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS, { stripSessionPanels: true });
+    expect(result).not.toBeNull();
+    expect(Object.keys(result.panels)).not.toContain(SESSION_PANEL_ID);
+    expect(Object.keys(result.panels)).toContain("chat");
+  });
+
+  describe("excludeSessionIds (per-env restore filter)", () => {
+    function buildLayoutWithTwoSessions(sidA: string, sidB: string) {
+      const layout = buildLayout();
+      layout.grid.root.data[1].data.views = [`session:${sidA}`, `session:${sidB}`];
+      layout.grid.root.data[1].data.activeView = `session:${sidA}`;
+      layout.panels = {
+        files: { id: "files", contentComponent: "files" },
+        chat: { id: "chat", contentComponent: "chat" },
+        git: { id: "git", contentComponent: "git" },
+        shell: { id: "shell", contentComponent: "shell" },
+        [`session:${sidA}`]: { id: `session:${sidA}`, contentComponent: "chat" },
+        [`session:${sidB}`]: { id: `session:${sidB}`, contentComponent: "chat" },
+      };
+      return layout;
+    }
+
+    it("strips session panels whose ids are in excludeSessionIds (phantom panels from deleted tasks)", () => {
+      // Regression for "phantom panels from local/session storage": a stale
+      // session id from a previously-deleted task can end up serialized in an
+      // env-layout (e.g. via a debounced save firing during a task switch).
+      // The env restore must drop session panels we know belong to another env.
+      const aliveId = "alive-1";
+      const phantomId = "phantom-deleted";
+      const layout = buildLayoutWithTwoSessions(aliveId, phantomId);
+      const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS, {
+        excludeSessionIds: new Set([phantomId]),
+      });
+      expect(result).not.toBeNull();
+      const alivePanel = `session:${aliveId}`;
+      expect(Object.keys(result.panels)).toContain(alivePanel);
+      expect(Object.keys(result.panels)).not.toContain(`session:${phantomId}`);
+      // The leaf's views list also drops the phantom.
+      const centerLeaf = result.grid.root.data[1];
+      expect(centerLeaf.data.views).toEqual([alivePanel]);
+      expect(centerLeaf.data.activeView).toBe(alivePanel);
+    });
+
+    it("keeps unmapped session ids (preserves still-loading sessions across restore)", () => {
+      // A session id present in the saved layout that the store has not yet
+      // mapped (WS hasn't arrived) MUST be kept — otherwise the user loses
+      // their valid chat tab on load. Reconcile cleans it up later if stale.
+      const layout = buildLayoutWithTwoSessions("a", "b");
+      const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS, {
+        excludeSessionIds: new Set<string>(),
+      });
+      expect(result).not.toBeNull();
+      expect(Object.keys(result.panels)).toContain("session:a");
+      expect(Object.keys(result.panels)).toContain("session:b");
+    });
+
+    it("ignores excludeSessionIds when undefined (preserves default per-env behavior)", () => {
+      // Without the option, behavior is unchanged: session panels are kept.
+      const layout = buildLayoutWithTwoSessions("a", "b");
+      const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS);
+      expect(result).not.toBeNull();
+      expect(Object.keys(result.panels)).toContain("session:a");
+      expect(Object.keys(result.panels)).toContain("session:b");
+    });
+
+    it("rejects mixing stripSessionPanels with excludeSessionIds at the type level", () => {
+      // The two options are intent-mutually-exclusive; the type union enforces
+      // it so a caller can't silently get strip-wins behavior.
+      const layout = buildLayoutWithTwoSessions("a", "b");
+      const result = sanitizeSerializedLayout(layout, VALID_COMPONENTS, {
+        stripSessionPanels: true,
+        // @ts-expect-error - the discriminated union forbids passing both
+        excludeSessionIds: new Set(["a"]),
+      });
+      // Compile-time guard is the contract; this just asserts the call still
+      // returns a usable value so the test isn't a no-op at runtime.
+      expect(result).not.toBeNull();
+    });
+  });
+});
+
+describe("tryRestoreLayout - env restore", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+  });
+
+  it("reconciles a stale saved grid width with the live container before applying fixups", () => {
+    const layout = buildLayout({ centerSize: 650, rightSize: 900 });
+    layout.grid.width = 1900;
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layout);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue(null);
+
+    const container = document.createElement("div");
+    const dockview = document.createElement("div");
+    dockview.className = "dv-dockview";
+    container.appendChild(dockview);
+    document.body.appendChild(container);
+    Object.defineProperties(container, {
+      clientWidth: { value: 1260 },
+      clientHeight: { value: 700 },
+    });
+
+    const api = makeFakeRestoreApi();
+    Object.defineProperties(api, {
+      width: { value: 1900, writable: true },
+      height: { value: 600, writable: true },
+    });
+
+    expect(tryRestoreLayout(api, "env-stale-width", VALID_COMPONENTS)).toBe(true);
+    expect(api.fromJSON).toHaveBeenCalledOnce();
+    expect(api.layout).toHaveBeenCalledWith(1260, 700);
+    expect((api.fromJSON as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan(
+      (api.layout as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0],
+    );
+  });
+
+  it("restores the (stripped) layout when every session in the saved env-layout is a phantom", () => {
+    // Saved layout had a single session panel — a phantom from a previously-
+    // deleted task. After stripping, no session panels remain. We still
+    // restore the (truncated) layout; useAutoSessionTab will add the active
+    // session's chat panel afterwards.
+    const layout = buildLayout();
+    layout.grid.root.data[1].data.views = [PHANTOM_PANEL_ID];
+    layout.grid.root.data[1].data.activeView = PHANTOM_PANEL_ID;
+    Object.assign(layout.panels, {
+      [PHANTOM_PANEL_ID]: { id: PHANTOM_PANEL_ID, contentComponent: "chat" },
+    });
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layout);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue(null);
+
+    const api = makeFakeRestoreApi();
+    const restored = tryRestoreLayout(api, "env-new", VALID_COMPONENTS, new Set(["phantom"]));
+    expect(restored).toBe(true);
+    expect(api.fromJSON).toHaveBeenCalledOnce();
+    // The phantom was stripped from the layout passed to fromJSON.
+    const restoredLayout = (api.fromJSON as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(Object.keys(restoredLayout.panels)).not.toContain(PHANTOM_PANEL_ID);
+  });
+
+  it("restores normally when at least one session panel survives the filter", () => {
+    const layout = buildLayout();
+    layout.grid.root.data[1].data.views = [ALIVE_PANEL_ID, PHANTOM_PANEL_ID];
+    layout.grid.root.data[1].data.activeView = ALIVE_PANEL_ID;
+    Object.assign(layout.panels, {
+      [ALIVE_PANEL_ID]: { id: ALIVE_PANEL_ID, contentComponent: "chat" },
+      [PHANTOM_PANEL_ID]: { id: PHANTOM_PANEL_ID, contentComponent: "chat" },
+    });
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layout);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue(null);
+
+    const api = makeFakeRestoreApi();
+    const restored = tryRestoreLayout(api, "env-X", VALID_COMPONENTS, new Set(["phantom"]));
+    expect(restored).toBe(true);
+    expect(api.fromJSON).toHaveBeenCalledOnce();
+  });
+
+  it("restores normally when the saved layout has no session panels at all (legit non-session env layout)", () => {
+    // An env may persist a layout with only files/terminal/etc. — no session
+    // panels to begin with. The fallback guard must NOT discard this layout.
+    const layout = buildLayout(); // center has "chat" only, no session:* ids
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layout);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue(null);
+
+    const api = makeFakeRestoreApi();
+    const restored = tryRestoreLayout(api, "env-X", VALID_COMPONENTS, new Set());
+    expect(restored).toBe(true);
+    expect(api.fromJSON).toHaveBeenCalledOnce();
+  });
+});
+
+describe("tryRestoreLayout - no env (task preparing)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  it("returns false and restores nothing when no env is known yet", () => {
+    // Regression: a null env (task preparing / session→env mapping not yet
+    // hydrated) must NOT restore the cross-env global layout — that flashed the
+    // previous task's proportions on a fresh task. onReady builds the default
+    // layout instead; the env's own layout is applied later by switchEnvLayout.
+    window.localStorage.setItem("dockview-layout-v2", JSON.stringify(buildLayout()));
+    const api = makeFakeRestoreApi();
+
+    const restored = tryRestoreLayout(api, null, VALID_COMPONENTS);
+
+    expect(restored).toBe(false);
+    expect(api.fromJSON).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Regression: an env-layout could be restored with a session panel whose id
+ * referred to a previously-deleted task's session. The fix strips session
+ * panels we KNOW belong to a different env; sessions not yet mapped in the
+ * store are preserved (they may still be loading via WS).
+ */
+describe("collectPhantomSessionIdsForEnv", () => {
+  it("returns session ids whose mapping is a different env", () => {
+    const state = {
+      environmentIdBySessionId: {
+        "sess-1": "env-A",
+        "sess-2": "env-A",
+        "sess-3": "env-B",
+      },
+    };
+    expect(collectPhantomSessionIdsForEnv(state, "env-A")).toEqual(new Set(["sess-3"]));
+    expect(collectPhantomSessionIdsForEnv(state, "env-B")).toEqual(new Set(["sess-1", "sess-2"]));
+  });
+
+  it("returns every mapped session as phantom when the env has no own sessions yet", () => {
+    const state = { environmentIdBySessionId: { "sess-1": "env-A" } };
+    expect(collectPhantomSessionIdsForEnv(state, "env-new")).toEqual(new Set(["sess-1"]));
+  });
+
+  it("does NOT classify a session as a phantom when its mapping is absent (still loading via WS)", () => {
+    // A session id present in a saved layout but not in environmentIdBySessionId
+    // could be a not-yet-arrived session for this very env. Keep it; reconcile
+    // will clean it up later if it really is stale.
+    const state = { environmentIdBySessionId: {} };
+    expect(collectPhantomSessionIdsForEnv(state, "env-A")).toEqual(new Set());
+  });
+});
+
+/**
+ * A stored payload written by an earlier version can name a panel component
+ * core no longer registers. `dockview-react` looks the component up in its
+ * `components` map and throws inside `api.fromJSON` for a missing one, so the
+ * retired entry must be dropped before the payload is applied.
+ */
+const RETIRED_COMPONENT = "prompt-history";
+
+/** A serialized payload whose center group holds a surviving chat tab next to a retired panel. */
+function layoutWithRetiredPanel() {
+  const layout = buildLayout();
+  const panels: Record<string, { id: string; contentComponent: string }> = { ...layout.panels };
+  panels[RETIRED_COMPONENT] = { id: RETIRED_COMPONENT, contentComponent: RETIRED_COMPONENT };
+  layout.grid.root.data[1].data.views = ["chat", RETIRED_COMPONENT];
+  layout.grid.root.data[1].data.activeView = "chat";
+  return { ...layout, panels };
+}
+
+/** A maximize overlay: sidebar column plus the maximized group. */
+function maximizeOverlay(maximizedViews: string[]) {
+  return {
+    grid: {
+      root: {
+        type: "branch" as const,
+        size: 600,
+        data: [
+          {
+            type: "leaf" as const,
+            size: 300,
+            data: { id: "g-sidebar", views: ["files"], activeView: "files" },
+          },
+          {
+            type: "leaf" as const,
+            size: 1300,
+            data: { id: "g-max", views: maximizedViews, activeView: maximizedViews[0] },
+          },
+        ],
+      },
+      height: 600,
+      width: 1600,
+      orientation: "HORIZONTAL" as const,
+    },
+    panels: Object.fromEntries(maximizedViews.map((id) => [id, { id, contentComponent: id }])),
+    activeGroup: "g-max",
+  };
+}
+
+/** A pre-maximize LayoutState carrying a root orientation worth preserving. */
+function preMaximizeState() {
+  return {
+    columns: [
+      {
+        id: "center",
+        groups: [{ id: "g-center", panels: [{ id: "chat", component: "chat", title: "Agent" }] }],
+      },
+    ],
+    rootOrientation: "VERTICAL" as const,
+  };
+}
+function preMaximizeStateWithSessions() {
+  return {
+    columns: [
+      {
+        id: "center",
+        groups: [
+          {
+            id: "g-center",
+            activePanel: PHANTOM_PANEL_ID,
+            panels: [
+              { id: PHANTOM_PANEL_ID, component: "chat", title: "Phantom" },
+              { id: ALIVE_PANEL_ID, component: "chat", title: "Agent" },
+            ],
+          },
+        ],
+      },
+    ],
+    rootOrientation: "VERTICAL" as const,
+  };
+}
+
+function maximizeOverlayWithSessions() {
+  const overlay = maximizeOverlay([PHANTOM_PANEL_ID, ALIVE_PANEL_ID]);
+  for (const id of [PHANTOM_PANEL_ID, ALIVE_PANEL_ID]) {
+    overlay.panels[id].contentComponent = "chat";
+  }
+  return overlay;
+}
+
+describe("tryRestoreLayout — retired panel compatibility", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+    window.sessionStorage.clear();
+    useDockviewStore.setState({ preMaximizeLayout: null, maximizedGroupId: null });
+  });
+
+  it("drops only the retired panel from a saved per-environment layout", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layoutWithRetiredPanel());
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-retired", VALID_COMPONENTS)).toBe(true);
+
+    const applied = (api.fromJSON as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    expect(Object.keys(applied.panels)).toEqual(
+      expect.arrayContaining(["chat", "files", "git", "shell"]),
+    );
+  });
+
+  it("applies a maximized blob without the retired panel and keeps the rest", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(null);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay(["chat", RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeState(),
+    });
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-retired-max", VALID_COMPONENTS)).toBe(true);
+
+    const applied = (api.fromJSON as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    expect(Object.keys(applied.panels)).toContain("chat");
+    // The maximized group kept a surviving panel, so the overlay still applies
+    // and the maximize state is tracked rather than discarded.
+    const state = useDockviewStore.getState();
+    expect(state.maximizedGroupId).not.toBeNull();
+    expect(state.preMaximizeLayout?.rootOrientation).toBe("VERTICAL");
+  });
+
+  it("applies the filtered pre-maximize layout when the maximized group was only the retired panel", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(null);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeState(),
+    });
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-retired-only", VALID_COMPONENTS)).toBe(true);
+
+    const applied = (api.fromJSON as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(Object.keys(applied.panels)).toContain("chat");
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    const state = useDockviewStore.getState();
+    expect(state.preMaximizeLayout).toBeNull();
+    expect(state.maximizedGroupId).toBeNull();
+  });
+  it("uses the pre-maximize snapshot when a retired-only group is absent from a stale env layout", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layoutWithRetiredPanel());
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeState(),
+    });
+    const persistLayout = vi.spyOn(localStorage, "setEnvLayout").mockReturnValue(true);
+
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-stale-before-max", VALID_COMPONENTS)).toBe(true);
+
+    const appliedLayout = vi.mocked(api.fromJSON).mock.calls.at(-1)?.[0];
+    expect(appliedLayout?.panels).toHaveProperty("chat");
+    expect(appliedLayout?.panels).not.toHaveProperty("files");
+    expect(persistLayout).toHaveBeenCalledWith(
+      "env-stale-before-max",
+      expect.objectContaining({
+        panels: expect.not.objectContaining({ files: expect.anything() }),
+      }),
+    );
+    expect(useDockviewStore.getState().maximizedGroupId).toBeNull();
+  });
+});
+
+describe("tryRestoreLayout — phantom sessions and fallback durability", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+    window.sessionStorage.clear();
+    useDockviewStore.setState({ preMaximizeLayout: null, maximizedGroupId: null });
+  });
+  it("filters known phantom sessions from a maximized overlay", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(null);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlayWithSessions(),
+      preMaximizeLayout: preMaximizeStateWithSessions(),
+    });
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-live", VALID_COMPONENTS, new Set(["phantom"]))).toBe(true);
+
+    const applied = vi.mocked(api.fromJSON).mock.calls[0][0];
+    expect(applied.panels).not.toHaveProperty(PHANTOM_PANEL_ID);
+    expect(applied.panels).toHaveProperty(ALIVE_PANEL_ID);
+  });
+
+  it("filters known phantom sessions from the pre-maximize fallback", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(null);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeStateWithSessions(),
+    });
+    const persistLayout = vi.spyOn(localStorage, "setEnvLayout");
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-live", VALID_COMPONENTS, new Set(["phantom"]))).toBe(true);
+
+    const applied = vi.mocked(api.fromJSON).mock.calls.at(-1)?.[0];
+    expect(applied?.panels).not.toHaveProperty(PHANTOM_PANEL_ID);
+    expect(applied?.panels).toHaveProperty(ALIVE_PANEL_ID);
+    const persisted = vi.mocked(persistLayout).mock.calls.at(-1)?.[1] as {
+      panels: Record<string, unknown>;
+    };
+    expect(persisted.panels).not.toHaveProperty(PHANTOM_PANEL_ID);
+    expect(persisted.panels).toHaveProperty(ALIVE_PANEL_ID);
+  });
+  it("filters known phantom sessions from a maximize overlay after env restore", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(buildLayout());
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlayWithSessions(),
+      preMaximizeLayout: preMaximizeStateWithSessions(),
+    });
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-live", VALID_COMPONENTS, new Set(["phantom"]))).toBe(true);
+
+    const applied = vi.mocked(api.fromJSON).mock.calls.at(-1)?.[0];
+    expect(applied?.panels).not.toHaveProperty(PHANTOM_PANEL_ID);
+    expect(applied?.panels).toHaveProperty(ALIVE_PANEL_ID);
+    expect(useDockviewStore.getState().preMaximizeLayout?.columns[0].groups[0].panels).toEqual([
+      expect.objectContaining({ id: ALIVE_PANEL_ID }),
+    ]);
+  });
+
+  it("filters known phantom sessions from an env-restored pre-maximize fallback", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(layoutWithRetiredPanel());
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeStateWithSessions(),
+    });
+    vi.spyOn(localStorage, "setEnvLayout").mockReturnValue(true);
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-live", VALID_COMPONENTS, new Set(["phantom"]))).toBe(true);
+
+    const applied = vi.mocked(api.fromJSON).mock.calls.at(-1)?.[0];
+    expect(applied?.panels).not.toHaveProperty(PHANTOM_PANEL_ID);
+    expect(applied?.panels).toHaveProperty(ALIVE_PANEL_ID);
+  });
+
+  it("keeps the maximize record when the filtered fallback cannot be persisted", () => {
+    vi.spyOn(localStorage, "getEnvLayout").mockReturnValue(null);
+    vi.spyOn(localStorage, "getEnvMaximizeState").mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout: preMaximizeState(),
+    });
+    vi.spyOn(localStorage, "setEnvLayout").mockReturnValue(false);
+    const removeMaximizeState = vi.spyOn(localStorage, "removeEnvMaximizeState");
+    const api = makeFakeRestoreApi();
+
+    expect(tryRestoreLayout(api, "env-write-fails", VALID_COMPONENTS)).toBe(true);
+
+    expect(removeMaximizeState).not.toHaveBeenCalled();
+  });
+});

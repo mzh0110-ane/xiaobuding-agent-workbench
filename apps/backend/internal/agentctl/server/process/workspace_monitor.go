@@ -1,0 +1,397 @@
+package process
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/common/subproc"
+	"go.uber.org/zap"
+)
+
+// DefaultFilePollInterval is the interval for polling file modification times.
+// This replaces fsnotify which on macOS (kqueue) opens a file descriptor per file,
+// causing "too many open files" errors in large workspaces.
+const DefaultFilePollInterval = 2 * time.Second
+
+// gitCommandTimeout is the maximum time to wait for any single git subprocess
+// the workspace tracker spawns (monitor loop quick-status, full status refresh,
+// diff enrichment). Without a per-command bound, a wedged invocation (FS hang,
+// index lock, EDR scan) would inherit only the tracker's lifetime ctx and pin
+// its gitThrottle slot for the lifetime of the session, blocking subsequent
+// poll cycles and producing the "empty changes panel after freeze" symptom.
+// 10s is generous for normal completion (typical poll commands finish in
+// <100ms) while still freeing the slot in time for the next poll cycle.
+//
+// A var (not const) so the regression test in workspace_git_cmd_test.go can
+// shrink it to milliseconds and prove that timed-out invocations release
+// their gitThrottle slot. Production code must not mutate it.
+var gitCommandTimeout = 10 * time.Second
+
+// maxConsecutiveGitFailures is the number of consecutive git command failures
+// before the polling loop gives up and stops. At 2-second intervals, 5 failures
+// means ~10 seconds — enough to rule out transient issues (index lock, brief GC race)
+// while stopping quickly enough to avoid log spam when git is permanently broken
+// (e.g., worktree .git reference points to a deleted gitdir after task archival).
+const maxConsecutiveGitFailures = 5
+
+// monitorLoop polls for file changes using file mtimes and quick git checks.
+// This is more efficient than fsnotify on macOS and avoids file descriptor exhaustion.
+//
+// The tick interval is driven by the current PollMode (set via SetPollMode):
+// fast (default 2s) for focused sessions, slow (30s) for sidebar-visible
+// sessions, paused (no-op tick) when nothing is watching.
+func (wt *WorkspaceTracker) monitorLoop(ctx context.Context) {
+	defer wt.wg.Done()
+
+	// If no valid git index was found at startup, there's nothing to poll.
+	// Exit immediately to avoid spamming "git diff-files: exit status 128" warnings
+	// every poll cycle until the consecutive failure threshold is reached.
+	if wt.gitIndexPath == "" {
+		wt.logger.Warn("no valid git repository found, file monitor not polling",
+			zap.String("workDir", wt.workDir))
+		// Close the initialScanDone channel even on early exit so callers
+		// waiting on <-wt.initialScanDone don't block forever.
+		select {
+		case <-wt.initialScanDone:
+		default:
+			close(wt.initialScanDone)
+		}
+		return
+	}
+
+	// Start with a stopped timer; we reset it explicitly per-iteration based
+	// on the current poll mode. Resettable timer (vs fixed Ticker) lets us
+	// react instantly when the mode changes — critical for the user-visible
+	// lag when a task gains focus.
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	// Initial update — done unconditionally so the first focus-grab isn't
+	// stuck waiting for the first tick. Skipped only in fully-paused initial
+	// state? No: even paused workspaces benefit from a one-time scan so
+	// transitioning to slow/fast later finds a populated cache.
+	initialScanStarted := time.Now()
+	wt.updateGitStatusClass(ctx, subproc.GitBackground)
+	wt.updateFiles(ctx)
+
+	// Cache the last known state (ignore error on initial fetch)
+	lastState, _ := wt.getWorkspaceState(ctx)
+	wt.recordMonitorTick(time.Since(initialScanStarted))
+
+	// Signal that the initial scan is done — tests wait on this instead of
+	// sleeping to avoid races with the goroutine's first getWorkspaceState.
+	select {
+	case <-wt.initialScanDone:
+		// already closed (shouldn't happen, but be safe)
+	default:
+		close(wt.initialScanDone)
+	}
+
+	wt.logger.Info("file polling started",
+		zap.Duration("fast_interval", wt.filePollInterval),
+		zap.String("initial_mode", string(wt.GetPollMode())))
+
+	var consecutiveFailures int
+
+	for {
+		filePoll, _, _ := wt.pollIntervals(wt.GetPollMode())
+		timer.Reset(filePoll)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-wt.stopCh:
+			return
+		case <-wt.monitorModeChanged:
+			if stop := wt.handleMonitorModeChange(ctx, timer, &lastState, &consecutiveFailures); stop {
+				return
+			}
+		case <-timer.C:
+			if stop := wt.handleMonitorTimerTick(ctx, &lastState, &consecutiveFailures); stop {
+				return
+			}
+		}
+	}
+}
+
+// handleMonitorModeChange responds to a SetPollMode-triggered wake-up: drains
+// any pending timer and, if we just transitioned into fast mode, runs an
+// immediate scan so the user sees fresh state without waiting for the next tick.
+// Returns true if monitorLoop should exit.
+func (wt *WorkspaceTracker) handleMonitorModeChange(ctx context.Context, timer *time.Timer, lastState *workspaceState, consecutiveFailures *int) bool {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	if wt.GetPollMode() != PollModeFast {
+		return false
+	}
+	if !atomic.CompareAndSwapInt32(&wt.monitorRunning, 0, 1) {
+		return false
+	}
+	return wt.monitorTick(ctx, lastState, consecutiveFailures)
+}
+
+// handleMonitorTimerTick is the body of a regular timer-driven tick. In paused
+// mode the body is a no-op (we still wake periodically to check the mode in
+// case the change-signal was missed). Returns true if monitorLoop should exit.
+func (wt *WorkspaceTracker) handleMonitorTimerTick(ctx context.Context, lastState *workspaceState, consecutiveFailures *int) bool {
+	if _, _, paused := wt.pollIntervals(wt.GetPollMode()); paused {
+		return false
+	}
+	// Skip this tick if the previous cycle is still running (prevents process
+	// pile-up when git commands take longer than the poll interval on large repos).
+	if !atomic.CompareAndSwapInt32(&wt.monitorRunning, 0, 1) {
+		return false
+	}
+	return wt.monitorTick(ctx, lastState, consecutiveFailures)
+}
+
+// monitorTick runs a single monitor cycle: checks workspace state and triggers
+// updates if changes are detected. Returns true if the loop should stop.
+// The deferred flag reset ensures monitorRunning is cleared even on panic.
+func (wt *WorkspaceTracker) monitorTick(ctx context.Context, lastState *workspaceState, consecutiveFailures *int) bool {
+	tickStarted := time.Now()
+	defer func() {
+		wt.recordMonitorTick(time.Since(tickStarted))
+		atomic.StoreInt32(&wt.monitorRunning, 0)
+		// Signal that the tick completed — tests wait on this instead of
+		// spinning on the monitorRunning atomic flag.
+		select {
+		case wt.tickDone <- struct{}{}:
+		default:
+		}
+	}()
+
+	currentState, err := wt.getWorkspaceState(ctx)
+	if err != nil {
+		if wt.accessDenied.Load() {
+			return false
+		}
+		if !wt.workDirExists() {
+			wt.logger.Warn("work directory no longer exists, stopping workspace tracker",
+				zap.String("workDir", wt.workDir))
+			return true
+		}
+
+		*consecutiveFailures++
+		if *consecutiveFailures >= maxConsecutiveGitFailures {
+			wt.logger.Error("git commands failing repeatedly, stopping workspace monitor",
+				zap.String("workDir", wt.workDir),
+				zap.Int("consecutiveFailures", *consecutiveFailures),
+				zap.Error(err))
+			return true
+		}
+		wt.logger.Warn("failed to get workspace state, will retry next cycle",
+			zap.String("workDir", wt.workDir),
+			zap.Int("consecutiveFailures", *consecutiveFailures),
+			zap.Error(err))
+		return false
+	}
+	*consecutiveFailures = 0
+	if currentState.changed(*lastState) {
+		*lastState = currentState
+		wt.logger.Debug("workspace state changed, updating")
+
+		wt.tryUpdateGitStatus(ctx)
+		wt.updateFiles(ctx)
+		wt.notifyWorkspaceStreamFileChange(types.FileChangeNotification{
+			Timestamp:      time.Now(),
+			RepositoryName: wt.repositoryName,
+			Operation:      types.FileOpRefresh,
+		})
+	}
+	return false
+}
+
+// workspaceState holds quick-check state for detecting workspace changes.
+type workspaceState struct {
+	indexMtime  time.Time // index mtime - changes on stage/unstage/commit
+	diffFilesID string    // hash of git diff-files output - changes on tracked file modification
+	untrackedID string    // hash of untracked files list + mtimes - changes on untracked file changes
+}
+
+// getWorkspaceState returns the current workspace state using fast checks.
+// Uses index mtime + git diff-files output + file mtimes.
+// Returns an error if any git command fails, so the caller can skip the update
+// and retry on the next poll cycle.
+func (wt *WorkspaceTracker) getWorkspaceState(ctx context.Context) (workspaceState, error) {
+	var state workspaceState
+
+	// Check index mtime (gitIndexPath is pre-validated at startup)
+	if wt.gitIndexPath != "" {
+		if info, err := os.Stat(wt.gitIndexPath); err == nil {
+			state.indexMtime = info.ModTime()
+		}
+	}
+
+	// git diff-files shows changed files with their blob hashes.
+	// However, the output doesn't change when an already-dirty file is modified
+	// again because the index blob hash stays constant and the worktree hash
+	// is always shown as 0000000 (not computed). To detect subsequent changes
+	// to dirty files, we also include the mtime of each dirty file.
+	out, stderr, err := wt.runPollingGitOutputWithStderr(ctx, "diff-files", "--name-only", "-z")
+	if err != nil {
+		wrapped := fmt.Errorf("git diff-files in %s: %w (stderr: %s)",
+			wt.workDir, err, stderr)
+		wt.recordFilesystemFailure("workspace.file_monitor", workspaceTrigger(ctx, "poll"), wrapped)
+		return state, wrapped
+	}
+	state.diffFilesID = wt.buildDirtyFilesID(string(out))
+
+	// Check eligible untracked files - git diff-files doesn't include them.
+	// The shared query excludes dependency trees before Git enumerates paths.
+	untrackedID, err := wt.getUntrackedFilesID(ctx)
+	if err != nil {
+		wt.recordFilesystemFailure("workspace.file_monitor", workspaceTrigger(ctx, "poll"), err)
+		return state, err
+	}
+	state.untrackedID = untrackedID
+
+	return state, nil
+}
+
+// buildDirtyFilesID builds an identifier string for dirty tracked files.
+// Includes file paths and their mtimes so subsequent changes are detected.
+func (wt *WorkspaceTracker) buildDirtyFilesID(diffFilesOutput string) string {
+	if diffFilesOutput == "" {
+		return ""
+	}
+
+	paths := strings.Split(diffFilesOutput, "\x00")
+	var hashInput strings.Builder
+	for _, file := range paths {
+		if file == "" {
+			continue
+		}
+		hashInput.WriteString(file)
+		hashInput.WriteByte(0)
+		// Include mtime so we detect content changes to already-dirty files
+		safePath, err := wt.sanitizePath(file)
+		if err == nil {
+			if info, statErr := os.Stat(safePath); statErr == nil {
+				hashInput.WriteString(fmt.Sprintf("%d", info.ModTime().UnixNano()))
+			}
+		}
+		hashInput.WriteByte(0)
+	}
+	return hashInput.String()
+}
+
+// getUntrackedFilesID returns a string identifying the current state of untracked files.
+// Uses file list + mtimes to detect when untracked files are added, removed, or modified.
+// Returns an error if the git command fails (e.g., timeout, index lock).
+func (wt *WorkspaceTracker) getUntrackedFilesID(ctx context.Context) (string, error) {
+	out, stderr, err := wt.runPollingGitOutputWithStderr(ctx, gitUntrackedFilesArgs...)
+	if err != nil {
+		return "", fmt.Errorf("git ls-files in %s: %w (stderr: %s)",
+			wt.workDir, err, stderr)
+	}
+
+	files, err := parseGitUntrackedOutput(ctx, out)
+	if err != nil {
+		return "", err
+	}
+	if len(files) == 0 {
+		return "", nil // No untracked files is not an error
+	}
+
+	// Build a string from file paths + mtimes to detect any changes
+	var hashInput strings.Builder
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		hashInput.WriteString(file)
+		// Include mtime so we detect content changes
+		// Sanitize path to prevent directory traversal attacks (CodeQL security fix)
+		safePath, err := wt.sanitizePath(file)
+		if err != nil {
+			continue // Skip files with invalid paths
+		}
+		if info, err := os.Stat(safePath); err == nil {
+			hashInput.WriteString(fmt.Sprintf(":%d", info.ModTime().UnixNano()))
+		}
+		hashInput.WriteString(";")
+	}
+
+	// Return the full string - any mtime change will produce a different string
+	return hashInput.String(), nil
+}
+
+// sanitizePath validates that the given relative file path stays within the workspace directory.
+// Returns the absolute path if valid, or an error if the path escapes the workspace.
+func (wt *WorkspaceTracker) sanitizePath(relPath string) (string, error) {
+	// Clean the path to resolve any . or .. components
+	joined := filepath.Join(wt.workDir, relPath)
+	absPath, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+
+	// Ensure the resolved path is within the workspace directory
+	workDirAbs, err := filepath.Abs(wt.workDir)
+	if err != nil {
+		return "", err
+	}
+
+	// Check that absPath starts with workDirAbs (with proper separator handling)
+	if !strings.HasPrefix(absPath, workDirAbs+string(os.PathSeparator)) && absPath != workDirAbs {
+		return "", fmt.Errorf("path escapes workspace: %s", relPath)
+	}
+
+	return absPath, nil
+}
+
+// changed returns true if the workspace state has changed.
+func (s workspaceState) changed(other workspaceState) bool {
+	return s.indexMtime != other.indexMtime ||
+		s.diffFilesID != other.diffFilesID ||
+		s.untrackedID != other.untrackedID
+}
+
+// emitFileChanges sends accumulated file changes to subscribers.
+// Falls back to a single generic refresh when there are too many changes or none.
+func (wt *WorkspaceTracker) emitFileChanges(changes []types.FileChangeNotification) {
+	const maxSpecificChanges = 50
+	if len(changes) == 0 || len(changes) > maxSpecificChanges {
+		wt.notifyWorkspaceStreamFileChange(types.FileChangeNotification{
+			Timestamp:      time.Now(),
+			RepositoryName: wt.repositoryName,
+			Operation:      types.FileOpRefresh,
+		})
+		return
+	}
+	for i := range changes {
+		// Stamp repository name on every emitted notification when this tracker
+		// is scoped to a multi-repo subpath. Callers that build the slice may
+		// not know the tracker's repo, so we set it here as the single source.
+		if changes[i].RepositoryName == "" {
+			changes[i].RepositoryName = wt.repositoryName
+		}
+		wt.notifyWorkspaceStreamFileChange(changes[i])
+	}
+}
+
+// notifyFileChange sends a file change notification immediately.
+// Used by direct file operations (create, delete, rename, apply diff) to notify
+// subscribers without waiting for the next poll cycle.
+func (wt *WorkspaceTracker) notifyFileChange(relPath, operation string) {
+	wt.notifyWorkspaceStreamFileChange(types.FileChangeNotification{
+		Timestamp:      time.Now(),
+		RepositoryName: wt.repositoryName,
+		Path:           relPath,
+		Operation:      operation,
+	})
+}

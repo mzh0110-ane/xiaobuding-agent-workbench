@@ -1,0 +1,399 @@
+import fs from "node:fs";
+import path from "node:path";
+import { test, expect } from "../../fixtures/test-base";
+import { SessionPage } from "../../pages/session-page";
+
+/**
+ * Verifies the UX for the inline prepare-progress card that renders below the
+ * initial user prompt:
+ *   - While running: card is expanded and streams the setup script output.
+ *   - On clean success: card auto-collapses (still visible as a summary row).
+ *   - On step failure: card stays expanded so the error is immediately visible;
+ *     user can click to collapse.
+ *   - Without a setup script: card still renders, auto-collapses on success.
+ *
+ * Each test creates a fresh executor profile carrying the desired prepare
+ * script — this hits the same `runSetupScript` path users exercise via the
+ * repository setup_script placeholder in profile templates, without mutating
+ * the worker-scoped seed profile (avoids cross-test contamination).
+ */
+test.describe("Setup script progress UX", () => {
+  async function createWorktreeProfileWithScript(
+    apiClient: import("../../helpers/api-client").ApiClient,
+    script: string,
+    name: string,
+  ): Promise<{ id: string }> {
+    const { executors } = await apiClient.listExecutors();
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    if (!worktreeExec) throw new Error("No worktree executor found");
+    return apiClient.createExecutorProfile(worktreeExec.id, name, { prepare_script: script });
+  }
+
+  test("streams setup script output while running, collapses after success", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(240_000);
+
+    // Hold repository preparation until the browser subscribes so its
+    // preparing state and streamed output stay observable. This test opts the
+    // shared fixture repository into the sync path, which guarantees that the
+    // cross-platform git shim can provide the gate before setup starts.
+    const gateID = Date.now();
+    const gitGateFile = path.join(backend.tmpDir, "git-delay-ms");
+    const gitStartedFile = path.join(backend.tmpDir, `git-started-${gateID}`);
+    const gitReleaseFile = path.join(backend.tmpDir, `git-release-${gateID}`);
+    const startedFile = path.join(backend.tmpDir, `setup-started-${gateID}`);
+    const releaseFile = path.join(backend.tmpDir, `setup-release-${gateID}`);
+    let profile: { id: string } | null = null;
+    const repositoryResponse = await apiClient.rawRequest(
+      "GET",
+      `/api/v1/repositories/${seedData.repositoryId}`,
+    );
+    expect(repositoryResponse.ok).toBeTruthy();
+    const repository = (await repositoryResponse.json()) as { pull_before_worktree?: boolean };
+    try {
+      fs.writeFileSync(
+        gitGateFile,
+        JSON.stringify({ startedFile: gitStartedFile, releaseFile: gitReleaseFile }),
+      );
+      await apiClient.updateRepository(seedData.repositoryId, { pull_before_worktree: true });
+      const setupScript = [
+        "echo '[setup] installing deps'",
+        `touch '${startedFile}'`,
+        `while [ ! -f '${releaseFile}' ]; do sleep 0.1; done`,
+        "echo '[setup] ready'",
+      ].join("; ");
+      profile = await createWorktreeProfileWithScript(
+        apiClient,
+        setupScript,
+        `E2E Streaming ${Date.now()}`,
+      );
+
+      const task = await apiClient.createTaskWithAgent(
+        seedData.workspaceId,
+        "Setup Script Streaming",
+        seedData.agentProfileId,
+        {
+          description: "/e2e:simple-message",
+          workflow_id: seedData.workflowId,
+          workflow_step_id: seedData.startStepId,
+          repository_ids: [seedData.repositoryId],
+          executor_profile_id: profile.id,
+        },
+      );
+
+      await testPage.goto(`/t/${task.id}`);
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+
+      await expect
+        .poll(() => fs.existsSync(gitStartedFile), {
+          message: "repository preparation should reach its deterministic git gate",
+          timeout: 90_000,
+        })
+        .toBe(true);
+      fs.writeFileSync(gitReleaseFile, "release");
+
+      await expect
+        .poll(() => fs.existsSync(startedFile), {
+          message: "setup script should reach its deterministic test gate",
+          timeout: 120_000,
+        })
+        .toBe(true);
+
+      // Panel appears inline in the chat, expanded while running.
+      const panel = testPage.getByTestId("prepare-progress-panel");
+      await expect(panel).toBeVisible({ timeout: 15_000 });
+      await expect(panel).toHaveAttribute("data-status", "preparing");
+      await expect(panel).toHaveAttribute("data-expanded", "true");
+      await expect(panel.getByTestId("prepare-progress-header-spinner")).toBeVisible();
+
+      // Setup script output reaches the expanded step list — either streamed
+      // in real time or captured from the final `prepare.completed` payload.
+      await expect(panel).toContainText("[setup] installing deps", { timeout: 30_000 });
+      fs.writeFileSync(releaseFile, "release");
+
+      // On clean success the panel stays visible but auto-collapses.
+      await expect(panel).toHaveAttribute("data-status", "completed", { timeout: 30_000 });
+      await expect(panel).toHaveAttribute("data-expanded", "false");
+    } finally {
+      // Always release a setup process that is still waiting before teardown.
+      if (!fs.existsSync(gitReleaseFile)) fs.writeFileSync(gitReleaseFile, "release");
+      if (!fs.existsSync(releaseFile)) fs.writeFileSync(releaseFile, "release");
+      if (profile) {
+        await apiClient.deleteExecutorProfile(profile.id).catch(() => {
+          // Profile may already be deleted if the test tore down mid-run.
+        });
+      }
+      await apiClient
+        .updateRepository(seedData.repositoryId, {
+          pull_before_worktree: repository.pull_before_worktree === true,
+        })
+        .catch(() => {});
+      if (fs.existsSync(gitGateFile)) fs.unlinkSync(gitGateFile);
+      if (fs.existsSync(gitStartedFile)) fs.unlinkSync(gitStartedFile);
+      if (fs.existsSync(gitReleaseFile)) fs.unlinkSync(gitReleaseFile);
+      if (fs.existsSync(startedFile)) fs.unlinkSync(startedFile);
+      if (fs.existsSync(releaseFile)) fs.unlinkSync(releaseFile);
+    }
+  });
+
+  test("keeps setup script failure details collapsed until requested", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(60_000);
+
+    // Exit non-zero with output on both streams — the panel must surface
+    // both so the user can diagnose without diving into backend logs. The
+    // upfront sleep gives the page + WS time to subscribe before the script
+    // terminates; without it the failure fires faster than the frontend can
+    // connect and we miss every event.
+    const failingScript = [
+      "echo '[setup] starting install'",
+      "sleep 4",
+      "echo 'ENOENT: package-lock.json missing' 1>&2",
+      "exit 1",
+    ].join("; ");
+    const profile = await createWorktreeProfileWithScript(
+      apiClient,
+      failingScript,
+      `E2E Failing ${Date.now()}`,
+    );
+
+    try {
+      const task = await apiClient.createTaskWithAgent(
+        seedData.workspaceId,
+        "Setup Script Failure",
+        seedData.agentProfileId,
+        {
+          description: "/e2e:simple-message",
+          workflow_id: seedData.workflowId,
+          workflow_step_id: seedData.startStepId,
+          repository_ids: [seedData.repositoryId],
+          executor_profile_id: profile.id,
+        },
+      );
+
+      await testPage.goto(`/t/${task.id}`);
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+
+      const panel = testPage.getByTestId("prepare-progress-panel");
+
+      // Setup script failures are non-fatal (agent still starts), so the panel
+      // transitions preparing → completed_with_error rather than the fatal
+      // `failed` state. The concise error state is visible immediately while
+      // command output remains collapsed until the user requests it.
+      await expect(panel).toBeVisible({ timeout: 15_000 });
+      await expect(panel).toHaveAttribute("data-status", "completed_with_error", {
+        timeout: 30_000,
+      });
+      await expect(panel).toHaveAttribute("data-expanded", "false");
+
+      const output = panel.locator("pre").filter({ hasText: /^\[setup\] starting install/ });
+      await expect(panel.getByRole("button", { name: "Show preparation details" })).toBeVisible();
+      await expect(output).toBeHidden();
+
+      // Both streams remain available after the user opens the disclosure.
+      await panel.getByRole("button", { name: "Show preparation details" }).click();
+      await expect(panel).toHaveAttribute("data-expanded", "true");
+      await expect(output).toBeVisible();
+      await expect(output).toContainText("[setup] starting install");
+      await expect(output).toContainText("ENOENT: package-lock.json missing");
+    } finally {
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+
+  test("prepare panel persists after page refresh", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+
+    const delayFile = path.join(backend.tmpDir, "git-delay-ms");
+    const setupScript = "echo '[setup] persistence check'";
+    const profile = await createWorktreeProfileWithScript(
+      apiClient,
+      setupScript,
+      `E2E Persist ${Date.now()}`,
+    );
+
+    try {
+      fs.writeFileSync(delayFile, "5000");
+
+      const task = await apiClient.createTaskWithAgent(
+        seedData.workspaceId,
+        "Prepare Panel Persist",
+        seedData.agentProfileId,
+        {
+          description: "/e2e:simple-message",
+          workflow_id: seedData.workflowId,
+          workflow_step_id: seedData.startStepId,
+          repository_ids: [seedData.repositoryId],
+          executor_profile_id: profile.id,
+        },
+      );
+
+      await testPage.goto(`/t/${task.id}`);
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+
+      const panel = testPage.getByTestId("prepare-progress-panel");
+
+      // Wait for preparation to complete.
+      await expect(panel).toBeVisible({ timeout: 15_000 });
+      await expect(panel).toHaveAttribute("data-status", "completed", { timeout: 30_000 });
+
+      // Expand the panel (auto-collapsed on success) and verify step data.
+      await panel.getByTestId("prepare-progress-toggle").click();
+      await expect(panel).toContainText("Validate repository", { timeout: 5_000 });
+      await expect(panel).toContainText("Run setup script", { timeout: 5_000 });
+
+      // Reload the page — the panel AND step data must survive the round-trip through SSR.
+      await testPage.reload();
+      await session.waitForLoad();
+
+      const panelAfterReload = testPage.getByTestId("prepare-progress-panel");
+      await expect(panelAfterReload).toBeVisible({ timeout: 10_000 });
+      // Status should still be "completed" (not "preparing").
+      await expect(panelAfterReload).toHaveAttribute("data-status", "completed");
+
+      // Step details must persist — not just the panel header.
+      // Expand the panel to see steps (auto-collapsed on success).
+      await panelAfterReload.getByTestId("prepare-progress-toggle").click();
+      await expect(panelAfterReload).toContainText("Validate repository");
+      await expect(panelAfterReload).toContainText("Run setup script");
+    } finally {
+      if (fs.existsSync(delayFile)) fs.unlinkSync(delayFile);
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+
+  test("repository setup script failure is non-fatal — agent still launches", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(90_000);
+
+    // This exercises the REPOSITORY-level setup_script (run inside
+    // worktree.Manager.Create via the script handler), which is a different
+    // path from the profile prepare_script the tests above cover. Before the
+    // fix, a non-zero exit aborted environment preparation and stopped the
+    // agent ("Environment setup failed"); the Resume / Start-fresh buttons
+    // then couldn't recover because each relaunch re-ran the same failing
+    // script. The script must now be non-fatal: the worktree is kept, the
+    // failure shows as a warning, and the agent launches normally.
+    const failingScript = [
+      "echo '[repo-setup] installing deps'",
+      "sleep 4",
+      "echo 'make: *** No rule to make target `i2nstall`.  Stop.' 1>&2",
+      "exit 2",
+    ].join("; ");
+    await apiClient.updateRepository(seedData.repositoryId, { setup_script: failingScript });
+
+    try {
+      const task = await apiClient.createTaskWithAgent(
+        seedData.workspaceId,
+        "Repo Setup Script Failure",
+        seedData.agentProfileId,
+        {
+          description: "/e2e:simple-message",
+          workflow_id: seedData.workflowId,
+          workflow_step_id: seedData.startStepId,
+          repository_ids: [seedData.repositoryId],
+          executor_profile_id: seedData.worktreeExecutorProfileId,
+        },
+      );
+
+      await testPage.goto(`/t/${task.id}`);
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+
+      const panel = testPage.getByTestId("prepare-progress-panel");
+      await expect(panel).toBeVisible({ timeout: 15_000 });
+
+      // The failure is surfaced as a non-fatal warning, NOT the fatal `failed`
+      // state — preparation completes and the worktree survives.
+      await expect(panel).toHaveAttribute("data-status", "completed_with_warnings", {
+        timeout: 45_000,
+      });
+
+      // The failure is surfaced as a warning banner on the worktree step so
+      // the user knows the setup script didn't run — without it blocking the
+      // launch. (The full script output also streams to a separate
+      // script_execution chat message.)
+      await expect(panel.getByTestId("prepare-warning-banner")).toContainText(
+        "Repository setup script failed",
+      );
+
+      // The core regression: the agent must launch and run to completion
+      // instead of stopping. Reaching chat-idle proves the turn finished and
+      // the session is awaiting input — preparation did not abort the launch.
+      await session.waitForChatIdle();
+
+      // The "agent stopped" recovery affordances must not appear — the task
+      // continued normally.
+      await expect(session.recoveryResumeButton()).toBeHidden();
+      await expect(session.recoveryFreshButton()).toBeHidden();
+    } finally {
+      // Reset the worker-scoped seed repo so sibling specs aren't contaminated.
+      await apiClient.updateRepository(seedData.repositoryId, { setup_script: "" }).catch(() => {});
+    }
+  });
+
+  test("renders collapsed on success when no setup script is configured", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+
+    // Slow the git fetch so prepare takes long enough for the page+WS to
+    // connect before the completed event fires — without this the events
+    // broadcast before the client is subscribed, and the panel never shows.
+    const delayFile = path.join(backend.tmpDir, "git-delay-ms");
+    try {
+      fs.writeFileSync(delayFile, "5000");
+
+      // Default seeded worktree profile — empty prepare_script. The worktree
+      // validate/sync/create steps still run (card appears), and with no
+      // error/warning the card auto-collapses once done.
+      const task = await apiClient.createTaskWithAgent(
+        seedData.workspaceId,
+        "No Setup Script",
+        seedData.agentProfileId,
+        {
+          description: "/e2e:simple-message",
+          workflow_id: seedData.workflowId,
+          workflow_step_id: seedData.startStepId,
+          repository_ids: [seedData.repositoryId],
+          executor_profile_id: seedData.worktreeExecutorProfileId,
+        },
+      );
+
+      await testPage.goto(`/t/${task.id}`);
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+
+      // Panel stays visible but auto-collapses on a clean run. This replaces
+      // the pre-redesign "disappears entirely" behavior — users want to be
+      // able to expand it and read what ran even on a happy path.
+      const panel = testPage.getByTestId("prepare-progress-panel");
+      await expect(panel).toBeVisible({ timeout: 30_000 });
+      await expect(panel).toHaveAttribute("data-status", "completed", { timeout: 30_000 });
+      await expect(panel).toHaveAttribute("data-expanded", "false");
+    } finally {
+      if (fs.existsSync(delayFile)) fs.unlinkSync(delayFile);
+    }
+  });
+});

@@ -1,0 +1,350 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { IconInfoCircle } from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import { CardContent } from "@kandev/ui/card";
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+  DrawerTrigger,
+} from "@kandev/ui/drawer";
+import { Input } from "@kandev/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@kandev/ui/select";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { useToast } from "@/components/toast-provider";
+import { SettingsFieldLabel } from "@/components/settings/settings-typography";
+import { settingsControlClassName } from "@/components/settings/settings-control";
+import { SettingsSection } from "@/components/settings/settings-section";
+import { SettingsCard } from "@/components/settings/settings-card";
+import { useSettingsSaveContributor } from "@/components/settings/settings-save-provider";
+import { useTouchDrawer } from "@/hooks/use-compact-task-chrome";
+import {
+  fetchGitHubWorkspaceSettings,
+  updateGitHubWorkspaceSettings,
+} from "@/lib/api/domains/github-api";
+import type {
+  GitHubRepoScopeMode,
+  RepoFilter,
+  UpdateGitHubWorkspaceSettingsRequest,
+} from "@/lib/types/github";
+import { useTranslation } from "react-i18next";
+import { t as translate } from "@/lib/i18n";
+import { controlSizingClassName } from "@kandev/ui/control-sizing";
+
+function splitCSV(value: string): string[] {
+  return value
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function parseRepoFilters(value: string): RepoFilter[] {
+  return splitCSV(value)
+    .map((repo) => {
+      const [owner, name, ...rest] = repo.split("/");
+      if (!owner || !name || rest.length > 0) return null;
+      return { owner, name };
+    })
+    .filter((repo): repo is RepoFilter => repo !== null);
+}
+
+function repoFiltersToInput(repos: RepoFilter[]): string {
+  return repos.map((repo) => `${repo.owner}/${repo.name}`).join(", ");
+}
+
+// Only the list matching the selected mode is sent; the other stays untouched
+// server-side.
+function scopePayload({
+  workspaceId,
+  mode,
+  orgs,
+  parsedRepos,
+}: {
+  workspaceId: string;
+  mode: GitHubRepoScopeMode;
+  orgs: string;
+  parsedRepos: RepoFilter[];
+}): UpdateGitHubWorkspaceSettingsRequest {
+  const payload: UpdateGitHubWorkspaceSettingsRequest = {
+    workspace_id: workspaceId,
+    repo_scope_mode: mode,
+  };
+  if (mode === "orgs") payload.repo_scope_orgs = splitCSV(orgs);
+  if (mode === "repos") payload.repo_scope_repos = parsedRepos;
+  return payload;
+}
+
+function RepositoryScopeHelp() {
+  const { t } = useTranslation();
+  const usesTouchDrawer = useTouchDrawer();
+  const [open, setOpen] = useState(false);
+  const button = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className={controlSizingClassName("icon", "cursor-pointer text-muted-foreground")}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-label={t("github:explainRepositoryScope")}
+    >
+      <IconInfoCircle className="h-4 w-4" />
+    </Button>
+  );
+  const drawerTrigger = <DrawerTrigger asChild>{button}</DrawerTrigger>;
+  const trigger = usesTouchDrawer ? (
+    drawerTrigger
+  ) : (
+    <Tooltip>
+      <TooltipTrigger asChild>{drawerTrigger}</TooltipTrigger>
+      <TooltipContent side="top" align="start" className="max-w-[320px] text-xs leading-relaxed">
+        {t("github:repositoryScopeHelp")}
+      </TooltipContent>
+    </Tooltip>
+  );
+
+  return (
+    <Drawer open={open} onOpenChange={setOpen}>
+      {trigger}
+      <DrawerContent>
+        <DrawerHeader>
+          <DrawerTitle>{t("github:repositoryScope")}</DrawerTitle>
+          <DrawerDescription>{t("github:repositoryScopeHelp")}</DrawerDescription>
+        </DrawerHeader>
+      </DrawerContent>
+    </Drawer>
+  );
+}
+
+type ScopeFieldsProps = {
+  mode: GitHubRepoScopeMode;
+  orgs: string;
+  repos: string;
+  baseline: { mode: GitHubRepoScopeMode; orgs: string; repos: string };
+  loading: boolean;
+  invalidRepos: boolean;
+  onModeChange: (mode: GitHubRepoScopeMode) => void;
+  onOrgsChange: (orgs: string) => void;
+  onReposChange: (repos: string) => void;
+};
+
+function RepositoryScopeFields({
+  mode,
+  orgs,
+  repos,
+  baseline,
+  loading,
+  invalidRepos,
+  onModeChange,
+  onOrgsChange,
+  onReposChange,
+}: ScopeFieldsProps) {
+  const { t } = useTranslation();
+  return (
+    <SettingsCard
+      isDirty={mode !== baseline.mode || orgs !== baseline.orgs || repos !== baseline.repos}
+    >
+      <CardContent className="grid gap-4 py-4 md:grid-cols-[220px_minmax(0,1fr)]">
+        <div className="space-y-1.5">
+          <SettingsFieldLabel htmlFor="github-scope-mode">{t("github:mode")}</SettingsFieldLabel>
+          <Select
+            value={mode}
+            onValueChange={(value) => onModeChange(value as GitHubRepoScopeMode)}
+            disabled={loading}
+          >
+            <SelectTrigger
+              id="github-scope-mode"
+              data-testid="github-scope-mode"
+              data-settings-dirty={mode !== baseline.mode}
+              className={settingsControlClassName()}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("github:allRepositories")}</SelectItem>
+              <SelectItem value="orgs">{t("github:organizations")}</SelectItem>
+              <SelectItem value="repos">{t("github:selectedRepositories")}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="grid gap-3">
+          <div className="space-y-1.5">
+            <SettingsFieldLabel htmlFor="github-scope-orgs">
+              {t("github:organizations")}
+            </SettingsFieldLabel>
+            <Input
+              id="github-scope-orgs"
+              value={orgs}
+              data-settings-dirty={orgs !== baseline.orgs}
+              onChange={(event) => onOrgsChange(event.target.value)}
+              disabled={loading || mode !== "orgs"}
+              // Sample GitHub organization logins, i.e. the shape of the value
+              // this field accepts. A translated `example-org` would stop being
+              // a usable example.
+              // eslint-disable-next-line i18next/no-literal-string -- example org logins
+              placeholder="kdlbs, example-org"
+              data-testid="github-scope-orgs-input"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <SettingsFieldLabel htmlFor="github-scope-repos">
+              {t("github:repositories")}
+            </SettingsFieldLabel>
+            <Input
+              id="github-scope-repos"
+              value={repos}
+              data-settings-dirty={repos !== baseline.repos}
+              onChange={(event) => onReposChange(event.target.value)}
+              disabled={loading || mode !== "repos"}
+              aria-invalid={invalidRepos}
+              // Sample `owner/repo` slugs — the format the sibling validation
+              // message describes, not copy.
+              // eslint-disable-next-line i18next/no-literal-string -- example repo slugs
+              placeholder="kdlbs/kandev, example/api"
+              data-testid="github-scope-repos-input"
+            />
+            {invalidRepos && (
+              <p className="text-xs text-destructive">
+                {t("github:useCommaSeparatedOwnerRepoValues")}
+              </p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </SettingsCard>
+  );
+}
+
+function useGitHubRepoScopeDraft(workspaceId: string) {
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const [mode, setMode] = useState<GitHubRepoScopeMode>("all");
+  const [orgs, setOrgs] = useState("");
+  const [repos, setRepos] = useState("");
+  const [baseline, setBaseline] = useState({
+    mode: "all" as GitHubRepoScopeMode,
+    orgs: "",
+    repos: "",
+  });
+  const [loading, setLoading] = useState(true);
+  const parsedRepos = useMemo(() => parseRepoFilters(repos), [repos]);
+  const invalidRepos = useMemo(() => {
+    const entries = splitCSV(repos);
+    return mode === "repos" && entries.length > 0 && parsedRepos.length !== entries.length;
+  }, [mode, parsedRepos.length, repos]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchGitHubWorkspaceSettings(workspaceId)
+      .then((settings) => {
+        if (cancelled) return;
+        const next = {
+          mode: settings.repo_scope_mode ?? "all",
+          orgs: (settings.repo_scope_orgs ?? []).join(", "),
+          repos: repoFiltersToInput(settings.repo_scope_repos ?? []),
+        };
+        setBaseline(next);
+        setMode(next.mode);
+        setOrgs(next.orgs);
+        setRepos(next.repos);
+      })
+      .catch(() => {
+        // The module-level `t` resolves at call time, so this follows the active
+        // locale without putting the hook's `t` in the effect deps — that would
+        // refetch on every locale switch and overwrite the user's unsaved edits
+        // via the setMode/setOrgs/setRepos calls above.
+        if (!cancelled)
+          toast({
+            description: translate("github:failedToLoadGithubWorkspaceSettings"),
+            variant: "error",
+          });
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [toast, workspaceId]);
+
+  const save = useCallback(async () => {
+    const submitted = { mode, orgs, repos };
+    try {
+      const updated = await updateGitHubWorkspaceSettings(
+        scopePayload({ workspaceId, mode, orgs, parsedRepos }),
+      );
+      const saved = {
+        mode: updated.repo_scope_mode,
+        orgs: (updated.repo_scope_orgs ?? []).join(", "),
+        repos: repoFiltersToInput(updated.repo_scope_repos ?? []),
+      };
+      setBaseline(saved);
+      setMode((current) => (current === submitted.mode ? saved.mode : current));
+      setOrgs((current) => (current === submitted.orgs ? saved.orgs : current));
+      setRepos((current) => (current === submitted.repos ? saved.repos : current));
+      toast({ description: t("github:githubWorkspaceSettingsSaved"), variant: "success" });
+    } catch {
+      toast({ description: t("github:failedToSaveGithubWorkspaceSettings"), variant: "error" });
+      throw new Error("Failed to save GitHub workspace settings");
+    }
+  }, [mode, orgs, parsedRepos, repos, t, toast, workspaceId]);
+  const discard = useCallback(() => {
+    setMode(baseline.mode);
+    setOrgs(baseline.orgs);
+    setRepos(baseline.repos);
+  }, [baseline]);
+  const revision = JSON.stringify([mode, orgs, repos]);
+  const dirty = revision !== JSON.stringify([baseline.mode, baseline.orgs, baseline.repos]);
+
+  useSettingsSaveContributor({
+    id: `github-repo-scope:${workspaceId}`,
+    revision,
+    isDirty: dirty,
+    canSave: !loading && !invalidRepos,
+    invalidReason: invalidRepos ? t("github:useCommaSeparatedOwnerRepoValues") : undefined,
+    save,
+    discard,
+  });
+
+  return {
+    mode,
+    orgs,
+    repos,
+    baseline,
+    loading,
+    invalidRepos,
+    setMode,
+    setOrgs,
+    setRepos,
+  };
+}
+
+export function GitHubRepoScopeSection({ workspaceId }: { workspaceId: string }) {
+  const { t } = useTranslation();
+  const draft = useGitHubRepoScopeDraft(workspaceId);
+
+  return (
+    <SettingsSection
+      title={t("github:repositoryScope")}
+      titleAccessory={<RepositoryScopeHelp />}
+      description={t("github:limitsGithubPullRequestsAndIssues")}
+    >
+      <RepositoryScopeFields
+        mode={draft.mode}
+        orgs={draft.orgs}
+        repos={draft.repos}
+        baseline={draft.baseline}
+        loading={draft.loading}
+        invalidRepos={draft.invalidRepos}
+        onModeChange={draft.setMode}
+        onOrgsChange={draft.setOrgs}
+        onReposChange={draft.setRepos}
+      />
+    </SettingsSection>
+  );
+}

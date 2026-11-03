@@ -1,0 +1,174 @@
+import type { DockviewApi } from "dockview-react";
+import type { LayoutState, LayoutPanel } from "./types";
+import { fromDockviewApi } from "./serializer";
+
+/** Panel IDs that always come from the preset and should never be merged. */
+const PRESET_ONLY_PANELS = new Set(["sidebar"]);
+
+/** Components that, when surviving as extras on a layout switch, belong next
+ *  to the chat/agent tabs in the CENTER column rather than the narrow side
+ *  "tools" column. These are main-content surfaces — the plan, the browser,
+ *  the VS Code editor, PR detail, and file/commit/diff previews — whereas
+ *  files/changes/terminal are tools that stay in the side column. Switching
+ *  from the plan/vscode/preview preset back to default must not strand these
+ *  in the right column.
+ *
+ *  Matched by component (not id) because some carry dynamic ids — a browser
+ *  panel is `browser:<url>`, not a literal `browser`; a pinned file editor
+ *  is `file:<path>` with component `file-editor`. */
+const CENTER_EXTRA_COMPONENTS = new Set([
+  "plan",
+  "browser",
+  "vscode",
+  "pr-detail",
+  "mr-detail",
+  "file-editor",
+  "commit-detail",
+  "diff-viewer",
+  // Plugin task panels (e.g. a Notes scratchpad) are main-content surfaces
+  // like plan/browser/vscode, not side "tools" — see plugin-panels.ts.
+  "plugin-panel",
+]);
+
+/** Collect all panels from a LayoutState, flattened. */
+function collectAllPanels(state: LayoutState): LayoutPanel[] {
+  const panels: LayoutPanel[] = [];
+  for (const col of state.columns) {
+    for (const group of col.groups) {
+      for (const panel of group.panels) {
+        panels.push(panel);
+      }
+    }
+  }
+  return panels;
+}
+
+/** Collect the set of panel IDs present in a LayoutState. */
+function collectPanelIds(state: LayoutState): Set<string> {
+  return new Set(collectAllPanels(state).map((p) => p.id));
+}
+
+/** Identify the column that should receive non-session extras. Prefer the last
+ *  non-sidebar, non-center column (e.g. "right", "plan", "preview", "vscode"),
+ *  falling back to "center" when the preset has no such side column. */
+function pickExtrasColumnId(targetPreset: LayoutState): string {
+  const sideCols = targetPreset.columns.filter((c) => c.id !== "sidebar" && c.id !== "center");
+  return sideCols[sideCols.length - 1]?.id ?? "center";
+}
+
+/** Append `toAdd` panels to a group's first leaf, preserving identity when no-op. */
+function appendToFirstGroup(
+  groups: LayoutState["columns"][number]["groups"],
+  toAdd: LayoutPanel[],
+  filterExisting?: (p: LayoutPanel) => boolean,
+): LayoutState["columns"][number]["groups"] {
+  return groups.map((group, idx) => {
+    if (idx !== 0) return group;
+    const basePanels = filterExisting ? group.panels.filter(filterExisting) : group.panels;
+    const existingIds = new Set(basePanels.map((p) => p.id));
+    const additions = toAdd.filter((p) => !existingIds.has(p.id));
+    if (additions.length === 0 && basePanels.length === group.panels.length) return group;
+    return { ...group, panels: [...basePanels, ...additions] };
+  });
+}
+
+/** Replace the reusable Chat slot with live session tabs in place.
+ *
+ * Keeping the replacement at Chat's original index preserves both the tab
+ * order and its selected state. Appending session tabs after the target
+ * preset's other panels would put PR Details ahead of Agent after a
+ * Plan → Default transition, making the background review tab visible while
+ * the agent input is hidden.
+ */
+function replaceChatWithSessionPanels(
+  groups: LayoutState["columns"][number]["groups"],
+  sessionPanels: LayoutPanel[],
+  toAdd: LayoutPanel[],
+): LayoutState["columns"][number]["groups"] {
+  return groups.map((group, idx) => {
+    if (idx !== 0) return group;
+
+    let insertedSessions = false;
+    const basePanels = group.panels.flatMap((panel) => {
+      if (panel.id !== "chat") return [panel];
+      insertedSessions = true;
+      return sessionPanels;
+    });
+    if (!insertedSessions) basePanels.unshift(...sessionPanels);
+
+    const existingIds = new Set(basePanels.map((panel) => panel.id));
+    const additions = toAdd.filter((panel) => !existingIds.has(panel.id));
+    const activePanel = group.activePanel === "chat" ? sessionPanels[0]?.id : group.activePanel;
+
+    return { ...group, panels: [...basePanels, ...additions], activePanel };
+  });
+}
+
+/**
+ * Pure merge logic: merge extra panels from the current state into a target
+ * preset layout. Session panels (`session:*`) replace the generic `chat`
+ * panel in the center column. Other extras (files, changes, terminal, etc.)
+ * are appended to the side column when one exists (e.g. "right"/"plan"/
+ * "preview"/"vscode"), otherwise they fall back to the center column.
+ */
+export function mergePanelsIntoPreset(
+  currentState: LayoutState,
+  targetPreset: LayoutState,
+): LayoutState {
+  const currentPanels = collectAllPanels(currentState);
+  const targetPanelIds = collectPanelIds(targetPreset);
+
+  const extraPanels = currentPanels.filter(
+    (p) => !targetPanelIds.has(p.id) && !PRESET_ONLY_PANELS.has(p.id),
+  );
+
+  if (extraPanels.length === 0) {
+    return targetPreset;
+  }
+
+  const sessionExtras = extraPanels.filter((p) => p.id.startsWith("session:"));
+  const centerExtras = extraPanels.filter((p) => CENTER_EXTRA_COMPONENTS.has(p.component));
+  const sideExtras = extraPanels.filter(
+    (p) => !p.id.startsWith("session:") && !CENTER_EXTRA_COMPONENTS.has(p.component),
+  );
+  const hasSessionPanels = sessionExtras.length > 0;
+  const extrasColumnId = pickExtrasColumnId(targetPreset);
+
+  const mergedColumns = targetPreset.columns.map((col) => {
+    if (col.id === "center") {
+      // Sessions always replace the generic "chat" placeholder in center.
+      // Center-affinity extras (e.g. "plan") sit alongside the chat. When
+      // the side column doesn't exist, side extras land here too.
+      const fallbackSide = extrasColumnId === "center" ? sideExtras : [];
+      const additions = [...centerExtras, ...fallbackSide];
+      if (hasSessionPanels) {
+        return {
+          ...col,
+          groups: replaceChatWithSessionPanels(col.groups, sessionExtras, additions),
+        };
+      }
+      if (additions.length === 0) return col;
+      return { ...col, groups: appendToFirstGroup(col.groups, additions) };
+    }
+    if (col.id === extrasColumnId && sideExtras.length > 0) {
+      return { ...col, groups: appendToFirstGroup(col.groups, sideExtras) };
+    }
+    return col;
+  });
+
+  return { columns: mergedColumns };
+}
+
+/**
+ * Merge current live panels into a target preset layout.
+ *
+ * Captures panels from the current dockview state that aren't in the target
+ * preset and appends them as tabs in the center group. This prevents panels
+ * from being lost when switching layouts.
+ */
+export function mergeCurrentPanelsIntoPreset(
+  api: DockviewApi,
+  targetPreset: LayoutState,
+): LayoutState {
+  return mergePanelsIntoPreset(fromDockviewApi(api), targetPreset);
+}

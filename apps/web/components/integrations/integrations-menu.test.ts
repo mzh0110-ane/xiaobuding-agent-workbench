@@ -1,0 +1,307 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createElement } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  IntegrationsMenu,
+  IntegrationsTopbarLinks,
+  MobileIntegrationsSection,
+} from "./integrations-menu";
+import { pluginRegistry } from "@/lib/plugins/registry";
+import type { NavItem } from "@/lib/plugins/types";
+import type { GitHubStatus } from "@/lib/types/github";
+import { TooltipProvider } from "@kandev/ui/tooltip";
+
+const useGitHubStatusMock = vi.hoisted(() => vi.fn());
+const useGitLabAvailableMock = vi.hoisted(() => vi.fn());
+const useJiraAuthedMock = vi.hoisted(() => vi.fn());
+const useLinearAuthedMock = vi.hoisted(() => vi.fn());
+const integrationStore = vi.hoisted(() => {
+  const state = {
+    auth: { mode: "local", authenticated: false, user: null },
+    workspaceContextGeneration: 0,
+    workspaces: { activeId: null as string | null, items: [] as Array<{ id: string }> },
+    userSettings: {},
+    features: { office: false },
+  };
+  return {
+    state,
+    getState: () => state,
+    subscribe: () => () => {},
+  };
+});
+
+vi.mock("@/hooks/domains/github/use-github-status", () => ({
+  useGitHubStatus: useGitHubStatusMock,
+}));
+
+vi.mock("@/hooks/domains/gitlab/use-task-mr", () => ({
+  useGitLabAvailable: useGitLabAvailableMock,
+}));
+
+vi.mock("@/hooks/domains/jira/use-jira-availability", () => ({
+  useJiraAuthed: useJiraAuthedMock,
+}));
+
+vi.mock("@/hooks/domains/linear/use-linear-availability", () => ({
+  useLinearAuthed: useLinearAuthedMock,
+}));
+
+// useNavAvailability now also folds in each integration's per-workspace
+// enabled toggle plus the "hide disabled" nav setting. This suite never
+// exercises that decoupling (see hooks/use-nav-availability.test.ts for
+// that) — every enabled hook here defaults to `true` and the hide-disabled
+// setting to `false`, reproducing the pre-existing "enabled && authed"
+// visibility these tests already assert on.
+function enabledStub() {
+  return { enabled: true, setEnabled: () => {}, loaded: true };
+}
+vi.mock("@/hooks/domains/azure-devops/use-azure-devops-enabled", () => ({
+  useAzureDevOpsEnabled: enabledStub,
+}));
+vi.mock("@/hooks/domains/github/use-github-enabled", () => ({
+  useGitHubEnabled: enabledStub,
+}));
+vi.mock("@/hooks/domains/gitlab/use-gitlab-enabled", () => ({
+  useGitLabEnabled: enabledStub,
+}));
+vi.mock("@/hooks/domains/jira/use-jira-enabled", () => ({
+  useJiraEnabled: enabledStub,
+}));
+vi.mock("@/hooks/domains/linear/use-linear-enabled", () => ({
+  useLinearEnabled: enabledStub,
+}));
+vi.mock("@/hooks/domains/integrations/use-hide-disabled-integrations-in-nav", () => ({
+  useHideDisabledIntegrationsInNav: () => ({ hideDisabled: false, setHideDisabled: () => {} }),
+}));
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (state: typeof integrationStore.state) => unknown) =>
+    selector(integrationStore.state),
+  useAppStoreApi: () => integrationStore,
+}));
+
+function status(overrides: Partial<GitHubStatus>): GitHubStatus {
+  return {
+    authenticated: false,
+    username: "",
+    auth_method: "none",
+    token_configured: false,
+    required_scopes: [],
+    ...overrides,
+  };
+}
+
+function mockAvailability({
+  githubReady,
+  gitlabReady = false,
+  jiraConfigured,
+  linearConfigured,
+}: {
+  githubReady: boolean;
+  gitlabReady?: boolean;
+  jiraConfigured: boolean;
+  linearConfigured: boolean;
+}) {
+  useGitHubStatusMock.mockReturnValue({
+    status: githubReady ? status({ token_configured: true }) : status({}),
+    loading: false,
+  });
+  useGitLabAvailableMock.mockReturnValue(gitlabReady);
+  useJiraAuthedMock.mockReturnValue(jiraConfigured);
+  useLinearAuthedMock.mockReturnValue(linearConfigured);
+}
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  integrationStore.state.workspaces.activeId = null;
+  integrationStore.state.workspaces.items = [];
+  integrationStore.state.workspaceContextGeneration += 1;
+});
+
+// `getGitHubIntegrationStatus` now lives in `hooks/use-nav-availability` with the
+// rest of the manifest's availability gating, and the link table moved into
+// `lib/navigation/`. Their unit coverage moved with them — see
+// `hooks/use-nav-availability.test.ts` and `lib/navigation/*.test.ts`.
+
+describe("IntegrationsMenu", () => {
+  it("opens configured integration links on hover", async () => {
+    mockAvailability({ githubReady: true, jiraConfigured: true, linearConfigured: false });
+
+    render(createElement(IntegrationsMenu, {}));
+
+    const trigger = screen.getByRole("button", { name: "Integrations" });
+    expect(screen.queryByText("GitHub")).toBeNull();
+
+    fireEvent.pointerEnter(trigger);
+
+    expect(await screen.findByText("GitHub")).toBeTruthy();
+    expect(screen.getByText("Jira")).toBeTruthy();
+    expect(screen.queryByText("Linear")).toBeNull();
+  });
+
+  it("does not render when no integrations are configured", () => {
+    mockAvailability({ githubReady: false, jiraConfigured: false, linearConfigured: false });
+
+    render(createElement(IntegrationsMenu, {}));
+
+    expect(screen.queryByRole("button", { name: "Integrations" })).toBeNull();
+  });
+
+  it("passes the active workspace id to the per-workspace availability hooks", () => {
+    integrationStore.state.workspaces.activeId = "ws-active";
+    integrationStore.state.workspaces.items = [{ id: "ws-active" }];
+    mockAvailability({ githubReady: true, jiraConfigured: true, linearConfigured: true });
+
+    render(createElement(IntegrationsMenu, {}));
+
+    // Jira and Linear are per-workspace: they must be scoped to the active
+    // workspace so the sidebar reflects the workspace the user is viewing.
+    expect(useJiraAuthedMock).toHaveBeenCalledWith("ws-active");
+    expect(useLinearAuthedMock).toHaveBeenCalledWith("ws-active");
+  });
+
+  it("falls back to null scope when the active workspace id is stale", () => {
+    // The active workspace was removed but activeId was not reconciled. Scoping
+    // to the deleted id would hide the links; fall back to null instead so the
+    // backend's default-workspace resolution applies.
+    integrationStore.state.workspaces.activeId = "ws-deleted";
+    integrationStore.state.workspaces.items = [{ id: "ws-remaining" }];
+    mockAvailability({ githubReady: false, jiraConfigured: true, linearConfigured: true });
+
+    render(createElement(IntegrationsMenu, {}));
+
+    expect(useJiraAuthedMock).toHaveBeenCalledWith(null);
+    expect(useLinearAuthedMock).toHaveBeenCalledWith(null);
+  });
+});
+
+function renderWithTooltip(component: Parameters<typeof render>[0]) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- TooltipProvider requires children in its type but createElement passes them as 3rd arg
+  return render(createElement(TooltipProvider, {} as any, component));
+}
+
+describe("IntegrationsTopbarLinks", () => {
+  it("renders an icon link for each configured integration", () => {
+    mockAvailability({ githubReady: true, jiraConfigured: false, linearConfigured: true });
+
+    renderWithTooltip(createElement(IntegrationsTopbarLinks, {}));
+
+    const githubLink = screen.getByRole("link", { name: "GitHub" });
+    const linearLink = screen.getByRole("link", { name: "Linear" });
+    expect(githubLink.getAttribute("href")).toBe("/github");
+    expect(linearLink.getAttribute("href")).toBe("/linear");
+    expect(screen.queryByRole("link", { name: "Jira" })).toBeNull();
+  });
+
+  it("renders nothing when no integrations are configured", () => {
+    mockAvailability({ githubReady: false, jiraConfigured: false, linearConfigured: false });
+
+    const { container } = renderWithTooltip(createElement(IntegrationsTopbarLinks, {}));
+    expect(container.firstChild).toBeNull();
+  });
+});
+
+describe("MobileIntegrationsSection", () => {
+  const HELLO_LABEL = "Hello Integration";
+  const HELLO_PATH = "/plugins/hello";
+
+  // Track every plugin registered through this suite so the singleton
+  // pluginRegistry is fully cleared after each test — a new test adding a new
+  // plugin id can't leak nav items into the ones that follow.
+  const registeredPluginIds: string[] = [];
+
+  function registerNavItem(pluginId: string, item: NavItem) {
+    registeredPluginIds.push(pluginId);
+    pluginRegistry.forPlugin(pluginId).registerNavItem(item);
+  }
+
+  function registerHelloIntegrationItem() {
+    registerNavItem("plugin-a", {
+      id: "hello",
+      label: HELLO_LABEL,
+      path: HELLO_PATH,
+      section: "integrations",
+    });
+  }
+
+  afterEach(() => {
+    for (const id of registeredPluginIds) pluginRegistry.unregisterPlugin(id);
+    registeredPluginIds.length = 0;
+  });
+
+  function renderMobileSection(onNavigate = vi.fn()) {
+    return {
+      onNavigate,
+      ...render(createElement(MobileIntegrationsSection, { onNavigate })),
+    };
+  }
+
+  it("renders a touch row for each configured first-party link and closes the sheet on click", () => {
+    mockAvailability({ githubReady: true, jiraConfigured: false, linearConfigured: true });
+
+    const { onNavigate } = renderMobileSection();
+
+    const githubLink = screen.getByRole("link", { name: "GitHub" });
+    expect(githubLink.getAttribute("href")).toBe("/github");
+    expect(screen.getByRole("link", { name: "Linear" }).getAttribute("href")).toBe("/linear");
+    expect(screen.queryByRole("link", { name: "Jira" })).toBeNull();
+
+    fireEvent.click(githubLink);
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders plugin nav items targeting the integrations section, gated on the plugins flag", () => {
+    mockAvailability({ githubReady: false, jiraConfigured: false, linearConfigured: false });
+    registerHelloIntegrationItem();
+    registerNavItem("plugin-b", {
+      id: "main-item",
+      label: "Main Item",
+      path: "/plugins/main",
+      section: "main",
+    });
+
+    renderMobileSection();
+
+    const pluginLink = screen.getByTestId("plugin-nav-item-hello");
+    expect(pluginLink.getAttribute("href")).toBe(HELLO_PATH);
+    expect(screen.getByText(HELLO_LABEL)).toBeTruthy();
+    // A "main" section plugin item belongs to the top-level nav, not here.
+    expect(screen.queryByTestId("plugin-nav-item-main-item")).toBeNull();
+  });
+
+  it("renders when only plugin items exist and no first-party links are configured", () => {
+    mockAvailability({ githubReady: false, jiraConfigured: false, linearConfigured: false });
+    registerHelloIntegrationItem();
+
+    renderMobileSection();
+
+    expect(screen.getByText("Integrations")).toBeTruthy();
+    expect(screen.getByTestId("plugin-nav-item-hello")).toBeTruthy();
+  });
+
+  it("excludes separately customized plugins and omitted destinations from the built-in section", () => {
+    mockAvailability({ githubReady: true, jiraConfigured: false, linearConfigured: true });
+    registerHelloIntegrationItem();
+    render(
+      createElement(MobileIntegrationsSection, {
+        onNavigate: vi.fn(),
+        includePlugins: false,
+        omitDestinations: ["linear"],
+        showSetup: true,
+      }),
+    );
+    expect(screen.getByRole("link", { name: "GitHub" }).getAttribute("href")).toBe("/github");
+    expect(screen.queryByRole("link", { name: HELLO_LABEL })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Linear" })).toBeNull();
+    expect(screen.getByTestId("mobile-integration-settings")).toBeTruthy();
+  });
+
+  it("renders nothing when there are no links and no plugin items", () => {
+    mockAvailability({ githubReady: false, jiraConfigured: false, linearConfigured: false });
+
+    const { container } = renderMobileSection();
+
+    expect(container.firstChild).toBeNull();
+  });
+});

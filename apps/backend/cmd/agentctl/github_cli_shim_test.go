@@ -1,0 +1,574 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	osExec "os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestInstallGitHubCLIShimCreatesManagedTools(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(root, "agentctl")
+	if err := os.WriteFile(binary, []byte("agentctl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	shimDir, cleanup, err := installGitHubCLIShim(binary, root)
+	if err != nil {
+		t.Fatalf("installGitHubCLIShim() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	for _, name := range []string{githubCLIShimName(), "agentctl"} {
+		entrypoint := filepath.Join(shimDir, name)
+		if _, err := os.Stat(entrypoint); err != nil {
+			t.Fatalf("stat %s managed tool: %v", name, err)
+		}
+		if filepath.Dir(entrypoint) != shimDir {
+			t.Fatalf("entrypoint = %q, want inside %q", entrypoint, shimDir)
+		}
+	}
+}
+
+func TestPrepareGitHubCLIShimPublishesCredentialHelperExecutable(t *testing.T) {
+	t.Setenv("KANDEV_GITHUB_CREDENTIAL_HELPER_PATH", "")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	cleanup, err := prepareGitHubCLIShim()
+	if err != nil {
+		t.Fatalf("prepareGitHubCLIShim() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if got := os.Getenv("KANDEV_GITHUB_CREDENTIAL_HELPER_PATH"); got != executable {
+		t.Fatalf("credential helper executable = %q, want %q", got, executable)
+	}
+}
+
+func TestInstallGitHubCLIShimCreatesLoginShellEnvironment(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(root, "agentctl")
+	if err := os.WriteFile(binary, []byte("agentctl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	shimDir, cleanup, err := installGitHubCLIShim(binary, root)
+	if err != nil {
+		t.Fatalf("installGitHubCLIShim() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	bashEnv := filepath.Join(shimDir, "bash-env.sh")
+	info, err := os.Stat(bashEnv)
+	if err != nil {
+		t.Fatalf("stat managed Bash environment: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("Bash environment mode = %o, want 700", got)
+	}
+	content, err := os.ReadFile(bashEnv)
+	if err != nil {
+		t.Fatalf("read managed Bash environment: %v", err)
+	}
+	for _, want := range []string{
+		"KANDEV_GITHUB_CLI_SHIM_DIR",
+		"KANDEV_GITHUB_PARENT_BASH_ENV",
+		"PATH=",
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("Bash environment missing %q: %s", want, content)
+		}
+	}
+}
+
+func TestInstallGitHubCLIShimLoginShellRestoresManagedTools(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Bash login-shell behavior is Unix-specific")
+	}
+	root := t.TempDir()
+	binary := filepath.Join(root, "agentctl")
+	if err := os.WriteFile(binary, []byte("agentctl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shimDir, cleanup, err := installGitHubCLIShim(binary, root)
+	if err != nil {
+		t.Fatalf("installGitHubCLIShim() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	marker := filepath.Join(t.TempDir(), "parent-bash-hook-ran")
+	parentEnv := filepath.Join(t.TempDir(), "parent-bash-env.sh")
+	if err := os.WriteFile(parentEnv, []byte("#!/bin/sh\nprintf hook-ran > \"$KANDEV_BASH_HOOK_MARKER\"\n"), 0o700); err != nil {
+		t.Fatalf("write parent Bash environment: %v", err)
+	}
+	env := make(map[string]string, len(os.Environ())+5)
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && key != "BASH_ENV" && key != "PATH" {
+			env[key] = value
+		}
+	}
+	env["KANDEV_GITHUB_CREDENTIAL_BROKER_URL"] = "https://kandev.example/resolve"
+	env["KANDEV_GITHUB_CLI_SHIM_DIR"] = shimDir
+	env["KANDEV_GITHUB_CLI_BASH_ENV"] = filepath.Join(shimDir, "bash-env.sh")
+	env["KANDEV_GITHUB_PARENT_BASH_ENV"] = parentEnv
+	env["KANDEV_BASH_HOOK_MARKER"] = marker
+	env["BASH_ENV"] = env["KANDEV_GITHUB_CLI_BASH_ENV"]
+	env["HOME"] = root
+	env["PATH"] = "/usr/bin:/bin"
+	commandEnv := make([]string, 0, len(env))
+	for key, value := range env {
+		commandEnv = append(commandEnv, key+"="+value)
+	}
+
+	command := osExec.Command("bash", "-lc", "printf 'agentctl=%s\\ngh=%s\\n' \"$(command -v agentctl || true)\" \"$(command -v gh || true)\"")
+	command.Env = commandEnv
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Bash login shell failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "agentctl="+filepath.Join(shimDir, "agentctl")) ||
+		!strings.Contains(string(output), "gh="+filepath.Join(shimDir, "gh")) {
+		t.Fatalf("managed tools = %q", output)
+	}
+	if hook, err := os.ReadFile(marker); err != nil || string(hook) != "hook-ran" {
+		t.Fatalf("parent Bash hook marker = %q, error = %v", hook, err)
+	}
+}
+
+func TestPathWithoutDirectoryPreservesPathList(t *testing.T) {
+	path := strings.Join([]string{"/bin", "/shim", "/usr/bin"}, string(os.PathListSeparator))
+	want := strings.Join([]string{"/bin", "/usr/bin"}, string(os.PathListSeparator))
+	if got := pathWithoutDirectory(path, "/shim"); got != want {
+		t.Fatalf("pathWithoutDirectory() = %q, want %q", got, want)
+	}
+}
+
+func TestIsGitHubCLIShimInvocation(t *testing.T) {
+	for _, name := range []string{"/tmp/shims/gh", `C:\\shims\\gh.exe`} {
+		if !isGitHubCLIShimInvocation(name) {
+			t.Fatalf("isGitHubCLIShimInvocation(%q) = false", name)
+		}
+	}
+	if isGitHubCLIShimInvocation("/usr/local/bin/agentctl") {
+		t.Fatal("agentctl executable was mistaken for gh shim")
+	}
+}
+
+func TestGitHubCLIShimRefreshesAndIsolatesEachInvocation(t *testing.T) {
+	issued := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		issued++
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"username": "x-access-token",
+			"password": "fresh-token-" + string(rune('0'+issued)),
+		})
+	}))
+	t.Cleanup(server.Close)
+	env := githubCredentialTestEnv(server.URL)
+	env["PATH"] = "/shim:/usr/bin"
+	env["GITHUB_TOKEN"] = "parent-token-must-not-win"
+	var childTokens []string
+	var configDirs []string
+	runner := func(_ context.Context, executable string, args []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+		if executable != "/usr/bin/gh" {
+			t.Errorf("executable = %q, want /usr/bin/gh", executable)
+		}
+		if len(args) != 2 || args[0] != "pr" || args[1] != "list" {
+			t.Errorf("args = %v", args)
+		}
+		childTokens = append(childTokens, envValue(childEnv, "GH_TOKEN"))
+		configDir := envValue(childEnv, "GH_CONFIG_DIR")
+		configDirs = append(configDirs, configDir)
+		if _, err := os.Stat(configDir); err != nil {
+			t.Errorf("GH_CONFIG_DIR was not available to gh: %v", err)
+		}
+		if got := envValue(childEnv, "GITHUB_TOKEN"); got != "" {
+			t.Errorf("child GITHUB_TOKEN = %q, want removed", got)
+		}
+		return nil
+	}
+	lookPath := func(file, path string) (string, error) {
+		if file != "gh" || path != "/usr/bin" {
+			t.Fatalf("lookPath(%q, %q)", file, path)
+		}
+		return "/usr/bin/gh", nil
+	}
+
+	for range 2 {
+		if err := runGitHubCLIShim(
+			context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+			lookupEnv(env), func() []string { return envMap(env) }, server.Client(), "/shim", lookPath, runner,
+		); err != nil {
+			t.Fatalf("runGitHubCLIShim() error = %v", err)
+		}
+	}
+	if got, want := strings.Join(childTokens, ","), "fresh-token-1,fresh-token-2"; got != want {
+		t.Fatalf("child GH_TOKEN values = %q, want %q", got, want)
+	}
+	if configDirs[0] == "" || configDirs[0] == configDirs[1] {
+		t.Fatalf("GH_CONFIG_DIR values = %v, want unique isolated directories", configDirs)
+	}
+	for _, configDir := range configDirs {
+		if _, err := os.Stat(configDir); !os.IsNotExist(err) {
+			t.Fatalf("GH_CONFIG_DIR %q remains after invocation", configDir)
+		}
+	}
+}
+
+func TestGitHubCLIShimReissuesInvalidLease(t *testing.T) {
+	var resolveCalls, reissueCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request githubBrokerResolveRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		switch r.URL.Path {
+		case "/resolve":
+			resolveCalls++
+			if resolveCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"code":"github_credential_lease_revoked"}`)
+				return
+			}
+			if request.Lease != "replacement-lease" {
+				t.Errorf("replacement resolve lease = %q", request.Lease)
+			}
+			_, _ = io.WriteString(w, `{"username":"x-access-token","password":"fresh-token"}`)
+		case "/reissue":
+			reissueCalls++
+			if request.Lease != "" || request.ReissueCapability != "execution-capability" {
+				t.Errorf("reissue request = %+v", request)
+			}
+			_, _ = io.WriteString(w, `{"token":"replacement-lease"}`)
+		default:
+			t.Errorf("unexpected endpoint %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	env := githubCredentialTestEnv(server.URL + "/resolve")
+	env[envGitHubCredentialReissueCapability] = "execution-capability"
+	env["PATH"] = "/shim:/usr/bin"
+	var childToken string
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, server.Client(), "/shim",
+		func(string, string) (string, error) { return "/usr/bin/gh", nil },
+		func(_ context.Context, _ string, _ []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+			childToken = envValue(childEnv, "GH_TOKEN")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runGitHubCLIShim() error = %v", err)
+	}
+	if childToken != "fresh-token" || resolveCalls != 2 || reissueCalls != 1 {
+		t.Fatalf("child token/calls = %q/%d/%d, want fresh-token/2/1", childToken, resolveCalls, reissueCalls)
+	}
+}
+
+func TestGitHubCLIShimSelectsRepositoryLease(t *testing.T) {
+	var got githubBrokerResolveRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_, _ = io.WriteString(w, `{"username":"x-access-token","password":"backend-token"}`)
+	}))
+	t.Cleanup(server.Close)
+	env := githubCredentialTestEnv(server.URL)
+	env["PATH"] = "/shim:/usr/bin"
+	env["GH_REPO"] = "acme/backend"
+	env[envGitHubCredentialScopes] = `[
+		{"lease":"frontend-lease","task_id":"task-1","session_id":"session-1","repository_id":"repo-1","owner":"acme","repo":"frontend","host":"github.com"},
+		{"lease":"backend-lease","task_id":"task-1","session_id":"session-1","repository_id":"repo-2","owner":"acme","repo":"backend","host":"github.com"}
+	]`
+	var childToken string
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, server.Client(), "/shim",
+		func(string, string) (string, error) { return "/usr/bin/gh", nil },
+		func(_ context.Context, _ string, _ []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+			childToken = envValue(childEnv, "GH_TOKEN")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runGitHubCLIShim() error = %v", err)
+	}
+	if got.Lease != "backend-lease" || got.RepositoryID != "repo-2" {
+		t.Fatalf("selected broker scope = %+v", got)
+	}
+	if childToken != "backend-token" {
+		t.Fatalf("child GH_TOKEN = %q, want backend-token", childToken)
+	}
+}
+
+func TestGitHubCLIShimAcceptsShortRepositoryPathForGitHubLease(t *testing.T) {
+	var got githubBrokerResolveRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_, _ = io.WriteString(w, `{"username":"x-access-token","password":"backend-token"}`)
+	}))
+	t.Cleanup(server.Close)
+	env := githubCredentialTestEnv(server.URL)
+	env["PATH"] = "/shim:/usr/bin"
+	env["GH_REPO"] = "acme/backend"
+	env[envGitHubCredentialScopes] = `[
+		{"lease":"backend-lease","task_id":"task-1","session_id":"session-1","repository_id":"repo-2","owner":"acme","repo":"backend","host":"github.com","path":"/acme/backend.git","provider_id":"github"}
+	]`
+	var childToken string
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, server.Client(), "/shim",
+		func(string, string) (string, error) { return "/usr/bin/gh", nil },
+		func(_ context.Context, _ string, _ []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+			childToken = envValue(childEnv, "GH_TOKEN")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runGitHubCLIShim() error = %v", err)
+	}
+	if got.Path != "/acme/backend.git" {
+		t.Fatalf("broker path = %q, want canonical GitHub clone path", got.Path)
+	}
+	if childToken != "backend-token" {
+		t.Fatalf("child GH_TOKEN = %q, want backend-token", childToken)
+	}
+}
+
+func TestParseGitHubCLIRepository(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		defaultHost string
+		want        githubCLIRepository
+	}{
+		{name: "owner and repo", raw: "acme/widgets", defaultHost: "github.com", want: githubCLIRepository{host: "github.com", owner: "acme", repo: "widgets"}},
+		{name: "enterprise", raw: "github.example.com/acme/widgets", want: githubCLIRepository{host: "github.example.com", owner: "acme", repo: "widgets"}},
+		{name: "HTTPS remote", raw: "https://github.com/acme/widgets.git", want: githubCLIRepository{host: "github.com", owner: "acme", repo: "widgets"}},
+		{name: "SSH remote", raw: "git@github.com:acme/widgets.git", want: githubCLIRepository{host: "github.com", owner: "acme", repo: "widgets"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseGitHubCLIRepository(test.raw, test.defaultHost)
+			if err != nil {
+				t.Fatalf("parseGitHubCLIRepository() error = %v", err)
+			}
+			if *got != test.want {
+				t.Fatalf("parseGitHubCLIRepository() = %+v, want %+v", *got, test.want)
+			}
+		})
+	}
+}
+
+func TestGitHubCLIRepositoryArgument(t *testing.T) {
+	for _, args := range [][]string{
+		{"pr", "list", "-R", "acme/widgets"},
+		{"pr", "list", "--repo=acme/widgets"},
+		{"pr", "list", "-Racme/widgets"},
+	} {
+		got, found, err := githubCLIRepositoryArgument(args)
+		if err != nil || !found || got != "acme/widgets" {
+			t.Fatalf("githubCLIRepositoryArgument(%v) = %q, %v, %v", args, got, found, err)
+		}
+	}
+}
+
+func envMap(env map[string]string) []string {
+	result := make([]string, 0, len(env))
+	for key, value := range env {
+		result = append(result, key+"="+value)
+	}
+	return result
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func TestGitHubCLIShimRefusesAtDepthBound(t *testing.T) {
+	env := map[string]string{envGitHubCLIShimDepth: strconv.Itoa(maxGitHubCLIShimDepth), "PATH": "/stale-shim:/usr/bin"}
+	runner := func(context.Context, string, []string, []string, io.Reader, io.Writer, io.Writer) error {
+		t.Fatal("shim at the depth bound must not launch gh")
+		return nil
+	}
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "view"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, nil, "/current-shim", lookPathIn, runner,
+	)
+	if err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Fatalf("runGitHubCLIShim() error = %v, want depth refusal", err)
+	}
+}
+
+func TestGitHubCLIShimRejectsMalformedDepth(t *testing.T) {
+	env := map[string]string{envGitHubCLIShimDepth: "many", "PATH": "/usr/bin"}
+	runner := func(context.Context, string, []string, []string, io.Reader, io.Writer, io.Writer) error {
+		t.Fatal("shim with a malformed depth must not launch gh")
+		return nil
+	}
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "view"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, nil, "/current-shim", lookPathIn, runner,
+	)
+	if err == nil || !strings.Contains(err.Error(), envGitHubCLIShimDepth) {
+		t.Fatalf("runGitHubCLIShim() error = %v, want malformed depth error", err)
+	}
+}
+
+// A nested invocation below the bound launches gh with the depth incremented.
+func TestGitHubCLIShimIncrementsChildDepth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"username": "x-access-token", "password": "token"})
+	}))
+	t.Cleanup(server.Close)
+	for _, inherited := range []string{"", "2"} {
+		env := githubCredentialTestEnv(server.URL)
+		env["PATH"] = "/shim:/usr/bin"
+		if inherited != "" {
+			env[envGitHubCLIShimDepth] = inherited
+		}
+		var depth string
+		runner := func(_ context.Context, _ string, _ []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+			depth = envValue(childEnv, envGitHubCLIShimDepth)
+			return nil
+		}
+		lookPath := func(string, string) (string, error) { return "/usr/bin/gh", nil }
+		if err := runGitHubCLIShim(
+			context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+			lookupEnv(env), func() []string { return envMap(env) }, server.Client(), "/shim", lookPath, runner,
+		); err != nil {
+			t.Fatalf("inherited depth %q: runGitHubCLIShim() error = %v", inherited, err)
+		}
+		want := "1"
+		if inherited != "" {
+			want = "3"
+		}
+		if depth != want {
+			t.Fatalf("inherited depth %q: child %s = %q, want %s", inherited, envGitHubCLIShimDepth, depth, want)
+		}
+	}
+}
+
+func TestGitHubCLIShimRemovesManagedDirectoriesFromChildPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"username": "x-access-token", "password": "token"})
+	}))
+	t.Cleanup(server.Close)
+
+	root := t.TempDir()
+	currentShim := filepath.Join(root, githubCLIShimDirPrefix+"current")
+	staleShim := filepath.Join(root, githubCLIShimDirPrefix+"stale")
+	realDir := filepath.Join(root, "real")
+	env := githubCredentialTestEnv(server.URL)
+	env["PATH"] = strings.Join([]string{currentShim, staleShim, realDir}, string(os.PathListSeparator))
+
+	var lookedUpPath, childPath string
+	err := runGitHubCLIShim(
+		context.Background(), []string{"pr", "list"}, strings.NewReader(""), io.Discard, io.Discard,
+		lookupEnv(env), func() []string { return envMap(env) }, server.Client(), currentShim,
+		func(_ string, path string) (string, error) {
+			lookedUpPath = path
+			return filepath.Join(realDir, "gh"), nil
+		},
+		func(_ context.Context, _ string, _ []string, childEnv []string, _ io.Reader, _, _ io.Writer) error {
+			childPath = envValue(childEnv, "PATH")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runGitHubCLIShim() error = %v", err)
+	}
+	wantPath := realDir
+	if lookedUpPath != wantPath {
+		t.Fatalf("real gh lookup PATH = %q, want %q", lookedUpPath, wantPath)
+	}
+	if childPath != wantPath {
+		t.Fatalf("real gh child PATH = %q, want %q", childPath, wantPath)
+	}
+}
+
+func TestLookPathSkippingShimsIgnoresLinksToSelf(t *testing.T) {
+	if runtime.GOOS == windowsOS {
+		t.Skip("symlink layout is unix-specific")
+	}
+	root := t.TempDir()
+	self := filepath.Join(root, "agentctl")
+	if err := os.WriteFile(self, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleShim := filepath.Join(root, "stale-shim")
+	realDir := filepath.Join(root, "real")
+	for _, dir := range []string{staleShim, realDir} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(self, filepath.Join(staleShim, "gh")); err != nil {
+		t.Fatal(err)
+	}
+	realGH := filepath.Join(realDir, "gh")
+	if err := os.WriteFile(realGH, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := strings.Join([]string{staleShim, realDir}, string(os.PathListSeparator))
+
+	if got, err := lookPathIn("gh", path); err != nil || got != filepath.Join(staleShim, "gh") {
+		t.Fatalf("lookPathIn = %q, %v; want the stale shim (the bug this guards against)", got, err)
+	}
+	got, err := lookPathSkippingShims(self)("gh", path)
+	if err != nil || got != realGH {
+		t.Fatalf("lookPathSkippingShims = %q, %v; want %q", got, err, realGH)
+	}
+	if _, err := lookPathSkippingShims(self)("gh", staleShim); err == nil {
+		t.Fatal("lookPathSkippingShims found gh although only the shim is on PATH")
+	}
+}
+
+// A shim directory is skipped by name: its gh need not be the running
+// executable (an older agentctl, or a copy on Windows).
+func TestLookPathSkippingShimsIgnoresShimDirectories(t *testing.T) {
+	root := t.TempDir()
+	staleShim, err := os.MkdirTemp(root, githubCLIShimDirPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := githubCLIShimName()
+	for _, executable := range []string{filepath.Join(staleShim, name), filepath.Join(realDir, name)} {
+		if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := strings.Join([]string{staleShim, realDir}, string(os.PathListSeparator))
+
+	got, err := lookPathSkippingShims("")("gh", path)
+	if err != nil || got != filepath.Join(realDir, name) {
+		t.Fatalf("lookPathSkippingShims = %q, %v; want the real gh", got, err)
+	}
+	if _, err := lookPathSkippingShims("")("gh", staleShim); err == nil {
+		t.Fatal("lookPathSkippingShims found gh although only a shim directory is on PATH")
+	}
+}

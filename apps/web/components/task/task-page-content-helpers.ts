@@ -1,0 +1,491 @@
+import { useMemo } from "react";
+import {
+  taskId as toTaskId,
+  workflowId as toWorkflowId,
+  workspaceId as toWorkspaceId,
+  repositoryId as toRepositoryId,
+  sessionId as toSessionId,
+  type Repository,
+  type Task,
+} from "@/lib/types/http";
+import type { KanbanState } from "@/lib/state/slices";
+import { issueFieldsFromMetadata } from "@/lib/metadata-utils";
+import { repositorySlug } from "@/lib/repository-slug";
+import { remoteRepositoryBrowserUrl } from "@/lib/utils/remote-repository-browser-url";
+import { parseTurnTimestamp } from "@/lib/state/slices/session/turn-actions";
+import type { TaskActionsMenuBoardRow } from "@/hooks/use-task-actions-menu";
+import { useAppStore } from "@/components/state-provider";
+import { findTaskInSnapshots } from "@/lib/kanban/find-task";
+import { selectSessionRecoveryError } from "@/lib/session-recovery-presentation";
+import type { TaskStatusSummary } from "@/lib/types/task-status-summary";
+
+const EMPTY_REPOSITORIES: Repository[] = [];
+
+export type TaskTopbarRepository = {
+  displayName: string;
+  fullName: string;
+  provider: string;
+  browserUrl: string | null;
+};
+
+export function selectWorkspaceRepositories(
+  itemsByWorkspaceId: Record<string, Repository[]>,
+  workspaceId: string | null | undefined,
+): Repository[] {
+  return (workspaceId && itemsByWorkspaceId[workspaceId]) || EMPTY_REPOSITORIES;
+}
+
+export function shouldReservePageLevelMobileFeedbackOffset(params: {
+  isMobile: boolean;
+  hasTaskMoveError: boolean;
+  hasEnsureSessionError: boolean;
+  hasBootstrapRecoveryError: boolean;
+  hasComposerRecoveryOwner?: boolean;
+  effectiveSessionId: string | null;
+  isSessionPassthrough: boolean;
+  hasResumptionError: boolean;
+  hasResumptionNotice: boolean;
+  hasStatusUnavailable: boolean;
+}): boolean {
+  const hasPageRecoveryFeedback = params.hasBootstrapRecoveryError
+    ? Boolean(params.effectiveSessionId && params.isSessionPassthrough)
+    : params.hasStatusUnavailable ||
+      (!params.hasComposerRecoveryOwner &&
+        (params.hasResumptionError || params.hasResumptionNotice));
+  return (
+    params.isMobile &&
+    (params.hasTaskMoveError || params.hasEnsureSessionError || hasPageRecoveryFeedback)
+  );
+}
+
+export function resolveTaskPageBootstrapRecoveryError(
+  statusSummary: TaskStatusSummary | null | undefined,
+  sessionId: string | null,
+  sessionMetadata: Record<string, unknown> | null | undefined,
+) {
+  return selectSessionRecoveryError(statusSummary?.active_error, sessionId, sessionMetadata);
+}
+
+type ACPDebugInfo = {
+  sessionId: unknown;
+  updatedAt: unknown;
+  meta: unknown;
+};
+
+function readACPDebugInfo(metadata: Record<string, unknown> | null | undefined): ACPDebugInfo {
+  const acp = metadata?.acp;
+  const acpObject =
+    acp && typeof acp === "object" && !Array.isArray(acp) ? (acp as Record<string, unknown>) : {};
+  return {
+    sessionId: acpObject.session_id ?? null,
+    updatedAt: acpObject.updated_at ?? null,
+    meta: acpObject.meta ?? null,
+  };
+}
+
+export function buildDebugEntries(params: {
+  connectionStatus: string;
+  task: Task | null;
+  effectiveSessionId: string | null | undefined;
+  activeSessionMetadata?: Record<string, unknown> | null;
+  taskSessionState: string | null;
+  isAgentWorking: boolean;
+  resumptionState: string;
+  resumptionError: string | null;
+  agentctlStatus: {
+    status: string;
+    isReady: boolean;
+    errorMessage?: string | null;
+    agentExecutionId?: string | null;
+  };
+  previewOpen: boolean;
+  previewStage: string;
+  previewUrl: string;
+  devProcessId: string | undefined;
+  devProcessStatus: string | null;
+}): Record<string, unknown> {
+  const {
+    connectionStatus,
+    task,
+    effectiveSessionId,
+    activeSessionMetadata,
+    taskSessionState,
+    isAgentWorking,
+    resumptionState,
+    resumptionError,
+    agentctlStatus,
+    previewOpen,
+    previewStage,
+    previewUrl,
+    devProcessId,
+    devProcessStatus,
+  } = params;
+  const acp = readACPDebugInfo(activeSessionMetadata);
+  return {
+    ws_status: connectionStatus,
+    task_id: task?.id ?? null,
+    session_id: effectiveSessionId ?? null,
+    acp_session_id: acp.sessionId,
+    acp_session_updated_at: acp.updatedAt,
+    acp_meta: acp.meta,
+    task_state: task?.state ?? null,
+    task_session_state: taskSessionState ?? null,
+    is_agent_working: isAgentWorking,
+    resumption_state: resumptionState,
+    resumption_error: resumptionError,
+    agentctl_status: agentctlStatus.status,
+    agentctl_ready: agentctlStatus.isReady,
+    agentctl_error: agentctlStatus.errorMessage ?? null,
+    agentctl_execution_id: agentctlStatus.agentExecutionId ?? null,
+    preview_open: previewOpen,
+    preview_stage: previewStage,
+    preview_url: previewUrl || null,
+    dev_process_id: devProcessId ?? null,
+    dev_process_status: devProcessStatus ?? null,
+  };
+}
+
+export function deriveIsAgentWorking(
+  taskSessionState: string | null,
+  isAgentRunning: boolean,
+  taskState: string | null,
+): boolean {
+  if (taskSessionState !== null)
+    return taskSessionState === "STARTING" || taskSessionState === "RUNNING";
+  return isAgentRunning && (taskState === "IN_PROGRESS" || taskState === "SCHEDULING");
+}
+
+/**
+ * Resolve the task the detail view should render, layering the freshest of
+ * three sources: the one-shot `fetchTask` details, the SSR/`initialTask`, and
+ * the live kanban entry. The base (details/initial) carries fields the kanban
+ * doesn't (repositories, timestamps); the kanban carries live board state.
+ */
+export function resolveEffectiveTask(
+  taskDetails: Task | null,
+  initialTask: Task | null,
+  kanbanTask: KanbanState["tasks"][number] | null,
+  effectiveTaskId: string | null,
+): Task | null {
+  const matchingTaskDetails = taskDetails?.id === effectiveTaskId ? taskDetails : null;
+  const matchingInitialTask = initialTask?.id === effectiveTaskId ? initialTask : null;
+  const baseTask = matchingTaskDetails ?? matchingInitialTask;
+
+  if (!baseTask && !kanbanTask) return null;
+  if (baseTask) return mergeBaseWithKanban(baseTask, kanbanTask);
+  if (kanbanTask) return buildTaskFromKanban(kanbanTask);
+  return null;
+}
+
+export function resolveLatestTaskProjection(
+  taskId: string | null,
+  activeTasks: KanbanState["tasks"],
+  snapshots: Record<string, { tasks: KanbanState["tasks"] }>,
+): KanbanState["tasks"][number] | null {
+  if (!taskId) return null;
+  const candidates = [activeTasks, ...Object.values(snapshots).map((snapshot) => snapshot.tasks)];
+  let latestTask: KanbanState["tasks"][number] | null = null;
+  let latestTimestamp: bigint | null = null;
+
+  for (const tasks of candidates) {
+    for (const task of tasks) {
+      if (task.id !== taskId) continue;
+      const updatedAt = parseTurnTimestamp(task.updatedAt ?? undefined);
+      if (
+        !latestTask ||
+        (updatedAt !== null && (latestTimestamp === null || updatedAt > latestTimestamp))
+      ) {
+        latestTask = task;
+        latestTimestamp = updatedAt;
+      }
+    }
+  }
+
+  return latestTask;
+}
+
+export function resolveWorkflowCurrentStepId(
+  sessionStepId: string | null,
+  taskStepId: string | null,
+  workflowStepIds: readonly string[],
+): string | null {
+  // The resolved task step is freshest across sources. Only use the session
+  // step as a fallback when it belongs to this workflow.
+  if (taskStepId) return taskStepId;
+  if (sessionStepId && workflowStepIds.includes(sessionStepId)) return sessionStepId;
+  return null;
+}
+
+function hasNewerKanbanState(
+  baseTask: Task,
+  kanbanTimestamp: bigint,
+  baseTimestamp: bigint | null,
+): boolean {
+  return Boolean(baseTask.archived_at && baseTimestamp !== null && kanbanTimestamp > baseTimestamp);
+}
+
+export function mergeBaseWithKanban(
+  baseTask: Task,
+  kanbanTask: KanbanState["tasks"][number] | null,
+): Task {
+  if (!kanbanTask) return baseTask;
+  const kanbanTimestamp = parseTurnTimestamp(kanbanTask.updatedAt ?? undefined);
+  const baseTimestamp = parseTurnTimestamp(baseTask.updated_at);
+  if (kanbanTimestamp === null || (baseTimestamp !== null && kanbanTimestamp < baseTimestamp)) {
+    return baseTask;
+  }
+  const hasCompletePlacement = Boolean(kanbanTask.workflowId && kanbanTask.workflowStepId);
+  return {
+    ...baseTask,
+    title: kanbanTask.title ?? baseTask.title,
+    description: kanbanTask.description ?? baseTask.description,
+    workflow_id: hasCompletePlacement ? toWorkflowId(kanbanTask.workflowId) : baseTask.workflow_id,
+    workflow_step_id: hasCompletePlacement ? kanbanTask.workflowStepId : baseTask.workflow_step_id,
+    position: kanbanTask.position ?? baseTask.position,
+    state: (kanbanTask.state as Task["state"] | undefined) ?? baseTask.state,
+    repositories: baseTask.repositories,
+    metadata: kanbanTask.metadata !== undefined ? kanbanTask.metadata : baseTask.metadata,
+    archived_at: hasNewerKanbanState(baseTask, kanbanTimestamp, baseTimestamp)
+      ? null
+      : baseTask.archived_at,
+  };
+}
+
+export function buildTaskFromKanban(kanbanTask: KanbanState["tasks"][number]): Task {
+  return {
+    id: toTaskId(kanbanTask.id),
+    title: kanbanTask.title,
+    description: kanbanTask.description ?? "",
+    workflow_step_id: kanbanTask.workflowStepId,
+    position: kanbanTask.position,
+    state: kanbanTask.state ?? "CREATED",
+    workspace_id: toWorkspaceId(kanbanTask.workspaceId ?? ""),
+    workflow_id: toWorkflowId(kanbanTask.workflowId ?? ""),
+    priority: kanbanTask.priority ?? "medium",
+    repositories:
+      kanbanTask.repositories?.map((repository) => ({
+        ...repository,
+        task_id: toTaskId(kanbanTask.id),
+        repository_id: toRepositoryId(repository.repository_id),
+        created_at: "",
+        updated_at: "",
+      })) ?? [],
+    workspace_folders: kanbanTask.workspaceFolders?.map((folder) => ({
+      ...folder,
+      task_id: toTaskId(kanbanTask.id),
+    })),
+    primary_session_id: kanbanTask.primarySessionId
+      ? toSessionId(kanbanTask.primarySessionId)
+      : null,
+    primary_session_pending_action: kanbanTask.primarySessionPendingAction,
+    task_pending_action: kanbanTask.taskPendingAction,
+    status_summary: kanbanTask.statusSummary,
+    foreground_activity: kanbanTask.foregroundActivity,
+    interrupted: kanbanTask.interrupted,
+    workspace_orphaned: kanbanTask.workspaceOrphaned,
+    auto_start_failed: kanbanTask.autoStartFailed,
+    is_from_office: kanbanTask.isFromOffice,
+    is_remote_executor: kanbanTask.isRemoteExecutor,
+    runner_editable: kanbanTask.runnerEditable,
+    runner_ineligible_reason: kanbanTask.runnerIneligibleReason,
+    autopilot: kanbanTask.autopilot,
+    workflow_agent_overrides: kanbanTask.workflowAgentOverrides,
+    parent_id: kanbanTask.parentTaskId ? toTaskId(kanbanTask.parentTaskId) : undefined,
+    created_at: kanbanTask.createdAt ?? "",
+    updated_at: kanbanTask.updatedAt ?? "",
+    metadata: kanbanTask.metadata,
+  };
+}
+
+export function buildArchivedValue(task: Task | null, repository: Repository | null) {
+  const isArchived = !!task?.archived_at;
+  return {
+    isArchived,
+    archivedTask: isArchived ? (task ?? undefined) : undefined,
+    archivedTaskId: isArchived ? task?.id : undefined,
+    archivedTaskTitle: isArchived ? task?.title : undefined,
+    archivedTaskRepositoryLabel: isArchived && repository ? repositorySlug(repository) : undefined,
+    archivedTaskUpdatedAt: isArchived ? task?.updated_at : undefined,
+  };
+}
+
+export function resolveTaskContentState(params: {
+  isMounted: boolean;
+  hasTask: boolean;
+  hasTaskLoadError: boolean;
+}) {
+  if (!params.isMounted) return "loading";
+  if (params.hasTaskLoadError) return "error";
+  if (params.hasTask) return "ready";
+  return "loading";
+}
+
+export function hasResolvedTaskDetails(params: {
+  effectiveTaskId: string | null;
+  taskDetailsId?: string | null;
+  initialTaskId?: string | null;
+}) {
+  if (!params.effectiveTaskId) return false;
+  return (
+    params.taskDetailsId === params.effectiveTaskId ||
+    params.initialTaskId === params.effectiveTaskId
+  );
+}
+
+export function syncActiveTaskSession(params: {
+  initialTaskId: string | undefined;
+  fallbackTaskId: string | null | undefined;
+  initialSessionId: string | null;
+  activeTaskId: string | null;
+  previousRouteTaskId: string | null | undefined;
+  setActiveSessionAuto: (taskId: string, sessionId: string) => void;
+  setActiveTask: (taskId: string) => void;
+}): boolean {
+  const taskId = params.initialTaskId ?? params.fallbackTaskId;
+  if (!taskId) return false;
+  const routeChanged = params.previousRouteTaskId !== taskId;
+  if (!routeChanged && params.activeTaskId !== taskId) return false;
+  if (params.initialSessionId) params.setActiveSessionAuto(taskId, params.initialSessionId);
+  else params.setActiveTask(taskId);
+  return true;
+}
+
+export function resolveTaskIds(task: Task | null) {
+  const taskValues = task ?? ({} as Task);
+  const primaryRepository = taskValues.repositories?.[0];
+  return {
+    taskId: taskValues.id ?? null,
+    workflowId: taskValues.workflow_id ?? null,
+    workspaceId: taskValues.workspace_id ?? null,
+    projectId: taskValues.project_id ?? null,
+    workflowStepId: taskValues.workflow_step_id ?? null,
+    primaryExecutorType: taskValues.primary_executor_type ?? null,
+    baseBranch: primaryRepository?.base_branch,
+    pullRequestTarget: primaryRepository?.branch_policy_pull_request_target || undefined,
+    isArchived: !!taskValues.archived_at,
+  };
+}
+
+function buildPullRequestTargetsByRepository(
+  task: Pick<Task, "repositories"> | null,
+  repositories: Repository[],
+): Record<string, string> {
+  const targets: Record<string, string> = {};
+  for (const taskRepository of task?.repositories ?? []) {
+    const target = taskRepository.branch_policy_pull_request_target?.trim();
+    if (!target) continue;
+    targets[taskRepository.repository_id] = target;
+    const workspaceRepository = repositories.find(
+      (candidate) => candidate.id === taskRepository.repository_id,
+    );
+    if (!workspaceRepository) continue;
+    targets[workspaceRepository.id] = target;
+    if (workspaceRepository.name) targets[workspaceRepository.name] = target;
+    const slug = repositorySlug(workspaceRepository);
+    if (slug) targets[slug] = target;
+  }
+  return targets;
+}
+
+/**
+ * The detail top bar's actions-menu subject: a live board-row lookup against
+ * the workflow snapshots with the flat task list as fallback (the same lookup
+ * `useSidebarTaskEdit` performs), NOT the detail page's own task record. The
+ * page's own record stays loaded on tasks the board has pruned (e.g. after a
+ * peer archives/deletes it, or for a task that was never on any board, such
+ * as an Office-managed task), so using it directly would make the
+ * "unresolved-row" identifier-only tier (AC-TASKS-TASK-ACTIONS-MENU-002.5)
+ * unreachable. Returns null when the subject genuinely has no board row.
+ */
+export function useTaskActionsMenuBoardRow(task: Task | null): TaskActionsMenuBoardRow | null {
+  const taskId = task?.id ?? null;
+  const taskPriority = task?.priority;
+  const kanbanTasks = useAppStore((state) => state.kanban.tasks);
+  const snapshots = useAppStore((state) => state.kanbanMulti.snapshots);
+  return useMemo(() => {
+    if (!taskId) return null;
+    const boardTask = findTaskInSnapshots(taskId, snapshots, kanbanTasks);
+    if (!boardTask) return null;
+    return {
+      id: boardTask.id,
+      title: boardTask.title,
+      description: boardTask.description,
+      workflowStepId: boardTask.workflowStepId,
+      state: boardTask.state,
+      priority: boardTask.priority ?? taskPriority,
+      repositoryId: boardTask.repositoryId,
+      repositories: boardTask.repositories,
+      parentTaskId: boardTask.parentTaskId,
+      primaryExecutorType: boardTask.primaryExecutorType,
+      workspaceMode: boardTask.workspaceMode,
+    };
+  }, [kanbanTasks, snapshots, taskId, taskPriority]);
+}
+
+export function resolveTaskPullRequestProps(
+  task: Pick<Task, "title" | "repositories"> | null,
+  repositories: Repository[] = [],
+) {
+  const primaryRepository = task?.repositories?.[0];
+  return {
+    baseBranch: primaryRepository?.base_branch,
+    pullRequestTarget: primaryRepository?.branch_policy_pull_request_target || undefined,
+    pullRequestTargetsByRepository: buildPullRequestTargetsByRepository(task, repositories),
+    taskTitle: task?.title,
+  };
+}
+
+export function resolveTaskProps(
+  task: Task | null,
+  repository: Repository | null,
+  repositories: Repository[] = [],
+) {
+  const ids = resolveTaskIds(task);
+  const issue = issueFieldsFromMetadata(task?.metadata);
+  const pullRequestProps = resolveTaskPullRequestProps(task, repositories);
+  return {
+    ...ids,
+    taskDescription: task?.description,
+    issueUrl: issue.issueUrl,
+    issueNumber: issue.issueNumber,
+    repositoryPath: repository?.local_path ?? null,
+    repositoryName: repository?.name ?? null,
+    /**
+     * What the top bar shows so a user can tell which project an open task
+     * belongs to: the same `owner/repo` identity the sidebar rows and the
+     * repository filter use, never the local clone path.
+     */
+    repositoryLabel: repository ? repositorySlug(repository) : null,
+    topbarRepository: resolveTaskTopbarRepository(task, repository),
+    ...pullRequestProps,
+    /**
+     * Total number of repositories linked to the task. Used by the top-bar
+     * breadcrumb to render a "+N" chip next to the primary repo name when
+     * the task is multi-repo. 0 / 1 means single-repo (no chip).
+     */
+    repositoryCount: task?.repositories?.length ?? 0,
+  };
+}
+
+function resolveTaskTopbarRepository(
+  task: Task | null,
+  repository: Repository | null,
+): TaskTopbarRepository | null {
+  const linkedRepository = task?.repositories?.[0];
+  if (
+    task?.repositories?.length !== 1 ||
+    !repository ||
+    linkedRepository?.repository_id !== repository.id ||
+    repository.source_type !== "provider"
+  ) {
+    return null;
+  }
+
+  const displayName = repository.provider_name?.trim() || repository.name?.trim();
+  return {
+    displayName: displayName || repositorySlug(repository),
+    fullName: repositorySlug(repository),
+    provider: repository.provider,
+    browserUrl: remoteRepositoryBrowserUrl(repository.remote_url, repository.provider),
+  };
+}

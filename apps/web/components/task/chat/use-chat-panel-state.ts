@@ -1,0 +1,567 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useAppStore } from "@/components/state-provider";
+import { useLayoutStore } from "@/lib/state/layout-store";
+import { useDockviewStore } from "@/lib/state/dockview-store";
+import { useSessionMessages } from "@/hooks/domains/session/use-session-messages";
+import { useSessionState } from "@/hooks/domains/session/use-session-state";
+import {
+  deriveSessionInputMode,
+  resolvesSteeringAffordance,
+} from "@/hooks/domains/session/session-input-mode";
+import { useSessionMcp } from "@/hooks/domains/session/use-session-mcp";
+import { useProcessedMessages } from "@/hooks/use-processed-messages";
+import { useSessionModel } from "@/hooks/domains/session/use-session-model";
+import { useQueue } from "@/hooks/domains/session/use-queue";
+import { useContextFilesStore, type ContextFile } from "@/lib/state/context-files-store";
+import { useCommentsStore, isPlanComment, type Comment } from "@/lib/state/slices/comments";
+import { usePendingReviewCommentsByFile } from "@/hooks/domains/comments/use-review-comments";
+import {
+  usePendingPlanComments,
+  usePendingPRFeedback,
+  usePendingWalkthroughComments,
+  usePendingAgentMessageComments,
+} from "@/hooks/domains/comments/use-pending-comments";
+import { useChatContextItems } from "./use-chat-context-items";
+import {
+  useAutoDisablePlanMode,
+  useAutoDisableUnsupportedPlanMode,
+  usePlanLayoutHandlers,
+} from "./use-plan-mode-helpers";
+import type { ReviewComment } from "@/lib/state/slices/comments";
+import type {
+  AgentMessageComment,
+  PlanComment,
+  PRFeedbackComment,
+  WalkthroughComment,
+} from "@/lib/state/slices/comments";
+import type { ActiveDocument } from "@/lib/state/slices/ui/types";
+import type { BuiltInPreset } from "@/lib/state/layout-manager/presets";
+import { readLastAgentError } from "@/lib/session-last-agent-error";
+import { clarificationTurnIdForSession } from "@/lib/utils/pending-clarification";
+import { usePlanCommentMigration } from "@/hooks/domains/comments/use-plan-comment-migration";
+import { usePreviewFeedback } from "@/hooks/domains/comments/use-preview-feedback";
+
+const EMPTY_CONTEXT_FILES: ContextFile[] = [];
+const PLAN_CONTEXT_PATH = "plan:context";
+
+// Tracks sessions for which the plan layout has already been auto-applied.
+// Module-scoped so it survives TaskChatPanel remounts (dockview's fromJSON
+// tears down and rebuilds the portal-hosted panel, which would otherwise
+// reset a component-local ref and cause the plan preset to be re-applied —
+// clobbering the just-restored saved layout on env switch).
+const autoAppliedPlanSessions = new Set<string>();
+
+export type CommentsState = {
+  planComments: PlanComment[];
+  pendingCommentsByFile: Record<string, ReviewComment[]>;
+  pendingPRFeedback: PRFeedbackComment[];
+  walkthroughComments: WalkthroughComment[];
+  messageComments: AgentMessageComment[];
+  markCommentsSent: (ids: string[]) => void;
+  handleRemoveCommentFile: (filePath: string) => void;
+  handleRemoveComment: (commentId: string) => void;
+  handleRemovePRFeedback: (commentId: string) => void;
+  handleClearPRFeedback: () => void;
+  handleRemoveWalkthroughComment: (commentId: string) => void;
+  handleClearWalkthroughComments: () => void;
+  handleClearMessageComments: () => void;
+  clearSessionPlanComments: () => void;
+};
+
+function removePendingCommentsForSession(sessionId: string | null, source: Comment["source"]) {
+  if (!sessionId) return;
+  const state = useCommentsStore.getState();
+  for (const id of [...state.pendingForChat]) {
+    const comment = state.byId[id];
+    if (comment?.sessionId === sessionId && comment.source === source) state.removeComment(id);
+  }
+}
+
+/** Re-focus chat input after dockview layout rebuild. */
+function useRefocusChatAfterLayout() {
+  return useCallback(() => {
+    const unsub = useDockviewStore.subscribe((state) => {
+      if (!state.isRestoringLayout) {
+        unsub();
+        requestAnimationFrame(() => {
+          document.querySelector<HTMLElement>(".tiptap.ProseMirror")?.focus();
+        });
+      }
+    });
+  }, []);
+}
+
+type AutoApplyPlanLayoutOpts = {
+  enabled?: boolean;
+  resolvedSessionId: string | null;
+  taskId: string | null;
+  sessionMetaPlanMode: boolean;
+  currentStepHasPlanMode: boolean;
+  setActiveDocument: (sid: string, doc: ActiveDocument | null) => void;
+  applyBuiltInPreset: (preset: BuiltInPreset) => void;
+  setPlanMode: (sid: string, enabled: boolean) => void;
+  addContextFile: (sid: string, file: { path: string; name: string }) => void;
+};
+
+/** Auto-apply plan layout when session metadata has plan_mode enabled AND the current
+ *  step actually configures enable_plan_mode. The step check guards against stale
+ *  sessionMetaPlanMode from deepMerge hydration preserving deleted metadata keys. */
+function useAutoApplyPlanLayout(opts: AutoApplyPlanLayoutOpts) {
+  const {
+    enabled = true,
+    resolvedSessionId,
+    taskId,
+    sessionMetaPlanMode,
+    currentStepHasPlanMode,
+    setActiveDocument,
+    applyBuiltInPreset,
+    setPlanMode,
+    addContextFile,
+  } = opts;
+  useEffect(() => {
+    if (!enabled || !resolvedSessionId || !taskId) return;
+    // Reset the guard when plan mode is disabled so future plan-mode steps
+    // in the same session can be auto-applied (e.g. after proceeding away and back).
+    if (!sessionMetaPlanMode && autoAppliedPlanSessions.has(resolvedSessionId)) {
+      autoAppliedPlanSessions.delete(resolvedSessionId);
+      return;
+    }
+    if (autoAppliedPlanSessions.has(resolvedSessionId)) return;
+    // Only auto-apply if both the session metadata AND the current step agree on plan mode.
+    // sessionMetaPlanMode can be stale (deepMerge hydration preserves deleted keys),
+    // so we cross-check with the step's actual configuration.
+    if (sessionMetaPlanMode && currentStepHasPlanMode) {
+      autoAppliedPlanSessions.add(resolvedSessionId);
+      setActiveDocument(resolvedSessionId, { type: "plan", taskId });
+      applyBuiltInPreset("plan");
+      setPlanMode(resolvedSessionId, true);
+      addContextFile(resolvedSessionId, { path: PLAN_CONTEXT_PATH, name: "Plan" });
+    }
+  }, [
+    resolvedSessionId,
+    taskId,
+    enabled,
+    sessionMetaPlanMode,
+    currentStepHasPlanMode,
+    setActiveDocument,
+    applyBuiltInPreset,
+    setPlanMode,
+    addContextFile,
+  ]);
+}
+
+export function usePlanMode(
+  resolvedSessionId: string | null,
+  taskId: string | null,
+  options: { enableLayoutEffects?: boolean } = {},
+) {
+  const enableLayoutEffects = options.enableLayoutEffects ?? true;
+  const activeDocument = useAppStore((state) =>
+    resolvedSessionId
+      ? (state.documentPanel.activeDocumentBySessionId[resolvedSessionId] ?? null)
+      : null,
+  );
+  const closeDocument = useLayoutStore((state) => state.closeDocument);
+  const setActiveDocument = useAppStore((state) => state.setActiveDocument);
+  const setPlanMode = useAppStore((state) => state.setPlanMode);
+  const addContextFile = useContextFilesStore((s) => s.addFile);
+  const removeContextFile = useContextFilesStore((s) => s.removeFile);
+  const applyBuiltInPreset = useDockviewStore((s) => s.applyBuiltInPreset);
+
+  const planModeFromStore = useAppStore((state) =>
+    resolvedSessionId ? (state.chatInput.planModeBySessionId[resolvedSessionId] ?? false) : false,
+  );
+  const sessionMetaPlanMode = useAppStore((state) =>
+    resolvedSessionId
+      ? state.taskSessions.items[resolvedSessionId]?.metadata?.plan_mode === true
+      : false,
+  );
+  const currentStepHasPlanMode = useAppStore((s) => {
+    if (!taskId) return false;
+    const task = s.kanban.tasks.find((t) => t.id === taskId);
+    const stepId = task?.workflowStepId;
+    if (!stepId) return false;
+    const step = s.kanban.steps.find((st) => st.id === stepId);
+    return step?.events?.on_enter?.some((a) => a.type === "enable_plan_mode") ?? false;
+  });
+  const planModeEnabled = planModeFromStore;
+  const planLayoutVisible = activeDocument?.type === "plan";
+
+  useAutoApplyPlanLayout({
+    enabled: enableLayoutEffects,
+    resolvedSessionId,
+    taskId,
+    sessionMetaPlanMode,
+    currentStepHasPlanMode,
+    setActiveDocument,
+    applyBuiltInPreset,
+    setPlanMode,
+    addContextFile,
+  });
+
+  useAutoDisablePlanMode({
+    enabled: enableLayoutEffects,
+    resolvedSessionId,
+    taskId,
+    sessionMetaPlanMode,
+    planModeFromStore,
+    applyBuiltInPreset,
+    closeDocument,
+    setActiveDocument,
+    setPlanMode,
+    removeContextFile,
+  });
+
+  const refocusChatAfterLayout = useRefocusChatAfterLayout();
+  const { togglePlanLayout, handlePlanModeChange } = usePlanLayoutHandlers({
+    enabled: enableLayoutEffects,
+    resolvedSessionId,
+    taskId,
+    setActiveDocument,
+    applyBuiltInPreset,
+    closeDocument,
+    setPlanMode,
+    addContextFile,
+    removeContextFile,
+    refocusChatAfterLayout,
+  });
+
+  return {
+    planModeEnabled,
+    planLayoutVisible,
+    activeDocument,
+    handlePlanModeChange,
+    togglePlanLayout,
+  };
+}
+
+export function useContextFiles(resolvedSessionId: string | null) {
+  const contextFiles = useContextFilesStore((s) =>
+    resolvedSessionId
+      ? (s.filesBySessionId[resolvedSessionId] ?? EMPTY_CONTEXT_FILES)
+      : EMPTY_CONTEXT_FILES,
+  );
+  const hydrateContextFiles = useContextFilesStore((s) => s.hydrateSession);
+  const addContextFile = useContextFilesStore((s) => s.addFile);
+  const toggleContextFile = useContextFilesStore((s) => s.toggleFile);
+  const removeContextFile = useContextFilesStore((s) => s.removeFile);
+  const unpinFile = useContextFilesStore((s) => s.unpinFile);
+  const clearEphemeral = useContextFilesStore((s) => s.clearEphemeral);
+
+  useEffect(() => {
+    if (resolvedSessionId) hydrateContextFiles(resolvedSessionId);
+  }, [resolvedSessionId, hydrateContextFiles]);
+
+  const handleToggleContextFile = useCallback(
+    (file: { path: string; name: string; pinned?: boolean }) => {
+      if (resolvedSessionId) toggleContextFile(resolvedSessionId, file);
+    },
+    [resolvedSessionId, toggleContextFile],
+  );
+
+  const handleAddContextFile = useCallback(
+    (file: { path: string; name: string; pinned?: boolean }) => {
+      if (resolvedSessionId) addContextFile(resolvedSessionId, file);
+    },
+    [resolvedSessionId, addContextFile],
+  );
+
+  return {
+    contextFiles,
+    addContextFile,
+    removeContextFile,
+    unpinFile,
+    clearEphemeral,
+    handleToggleContextFile,
+    handleAddContextFile,
+  };
+}
+
+export function useCommentsState(
+  resolvedSessionId: string | null,
+  taskId: string | null,
+): CommentsState {
+  const hydrateComments = useCommentsStore((state) => state.hydrateSession);
+  useEffect(() => {
+    if (resolvedSessionId) hydrateComments(resolvedSessionId);
+  }, [resolvedSessionId, hydrateComments]);
+  const planComments = usePendingPlanComments(taskId);
+  const pendingCommentsByFile = usePendingReviewCommentsByFile(resolvedSessionId);
+  const pendingPRFeedback = usePendingPRFeedback(resolvedSessionId);
+  const walkthroughComments = usePendingWalkthroughComments(resolvedSessionId);
+  const messageComments = usePendingAgentMessageComments(resolvedSessionId);
+  const markCommentsSent = useCommentsStore((state) => state.markCommentsSent);
+  const removeComment = useCommentsStore((state) => state.removeComment);
+  const clearSessionPlanComments = useCallback(() => {
+    const state = useCommentsStore.getState();
+    const ids = resolvedSessionId ? state.bySession[resolvedSessionId] : undefined;
+    if (!ids) return;
+    for (const id of ids) {
+      const c = state.byId[id];
+      if (c && isPlanComment(c)) state.removeComment(id);
+    }
+  }, [resolvedSessionId]);
+  const handleRemoveCommentFile = useCallback(
+    (filePath: string) => {
+      const comments = pendingCommentsByFile[filePath] || [];
+      for (const comment of comments) removeComment(comment.id);
+    },
+    [pendingCommentsByFile, removeComment],
+  );
+  const handleRemoveComment = useCallback(
+    (commentId: string) => removeComment(commentId),
+    [removeComment],
+  );
+  const handleRemovePRFeedback = useCallback(
+    (commentId: string) => removeComment(commentId),
+    [removeComment],
+  );
+  const handleClearPRFeedback = useCallback(() => {
+    removePendingCommentsForSession(resolvedSessionId, "pr-feedback");
+  }, [resolvedSessionId]);
+  const handleRemoveWalkthroughComment = useCallback(
+    (commentId: string) => removeComment(commentId),
+    [removeComment],
+  );
+  const handleClearWalkthroughComments = useCallback(() => {
+    removePendingCommentsForSession(resolvedSessionId, "walkthrough");
+  }, [resolvedSessionId]);
+  const handleClearMessageComments = useCallback(() => {
+    removePendingCommentsForSession(resolvedSessionId, "agent-message");
+  }, [resolvedSessionId]);
+  return {
+    planComments,
+    pendingCommentsByFile,
+    pendingPRFeedback,
+    walkthroughComments,
+    messageComments,
+    markCommentsSent,
+    handleRemoveCommentFile,
+    handleRemoveComment,
+    handleRemovePRFeedback,
+    handleClearPRFeedback,
+    handleRemoveWalkthroughComment,
+    handleClearWalkthroughComments,
+    handleClearMessageComments,
+    clearSessionPlanComments,
+  };
+}
+
+function useSessionData(
+  resolvedSessionId: string | null,
+  session: ReturnType<typeof useSessionState>["session"],
+  taskId: string | null,
+  taskDescription: string | null,
+) {
+  const {
+    messages,
+    isLoading: messagesLoading,
+    isInitialMessagesLoading,
+    historyRefreshPending,
+    historyInitialized,
+    hasMore: hasOlderMessages,
+    historyStatus,
+    historyError,
+    retryHistory,
+  } = useSessionMessages(resolvedSessionId);
+  const turns = useAppStore((state) =>
+    resolvedSessionId ? state.turns.bySession[resolvedSessionId] : undefined,
+  );
+  const currentTurnId = useMemo(
+    () => clarificationTurnIdForSession(session?.state, turns),
+    [session?.state, turns],
+  );
+  const currentTurnCompleted = useMemo(() => {
+    if (currentTurnId === null) return true;
+    if (currentTurnId === undefined || !turns) return undefined;
+    return turns.find((turn) => turn.id === currentTurnId)?.completed_at != null;
+  }, [currentTurnId, turns]);
+  const lastAgentError = useMemo(() => readLastAgentError(session?.metadata), [session?.metadata]);
+  const processed = useProcessedMessages(messages, taskId, resolvedSessionId, taskDescription, {
+    initialPromptPreview: session?.metadata?.initial_prompt_preview,
+    historyInitialized,
+    hasOlderMessages,
+    lastAgentError,
+    currentTurnId,
+    currentTurnCompleted,
+    pendingAction: session?.pending_action,
+  });
+  const { sessionModel, activeModel } = useSessionModel(
+    resolvedSessionId,
+    session?.agent_profile_id,
+  );
+  const chatSubmitKey = useAppStore((state) => state.userSettings.chatSubmitKey);
+  const agentCommands = useAppStore((state) =>
+    resolvedSessionId ? state.availableCommands.bySessionId[resolvedSessionId] : undefined,
+  );
+  const {
+    clearAll: clearQueue,
+    editEntry: editQueueEntry,
+    removeEntry: removeQueueEntry,
+    ...queueRest
+  } = useQueue(resolvedSessionId);
+  return {
+    messages,
+    messagesLoading,
+    isInitialMessagesLoading,
+    historyRefreshPending,
+    historyStatus,
+    historyError,
+    retryHistory,
+    ...processed,
+    sessionModel,
+    activeModel,
+    chatSubmitKey,
+    agentCommands,
+    clearQueue,
+    editQueueEntry,
+    removeQueueEntry,
+    ...queueRest,
+  };
+}
+
+type TodoStatus = "pending" | "in_progress" | "completed" | "failed";
+
+export function useSessionTodoItems(
+  resolvedSessionId: string | null,
+  messageTodos: Array<{ text: string; done?: boolean }>,
+) {
+  const storeTodos = useAppStore((s) =>
+    resolvedSessionId ? s.sessionTodos.bySessionId[resolvedSessionId] : undefined,
+  );
+  return useMemo(() => {
+    if (storeTodos && storeTodos.length > 0) {
+      return storeTodos.map((e: { description: string; status: string }) => ({
+        text: e.description,
+        done: e.status === "completed",
+        status: e.status as TodoStatus,
+      }));
+    }
+    return messageTodos;
+  }, [storeTodos, messageTodos]);
+}
+
+function deriveQueueAwareSessionInput(
+  session: ReturnType<typeof useSessionState>["session"],
+  queuedCount: number,
+) {
+  const inputMode = deriveSessionInputMode(session, queuedCount);
+  return { inputMode, isAgentBusy: inputMode === "queue" };
+}
+
+export type UseChatPanelStateOptions = {
+  sessionId: string | null;
+  taskId?: string | null;
+  /** Disable Dockview and plan-layout mutations for embedded multi-panel hosts. */
+  disableWorkbenchEffects?: boolean;
+  onOpenFile?: (path: string, repo?: string) => void;
+  onOpenFileAtLine?: (filePath: string, repositoryName?: string) => void;
+};
+
+export function useChatPanelState({
+  sessionId,
+  taskId: taskIdHint = null,
+  disableWorkbenchEffects = false,
+  onOpenFile,
+  onOpenFileAtLine,
+}: UseChatPanelStateOptions) {
+  const sessionState = useSessionState(sessionId, { taskIdHint });
+  const { resolvedSessionId, taskId } = sessionState;
+  const planMode = usePlanMode(resolvedSessionId, taskId, {
+    enableLayoutEffects: !disableWorkbenchEffects,
+  });
+  const {
+    supportsMcp,
+    mcpServers,
+    attachmentHistory: mcpAttachmentHistory,
+  } = useSessionMcp(sessionState.session?.agent_profile_id, sessionState.session?.id);
+  const planModeAvailable = supportsMcp;
+
+  // When MCP is available: full plan mode toggle (layout + chat input state)
+  // When MCP is unavailable: layout-only toggle (plan panel visible, but no plan context/border)
+  const {
+    handlePlanModeChange: rawHandlePlanModeChange,
+    togglePlanLayout,
+    planModeEnabled,
+    planLayoutVisible,
+  } = planMode;
+  const guardedHandlePlanModeChange = useCallback(
+    (enabled: boolean) => {
+      if (planModeAvailable) return rawHandlePlanModeChange(enabled);
+      // Toggle based on current layout state, ignoring the passed value
+      togglePlanLayout(!planLayoutVisible);
+    },
+    [planModeAvailable, rawHandlePlanModeChange, togglePlanLayout, planLayoutVisible],
+  );
+
+  const hasAgentProfile = Boolean(sessionState.session?.agent_profile_id);
+  useAutoDisableUnsupportedPlanMode({
+    planModeEnabled,
+    hasAgentProfile,
+    planModeAvailable,
+    resolvedSessionId,
+  });
+
+  const contextFilesState = useContextFiles(resolvedSessionId);
+  const { contextFiles, removeContextFile, unpinFile } = contextFilesState;
+  const sessionData = useSessionData(
+    resolvedSessionId,
+    sessionState.session,
+    taskId,
+    sessionState.taskDescription,
+  );
+  const comments = useCommentsState(resolvedSessionId, taskId);
+  const previewFeedbackState = usePreviewFeedback(taskId);
+  const planCommentMigration = usePlanCommentMigration(taskId);
+  const [previewFeedbackOpen, setPreviewFeedbackOpen] = useState(false);
+  const onOpenPreviewFeedback = useCallback(() => setPreviewFeedbackOpen(true), []);
+
+  const planContextEnabled = useMemo(
+    () => contextFiles.some((f) => f.path === PLAN_CONTEXT_PATH),
+    [contextFiles],
+  );
+
+  const { contextItems, prompts } = useChatContextItems({
+    planContextEnabled,
+    contextFiles,
+    resolvedSessionId,
+    removeContextFile,
+    unpinFile,
+    comments,
+    previewFeedback: previewFeedbackState.items,
+    taskId,
+    onOpenFile,
+    onOpenFileAtLine,
+    onOpenPreviewFeedback,
+  });
+
+  const todoItems = useSessionTodoItems(resolvedSessionId, sessionData.todoItems);
+
+  return {
+    ...sessionState,
+    ...planMode,
+    handlePlanModeChange: guardedHandlePlanModeChange,
+    ...contextFilesState,
+    ...sessionData,
+    ...comments,
+    previewFeedback: previewFeedbackState.items,
+    previewFeedbackState,
+    previewFeedbackOpen,
+    setPreviewFeedbackOpen,
+    planCommentMigration,
+    contextItems,
+    planContextEnabled,
+    planModeAvailable,
+    mcpServers,
+    mcpAttachmentHistory,
+    prompts,
+    todoItems,
+    ...deriveQueueAwareSessionInput(sessionState.session, sessionData.count),
+    supportsSteering: resolvesSteeringAffordance(sessionState.supportsSteering, sessionData.count),
+  };
+}
+
+/** The value returned by {@link useChatPanelState}, threaded through the chat input area and its extracted hooks. */
+export type ChatPanelState = ReturnType<typeof useChatPanelState>;

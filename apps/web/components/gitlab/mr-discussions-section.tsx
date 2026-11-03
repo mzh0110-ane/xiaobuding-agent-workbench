@@ -1,0 +1,180 @@
+"use client";
+
+import { useState } from "react";
+import { IconCheck, IconMessagePlus, IconSend } from "@tabler/icons-react";
+import { Badge } from "@kandev/ui/badge";
+import { Button } from "@kandev/ui/button";
+import { Textarea } from "@kandev/ui/textarea";
+import type { GitLabMRDiscussion } from "@/lib/types/gitlab";
+import { CollapsibleSection, formatTimeAgo, PRMarkdownBody } from "@/components/github/pr-shared";
+import { useTranslation } from "react-i18next";
+import { controlSizingClassName } from "@kandev/ui/control-sizing";
+
+function discussionLocation(discussion: GitLabMRDiscussion): string {
+  if (!discussion.path) return "";
+  const line = discussion.line || discussion.old_line;
+  return `\`${discussion.path}${line ? `:${line}` : ""}\``;
+}
+
+export function buildDiscussionContext(discussion: GitLabMRDiscussion, mrUrl: string): string {
+  const parts = ["### Merge request discussion", ""];
+  const location = discussionLocation(discussion);
+  if (location) parts.push(`Location: ${location}`, "");
+  for (const note of discussion.notes) {
+    parts.push(`**${note.author}**:`, note.body, "");
+  }
+  parts.push(`Merge request: ${mrUrl}`, "Please address this discussion.");
+  return parts.join("\n");
+}
+
+export function buildAllDiscussionsContext(
+  discussions: GitLabMRDiscussion[],
+  mrUrl: string,
+): string {
+  return discussions
+    .map((discussion) => buildDiscussionContext(discussion, mrUrl))
+    .join("\n\n---\n\n");
+}
+
+type DiscussionProps = {
+  discussion: GitLabMRDiscussion;
+  busy: boolean;
+  onReply: (discussionId: string, body: string) => Promise<boolean>;
+  onResolve: (discussionId: string) => Promise<boolean>;
+  onAddContext: (content: string) => void;
+  mrUrl: string;
+};
+
+function Discussion({
+  discussion,
+  busy,
+  onReply,
+  onResolve,
+  onAddContext,
+  mrUrl,
+}: DiscussionProps) {
+  const { t } = useTranslation();
+  const [reply, setReply] = useState("");
+  const submitReply = async () => {
+    const body = reply.trim();
+    if (!body) return;
+    if (await onReply(discussion.id, body)) setReply("");
+  };
+  const location = discussionLocation(discussion);
+
+  return (
+    <article
+      className="rounded-md border border-border bg-muted/20 p-2.5"
+      data-testid={`gitlab-discussion-${discussion.id}`}
+    >
+      <header className="mb-2 flex min-w-0 items-center gap-2">
+        {location && (
+          <span className="min-w-0 truncate font-mono text-[11px]">
+            {location.replaceAll("`", "")}
+          </span>
+        )}
+        {discussion.resolved && (
+          <Badge variant="outline" className="ml-auto text-[10px]">
+            {t("gitlab:resolved")}
+          </Badge>
+        )}
+        <Button
+          size="icon"
+          variant="ghost"
+          className={controlSizingClassName("icon", "ml-auto shrink-0 cursor-pointer")}
+          aria-label={t("gitlab:addDiscussionToTaskContext")}
+          onClick={() => onAddContext(buildDiscussionContext(discussion, mrUrl))}
+        >
+          <IconMessagePlus className="h-3.5 w-3.5" />
+        </Button>
+      </header>
+      <div className="space-y-2">
+        {discussion.notes.map((note) => (
+          <div key={note.id} className="border-l-2 border-border pl-2.5">
+            <div className="flex items-center gap-2 text-xs">
+              <strong>{note.author}</strong>
+              <span className="text-[10px] text-muted-foreground">
+                {formatTimeAgo(note.created_at)}
+              </span>
+            </div>
+            <PRMarkdownBody body={note.body} />
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+        <Textarea
+          value={reply}
+          onChange={(event) => setReply(event.target.value)}
+          placeholder={t("gitlab:replyToThisDiscussion")}
+          aria-label={t("gitlab:discussionReply")}
+          className="min-h-20 flex-1 resize-y text-sm"
+        />
+        <div className="flex gap-2">
+          {discussion.resolvable && !discussion.resolved && (
+            <Button
+              variant="outline"
+              className={controlSizingClassName("standard", "flex-1 cursor-pointer gap-1")}
+              disabled={busy}
+              onClick={() => void onResolve(discussion.id)}
+            >
+              <IconCheck className="h-3.5 w-3.5" /> {t("gitlab:resolve")}
+            </Button>
+          )}
+          <Button
+            className={controlSizingClassName("standard", "flex-1 cursor-pointer gap-1")}
+            disabled={busy || !reply.trim()}
+            onClick={() => void submitReply()}
+          >
+            <IconSend className="h-3.5 w-3.5" /> {t("gitlab:reply")}
+          </Button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+export function MRDiscussionsSection({
+  discussions,
+  mrUrl,
+  busy,
+  onReply,
+  onResolve,
+  onAddContext,
+}: {
+  discussions: GitLabMRDiscussion[];
+  mrUrl: string;
+  busy: boolean;
+  onReply: DiscussionProps["onReply"];
+  onResolve: DiscussionProps["onResolve"];
+  onAddContext: DiscussionProps["onAddContext"];
+}) {
+  const { t } = useTranslation();
+  return (
+    <CollapsibleSection
+      title={t("gitlab:discussions")}
+      count={discussions.length}
+      defaultOpen
+      onAddAll={
+        discussions.length
+          ? () => onAddContext(buildAllDiscussionsContext(discussions, mrUrl))
+          : undefined
+      }
+      addAllLabel={t("gitlab:addAllDiscussionsToTaskContext")}
+    >
+      {discussions.length === 0 && (
+        <p className="px-2 py-2 text-xs text-muted-foreground">{t("gitlab:noDiscussionsYet")}</p>
+      )}
+      {discussions.map((discussion) => (
+        <Discussion
+          key={discussion.id}
+          discussion={discussion}
+          busy={busy}
+          onReply={onReply}
+          onResolve={onResolve}
+          onAddContext={onAddContext}
+          mrUrl={mrUrl}
+        />
+      ))}
+    </CollapsibleSection>
+  );
+}

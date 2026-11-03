@@ -1,0 +1,709 @@
+/* eslint-disable max-lines -- this file is the canonical Office entity contract. */
+// --- Office entity types ---
+//
+// Per ADR 0005 Wave E the canonical `AgentProfile`, `AgentRole`, `AgentStatus`,
+// `BillingType`, `UtilizationWindow`, and `ProviderUsage` types live in
+// `lib/types/agent-profile.ts`. Office consumers see profiles via the
+// office API (which always populates orchestration fields), so this slice
+// re-exports `OfficeAgentProfile` as `AgentProfile` for import-path
+// compatibility — keeping office orchestration fields non-optional within
+// the office subtree.
+
+export type {
+  AgentRole,
+  AgentStatus,
+  BillingType,
+  UtilizationWindow,
+  ProviderUsage,
+} from "@/lib/types/agent-profile";
+
+export type { OfficeAgentProfile as AgentProfile } from "@/lib/types/agent-profile";
+
+import type { OfficeAgentProfile as AgentProfile } from "@/lib/types/agent-profile";
+import type { QuorumResponseDTO, TaskQuorumSliceState } from "./quorum-types";
+
+export type SkillSourceType =
+  | "inline"
+  | "local_path"
+  | "git"
+  | "skills_sh"
+  | "user_home"
+  // System skills shipped bundled in the kandev binary. Synced into
+  // office_skills at backend start. Read-only in the UI: users cannot
+  // edit or delete them — they get refreshed in place on every kandev
+  // upgrade.
+  | "system";
+
+export type Skill = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  slug: string;
+  description?: string;
+  sourceType: SkillSourceType;
+  sourceLocator?: string;
+  content?: string;
+  fileInventory?: string[];
+  createdByAgentProfileId?: string;
+  // True iff this row was upserted by the kandev startup system-skill
+  // sync. UI hides edit/delete affordances and surfaces a `System`
+  // badge.
+  isSystem?: boolean;
+  // The kandev release version that wrote the current content. Shown
+  // in the system-skill footer so users can correlate a SKILL.md edit
+  // with the release that delivered it.
+  systemVersion?: string;
+  // Agent roles that auto-attach this skill at agent-create time.
+  // Empty / undefined → no auto-attach (the user toggles it explicitly).
+  defaultForRoles?: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProjectStatus = "active" | "completed" | "on_hold" | "archived";
+
+export type TaskCounts = {
+  total: number;
+  in_progress: number;
+  done: number;
+  blocked: number;
+};
+
+export type Project = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  description?: string;
+  status: ProjectStatus;
+  leadAgentProfileId?: string;
+  color?: string;
+  budgetCents?: number;
+  repositories?: string[];
+  executorConfig?: Record<string, unknown>;
+  taskCounts?: TaskCounts;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ApprovalType =
+  | "hire_agent"
+  | "budget_increase"
+  | "board_approval"
+  | "task_review"
+  | "skill_creation";
+export type ApprovalStatus = "pending" | "approved" | "rejected";
+
+export type Approval = {
+  id: string;
+  workspaceId: string;
+  type: ApprovalType;
+  requestedByAgentProfileId?: string;
+  status: ApprovalStatus;
+  payload?: Record<string, unknown>;
+  decisionNote?: string;
+  decidedBy?: string;
+  decidedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ActivityEntry = {
+  id: string;
+  workspaceId: string;
+  actorType: "user" | "agent" | "system";
+  actorId: string;
+  actorName?: string;
+  action: string;
+  targetType?: string;
+  targetId?: string;
+  targetName?: string;
+  targetIdentifier?: string;
+  details?: Record<string, unknown>;
+  runId?: string;
+  sessionId?: string;
+  createdAt: string;
+};
+
+export type CostBreakdownItem = {
+  group_key: string;
+  group_label?: string;
+  total_subcents: number;
+  count: number;
+};
+
+export type CostSummary = {
+  totalSubcents: number;
+  byAgent: Array<{ agentProfileId: string; name: string; costSubcents: number }>;
+  byProject: Array<{ projectId: string; name: string; costSubcents: number }>;
+  byModel: Array<{ model: string; costSubcents: number; tokensIn: number; tokensOut: number }>;
+};
+
+export type BudgetPolicy = {
+  id: string;
+  workspaceId: string;
+  scopeType: "agent" | "project" | "workspace";
+  scopeId: string;
+  limitSubcents: number;
+  period: "daily" | "monthly" | "yearly" | "total";
+  alertThresholdPct: number;
+  actionOnExceed: "notify_only" | "pause_agent" | "block_new_tasks";
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RoutineStatus = "active" | "paused" | "archived";
+
+// ScheduleState is REQ-OFFICE-ROUTINE-ARMING-001's classification of whether a
+// routine's triggers can currently fire it, independent of `status` (intent).
+export type ScheduleState =
+  | "armed"
+  | "trigger_invalid"
+  | "trigger_unscheduled"
+  | "trigger_disabled"
+  | "event_only"
+  | "unscheduled_manual_only"
+  | "unscheduled_no_trigger"
+  | "unknown";
+
+export type UnarmedReason = "disabled" | "not_schedulable" | "stalled";
+
+export type UnarmedCronTrigger = {
+  triggerId: string;
+  reasons: UnarmedReason[];
+};
+
+export type Routine = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  description?: string;
+  taskTemplate: Record<string, unknown>;
+  assigneeAgentProfileId?: string;
+  // The server can store any status string; only the three named
+  // RoutineStatus values are selectable from the detail form.
+  status: string;
+  concurrencyPolicy: string;
+  catchUpPolicy?: string;
+  catchUpMax?: number;
+  variables?: Record<string, unknown>;
+  lastRunAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  scheduleState?: ScheduleState;
+  unarmedCronTriggers?: UnarmedCronTrigger[];
+};
+
+export type RoutineTriggerKind = "cron" | "webhook";
+export type RoutineRunStatus =
+  | "received"
+  | "task_created"
+  | "skipped"
+  | "coalesced"
+  | "failed"
+  | "done"
+  | "cancelled";
+
+export type RoutineTrigger = {
+  id: string;
+  routineId: string;
+  // The server can store any trigger kind; only "cron" is creatable from the UI today.
+  kind: string;
+  cronExpression?: string;
+  timezone?: string;
+  publicId?: string;
+  signingMode?: string;
+  nextRunAt?: string;
+  lastFiredAt?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RoutineRun = {
+  id: string;
+  routineId: string;
+  triggerId?: string;
+  source: string;
+  // The server can store any run status string.
+  status: string;
+  triggerPayload?: string;
+  linkedTaskId?: string;
+  coalescedIntoRunId?: string;
+  dispatchFingerprint?: string;
+  // Gap summary measured for the claim that created this run (absent when no
+  // gap was recorded — never a stored zero). See
+  // docs/specs/office/requirements/routine-catch-up.md AC-002.
+  catchUpMissedTicks?: number;
+  catchUpFirstMissedAt?: string;
+  catchUpTruncated?: boolean;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+};
+
+/** Fields the client can supply when creating a routine (POST body, camelCase). */
+export type CreateRoutineInput = {
+  name: string;
+  description?: string;
+  taskTemplate?: Record<string, unknown> | string;
+  assigneeAgentProfileId?: string;
+  concurrencyPolicy?: string;
+  catchUpPolicy?: string;
+  catchUpMax?: number;
+  variables?: Record<string, unknown> | string;
+};
+
+/**
+ * Fields the client can patch on a routine (PATCH body, camelCase). Absent
+ * keys are omitted from the request and preserve the stored value; empty
+ * strings clear the field, except concurrencyPolicy/catchUpPolicy (omitted
+ * rather than cleared) and status (never sent empty).
+ */
+export type UpdateRoutinePatch = {
+  name?: string;
+  description?: string;
+  taskTemplate?: Record<string, unknown> | string;
+  assigneeAgentProfileId?: string;
+  status?: RoutineStatus | string;
+  concurrencyPolicy?: string;
+  catchUpPolicy?: string;
+  catchUpMax?: number;
+  variables?: Record<string, unknown> | string;
+};
+
+/** Fields the client can supply when creating a trigger (POST body, camelCase). */
+export type CreateTriggerInput = {
+  kind: RoutineTriggerKind;
+  cronExpression?: string;
+  timezone?: string;
+  publicId?: string;
+  signingMode?: string;
+  secret?: string;
+};
+
+export type InboxItemType =
+  | "approval"
+  | "budget_alert"
+  | "agent_error"
+  | "agent_run_failed"
+  | "agent_paused_after_failures"
+  | "task_review"
+  | "task_review_request"
+  | "provider_degraded";
+
+export type InboxItem = {
+  id: string;
+  type: InboxItemType;
+  title: string;
+  description?: string;
+  status: string;
+  entity_id?: string;
+  entity_type?: string;
+  createdAt: string;
+  payload?: Record<string, unknown>;
+};
+
+export type Run = {
+  id: string;
+  agent_profile_id: string;
+  reason: string;
+  status: "queued" | "claimed" | "finished" | "failed" | "cancelled";
+  cancel_reason?: string;
+  /** Verbatim error payload set when status === "failed". */
+  error_message?: string;
+  requested_at: string;
+};
+
+export type OfficeTaskStatus =
+  | "backlog"
+  | "todo"
+  | "in_progress"
+  | "in_review"
+  | "blocked"
+  | "done"
+  | "cancelled";
+
+export type OfficeTaskPriority = "critical" | "high" | "medium" | "low" | "none";
+
+export type TaskLabel = {
+  name: string;
+  color: string;
+};
+
+import type { OfficeTask } from "./office-task-type";
+export type { OfficeTask } from "./office-task-type";
+
+export type TaskFilterState = {
+  statuses: OfficeTaskStatus[];
+  priorities: OfficeTaskPriority[];
+  assigneeIds: string[];
+  projectIds: string[];
+  search: string;
+};
+
+export type TaskSortField = "status" | "priority" | "title" | "created" | "updated";
+export type TaskSortDir = "asc" | "desc";
+export type TaskGroupBy = "status" | "priority" | "assignee" | "project" | "parent" | "none";
+export type TaskViewMode = "list" | "board";
+
+export type TasksState = {
+  items: OfficeTask[];
+  filters: TaskFilterState;
+  viewMode: TaskViewMode;
+  sortField: TaskSortField;
+  sortDir: TaskSortDir;
+  groupBy: TaskGroupBy;
+  nestingEnabled: boolean;
+  isLoading: boolean;
+};
+
+export type RunActivityDay = {
+  date: string;
+  succeeded: number;
+  failed: number;
+  other: number;
+};
+
+export type TaskBreakdown = {
+  open: number;
+  in_progress: number;
+  blocked: number;
+  done: number;
+};
+
+export type RecentTask = {
+  id: string;
+  identifier: string;
+  title: string;
+  status: string;
+  assignee_agent_profile_id: string;
+  updated_at: string;
+};
+
+export type LiveRun = {
+  agentId: string;
+  agentName: string;
+  taskId: string;
+  taskTitle: string;
+  taskIdentifier: string;
+  status: string;
+  durationMs: number;
+  startedAt: string;
+  finishedAt?: string;
+};
+
+export type DashboardData = {
+  agent_count: number;
+  running_count: number;
+  paused_count: number;
+  error_count: number;
+  tasks_in_progress: number;
+  open_tasks: number;
+  blocked_tasks: number;
+  month_spend_subcents: number;
+  pending_approvals: number;
+  recent_activity: ActivityEntry[];
+  task_count: number;
+  skill_count: number;
+  routine_count: number;
+  run_activity: RunActivityDay[];
+  task_breakdown: TaskBreakdown;
+  recent_tasks: RecentTask[];
+  /**
+   * Per-agent card payload. Embedded in the dashboard response so the
+   * dashboard renders in a single round-trip (Stream A + G of office
+   * optimization). Always non-null; empty array for workspaces with no
+   * agents. Type kept as `unknown[]` here to avoid importing from the
+   * api domain — `AgentCardsPanel` narrows it via the api `AgentSummary`
+   * type at the consumer.
+   */
+  agent_summaries: AgentSummary[];
+};
+
+/**
+ * Slim per-agent card payload duplicated from `office-api` so the store
+ * type doesn't depend on the api module. Mirrors the snake_case JSON shape
+ * the backend serialises.
+ */
+export type AgentSummary = {
+  agent_id: string;
+  agent_name: string;
+  agent_role: string;
+  status: "live" | "finished" | "never_run";
+  live_session?: SessionSummaryLite | null;
+  last_session?: SessionSummaryLite | null;
+  recent_sessions: SessionSummaryLite[];
+  last_run_status?: "ok" | "failed";
+  pause_reason?: string;
+  consecutive_failures?: number;
+};
+
+export type SessionSummaryLite = {
+  session_id: string;
+  task_id: string;
+  task_identifier: string;
+  task_title: string;
+  state: string;
+  started_at: string;
+  completed_at?: string | null;
+  duration_seconds: number;
+  command_count: number;
+};
+
+// --- Meta types (from backend /api/v1/office/meta) ---
+
+export type StatusMeta = {
+  id: string;
+  label: string;
+  order: number;
+  color: string;
+};
+
+export type PriorityMeta = {
+  id: string;
+  label: string;
+  order: number;
+  color: string;
+  value: number;
+};
+
+export type RoleMeta = {
+  id: string;
+  label: string;
+  description: string;
+  color: string;
+};
+
+export type ExecutorTypeMeta = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+export type SkillSourceTypeMeta = {
+  id: string;
+  label: string;
+  readOnly: boolean;
+  readOnlyReason?: string;
+};
+
+export type ProjectStatusMeta = {
+  id: string;
+  label: string;
+  color: string;
+};
+
+export type AgentStatusMeta = {
+  id: string;
+  label: string;
+  color: string;
+};
+
+export type RoutineRunStatusMeta = {
+  id: string;
+  label: string;
+  color: string;
+};
+
+export type InboxItemTypeMeta = {
+  id: string;
+  label: string;
+  icon: string;
+};
+
+export type PermissionMeta = {
+  key: string;
+  label: string;
+  description: string;
+  type: "bool" | "int";
+};
+
+export type OfficeMeta = {
+  statuses: StatusMeta[];
+  priorities: PriorityMeta[];
+  roles: RoleMeta[];
+  executorTypes: ExecutorTypeMeta[];
+  skillSourceTypes: SkillSourceTypeMeta[];
+  projectStatuses: ProjectStatusMeta[];
+  agentStatuses: AgentStatusMeta[];
+  routineRunStatuses: RoutineRunStatusMeta[];
+  inboxItemTypes: InboxItemTypeMeta[];
+  permissions: PermissionMeta[];
+  permissionDefaults: Record<string, Record<string, unknown>>;
+};
+
+// --- Provider routing types ---
+//
+// Defined in `./routing-types` (kept out of this file to stay under the
+// 600-line cap) and re-exported here so existing
+// `@/lib/state/slices/office/types` imports keep working unchanged.
+
+export type {
+  Tier,
+  RoutingErrorCode,
+  TierMap,
+  ProviderProfile,
+  ExecutionProfileSummary,
+  WakeReason,
+  TierPerReason,
+  RoleTierMap,
+  TierSource,
+  WorkspaceRouting,
+  AgentRoutingOverrides,
+  ProviderHealthState,
+  ProviderHealthScope,
+  ProviderHealth,
+  RouteAttemptOutcome,
+  RouteAttempt,
+  ProviderModelPair,
+  AgentRoutePreview,
+  AgentRouteData,
+  RoutingState,
+  ProviderHealthSliceState,
+  RunAttemptsState,
+  AgentRoutingSliceState,
+} from "./routing-types";
+
+// --- Workspace kill switch (pause) types ---
+//
+// Defined in `./pause-types` (kept out of this file to stay under the
+// 600-line cap), same split as routing-types above.
+
+export type {
+  WorkspacePauseRecord,
+  WorkspacePauseStatus,
+  WorkspacePauseSliceState,
+  WorkspacePauseOutcome,
+} from "./pause-types";
+
+import type {
+  AgentRouteData,
+  AgentRoutePreview,
+  AgentRoutingSliceState,
+  ProviderHealth,
+  ProviderHealthSliceState,
+  RouteAttempt,
+  RoutingState,
+  RunAttemptsState,
+  WorkspaceRouting,
+} from "./routing-types";
+import type { WorkspacePauseOutcome, WorkspacePauseSliceState } from "./pause-types";
+
+// --- Slice state & actions ---
+
+/**
+ * One or more refetch types fired together. A single WS event routinely
+ * triggers several types in the same synchronous handler (e.g. `task:<id>`
+ * and `dashboard`); batching them into one trigger object is what lets
+ * `useOfficeRefetch` observe every type instead of only the last write to
+ * survive React's automatic batching of same-tick store updates.
+ */
+export type OfficeRefetchTrigger = {
+  types: string[];
+  timestamp: number;
+};
+
+/**
+ * Office collections that belong to one workspace, stored per workspace id
+ * rather than as a single current value.
+ *
+ * These used to be flat, which was safe only while the office route was the
+ * one thing that loaded them: entering the route overwrote whatever the
+ * previous workspace had left behind. Now that the data is loaded wherever
+ * an office workspace is active, two workspaces' worth of it can be in flight
+ * across a switch, and a flat field renders the wrong one in between.
+ * `routing` and `providerHealth` in this same slice were already keyed for
+ * the same reason.
+ *
+ * Read these through `selectors.ts` rather than indexing directly — the
+ * selectors resolve the active workspace and return stable empty values, so a
+ * component subscribing to a workspace with no entry does not re-render on
+ * every unrelated store write.
+ */
+export type OfficeSliceState = {
+  office: {
+    agentProfilesByWorkspaceId: Record<string, AgentProfile[]>;
+    skills: Skill[];
+    projectsByWorkspaceId: Record<string, Project[]>;
+    approvals: Approval[];
+    activity: ActivityEntry[];
+    costSummary: CostSummary | null;
+    budgetPolicies: BudgetPolicy[];
+    routines: Routine[];
+    inboxItemsByWorkspaceId: Record<string, InboxItem[]>;
+    inboxCountByWorkspaceId: Record<string, number>;
+    runs: Run[];
+    dashboardByWorkspaceId: Record<string, DashboardData | null>;
+    tasks: TasksState;
+    meta: OfficeMeta | null;
+    isLoading: boolean;
+    // A single WS handler often fires several distinct types in the same
+    // synchronous call (e.g. `task:${id}` then `dashboard`); batching them
+    // into one OfficeRefetchTrigger object per tick is what lets every
+    // matching subscriber observe its type instead of only the last write
+    // surviving React's automatic batching. See useOfficeRefetch.
+    refetchTrigger: OfficeRefetchTrigger | null;
+    routing: RoutingState;
+    providerHealth: ProviderHealthSliceState;
+    runAttempts: RunAttemptsState;
+    agentRouting: AgentRoutingSliceState;
+    taskQuorum: TaskQuorumSliceState;
+    pause: WorkspacePauseSliceState;
+  };
+};
+
+export type OfficeSliceActions = {
+  setOfficeAgentProfiles: (workspaceId: string, agents: AgentProfile[]) => void;
+  addOfficeAgentProfile: (workspaceId: string, agent: AgentProfile) => void;
+  updateOfficeAgentProfile: (workspaceId: string, id: string, patch: Partial<AgentProfile>) => void;
+  removeOfficeAgentProfile: (workspaceId: string, id: string) => void;
+  setSkills: (skills: Skill[]) => void;
+  addSkill: (skill: Skill) => void;
+  updateSkill: (id: string, patch: Partial<Skill>) => void;
+  removeSkill: (id: string) => void;
+  setProjects: (workspaceId: string, projects: Project[]) => void;
+  addProject: (workspaceId: string, project: Project) => void;
+  updateProject: (workspaceId: string, id: string, patch: Partial<Project>) => void;
+  removeProject: (workspaceId: string, id: string) => void;
+  setApprovals: (approvals: Approval[]) => void;
+  setActivity: (entries: ActivityEntry[]) => void;
+  setCostSummary: (summary: CostSummary | null) => void;
+  setBudgetPolicies: (policies: BudgetPolicy[]) => void;
+  setRoutines: (routines: Routine[]) => void;
+  setInboxItems: (workspaceId: string, items: InboxItem[]) => void;
+  setInboxCount: (workspaceId: string, count: number) => void;
+  setRuns: (runs: Run[]) => void;
+  setDashboard: (workspaceId: string, data: DashboardData | null) => void;
+  setTasks: (tasks: OfficeTask[]) => void;
+  appendTasks: (tasks: OfficeTask[]) => void;
+  patchTaskInStore: (taskId: string, patch: Partial<OfficeTask>) => void;
+  setTaskFilters: (filters: Partial<TaskFilterState>) => void;
+  setTaskViewMode: (mode: TaskViewMode) => void;
+  setTaskSortField: (field: TaskSortField) => void;
+  setTaskSortDir: (dir: TaskSortDir) => void;
+  setTaskGroupBy: (groupBy: TaskGroupBy) => void;
+  toggleNesting: () => void;
+  setTasksLoading: (loading: boolean) => void;
+  setMeta: (meta: OfficeMeta | null) => void;
+  setOfficeLoading: (loading: boolean) => void;
+  setOfficeRefetchTrigger: (type: string) => void;
+  setWorkspaceRouting: (workspaceId: string, cfg: WorkspaceRouting | undefined) => void;
+  setKnownProviders: (providers: string[]) => void;
+  setRoutingPreview: (workspaceId: string, agents: AgentRoutePreview[]) => void;
+  setProviderHealth: (workspaceId: string, health: ProviderHealth[]) => void;
+  upsertProviderHealth: (workspaceId: string, row: ProviderHealth) => void;
+  setRunAttempts: (runId: string, attempts: RouteAttempt[]) => void;
+  appendRunAttempt: (runId: string, attempt: RouteAttempt) => void;
+  setAgentRouting: (agentId: string, data: AgentRouteData | undefined) => void;
+  setTaskQuorum: (taskId: string, quorum: QuorumResponseDTO) => void;
+  beginPauseRequest: () => number;
+  resetPauseState: () => void;
+  applyPauseResponse: (
+    tag: number,
+    responseWorkspaceId: string,
+    activeWorkspaceId: string | null,
+    outcome: WorkspacePauseOutcome,
+  ) => boolean;
+};
+
+export type OfficeSlice = OfficeSliceState & OfficeSliceActions;

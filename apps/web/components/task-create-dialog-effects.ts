@@ -1,0 +1,663 @@
+"use client";
+
+import { useEffect, useMemo, useRef } from "react";
+import type { Repository, Executor, ExecutorProfile } from "@/lib/types/http";
+import { DEFAULT_LOCAL_EXECUTOR_TYPE } from "@/lib/utils";
+import { useToast } from "@/components/toast-provider";
+import { getLocalRepositoryStatusAction } from "@/app/actions/workspaces";
+import { listWorkflowSteps } from "@/lib/api/domains/workflow-api";
+import { parseGitHubAnyUrl } from "@/hooks/domains/github/use-pr-info-by-url";
+import type {
+  DialogFormState,
+  StoreSelections,
+  TaskCreateEffectsArgs,
+} from "@/components/task-create-dialog-types";
+import {
+  useAgentProfileAutopickEffect,
+  useWorkflowAgentProfileEffect,
+} from "@/components/task-create-dialog-autopick";
+import { useRepositoryAutoSelectEffect } from "@/components/task-create-dialog-repository-autopick";
+import { createDebugLogger, isDebug } from "@/lib/debug/log";
+import { t } from "@/lib/i18n";
+import { useRepositoryDiscovery } from "@/hooks/domains/workspace/use-repository-discovery";
+
+// Re-export autopick hooks for callers that imported them from this module.
+export { useWorkflowAgentProfileEffect };
+export { useRepositoryAutoSelectEffect } from "@/components/task-create-dialog-repository-autopick";
+// Also re-exported for the test file, which expects the symbol to live here.
+export { decideAgentProfileAutopick } from "@/components/task-create-dialog-autopick";
+
+const selectionDebug = createDebugLogger("task-create:selection");
+
+export function useWorkflowStepsEffect(
+  fs: DialogFormState,
+  open: boolean,
+  workflowId: string | null,
+  effectiveWorkflowId: string | null,
+) {
+  const { setFetchedSteps } = fs;
+  useEffect(() => {
+    void Promise.resolve().then(() => setFetchedSteps(null));
+    if (!open || !effectiveWorkflowId || effectiveWorkflowId === workflowId) {
+      return;
+    }
+    let cancelled = false;
+    listWorkflowSteps(effectiveWorkflowId)
+      .then((response) => {
+        if (cancelled) return;
+        const sorted = [...response.steps].sort((a, b) => a.position - b.position);
+        setFetchedSteps(
+          sorted.map((s) => ({
+            id: s.id,
+            title: s.name,
+            workflowId: effectiveWorkflowId,
+            position: s.position,
+            is_start_step: s.is_start_step,
+            prompt: s.prompt,
+            events: s.events,
+          })),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setFetchedSteps(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveWorkflowId, open, workflowId, setFetchedSteps]);
+}
+
+export function useDiscoverReposEffect(
+  fs: DialogFormState,
+  open: boolean,
+  workspaceId: string | null,
+  repositoriesLoading: boolean,
+  toast: ReturnType<typeof useToast>["toast"],
+) {
+  const discovery = useRepositoryDiscovery(workspaceId, open && !repositoriesLoading);
+  const { setDiscoveredRepositories, setDiscoverReposLoading, setDiscoverReposLoaded } = fs;
+  const reportedErrorRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!open || !workspaceId || repositoriesLoading) return;
+    setDiscoveredRepositories(discovery.repositories);
+    setDiscoverReposLoading(discovery.isLoading || discovery.isRefreshing);
+    setDiscoverReposLoaded(discovery.hasSnapshot || discovery.error !== null);
+    if (discovery.error && reportedErrorRef.current !== discovery.error.message) {
+      reportedErrorRef.current = discovery.error.message;
+      toast({
+        title: t("task:failedToDiscoverRepositories"),
+        description: discovery.error.message || t("common:requestFailed"),
+        variant: "error",
+      });
+    }
+  }, [
+    discovery.error,
+    discovery.hasSnapshot,
+    discovery.isLoading,
+    discovery.isRefreshing,
+    discovery.repositories,
+    open,
+    repositoriesLoading,
+    setDiscoveredRepositories,
+    setDiscoverReposLoaded,
+    setDiscoverReposLoading,
+    toast,
+    workspaceId,
+  ]);
+}
+
+// Per-row branch listing now lives in the chip itself via useBranches, so the
+// old useLocalBranchesEffect is gone.
+//
+// useCurrentLocalBranchEffect still earns its keep — the fresh-branch
+// consent flow needs to know which branch the on-disk clone is currently on,
+// and that's only meaningful for a single-row local-executor task. For multi-
+// repo tasks fresh-branch is hidden in the UI, so we only resolve a path
+// when there's exactly one row.
+export function useCurrentLocalBranchEffect(
+  fs: DialogFormState,
+  open: boolean,
+  workspaceId: string | null,
+  repositories: Repository[],
+) {
+  const { repositories: rows, useRemote, setCurrentLocalBranch, setCurrentLocalBranchLoading } = fs;
+  useEffect(() => {
+    if (!open || !workspaceId || useRemote || rows.length !== 1) {
+      setCurrentLocalBranch("");
+      setCurrentLocalBranchLoading(false);
+      return;
+    }
+    const row = rows[0];
+    let path = row.localPath ?? "";
+    if (!path && row.repositoryId) {
+      const repo = repositories.find((r: Repository) => r.id === row.repositoryId);
+      path = repo?.local_path ?? "";
+    }
+    if (!path) {
+      setCurrentLocalBranch("");
+      setCurrentLocalBranchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setCurrentLocalBranchLoading(true);
+    getLocalRepositoryStatusAction(workspaceId, path)
+      .then((r) => {
+        if (cancelled) return;
+        setCurrentLocalBranch(r.current_branch ?? "");
+        setCurrentLocalBranchLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCurrentLocalBranch("");
+        setCurrentLocalBranchLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    open,
+    workspaceId,
+    useRemote,
+    rows,
+    repositories,
+    setCurrentLocalBranch,
+    setCurrentLocalBranchLoading,
+  ]);
+}
+
+/**
+ * Picks the default executor ID to auto-fill on dialog open. Repo-less tasks
+ * skip the worktree executor (it needs a repo). Explicit local paths prefer
+ * the local executor because the user chose an on-machine working tree.
+ * Otherwise repo-backed tasks use the workspace default →
+ * DEFAULT_LOCAL_EXECUTOR_TYPE → first available, in priority order.
+ */
+function pickDefaultExecutorId(
+  executors: Executor[],
+  workspaceDefaults: { default_executor_id?: string | null } | null | undefined,
+  noRepository: boolean,
+  preferLocalExecutor: boolean,
+): string | null {
+  const eligible =
+    noRepository || preferLocalExecutor
+      ? executors.filter((e: Executor) => e.type !== "worktree")
+      : executors;
+  if (eligible.length === 0) return null;
+  if (preferLocalExecutor) {
+    const directLocal = eligible.find((e) => isDirectLocalExecutorType(e.type));
+    if (directLocal) return directLocal.id;
+  }
+  const defId = workspaceDefaults?.default_executor_id ?? null;
+  if (defId && eligible.some((e: Executor) => e.id === defId)) return defId;
+  if (noRepository || preferLocalExecutor) {
+    const directLocal = eligible.find((e: Executor) => isDirectLocalExecutorType(e.type));
+    if (directLocal) return directLocal.id;
+  }
+  const local = eligible.find((e: Executor) => e.type === DEFAULT_LOCAL_EXECUTOR_TYPE);
+  return local?.id ?? eligible[0].id;
+}
+
+type ExecutorProfileCandidate = ExecutorProfile & {
+  _executorId: string;
+  _executorType: string;
+};
+
+function isDirectLocalExecutorType(executorType: string | undefined): boolean {
+  return executorType === "local" || executorType === "local_pc";
+}
+
+function isWorktreeExecutorType(executorType: string | undefined): boolean {
+  return executorType === "worktree";
+}
+
+function flattenExecutorProfiles(executors: Executor[]): ExecutorProfileCandidate[] {
+  return executors.flatMap((e) =>
+    (e.profiles ?? []).map((p) => ({
+      ...p,
+      _executorId: e.id,
+      _executorType: p.executor_type ?? e.type,
+    })),
+  );
+}
+
+function pickDefaultExecutorProfileId(
+  executors: Executor[],
+  workspaceDefaults: { default_executor_id?: string | null } | null | undefined,
+  noRepository: boolean,
+  preferLocalExecutor: boolean,
+  lastUsedExecutorProfileId?: string | null,
+): string | null {
+  const allProfiles = flattenExecutorProfiles(executors);
+  if (allProfiles.length === 0) return null;
+  const eligibleProfiles =
+    noRepository || preferLocalExecutor
+      ? allProfiles.filter((p) => !isWorktreeExecutorType(p._executorType))
+      : allProfiles;
+  if (eligibleProfiles.length === 0) return null;
+
+  const executorId = pickDefaultExecutorId(
+    executors,
+    workspaceDefaults,
+    noRepository,
+    preferLocalExecutor,
+  );
+  const lastUsedProfile = eligibleProfiles.find((p) => p.id === lastUsedExecutorProfileId);
+  if (lastUsedProfile && lastUsedProfile._executorId === executorId) {
+    return lastUsedProfile.id;
+  }
+
+  const executorProfile = eligibleProfiles.find((p) => p._executorId === executorId);
+  return executorProfile?.id ?? eligibleProfiles[0].id;
+}
+
+type ExecutorAutopickContext = {
+  executors: Executor[];
+  workspaceDefaults: StoreSelections["workspaceDefaults"];
+  userSettingsLoaded?: boolean;
+  lastUsedExecutorProfileId?: string | null;
+  noRepository: boolean;
+  preferLocalExecutor: boolean;
+};
+
+type ExecutorProfileLastUsedState = {
+  allProfiles: ExecutorProfileCandidate[];
+  eligibleProfiles: ExecutorProfileCandidate[];
+  settingsId: string | null;
+  settingsValid: boolean;
+  settingsCompatible: boolean;
+};
+
+function getExecutorProfileLastUsedState(
+  context: ExecutorAutopickContext,
+  settingsId: string | null,
+): ExecutorProfileLastUsedState {
+  const { executors, noRepository, preferLocalExecutor } = context;
+  const allProfiles = flattenExecutorProfiles(executors);
+  const eligibleProfiles =
+    noRepository || preferLocalExecutor
+      ? allProfiles.filter((p) => !isWorktreeExecutorType(p._executorType))
+      : allProfiles;
+  const defaultExecutorId = pickDefaultExecutorId(
+    executors,
+    context.workspaceDefaults,
+    noRepository,
+    preferLocalExecutor,
+  );
+  const settingsProfile = eligibleProfiles.find((p) => p.id === settingsId);
+  return {
+    allProfiles,
+    eligibleProfiles,
+    settingsId,
+    settingsValid: Boolean(settingsProfile),
+    settingsCompatible: Boolean(
+      settingsProfile && settingsProfile._executorId === defaultExecutorId,
+    ),
+  };
+}
+
+function shouldDeferExecutorProfileAutopick(
+  context: ExecutorAutopickContext,
+  _lastUsed: ExecutorProfileLastUsedState,
+) {
+  return context.userSettingsLoaded === false;
+}
+
+export function shouldWaitForLastUsedExecutorProfile(context: ExecutorAutopickContext) {
+  const lastUsedProfile = getExecutorProfileLastUsedState(
+    context,
+    context.lastUsedExecutorProfileId ?? null,
+  );
+  if (!lastUsedProfile.settingsCompatible) return false;
+  if (isDebug()) {
+    selectionDebug("executor-autopick", {
+      current: "-",
+      pick: "-",
+      executor_count: context.executors.length,
+      workspace_default: context.workspaceDefaults?.default_executor_id ?? "-",
+      no_repository: context.noRepository,
+      prefer_local_executor: context.preferLocalExecutor,
+      settings_compatible: lastUsedProfile.settingsCompatible,
+      source: "executor-profile-last-used",
+    });
+  }
+  return true;
+}
+
+function logExecutorProfileAutopick(
+  pick: string | null,
+  context: ExecutorAutopickContext,
+  lastUsed: ExecutorProfileLastUsedState,
+  source?: string,
+) {
+  if (!isDebug()) return;
+  selectionDebug("executor-profile-autopick", {
+    current: "-",
+    pick: pick ?? "-",
+    settings_id: lastUsed.settingsId ?? "-",
+    settings_valid: lastUsed.settingsValid,
+    settings_compatible: lastUsed.settingsCompatible,
+    profile_count: lastUsed.allProfiles.length,
+    workspace_default_executor: context.workspaceDefaults?.default_executor_id ?? "-",
+    no_repository: context.noRepository,
+    prefer_local_executor: context.preferLocalExecutor,
+    ...(source ? { source } : {}),
+  });
+}
+
+function useExecutorIdAutopickEffect({
+  open,
+  executorId,
+  context,
+  setExecutorId,
+}: {
+  open: boolean;
+  executorId: string;
+  context: ExecutorAutopickContext;
+  setExecutorId: (id: string) => void;
+}) {
+  const { executors, workspaceDefaults, noRepository, preferLocalExecutor } = context;
+  useEffect(() => {
+    if (!open || executorId || executors.length === 0) return;
+    if (context.userSettingsLoaded === false) {
+      if (isDebug()) {
+        selectionDebug("executor-autopick", {
+          current: "-",
+          pick: "-",
+          executor_count: executors.length,
+          workspace_default: workspaceDefaults?.default_executor_id ?? "-",
+          no_repository: noRepository,
+          prefer_local_executor: preferLocalExecutor,
+          source: "user-settings-loading",
+        });
+      }
+      return;
+    }
+    if (shouldWaitForLastUsedExecutorProfile(context)) {
+      return;
+    }
+    const pick = pickDefaultExecutorId(
+      executors,
+      workspaceDefaults,
+      noRepository,
+      preferLocalExecutor,
+    );
+    if (isDebug()) {
+      selectionDebug("executor-autopick", {
+        current: "-",
+        pick: pick ?? "-",
+        executor_count: executors.length,
+        workspace_default: workspaceDefaults?.default_executor_id ?? "-",
+        no_repository: noRepository,
+        prefer_local_executor: preferLocalExecutor,
+      });
+    }
+    if (pick) void Promise.resolve().then(() => setExecutorId(pick));
+  }, [
+    open,
+    executorId,
+    executors,
+    workspaceDefaults,
+    setExecutorId,
+    noRepository,
+    preferLocalExecutor,
+    context.userSettingsLoaded,
+    context.lastUsedExecutorProfileId,
+  ]);
+}
+
+function useExecutorProfileAutopickEffect({
+  open,
+  executorProfileId,
+  context,
+  setExecutorProfileId,
+}: {
+  open: boolean;
+  executorProfileId: string;
+  context: ExecutorAutopickContext;
+  setExecutorProfileId: (id: string) => void;
+}) {
+  const { executors, workspaceDefaults, noRepository, preferLocalExecutor } = context;
+  useEffect(() => {
+    // Auto-select executor profile: last-used backend setting → source-aware
+    // executor default → first eligible profile.
+    if (!open || executorProfileId || executors.length === 0) return;
+    const lastUsed = getExecutorProfileLastUsedState(
+      context,
+      context.lastUsedExecutorProfileId ?? null,
+    );
+    if (shouldDeferExecutorProfileAutopick(context, lastUsed)) {
+      logExecutorProfileAutopick(null, context, lastUsed, "user-settings-loading");
+      return;
+    }
+    const pick = pickDefaultExecutorProfileId(
+      executors,
+      workspaceDefaults,
+      noRepository,
+      preferLocalExecutor,
+      context.lastUsedExecutorProfileId,
+    );
+    logExecutorProfileAutopick(pick, context, lastUsed);
+    if (pick) void Promise.resolve().then(() => setExecutorProfileId(pick));
+  }, [
+    open,
+    executorProfileId,
+    executors,
+    workspaceDefaults,
+    setExecutorProfileId,
+    noRepository,
+    preferLocalExecutor,
+    context.lastUsedExecutorProfileId,
+    context.userSettingsLoaded,
+  ]);
+}
+
+export function useDefaultSelectionsEffect(
+  fs: DialogFormState,
+  open: boolean,
+  sel: StoreSelections,
+  workflows: Array<{ id: string; agent_profile_id?: string }>,
+  editingTaskExecutorProfileId?: string | null,
+) {
+  const { executors, workspaceDefaults } = sel;
+  const {
+    executorId,
+    executorProfileId,
+    setExecutorId,
+    setExecutorProfileIdFromSeed,
+    noRepository,
+    preferLocalExecutor: presetPrefersLocalExecutor,
+    useRemote,
+    repositories,
+  } = fs;
+  const preferLocalExecutor =
+    !useRemote &&
+    (presetPrefersLocalExecutor ||
+      (!noRepository && repositories.some((row) => Boolean(row.localPath))));
+  const executorAutopickContext = useMemo(
+    () => ({
+      executors,
+      workspaceDefaults,
+      userSettingsLoaded: sel.userSettingsLoaded,
+      lastUsedExecutorProfileId: sel.lastUsedExecutorProfileId,
+      noRepository,
+      preferLocalExecutor,
+    }),
+    [
+      executors,
+      workspaceDefaults,
+      sel.userSettingsLoaded,
+      sel.lastUsedExecutorProfileId,
+      noRepository,
+      preferLocalExecutor,
+    ],
+  );
+  const hasStoredEditingExecutorProfile = Boolean(editingTaskExecutorProfileId);
+  // Seed the picker from the task's own stored runner (edit mode only)
+  // before any create-mode "resolve a default" autopick runs: a task that
+  // already has a stored runner is seeded from that stored value, not from
+  // the create-mode default-resolution path. Gating the autopick effect's
+  // own `open` (below) rather than adding a state-machine flag keeps this
+  // race-free: the two effects cannot both compute a pick for the same
+  // render.
+  useEffect(() => {
+    if (!open || executorProfileId || !editingTaskExecutorProfileId) return;
+    setExecutorProfileIdFromSeed(editingTaskExecutorProfileId);
+  }, [open, executorProfileId, editingTaskExecutorProfileId, setExecutorProfileIdFromSeed]);
+
+  useAgentProfileAutopickEffect(fs, open, sel, workflows);
+  useExecutorIdAutopickEffect({
+    open,
+    executorId,
+    context: executorAutopickContext,
+    setExecutorId,
+  });
+  useExecutorProfileAutopickEffect({
+    open: open && !hasStoredEditingExecutorProfile,
+    executorProfileId,
+    context: executorAutopickContext,
+    setExecutorProfileId: setExecutorProfileIdFromSeed,
+  });
+
+  // Derive executorId from the selected executor profile
+  useEffect(() => {
+    if (!executorProfileId) return;
+    for (const executor of executors) {
+      const match = (executor.profiles ?? []).find((p) => p.id === executorProfileId);
+      if (match) {
+        if (isDebug()) {
+          selectionDebug("executor-derived-from-profile", {
+            executor_profile_id: executorProfileId,
+            executor_id: executor.id,
+          });
+        }
+        void Promise.resolve().then(() => setExecutorId(executor.id));
+        return;
+      }
+    }
+  }, [executorProfileId, executors, setExecutorId]);
+}
+
+/**
+ * Surfaces a "Invalid GitHub URL" error for the first remote row when its URL
+ * doesn't parse as a repo or a PR URL. Per-row PR-info fetching + branch
+ * auto-select live inside `RemoteRepoChip` via `usePRInfoByURL` and
+ * `useRowBranchAutoSelect`; this effect just keeps the surfaced error banner
+ * in sync with the first row's URL.
+ */
+export function useGitHubUrlErrorEffect(fs: DialogFormState, open: boolean) {
+  const { useRemote, setGitHubUrlError } = fs;
+  const firstUrl = fs.remoteRepos[0]?.url ?? "";
+  useEffect(() => {
+    if (!open) return;
+    // When the user leaves Remote mode (toggle off / switch to workspace
+    // mode / dialog reopens in non-Remote mode) we must clear any stale
+    // error left over from a previous Remote-mode pass. The early return
+    // used to skip this — the banner stuck around after the field that
+    // produced it had been hidden, which surfaced confusing "Invalid
+    // GitHub URL" text alongside a repo picker.
+    if (!useRemote) {
+      setGitHubUrlError(null);
+      return;
+    }
+    const trimmed = firstUrl.trim();
+    if (!trimmed) {
+      setGitHubUrlError(null);
+      return;
+    }
+    const parsed = parseGitHubAnyUrl(trimmed);
+    if (!parsed) {
+      setGitHubUrlError(t("task:invalidGitHubUrl"));
+      return;
+    }
+    setGitHubUrlError(null);
+  }, [open, useRemote, firstUrl, setGitHubUrlError]);
+}
+
+export function useTaskCreateDialogEffects(fs: DialogFormState, args: TaskCreateEffectsArgs) {
+  const {
+    open,
+    workspaceId,
+    workflowId,
+    effectiveWorkflowId,
+    repositories,
+    repositoriesLoading,
+    editingTaskExecutorProfileId,
+  } = args;
+  const {
+    agentProfiles,
+    compatibleAgentProfiles,
+    authLoaded,
+    executors,
+    workspaceDefaults,
+    toast,
+    workflows,
+    isLocalExecutor,
+  } = args;
+  useWorkflowStepsEffect(fs, open, workflowId, effectiveWorkflowId);
+  useWorkflowAgentProfileEffect(fs, workflows, agentProfiles, compatibleAgentProfiles, {
+    lastUsedAgentProfileId: args.lastUsedAgentProfileId,
+    authLoaded,
+    userSettingsLoaded: args.userSettingsLoaded,
+    effectiveWorkflowId,
+  });
+  useRepositoryAutoSelectEffect(fs, open, workspaceId, repositories, {
+    lastUsedRepositoryId: args.lastUsedRepositoryId,
+    userSettingsLoaded: args.userSettingsLoaded,
+  });
+  useDiscoverReposEffect(fs, open, workspaceId, repositoriesLoading, toast);
+  useCurrentLocalBranchEffect(fs, open, workspaceId, repositories);
+  useResetBranchOnLocalSwitchEffect(fs, isLocalExecutor, args.preserveBranch);
+  useDefaultSelectionsEffect(
+    fs,
+    open,
+    {
+      agentProfiles,
+      compatibleAgentProfiles,
+      authLoaded,
+      executors,
+      workspaceDefaults,
+      userSettingsLoaded: args.userSettingsLoaded,
+      lastUsedAgentProfileId: args.lastUsedAgentProfileId,
+      lastUsedExecutorProfileId: args.lastUsedExecutorProfileId,
+      effectiveWorkflowId,
+    },
+    workflows,
+    editingTaskExecutorProfileId,
+  );
+  useGitHubUrlErrorEffect(fs, open);
+}
+
+// Reset row.branch on every "switch to local executor" transition so the
+// chip's autoselect effect can re-fire and prefer the workspace's current
+// branch (preferredDefaultBranch). Without this, a branch the user picked
+// under worktree mode (say "develop") would persist on the row, the chip
+// would show "develop" after switching to local, and submit would carry
+// "develop" → backend `git checkout develop` against the user's working
+// tree. With the reset, switching to local always defaults to "current
+// branch on disk" and the user has to opt back into a different branch
+// explicitly.
+function useResetBranchOnLocalSwitchEffect(
+  fs: DialogFormState,
+  isLocalExecutor: boolean,
+  preserveBranch: string | undefined,
+) {
+  const { repositories: rows, updateRepository } = fs;
+  const wasLocalRef = useRef(isLocalExecutor);
+  useEffect(() => {
+    const prev = wasLocalRef.current;
+    wasLocalRef.current = isLocalExecutor;
+    if (!isLocalExecutor || prev) return; // only fire on false → true transition
+    for (const row of rows) {
+      // Preserve a branch the caller asked us to keep (e.g. the PR head branch
+      // when launching from a GitHub PR). Without this, the executor's async
+      // settle on dialog open looks like a worktree→local switch and clobbers
+      // the explicit branch choice, leaving the chip showing "current: main".
+      // Both `row.branch` and `preserveBranch` are bare branch names with no
+      // remote prefix — current callers (`initialValues.checkoutBranch` /
+      // `initialValues.branch`) never pass `origin/...` here.
+      if (row.branch && row.branch !== preserveBranch) {
+        updateRepository(row.key, { branch: "" });
+      }
+    }
+  }, [isLocalExecutor, rows, updateRepository, preserveBranch]);
+}

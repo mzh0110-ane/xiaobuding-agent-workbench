@@ -1,0 +1,51 @@
+"use client";
+
+import { IconLoader2, IconSearch, IconX } from "@tabler/icons-react";
+import { Input } from "@kandev/ui/input";
+import { PanelHeaderBar } from "./panel-primitives";
+import { useTranslation } from "react-i18next";
+
+type FileBrowserSearchHeaderProps = {
+  isSearching: boolean;
+  localSearchQuery: string;
+  searchInputRef: React.RefObject<HTMLInputElement | null>;
+  onSearchChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onCloseSearch: () => void;
+};
+
+export function FileBrowserSearchHeader({
+  isSearching,
+  localSearchQuery,
+  searchInputRef,
+  onSearchChange,
+  onCloseSearch,
+}: FileBrowserSearchHeaderProps) {
+  const { t } = useTranslation();
+  return (
+    <PanelHeaderBar className="group/header">
+      {isSearching ? (
+        <IconLoader2 className="h-3.5 w-3.5 text-muted-foreground animate-spin shrink-0" />
+      ) : (
+        <IconSearch className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+      )}
+      <Input
+        ref={searchInputRef}
+        type="text"
+        controlSize="none"
+        value={localSearchQuery}
+        onChange={onSearchChange}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onCloseSearch();
+        }}
+        placeholder={t("task:searchFiles2")}
+        className="flex-1 min-w-0 h-5 text-xs border-none bg-transparent shadow-none focus-visible:ring-0 px-2"
+      />
+      <button
+        className="inline-flex h-6 w-6 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer max-md:h-11 [@media(pointer:coarse)]:h-11 max-md:w-11 [@media(pointer:coarse)]:w-11"
+        onClick={onCloseSearch}
+      >
+        <IconX className="h-3.5 w-3.5" />
+      </button>
+    </PanelHeaderBar>
+  );
+}

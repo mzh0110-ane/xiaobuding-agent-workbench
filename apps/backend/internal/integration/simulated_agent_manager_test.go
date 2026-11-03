@@ -1,0 +1,741 @@
+// Package integration provides end-to-end integration tests for the Kandev backend.
+package integration
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/orchestrator/executor"
+	"github.com/kandev/kandev/pkg/acp/protocol"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// SimulatedAgentManagerClient simulates agent container behavior for testing.
+// It publishes realistic agent events (started, ACP messages, completion) to the event bus.
+type SimulatedAgentManagerClient struct {
+	eventBus            bus.EventBus
+	logger              *logger.Logger
+	mu                  sync.Mutex
+	instances           map[string]*simulatedInstance
+	permissions         map[string][]streams.PendingAgentPermission
+	permissionResponses int
+	launchDelay         time.Duration
+	executionTime       time.Duration
+	shouldFail          bool
+	failAfter           int // Fail after N successful launches
+	launchCount         int32
+	promptCalls         atomic.Int32
+	restartProcessCalls atomic.Int32
+	resetContextCalls   atomic.Int32
+	acpMessageFn        func(taskID, executionID string) []protocol.Message // Custom ACP messages
+	stopCh              chan struct{}
+}
+
+// simulatedInstance tracks a simulated agent instance
+type simulatedInstance struct {
+	id             string
+	taskID         string
+	sessionID      string
+	agentProfileID string
+	status         v1.AgentStatus
+	statusMu       sync.Mutex // Protects status field
+	stopCh         chan struct{}
+	// hung indicates the agent acknowledged an ACP cancel but never emitted a
+	// completion event, so CancelAgent should return lifecycle.ErrCancelEscalated.
+	hung bool
+}
+
+// NewSimulatedAgentManager creates a new simulated agent manager
+func NewSimulatedAgentManager(eventBus bus.EventBus, log *logger.Logger) *SimulatedAgentManagerClient {
+	return &SimulatedAgentManagerClient{
+		eventBus:      eventBus,
+		logger:        log,
+		instances:     make(map[string]*simulatedInstance),
+		permissions:   make(map[string][]streams.PendingAgentPermission),
+		launchDelay:   50 * time.Millisecond,
+		executionTime: 200 * time.Millisecond,
+		stopCh:        make(chan struct{}),
+	}
+}
+
+// SetLaunchDelay sets the delay before agent "starts"
+func (s *SimulatedAgentManagerClient) SetLaunchDelay(d time.Duration) {
+	s.launchDelay = d
+}
+
+// SetExecutionTime sets how long the simulated task takes
+func (s *SimulatedAgentManagerClient) SetExecutionTime(d time.Duration) {
+	s.executionTime = d
+}
+
+// SetShouldFail configures whether launches should fail
+func (s *SimulatedAgentManagerClient) SetShouldFail(fail bool) {
+	s.shouldFail = fail
+}
+
+// SetFailAfter configures the agent to fail after N successful launches
+func (s *SimulatedAgentManagerClient) SetFailAfter(n int) {
+	s.failAfter = n
+}
+
+// SetACPMessageFn sets a custom function to generate ACP messages
+func (s *SimulatedAgentManagerClient) SetACPMessageFn(fn func(taskID, executionID string) []protocol.Message) {
+	s.acpMessageFn = fn
+}
+
+// LaunchAgent simulates launching an agent container
+func (s *SimulatedAgentManagerClient) LaunchAgent(ctx context.Context, req *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+	count := atomic.AddInt32(&s.launchCount, 1)
+
+	if s.shouldFail {
+		return nil, fmt.Errorf("simulated launch failure")
+	}
+
+	if s.failAfter > 0 && int(count) > s.failAfter {
+		return nil, fmt.Errorf("simulated launch failure after %d attempts", s.failAfter)
+	}
+
+	executionID := uuid.New().String()
+	containerID := "sim-container-" + executionID[:8]
+
+	s.mu.Lock()
+	instance := &simulatedInstance{
+		id:             executionID,
+		taskID:         req.TaskID,
+		sessionID:      req.SessionID,
+		agentProfileID: req.AgentProfileID,
+		status:         v1.AgentStatusStarting,
+		stopCh:         make(chan struct{}),
+	}
+	s.instances[executionID] = instance
+	s.mu.Unlock()
+
+	// Simulate agent lifecycle in background
+	go s.runAgentSimulation(instance, req)
+
+	return &executor.LaunchAgentResponse{
+		AgentExecutionID: executionID,
+		ContainerID:      containerID,
+		Status:           v1.AgentStatusStarting,
+	}, nil
+}
+
+// SetExecutionDescription updates the task description for an execution
+func (s *SimulatedAgentManagerClient) SetExecutionDescription(ctx context.Context, agentExecutionID string, description string) error {
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) SetExecutionEnv(ctx context.Context, agentExecutionID string, env map[string]string) error {
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) SetMcpMode(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
+// StartAgentProcess simulates starting the agent subprocess
+func (s *SimulatedAgentManagerClient) StartAgentProcess(ctx context.Context, agentExecutionID string) error {
+	s.logger.Info("simulated: starting agent process",
+		zap.String("agent_execution_id", agentExecutionID))
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) IsAgentCommandConfigured(_ string) bool { return true }
+
+// runAgentSimulation simulates the agent execution lifecycle
+func (s *SimulatedAgentManagerClient) runAgentSimulation(instance *simulatedInstance, req *executor.LaunchAgentRequest) {
+	// Wait for launch delay
+	select {
+	case <-time.After(s.launchDelay):
+	case <-instance.stopCh:
+		return
+	case <-s.stopCh:
+		return
+	}
+
+	// Publish agent started event
+	s.publishAgentEvent(events.AgentStarted, instance)
+
+	// Simulate some ACP messages
+	s.publishACPMessages(instance, req)
+
+	// Wait for execution time
+	select {
+	case <-time.After(s.executionTime):
+	case <-instance.stopCh:
+		s.publishAgentEvent(events.AgentStopped, instance)
+		return
+	case <-s.stopCh:
+		return
+	}
+
+	// Publish agent ready (finished prompt, waiting for follow-up or completion)
+	instance.statusMu.Lock()
+	instance.status = v1.AgentStatusReady
+	instance.statusMu.Unlock()
+	s.publishAgentEvent(events.AgentReady, instance)
+}
+
+// publishAgentEvent publishes an agent lifecycle event
+func (s *SimulatedAgentManagerClient) publishAgentEvent(eventType string, instance *simulatedInstance) {
+	instance.statusMu.Lock()
+	status := instance.status
+	instance.statusMu.Unlock()
+
+	data := map[string]interface{}{
+		"instance_id":      instance.id,
+		"task_id":          instance.taskID,
+		"agent_profile_id": instance.agentProfileID,
+		"container_id":     "sim-container-" + instance.id[:8],
+		"status":           string(status),
+		"started_at":       time.Now(),
+		"progress":         50,
+	}
+
+	event := bus.NewEvent(eventType, "simulated-agent-manager", data)
+	if err := s.eventBus.Publish(context.Background(), eventType, event); err != nil {
+		s.logger.Error("failed to publish agent event")
+	}
+}
+
+// publishACPMessages publishes simulated ACP messages
+func (s *SimulatedAgentManagerClient) publishACPMessages(instance *simulatedInstance, req *executor.LaunchAgentRequest) {
+	var messages []protocol.Message
+
+	if s.acpMessageFn != nil {
+		messages = s.acpMessageFn(instance.taskID, instance.id)
+	} else {
+		// Default ACP messages
+		messages = []protocol.Message{
+			{
+				Type:      protocol.MessageTypeProgress,
+				TaskID:    instance.taskID,
+				Timestamp: time.Now(),
+				Data: map[string]interface{}{
+					"progress": 25,
+					"stage":    "starting",
+					"message":  "Agent started processing task",
+				},
+			},
+			{
+				Type:      protocol.MessageTypeLog,
+				TaskID:    instance.taskID,
+				Timestamp: time.Now(),
+				Data: map[string]interface{}{
+					"level":   "info",
+					"message": "Processing task: " + req.TaskDescription,
+				},
+			},
+			{
+				Type:      protocol.MessageTypeProgress,
+				TaskID:    instance.taskID,
+				Timestamp: time.Now(),
+				Data: map[string]interface{}{
+					"progress": 75,
+					"stage":    "executing",
+					"message":  "Task execution in progress",
+				},
+			},
+		}
+	}
+
+	// Publish each message with a small delay
+	for _, msg := range messages {
+		sessionID := msg.SessionID
+		if sessionID == "" {
+			sessionID = instance.sessionID
+		}
+		msgData := map[string]interface{}{
+			"type":         msg.Type,
+			"task_id":      msg.TaskID,
+			"session_id":   sessionID,
+			"execution_id": instance.id,
+			"timestamp":    msg.Timestamp,
+			"data":         msg.Data,
+		}
+
+		event := bus.NewEvent(events.AgentStream, "simulated-agent", msgData)
+		subject := events.BuildAgentStreamSubject(instance.taskID)
+		if err := s.eventBus.Publish(context.Background(), subject, event); err != nil {
+			s.logger.Error("failed to publish agent stream event")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// StopAgent simulates stopping an agent
+func (s *SimulatedAgentManagerClient) StopAgent(ctx context.Context, agentExecutionID string, force bool) error {
+	s.mu.Lock()
+	execution, exists := s.instances[agentExecutionID]
+	s.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("agent execution %q not found", agentExecutionID)
+	}
+
+	close(execution.stopCh)
+	execution.statusMu.Lock()
+	execution.status = v1.AgentStatusStopped
+	execution.statusMu.Unlock()
+
+	s.publishAgentEvent(events.AgentStopped, execution)
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) StopAgentWithReason(ctx context.Context, agentExecutionID, reason string, force bool) error {
+	return s.StopAgent(ctx, agentExecutionID, force)
+}
+
+// PromptAgent sends a follow-up prompt to a running agent
+// Note: attachments parameter is accepted but not used in simulation
+func (s *SimulatedAgentManagerClient) PromptAgent(ctx context.Context, agentExecutionID string, prompt string, _ []v1.MessageAttachment, _ bool) (*executor.PromptResult, error) {
+	s.promptCalls.Add(1)
+	s.mu.Lock()
+	execution, exists := s.instances[agentExecutionID]
+	s.mu.Unlock()
+
+	if !exists {
+		return nil, fmt.Errorf("agent execution %q not found", agentExecutionID)
+	}
+
+	// Simulate receiving prompt and generating response
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+
+		msg := protocol.Message{
+			Type:      protocol.MessageTypeLog,
+			TaskID:    execution.taskID,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"level":   "info",
+				"message": "Received follow-up prompt: " + prompt,
+			},
+		}
+
+		msgData := map[string]interface{}{
+			"type":      msg.Type,
+			"task_id":   msg.TaskID,
+			"timestamp": msg.Timestamp,
+			"data":      msg.Data,
+		}
+
+		event := bus.NewEvent(events.AgentStream, "simulated-agent", msgData)
+		subject := events.BuildAgentStreamSubject(execution.taskID)
+		if err := s.eventBus.Publish(context.Background(), subject, event); err != nil {
+			s.logger.Warn("failed to publish simulated agent stream event", zap.Error(err))
+		}
+	}()
+
+	return &executor.PromptResult{
+		StopReason: "end_turn",
+	}, nil
+}
+
+func (s *SimulatedAgentManagerClient) PromptAgentWithAdmissionCallback(
+	ctx context.Context,
+	agentExecutionID, prompt string,
+	attachments []v1.MessageAttachment,
+	dispatchOnly bool,
+	beforeAdmission func() error,
+	onDispatched func(),
+) (*executor.PromptResult, error) {
+	if beforeAdmission != nil {
+		if err := beforeAdmission(); err != nil {
+			return nil, err
+		}
+	}
+	result, err := s.PromptAgent(ctx, agentExecutionID, prompt, attachments, dispatchOnly)
+	if err == nil && onDispatched != nil {
+		onDispatched()
+	}
+	return result, err
+}
+
+// RespondToPermissionBySessionID responds to a permission request for a session
+func (s *SimulatedAgentManagerClient) RespondToPermissionBySessionID(ctx context.Context, sessionID, pendingID, optionID string, cancelled bool) error {
+	s.logger.Info("simulated: responding to permission",
+		zap.String("session_id", sessionID),
+		zap.String("pending_id", pendingID),
+		zap.String("option_id", optionID),
+		zap.Bool("cancelled", cancelled))
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) SetPendingPermissions(sessionID string, permissions []streams.PendingAgentPermission) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.permissions[sessionID] = append([]streams.PendingAgentPermission(nil), permissions...)
+}
+
+func (s *SimulatedAgentManagerClient) PermissionResponseCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.permissionResponses
+}
+
+func (s *SimulatedAgentManagerClient) ListPendingPermissionsBySessionID(_ context.Context, sessionID string) ([]streams.PendingAgentPermission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]streams.PendingAgentPermission(nil), s.permissions[sessionID]...), nil
+}
+
+func (s *SimulatedAgentManagerClient) ResolvePermissionBySessionID(_ context.Context, sessionID, requestID, pendingID, optionID string) (*streams.PermissionResolveResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for permissionIndex, permission := range s.permissions[sessionID] {
+		if permission.RequestID != requestID || permission.PendingID != pendingID {
+			continue
+		}
+		for _, option := range permission.Options {
+			if option.OptionID != optionID {
+				continue
+			}
+			s.permissions[sessionID] = append(s.permissions[sessionID][:permissionIndex], s.permissions[sessionID][permissionIndex+1:]...)
+			s.permissionResponses++
+			return &streams.PermissionResolveResponse{
+				RequestID: requestID, PendingID: pendingID, OptionID: optionID,
+				OptionKind: option.Kind, Status: "resolved",
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("permission no longer pending")
+}
+
+func (s *SimulatedAgentManagerClient) CancelPermissionBySessionID(_ context.Context, sessionID, requestID, pendingID string) (*streams.PermissionCancelResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	permissions := s.permissions[sessionID]
+	for permissionIndex, permission := range permissions {
+		if permission.RequestID != requestID || permission.PendingID != pendingID {
+			continue
+		}
+		s.permissions[sessionID] = append(permissions[:permissionIndex], permissions[permissionIndex+1:]...)
+		return &streams.PermissionCancelResponse{RequestID: requestID, PendingID: pendingID, Status: "cancelled"}, nil
+	}
+	return nil, fmt.Errorf("permission no longer pending")
+}
+
+func TestSimulatedAgentManagerCancelPermissionConsumesExactTuple(t *testing.T) {
+	manager := &SimulatedAgentManagerClient{permissions: make(map[string][]streams.PendingAgentPermission)}
+	manager.SetPendingPermissions("session-1", []streams.PendingAgentPermission{{
+		RequestID: "request-1",
+		PendingID: "pending-1",
+		Options: []streams.PermissionChoice{{
+			OptionID: "allow-once",
+			Kind:     streams.PermissionOptionKindAllowOnce,
+		}},
+	}})
+
+	for _, tuple := range []struct {
+		sessionID string
+		requestID string
+		pendingID string
+	}{
+		{sessionID: "session-other", requestID: "request-1", pendingID: "pending-1"},
+		{sessionID: "session-1", requestID: "request-other", pendingID: "pending-1"},
+		{sessionID: "session-1", requestID: "request-1", pendingID: "pending-other"},
+	} {
+		if _, err := manager.CancelPermissionBySessionID(t.Context(), tuple.sessionID, tuple.requestID, tuple.pendingID); err == nil || !strings.Contains(err.Error(), "permission no longer pending") {
+			t.Fatalf("mismatched cancellation (%+v) error = %v, want permission no longer pending", tuple, err)
+		}
+	}
+	listed, err := manager.ListPendingPermissionsBySessionID(t.Context(), "session-1")
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("list after mismatches = %+v, err=%v, want original permission", listed, err)
+	}
+
+	cancelled, err := manager.CancelPermissionBySessionID(t.Context(), "session-1", "request-1", "pending-1")
+	if err != nil || cancelled.Status != "cancelled" {
+		t.Fatalf("exact cancellation = %+v, err=%v", cancelled, err)
+	}
+	listed, err = manager.ListPendingPermissionsBySessionID(t.Context(), "session-1")
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("list after cancellation = %+v, err=%v, want empty", listed, err)
+	}
+	if _, err := manager.ResolvePermissionBySessionID(t.Context(), "session-1", "request-1", "pending-1", "allow-once"); err == nil || !strings.Contains(err.Error(), "permission no longer pending") {
+		t.Fatalf("resolve after cancellation error = %v, want permission no longer pending", err)
+	}
+}
+
+// ProbeBackgroundWorkloads simulates background-workload liveness probing.
+func (s *SimulatedAgentManagerClient) ProbeBackgroundWorkloads(ctx context.Context, sessionID string) (client.ProbeResult, error) {
+	return client.ProbeResultUnknown, nil
+}
+
+// CompleteAgent marks an agent as completed
+func (s *SimulatedAgentManagerClient) CompleteAgent(executionID string) {
+	s.mu.Lock()
+	execution, exists := s.instances[executionID]
+	s.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	execution.status = v1.AgentStatusCompleted
+	s.publishAgentEvent(events.AgentCompleted, execution)
+}
+
+// FailAgent marks an agent as failed
+func (s *SimulatedAgentManagerClient) FailAgent(executionID string, reason string) {
+	s.mu.Lock()
+	execution, exists := s.instances[executionID]
+	s.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	execution.status = v1.AgentStatusFailed
+	s.publishAgentEvent(events.AgentFailed, execution)
+}
+
+// GetLaunchCount returns the number of times LaunchAgent was called
+func (s *SimulatedAgentManagerClient) GetLaunchCount() int {
+	return int(atomic.LoadInt32(&s.launchCount))
+}
+
+// PromptCallCount returns the number of follow-up prompt dispatches. Launch
+// count alone cannot prove that an existing execution was not prompted.
+func (s *SimulatedAgentManagerClient) PromptCallCount() int {
+	return int(s.promptCalls.Load())
+}
+
+// Close stops all simulated agents
+func (s *SimulatedAgentManagerClient) Close() {
+	close(s.stopCh)
+}
+
+// IsAgentRunningForSession checks if a simulated agent is running for a session
+func (s *SimulatedAgentManagerClient) IsAgentRunningForSession(ctx context.Context, sessionID string) bool {
+	s.mu.Lock()
+	var instance *simulatedInstance
+	for _, inst := range s.instances {
+		if inst.sessionID == sessionID {
+			instance = inst
+			break
+		}
+	}
+	s.mu.Unlock()
+	if instance == nil {
+		return false
+	}
+	instance.statusMu.Lock()
+	running := instance.status == v1.AgentStatusRunning
+	instance.statusMu.Unlock()
+	return running
+}
+
+func (s *SimulatedAgentManagerClient) markAgentRunningForSession(sessionID string) bool {
+	s.mu.Lock()
+	var instance *simulatedInstance
+	for _, candidate := range s.instances {
+		if candidate.sessionID == sessionID {
+			instance = candidate
+			break
+		}
+	}
+	s.mu.Unlock()
+	if instance == nil {
+		return false
+	}
+	instance.statusMu.Lock()
+	instance.status = v1.AgentStatusRunning
+	instance.statusMu.Unlock()
+	return true
+}
+
+func (s *SimulatedAgentManagerClient) IsAgentReadyForPrompt(ctx context.Context, sessionID string) bool {
+	return s.IsAgentRunningForSession(ctx, sessionID)
+}
+
+// CancelAgent cancels the current agent turn for a session.
+// Returns lifecycle.ErrNoExecutionForSession when no live execution exists for the session
+// (for example, after CrashAgentForSession has been used to simulate a crash), matching the
+// real lifecycle adapter's behaviour.
+//
+// If the session has been marked "hung" via MarkAgentHungForSession, the call returns
+// lifecycle.ErrCancelEscalated to model the real manager's escalation path when the agent
+// accepts an ACP cancel but never publishes a completion event.
+func (s *SimulatedAgentManagerClient) CancelAgent(ctx context.Context, sessionID string) error {
+	s.logger.Info("simulated: cancelling agent turn",
+		zap.String("session_id", sessionID))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, inst := range s.instances {
+		if inst.sessionID != sessionID {
+			continue
+		}
+		if inst.hung {
+			return fmt.Errorf("session %q: %w", sessionID, lifecycle.ErrCancelEscalated)
+		}
+		return nil
+	}
+	return fmt.Errorf("session %q: %w", sessionID, lifecycle.ErrNoExecutionForSession)
+}
+
+// MarkAgentHungForSession marks the simulated agent for a session as "hung" so subsequent
+// CancelAgent calls return lifecycle.ErrCancelEscalated. This models a real agent that
+// acknowledged the ACP cancel but never emitted a completion event, forcing the lifecycle
+// manager to escalate.
+func (s *SimulatedAgentManagerClient) MarkAgentHungForSession(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, inst := range s.instances {
+		if inst.sessionID == sessionID {
+			inst.hung = true
+			return
+		}
+	}
+}
+
+// CrashAgentForSession simulates an agent subprocess crashing mid-turn.
+// It stops the agent simulation goroutine and removes the instance from the tracking map,
+// so subsequent lookups (CancelAgent, IsAgentRunningForSession) behave as if the execution
+// is gone. The session's state in the DB is deliberately left untouched — this mirrors the
+// real-world stuck state where the session is still RUNNING but no execution exists.
+func (s *SimulatedAgentManagerClient) CrashAgentForSession(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for execID, inst := range s.instances {
+		if inst.sessionID != sessionID {
+			continue
+		}
+		select {
+		case <-inst.stopCh:
+			// already stopped
+		default:
+			close(inst.stopCh)
+		}
+		delete(s.instances, execID)
+		return
+	}
+}
+
+// ResolveAgentProfile resolves an agent profile ID to profile information
+func (s *SimulatedAgentManagerClient) ResolveAgentProfile(ctx context.Context, profileID string) (*executor.AgentProfileInfo, error) {
+	return &executor.AgentProfileInfo{
+		ProfileID:   profileID,
+		ProfileName: "Simulated Profile",
+		AgentID:     "augment-agent",
+		AgentName:   "Augment Agent",
+		Model:       "claude-sonnet-4-20250514",
+	}, nil
+}
+
+func (s *SimulatedAgentManagerClient) RestartAgentProcess(ctx context.Context, agentExecutionID string) error {
+	s.restartProcessCalls.Add(1)
+	s.logger.Info("simulated: restarting agent process",
+		zap.String("agent_execution_id", agentExecutionID))
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) ResetAgentContext(ctx context.Context, agentExecutionID string) error {
+	s.resetContextCalls.Add(1)
+	return s.RestartAgentProcess(ctx, agentExecutionID)
+}
+
+func (s *SimulatedAgentManagerClient) ResetContextCallCount() int {
+	return int(s.resetContextCalls.Load())
+}
+
+func (s *SimulatedAgentManagerClient) RestartProcessCallCount() int {
+	return int(s.restartProcessCalls.Load())
+}
+
+func (s *SimulatedAgentManagerClient) SetSessionModelBySessionID(_ context.Context, _, _ string) error {
+	return fmt.Errorf("not supported")
+}
+
+func (s *SimulatedAgentManagerClient) SetSessionModeBySessionID(_ context.Context, _, _ string) error {
+	return fmt.Errorf("not supported")
+}
+
+func (s *SimulatedAgentManagerClient) WasSessionInitialized(_ string) bool { return false }
+func (s *SimulatedAgentManagerClient) IsPassthroughSession(ctx context.Context, sessionID string) bool {
+	return false
+}
+func (s *SimulatedAgentManagerClient) WritePassthroughStdin(_ context.Context, _ string, _ string) error {
+	return nil
+}
+func (s *SimulatedAgentManagerClient) ResolvePassthroughConfig(_ context.Context, _ string) (agents.PassthroughConfig, error) {
+	return agents.PassthroughConfig{}, nil
+}
+func (s *SimulatedAgentManagerClient) MarkPassthroughRunning(_ string) error {
+	return nil
+}
+
+func (s *SimulatedAgentManagerClient) GetRemoteRuntimeStatusBySession(ctx context.Context, sessionID string) (*executor.RemoteRuntimeStatus, error) {
+	return nil, nil
+}
+
+func (s *SimulatedAgentManagerClient) PollRemoteStatusForRecords(ctx context.Context, records []executor.RemoteStatusPollRequest) {
+}
+func (s *SimulatedAgentManagerClient) CleanupStaleExecutionBySessionID(ctx context.Context, sessionID string) error {
+	return nil
+}
+func (s *SimulatedAgentManagerClient) EnsureWorkspaceExecutionForSession(ctx context.Context, taskID, sessionID string) error {
+	return nil
+}
+func (s *SimulatedAgentManagerClient) GetExecutionIDForSession(_ context.Context, sessionID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for execID, inst := range s.instances {
+		if inst.sessionID == sessionID {
+			return execID, nil
+		}
+	}
+	return "", fmt.Errorf("no execution found for session %s", sessionID)
+}
+func (s *SimulatedAgentManagerClient) ListExecutionsForTask(taskID string) []lifecycle.ExecutionReference {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var references []lifecycle.ExecutionReference
+	for executionID, inst := range s.instances {
+		if inst.taskID == taskID && inst.sessionID != "" {
+			references = append(references, lifecycle.ExecutionReference{
+				SessionID: inst.sessionID, ExecutionID: executionID,
+			})
+		}
+	}
+	return references
+}
+func (s *SimulatedAgentManagerClient) GetGitLog(_ context.Context, _, _ string, _ int, _ string) (*client.GitLogResult, error) {
+	return nil, nil
+}
+func (s *SimulatedAgentManagerClient) GetCumulativeDiff(_ context.Context, _, _ string) (*client.CumulativeDiffResult, error) {
+	return nil, nil
+}
+func (s *SimulatedAgentManagerClient) GetGitStatus(_ context.Context, _ string) (*client.GitStatusResult, error) {
+	return &client.GitStatusResult{
+		Success:    true,
+		Branch:     "main",
+		HeadCommit: "simulated-commit",
+	}, nil
+}
+func (s *SimulatedAgentManagerClient) GetGitStatusFresh(_ context.Context, _ string) (*client.GitStatusResult, error) {
+	return nil, nil
+}
+func (s *SimulatedAgentManagerClient) WaitForAgentctlReady(_ context.Context, _ string) error {
+	return nil
+}
+func (s *SimulatedAgentManagerClient) GetSessionAuthMethods(_ string) []streams.AuthMethodInfo {
+	return nil
+}

@@ -1,0 +1,175 @@
+import { describe, expect, it } from "vitest";
+import {
+  getEnvironmentStatusSnapshot,
+  resolveExecutorEnvironmentStatus,
+  resolvePluginExecutorEnvironmentStatus,
+  resolvePluginExecutorRetention,
+} from "./executor-environment-status";
+import type {
+  ContainerLiveStatus,
+  PluginExecutorLiveStatus,
+  TaskEnvironment,
+} from "@/lib/api/domains/task-environment-api";
+import type { KubernetesSession } from "@/lib/types/http-kubernetes";
+
+const baseEnv: TaskEnvironment = {
+  id: "env-1",
+  task_id: "task-1",
+  repository_id: "repo-1",
+  executor_type: "local_docker",
+  executor_id: "local-docker",
+  executor_profile_id: "profile-1",
+  agent_execution_id: "exec-1",
+  control_port: 41001,
+  status: "ready",
+  created_at: "2026-05-02T00:00:00Z",
+  updated_at: "2026-05-02T00:00:00Z",
+};
+
+function container(overrides: Partial<ContainerLiveStatus>): ContainerLiveStatus {
+  return {
+    container_id: "container-1",
+    state: "running",
+    status: "running",
+    started_at: "2026-05-02T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function resolveKubernetesStatus(
+  session: KubernetesSession | null,
+  options: { loaded?: boolean; error?: string | null } = {},
+) {
+  return (
+    resolveExecutorEnvironmentStatus as unknown as (
+      env: TaskEnvironment,
+      container: ContainerLiveStatus | null,
+      kubernetes: {
+        session: KubernetesSession | null;
+        loaded: boolean;
+        error: string | null;
+      },
+    ) => ReturnType<typeof resolveExecutorEnvironmentStatus>
+  )({ ...baseEnv, executor_type: "k8s", status: "ready" }, null, {
+    session,
+    loaded: options.loaded ?? true,
+    error: options.error ?? null,
+  });
+}
+
+describe("resolveExecutorEnvironmentStatus", () => {
+  it("uses live container state ahead of recorded environment status", () => {
+    expect(
+      resolveExecutorEnvironmentStatus(
+        { ...baseEnv, status: "ready" },
+        container({ state: "exited", status: "exited", exit_code: 137 }),
+      ),
+    ).toEqual({ label: "exited (137)", tone: "error" });
+  });
+
+  it("shows paused containers as a warning state", () => {
+    expect(resolveExecutorEnvironmentStatus(baseEnv, container({ state: "paused" }))).toEqual({
+      label: "paused",
+      tone: "warn",
+    });
+  });
+
+  it("falls back to the persisted environment status when no live container exists", () => {
+    expect(resolveExecutorEnvironmentStatus({ ...baseEnv, status: "creating" }, null)).toEqual({
+      label: "starting",
+      tone: "warn",
+    });
+  });
+
+  it("uses exact Kubernetes state instead of the recorded ready status", () => {
+    expect(
+      resolveKubernetesStatus({
+        session_id: "session-1",
+        task_id: "task-1",
+        pod_phase: "Running",
+        container_state: "running",
+        restarts: 0,
+      }),
+    ).toEqual({ label: "Running", tone: "running" });
+    expect(resolveKubernetesStatus(null)).toEqual({ label: "Unavailable", tone: "warn" });
+    expect(resolveKubernetesStatus(null, { error: "status request failed" })).toEqual({
+      label: "Error",
+      tone: "error",
+    });
+  });
+
+  it("prioritizes Kubernetes failure reason and pending state", () => {
+    expect(
+      resolveKubernetesStatus({
+        session_id: "session-1",
+        task_id: "task-1",
+        pod_phase: "Pending",
+        container_state: "waiting",
+        restarts: 0,
+      }),
+    ).toEqual({ label: "Waiting", tone: "warn" });
+    expect(
+      resolveKubernetesStatus({
+        session_id: "session-1",
+        task_id: "task-1",
+        pod_phase: "Failed",
+        container_state: "terminated",
+        restarts: 1,
+        failure_reason: "ImagePullBackOff",
+      }),
+    ).toEqual({ label: "ImagePullBackOff", tone: "error" });
+  });
+});
+
+describe("getEnvironmentStatusSnapshot", () => {
+  it("uses a stable key for status transition notifications", () => {
+    expect(getEnvironmentStatusSnapshot(baseEnv, container({ state: "running" }))).toEqual({
+      key: "running:running",
+      label: "running",
+      tone: "running",
+    });
+    expect(getEnvironmentStatusSnapshot(null, null)).toEqual({
+      key: "none",
+      label: "not created",
+      tone: "neutral",
+    });
+  });
+});
+
+describe("plugin executor status", () => {
+  it.each([
+    ["expired", "Expired", "error"],
+    ["unknown", "Unknown", "warn"],
+    ["unavailable", "Unavailable", "warn"],
+    ["cleanup_pending", "Cleanup pending", "warn"],
+  ] as const)("projects %s without implying a false expiry", (state, label, tone) => {
+    const status: PluginExecutorLiveStatus = {
+      state,
+      retention: "unknown",
+      deadline_passed: state !== "expired",
+    };
+    expect(resolvePluginExecutorEnvironmentStatus(status)).toEqual({ label, tone });
+  });
+
+  it("keeps retention consequence and exact expiry explicit", () => {
+    expect(resolvePluginExecutorRetention("persistent")).toBe("Workspace data is retained.");
+    expect(resolvePluginExecutorRetention("bounded")).toBe(
+      "Workspace data may be lost when compute expires.",
+    );
+    expect(resolvePluginExecutorRetention("unknown")).toBe("Workspace retention is unknown.");
+    const pluginStatus: PluginExecutorLiveStatus = {
+      state: "running",
+      retention: "bounded",
+      expires_at: "2026-09-26T18:00:00Z",
+      deadline_passed: false,
+    };
+    expect(
+      resolveExecutorEnvironmentStatus(
+        { ...baseEnv, executor_type: "plugin_remote" },
+        null,
+        undefined,
+        pluginStatus,
+      ),
+    ).toEqual({ label: "Running", tone: "running" });
+  });
+});

@@ -1,0 +1,2026 @@
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	promptcfg "github.com/kandev/kandev/config/prompts"
+	"github.com/kandev/kandev/internal/common/securityutil"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/github"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/service"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+)
+
+func isWatcherCapacityRejection(err error) bool {
+	return errors.Is(err, wfmodels.ErrWIPLimitExceeded)
+}
+
+const (
+	issueWatchIDKey             = "issue_watch_id"
+	issueNumberKey              = "issue_number"
+	githubPRStateOpen           = "open"
+	githubPRStateClosed         = "closed"
+	githubPRStateMerged         = "merged"
+	ciAutomationDetachedTimeout = 2 * time.Minute
+)
+
+// GitHubService is the interface the orchestrator uses for GitHub operations.
+// All PR-write methods carry repository_id so multi-repo tasks (where the
+// same task spans multiple repos and so multiple PRs) don't collapse to one
+// row by colliding on the legacy UNIQUE(session_id) / UNIQUE(task_id, pr_number)
+// constraints. Empty repository_id preserves single-repo legacy behavior.
+type GitHubService interface {
+	CreatePRWatch(ctx context.Context, sessionID, taskID, repositoryID, owner, repo string, prNumber int, branch string) (*github.PRWatch, error)
+	CreatePRWatchForWorkspace(ctx context.Context, workspaceID, sessionID, taskID, repositoryID, owner, repo string, prNumber int, branch string) (*github.PRWatch, error)
+	EnsurePRWatchForWorkspace(ctx context.Context, workspaceID, sessionID, taskID, repositoryID, owner, repo, branch string) (*github.PRWatch, error)
+	FindPRByBranchForWorkspace(ctx context.Context, workspaceID, owner, repo, branch string) (*github.PR, error)
+	GetPRWatchBySessionAndRepo(ctx context.Context, sessionID, repositoryID string) (*github.PRWatch, error)
+	GetPRWatchBySessionRepoAndBranch(ctx context.Context, sessionID, repositoryID, branch string) (*github.PRWatch, error)
+	ListPRWatchesBySession(ctx context.Context, sessionID string) ([]*github.PRWatch, error)
+	UpdatePRWatchBranchIfSearching(ctx context.Context, id, branch string) error
+	UpdatePRWatchPRNumber(ctx context.Context, id string, prNumber int) error
+	UpdatePRWatchRepository(ctx context.Context, id, owner, repo string) error
+	ResetPRWatch(ctx context.Context, id, branch string) error
+	AssociatePRWithTask(ctx context.Context, taskID, repositoryID string, pr *github.PR) (*github.TaskPR, error)
+	AssociatePRWithTaskForWorkspace(ctx context.Context, workspaceID, taskID, repositoryID string, pr *github.PR) (*github.TaskPR, error)
+	GetTaskPR(ctx context.Context, taskID string) (*github.TaskPR, error)
+	ListTaskPRs(ctx context.Context, taskIDs []string) (map[string][]*github.TaskPR, error)
+	TriggerPRSyncAll(ctx context.Context, taskID string) ([]*github.TaskPR, error)
+	GetTaskPRByOwnerRepoNumber(ctx context.Context, taskID, owner, repo string, prNumber int) (*github.TaskPR, error)
+	GetTaskCIOptionsResponse(ctx context.Context, taskID string) (*github.TaskCIOptionsResponse, error)
+	GetTaskCIPRState(ctx context.Context, taskID, repositoryID string, prNumber int) (*github.TaskCIPRAutomationState, error)
+	RecordTaskCIFixAttempt(ctx context.Context, attempt github.TaskCIFixAttempt) error
+	RefreshTaskCIFixCheckpoint(ctx context.Context, taskID, repositoryID string, prNumber int, signature, checkpointJSON string) error
+	RecordTaskCIMergeAttempt(ctx context.Context, attempt github.TaskCIMergeAttempt) error
+	RecordTaskCIMergeAttemptResult(ctx context.Context, taskID, repositoryID string, prNumber int, signature, result, message string) error
+	RecordTaskCIMergeQueueObservation(ctx context.Context, observation github.TaskCIMergeQueueObservation) error
+	RecordTaskCIError(ctx context.Context, taskID, repositoryID string, prNumber int, message string) error
+	RecordTaskCIAutoMergeError(ctx context.Context, taskID, repositoryID string, prNumber int, message string) error
+	MarkTaskCIAutoFixExhausted(ctx context.Context, taskID, repositoryID string, prNumber int, message string) error
+	ClearTaskCIError(ctx context.Context, taskID, repositoryID string, prNumber int) error
+	GetPRFeedbackForAutomation(ctx context.Context, workspaceID, owner, repo string, number int) (*github.PRFeedback, error)
+	MergePRForAutomation(ctx context.Context, workspaceID, owner, repo string, number int, mergeMethod, expectedHeadSHA string) error
+	ListActivePRWatches(ctx context.Context) ([]*github.PRWatch, error)
+	ReserveReviewPRTask(ctx context.Context, watchID, repoOwner, repoName string, prNumber int, prURL string) (bool, error)
+	AssignReviewPRTaskID(ctx context.Context, watchID, repoOwner, repoName string, prNumber int, taskID string) error
+	ReleaseReviewPRTask(ctx context.Context, watchID, repoOwner, repoName string, prNumber int) error
+
+	// Issue watch dedup operations
+	ReserveIssueWatchTask(ctx context.Context, watchID, repoOwner, repoName string, issueNumber int, issueURL string) (bool, error)
+	AssignIssueWatchTaskID(ctx context.Context, watchID, repoOwner, repoName string, issueNumber int, taskID string) error
+	ReleaseIssueWatchTask(ctx context.Context, watchID, repoOwner, repoName string, issueNumber int) error
+
+	// Self-heal operations: invoked from createIssueTask / createReviewTask
+	// when the watcher's bound agent profile has been soft-deleted. Symmetric
+	// with the Linear/Jira coordinator-driven path.
+	DisableIssueWatchWithError(ctx context.Context, watchID, cause string) error
+	DisableReviewWatchWithError(ctx context.Context, watchID, cause string) error
+}
+
+// ReviewTaskCreator creates tasks from review watch events.
+type ReviewTaskCreator interface {
+	CreateReviewTask(ctx context.Context, req *ReviewTaskRequest) (*models.Task, error)
+}
+
+// IssueTaskCreator creates tasks from issue watch events.
+type IssueTaskCreator interface {
+	CreateIssueTask(ctx context.Context, req *IssueTaskRequest) (*models.Task, error)
+}
+
+// IssueTaskRequest contains the data for creating a task from an issue watch event.
+type IssueTaskRequest struct {
+	WorkspaceID    string
+	WorkflowID     string
+	WorkflowStepID string
+	Title          string
+	Description    string
+	Metadata       map[string]interface{}
+	Repositories   []IssueTaskRepository
+}
+
+// IssueTaskRepository associates a repository with an issue task.
+type IssueTaskRepository struct {
+	RepositoryID string
+	BaseBranch   string
+}
+
+// RepositoryResolver resolves a GitHub repo to a local clone + Repository DB record.
+type RepositoryResolver interface {
+	ResolveForReview(ctx context.Context, workspaceID, provider, owner, name, defaultBranch string) (repositoryID, baseBranch string, err error)
+}
+
+// ReviewTaskRequest contains the data for creating a task from a review watch PR.
+type ReviewTaskRequest struct {
+	WorkspaceID    string
+	WorkflowID     string
+	WorkflowStepID string
+	Title          string
+	Description    string
+	Metadata       map[string]interface{}
+	Repositories   []ReviewTaskRepository
+	// IsEphemeral marks a quick-chat-style task. Automation runs do NOT set
+	// it: they are hidden from the board by their Origin instead, which is
+	// what lets them keep their worktree and reach a terminal run status.
+	IsEphemeral bool
+	// Origin tags the task with a provenance label (see task/models.TaskOrigin*).
+	// Defaults to TaskOriginManual when empty.
+	Origin string
+}
+
+// ReviewTaskRepository associates a repository with a review task.
+type ReviewTaskRepository struct {
+	RepositoryID   string
+	BaseBranch     string
+	CheckoutBranch string
+	PRNumber       int // GitHub PR number; carried so worktree creation can use refs/pull/<N>/head for fork PRs.
+	// Name is the repository's configured Name, populated only by
+	// resolveExplicitRepositories for use by the webhook repository-selector
+	// match in resolveAutomationRepository (see S1 in the alert-ingest spec).
+	// Task creation itself does not read it.
+	Name string
+}
+
+// SetGitHubService sets the GitHub service for PR auto-detection.
+func (s *Service) SetGitHubService(ghSvc GitHubService) {
+	s.githubService = ghSvc
+}
+
+// SetReviewTaskCreator sets the task creator for review watch auto-task creation.
+func (s *Service) SetReviewTaskCreator(tc ReviewTaskCreator) {
+	s.reviewTaskCreator = tc
+}
+
+// SetRepositoryResolver sets the repository resolver for review task creation.
+func (s *Service) SetRepositoryResolver(rr RepositoryResolver) {
+	s.repositoryResolver = rr
+}
+
+// SetIssueTaskCreator sets the task creator for issue watch auto-task
+// creation. Holds s.mu across both the field write and the coordinator
+// (re)init so the watcherCoordinator / issueTaskCreator pair stays
+// consistent against concurrent SetProfileLookup or dispatchWatcherEvent
+// goroutines — the asymmetric locking surface flagged on PR #1094 review.
+func (s *Service) SetIssueTaskCreator(tc IssueTaskCreator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.issueTaskCreator = tc
+	s.initWatcherCoordinatorLocked()
+}
+
+// handlePRFeedback logs PR feedback events. WS broadcasting is handled in main.go.
+func (s *Service) handlePRFeedback(ctx context.Context, event *bus.Event) error {
+	feedbackEvt, ok := event.Data.(*github.PRFeedbackEvent)
+	if !ok {
+		return nil
+	}
+	s.logger.Debug("received PR feedback event",
+		zap.String("session_id", feedbackEvt.SessionID),
+		zap.Int("pr_number", feedbackEvt.PRNumber))
+	if s.githubService != nil {
+		pr, err := s.githubService.GetTaskPRByOwnerRepoNumber(ctx, feedbackEvt.TaskID, feedbackEvt.Owner, feedbackEvt.Repo, feedbackEvt.PRNumber)
+		if err != nil {
+			s.logger.Debug("failed to load task PR for CI automation", zap.String("task_id", feedbackEvt.TaskID), zap.Error(err))
+			return nil
+		}
+		if pr != nil {
+			s.startTaskPRCIAutomation(ctx, pr)
+		}
+	}
+	return nil
+}
+
+func (s *Service) handleTaskPRUpdated(ctx context.Context, event *bus.Event) error {
+	pr, ok := event.Data.(*github.TaskPR)
+	if !ok || pr == nil {
+		return nil
+	}
+	s.startTaskPRCIAutomation(ctx, pr)
+	return nil
+}
+
+func (s *Service) handleTaskCIOptionsUpdated(ctx context.Context, event *bus.Event) error {
+	options, ok := event.Data.(*github.TaskCIOptionsResponse)
+	if !ok || options == nil || event.Source == ciAutomationStateEventSource ||
+		!anyTaskPRAutomationEnabled(options) || s.githubService == nil {
+		return nil
+	}
+	detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ciAutomationDetachedTimeout)
+	defer cancel()
+	prs, err := s.githubService.TriggerPRSyncAll(detachedCtx, options.TaskID)
+	if err != nil {
+		s.logger.Warn("failed to sync task PRs for CI automation options update", zap.String("task_id", options.TaskID), zap.Error(err))
+		s.recordTaskCIOptionsSyncError(detachedCtx, options.TaskID, prs, err)
+	}
+	for _, pr := range prs {
+		s.startTaskPRCIAutomationWithoutRefresh(ctx, pr)
+	}
+	return nil
+}
+
+// anyTaskPRAutomationEnabled reports whether any linked PR has at least one
+// automation switch on. Per-PR scoping means the task-wide aggregate on
+// options can be false (mixed configuration across PRs) while individual
+// PRs still need this update's PR sync — so this checks the per-PR array
+// rather than the aggregated top-level booleans. Falls back to the top-level
+// booleans when PROptions is empty (e.g. a caller that built the response by
+// hand without per-PR data), matching resolvePRScopedCIOptions's same
+// graceful-degradation pattern rather than silently swallowing the event.
+func anyTaskPRAutomationEnabled(options *github.TaskCIOptionsResponse) bool {
+	if options == nil {
+		return false
+	}
+	if len(options.PROptions) == 0 {
+		return options.AutoFixEnabled || options.AutoMergeEnabled ||
+			options.PromptOnReviewRequested || options.PromptOnMerged || options.PromptOnClosed
+	}
+	for _, opt := range options.PROptions {
+		if opt == nil {
+			continue
+		}
+		if opt.AutoFixEnabled || opt.AutoMergeEnabled ||
+			opt.PromptOnReviewRequested || opt.PromptOnMerged || opt.PromptOnClosed {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) recordTaskCIOptionsSyncError(ctx context.Context, taskID string, synced []*github.TaskPR, syncErr error) {
+	syncedKeys := make(map[ciAutomationTaskPRSyncKey]struct{}, len(synced))
+	for _, pr := range synced {
+		if pr == nil {
+			continue
+		}
+		syncedKeys[ciAutomationTaskPRSyncKeyFor(pr)] = struct{}{}
+	}
+	prsByTask, err := s.githubService.ListTaskPRs(ctx, []string{taskID})
+	if err != nil {
+		s.logger.Warn("failed to load task PRs after CI automation sync failure", zap.String("task_id", taskID), zap.Error(err))
+		return
+	}
+	for _, pr := range prsByTask[taskID] {
+		if _, ok := syncedKeys[ciAutomationTaskPRSyncKeyFor(pr)]; ok {
+			continue
+		}
+		s.recordCIAutomationError(ctx, pr, fmt.Sprintf("sync PR status: %v", syncErr))
+	}
+}
+
+type ciAutomationTaskPRSyncKey struct {
+	repositoryID string
+	owner        string
+	repo         string
+	prNumber     int
+}
+
+func ciAutomationTaskPRSyncKeyFor(pr *github.TaskPR) ciAutomationTaskPRSyncKey {
+	if pr == nil {
+		return ciAutomationTaskPRSyncKey{}
+	}
+	return ciAutomationTaskPRSyncKey{
+		repositoryID: pr.RepositoryID,
+		owner:        strings.ToLower(pr.Owner),
+		repo:         strings.ToLower(pr.Repo),
+		prNumber:     pr.PRNumber,
+	}
+}
+
+func (s *Service) startTaskPRCIAutomation(ctx context.Context, pr *github.TaskPR) {
+	s.startTaskPRCIAutomationWithRefresh(ctx, pr, true)
+}
+
+func (s *Service) startTaskPRCIAutomationWithoutRefresh(ctx context.Context, pr *github.TaskPR) {
+	s.startTaskPRCIAutomationWithRefresh(ctx, pr, false)
+}
+
+func (s *Service) startTaskPRCIAutomationWithRefresh(ctx context.Context, pr *github.TaskPR, refresh bool) {
+	if pr == nil {
+		return
+	}
+	s.ciAutomationMu.Lock()
+	if s.ciAutomationStopped {
+		s.ciAutomationMu.Unlock()
+		return
+	}
+	if s.ciAutomationCtx == nil {
+		s.ciAutomationCtx, s.ciAutomationCancel = context.WithCancel(context.Background())
+	}
+	workerCtx := s.ciAutomationCtx
+	s.ciAutomationWorkers.Add(1)
+	s.ciAutomationMu.Unlock()
+	key := fmt.Sprintf("%s|%s|%d", pr.TaskID, pr.RepositoryID, pr.PRNumber)
+	request := ciAutomationRequest{ctx: ctx, pr: pr, refresh: refresh}
+	if !s.ciAutomationInFlight.Enqueue(key, request) {
+		s.ciAutomationWorkers.Done()
+		s.logger.Debug("CI automation follow-up coalesced",
+			zap.String("task_id", pr.TaskID),
+			zap.String("repository_id", pr.RepositoryID),
+			zap.Int("pr_number", pr.PRNumber))
+		return
+	}
+	go func() {
+		defer s.ciAutomationWorkers.Done()
+		for {
+			if workerCtx.Err() != nil {
+				return
+			}
+			automationCtx, cancel := context.WithTimeout(workerCtx, ciAutomationDetachedTimeout)
+			err := s.handleTaskPRCIAutomationWithRefresh(automationCtx, request.pr, request.refresh)
+			cancel()
+			if err != nil {
+				s.logger.Debug("CI automation handling failed", zap.String("task_id", request.pr.TaskID), zap.Error(err))
+			}
+			var ok bool
+			request, ok = s.ciAutomationInFlight.Next(key)
+			if !ok {
+				return
+			}
+		}
+	}()
+}
+
+type ciAutomationRequest struct {
+	ctx     context.Context
+	pr      *github.TaskPR
+	refresh bool
+}
+
+type ciAutomationWork struct {
+	pending *ciAutomationRequest
+}
+
+// ciAutomationCoordinator owns the per-PR worker lifecycle. Enqueue returns
+// true only to the caller that must start the worker. Later requests replace
+// the single pending follow-up while preserving the strongest refresh need.
+type ciAutomationCoordinator struct {
+	mu    sync.Mutex
+	works map[string]*ciAutomationWork
+}
+
+func (c *ciAutomationCoordinator) Enqueue(key string, request ciAutomationRequest) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.works == nil {
+		c.works = make(map[string]*ciAutomationWork)
+	}
+	if work, ok := c.works[key]; ok {
+		if work.pending != nil && work.pending.refresh {
+			request.refresh = true
+		}
+		work.pending = &request
+		return false
+	}
+	c.works[key] = &ciAutomationWork{}
+	return true
+}
+
+func (c *ciAutomationCoordinator) Next(key string) (ciAutomationRequest, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	work, ok := c.works[key]
+	if !ok {
+		return ciAutomationRequest{}, false
+	}
+	if work.pending != nil {
+		request := *work.pending
+		work.pending = nil
+		return request, true
+	}
+	delete(c.works, key)
+	return ciAutomationRequest{}, false
+}
+
+// Has reports whether a worker is currently active for key. It is intentionally
+// read-only so tests can observe coalescing without exposing coordinator state.
+func (c *ciAutomationCoordinator) Has(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, exists := c.works[key]
+	return exists
+}
+
+func (s *Service) resetCIAutomationWorkers() {
+	s.ciAutomationMu.Lock()
+	defer s.ciAutomationMu.Unlock()
+	s.ciAutomationStopped = false
+	s.ciAutomationCtx, s.ciAutomationCancel = context.WithCancel(context.Background())
+}
+
+func (s *Service) stopCIAutomationWorkers() {
+	s.ciAutomationMu.Lock()
+	s.ciAutomationStopped = true
+	cancel := s.ciAutomationCancel
+	s.ciAutomationMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.ciAutomationWorkers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(sendNowClaimRecoveryTimeout):
+		s.logger.Warn("timed out waiting for CI automation workers during shutdown")
+	}
+}
+
+// handleNewReviewPR creates a task for a new PR needing review.
+// Auto-start is determined by the workflow step's on_enter actions.
+func (s *Service) handleNewReviewPR(ctx context.Context, event *bus.Event) error {
+	reviewEvt, ok := event.Data.(*github.NewReviewPREvent)
+	if !ok {
+		return nil
+	}
+
+	pr := reviewEvt.PR
+	s.logger.Info("new PR to review detected",
+		zap.String("review_watch_id", reviewEvt.ReviewWatchID),
+		zap.String("repo", fmt.Sprintf("%s/%s", pr.RepoOwner, pr.RepoName)),
+		zap.Int("pr_number", pr.Number))
+
+	if s.reviewTaskCreator == nil {
+		s.logger.Warn("review task creator not configured, skipping task creation")
+		return nil
+	}
+
+	// Use a background context: the parent ctx may be an HTTP request context
+	// that gets canceled as soon as the response is sent, but the clone +
+	// task creation must survive beyond the request lifetime.
+	go s.createReviewTask(context.Background(), reviewEvt)
+	return nil
+}
+
+func (s *Service) createReviewTask(ctx context.Context, evt *github.NewReviewPREvent) {
+	pr := evt.PR
+	repoSlug := fmt.Sprintf("%s/%s", pr.RepoOwner, pr.RepoName)
+
+	s.logger.Debug("creating review task from PR",
+		zap.String("repo", repoSlug),
+		zap.Int("pr_number", pr.Number),
+		zap.String("head_branch", pr.HeadBranch),
+		zap.String("base_branch", pr.BaseBranch),
+		zap.String("review_watch_id", evt.ReviewWatchID))
+
+	if s.preflightDeletedProfileForGitHubReview(ctx, evt) {
+		return
+	}
+
+	if !s.reserveReviewPR(ctx, evt) {
+		return
+	}
+
+	repositories := s.resolveReviewRepository(ctx, evt.WorkspaceID, pr)
+	task, err := s.reviewTaskCreator.CreateReviewTask(ctx, buildReviewTaskRequest(evt, repositories, repoSlug))
+	if err != nil {
+		if isWatcherCapacityRejection(err) {
+			s.logger.Info("review workflow step at capacity; deferring review task",
+				zap.String("review_watch_id", evt.ReviewWatchID),
+				zap.Int("pr_number", pr.Number),
+				zap.String("workflow_step_id", evt.WorkflowStepID),
+				zap.Error(err))
+		} else {
+			s.logger.Error("failed to create review task",
+				zap.String("review_watch_id", evt.ReviewWatchID),
+				zap.Int("pr_number", pr.Number),
+				zap.Error(err))
+		}
+		s.releaseReviewPR(ctx, evt)
+		return
+	}
+
+	s.attachTaskToReservation(ctx, evt, task.ID)
+
+	s.logger.Info("created review task",
+		zap.String("task_id", task.ID),
+		zap.Int("pr_number", pr.Number),
+		zap.String("repo", repoSlug))
+
+	// Check if the target workflow step has auto_start_agent on_enter action.
+	// If so, start the task (which launches the agent and triggers processOnEnter).
+	// Otherwise, the task sits in the step waiting for user action.
+	if task.QueuedForStepID != "" || !s.shouldAutoStartStep(ctx, task.WorkflowStepID) {
+		return
+	}
+	s.autoStartReviewTask(ctx, evt, task)
+}
+
+// reserveReviewPR atomically claims the dedup slot before the slow clone +
+// task creation. Returns false (caller must bail) if another handler already
+// holds the slot or if the reserve call errored. A nil githubService means
+// dedup is disabled and we always proceed.
+func (s *Service) reserveReviewPR(ctx context.Context, evt *github.NewReviewPREvent) bool {
+	if s.githubService == nil {
+		return true
+	}
+	pr := evt.PR
+	reserved, err := s.githubService.ReserveReviewPRTask(
+		ctx, evt.ReviewWatchID, pr.RepoOwner, pr.RepoName, pr.Number, pr.HTMLURL,
+	)
+	if err != nil {
+		s.logger.Error("failed to reserve review PR slot",
+			zap.String("review_watch_id", evt.ReviewWatchID),
+			zap.Int("pr_number", pr.Number),
+			zap.Error(err))
+		return false
+	}
+	if !reserved {
+		s.logger.Debug("review PR already reserved by concurrent handler, skipping",
+			zap.String("review_watch_id", evt.ReviewWatchID),
+			zap.Int("pr_number", pr.Number))
+		return false
+	}
+	return true
+}
+
+// releaseReviewPR removes the reservation when task creation fails so a later
+// poll can retry this PR instead of it being blocked by an orphan row.
+func (s *Service) releaseReviewPR(ctx context.Context, evt *github.NewReviewPREvent) {
+	if s.githubService == nil {
+		return
+	}
+	pr := evt.PR
+	if err := s.githubService.ReleaseReviewPRTask(
+		ctx, evt.ReviewWatchID, pr.RepoOwner, pr.RepoName, pr.Number,
+	); err != nil {
+		s.logger.Warn("failed to release review PR reservation after task-create failure",
+			zap.Int("pr_number", pr.Number),
+			zap.Error(err))
+	}
+}
+
+// attachTaskToReservation stamps the created task ID onto the reservation and
+// associates the PR with the task so the frontend can display PR info.
+func (s *Service) attachTaskToReservation(ctx context.Context, evt *github.NewReviewPREvent, taskID string) {
+	if s.githubService == nil {
+		return
+	}
+	pr := evt.PR
+	if err := s.githubService.AssignReviewPRTaskID(
+		ctx, evt.ReviewWatchID, pr.RepoOwner, pr.RepoName, pr.Number, taskID,
+	); err != nil {
+		s.logger.Error("failed to assign task ID to review PR reservation",
+			zap.String("task_id", taskID),
+			zap.Int("pr_number", pr.Number),
+			zap.Error(err))
+	}
+	// Review tasks are single-repo (the PR's own repo). Resolve to that
+	// task_repository's repository_id so the resulting TaskPR row is scoped
+	// per-repo even though there's only one. Empty falls back to legacy
+	// "delete all" semantics which is fine for the 1-repo case.
+	repositoryID := s.resolvePrimaryTaskRepositoryID(ctx, taskID)
+	if _, err := s.githubService.AssociatePRWithTask(ctx, taskID, repositoryID, pr); err != nil {
+		s.logger.Error("failed to associate PR with review task",
+			zap.String("task_id", taskID),
+			zap.Int("pr_number", pr.Number),
+			zap.Error(err))
+	}
+}
+
+// buildReviewTaskRequest builds the ReviewTaskRequest payload from an event.
+func buildReviewTaskRequest(evt *github.NewReviewPREvent, repositories []ReviewTaskRepository, repoSlug string) *ReviewTaskRequest {
+	pr := evt.PR
+	metadata := map[string]interface{}{
+		"review_watch_id":     evt.ReviewWatchID,
+		"pr_number":           pr.Number,
+		"pr_url":              pr.HTMLURL,
+		"pr_repo":             repoSlug,
+		"pr_author":           pr.AuthorLogin,
+		"pr_branch":           pr.HeadBranch,
+		"agent_profile_id":    evt.AgentProfileID,
+		"executor_profile_id": evt.ExecutorProfileID,
+		// Permanent guard: both the workflow-promotion path and this watcher's
+		// synchronous path must compete for the one-shot launch token.
+		models.MetaKeyAutoStartGuard: true,
+	}
+	if reviewPRHeadMatchesBase(pr) {
+		metadata[models.MetaKeyAutoStartClaimed] = true
+	} else {
+		// Fork-controlled files can be evaluated by the repository setup script,
+		// which receives executor-profile environment values. Leave fork review
+		// tasks for an explicit user start instead of granting an unattended token.
+		metadata[models.MetaKeyForkPRRequiresManualStart] = true
+	}
+	return &ReviewTaskRequest{
+		WorkspaceID:    evt.WorkspaceID,
+		WorkflowID:     evt.WorkflowID,
+		WorkflowStepID: evt.WorkflowStepID,
+		Title:          service.TruncateTaskTitle(fmt.Sprintf("PR #%d: %s", pr.Number, pr.Title)),
+		Description:    interpolateReviewPrompt(evt.Prompt, pr),
+		Repositories:   repositories,
+		Metadata:       metadata,
+	}
+}
+
+func reviewPRHeadMatchesBase(pr *github.PR) bool {
+	if pr == nil || pr.RepoOwner == "" || pr.RepoName == "" || pr.HeadRepoOwner == "" || pr.HeadRepoName == "" {
+		return false
+	}
+	return strings.EqualFold(pr.RepoOwner, pr.HeadRepoOwner) && strings.EqualFold(pr.RepoName, pr.HeadRepoName)
+}
+
+// buildIssueTaskTitle builds the "Issue #<n>: <title>" task title for an issue
+// watcher, shortened to the task title limit so an over-long remote issue title
+// does not cause CreateIssueTask to reject the whole task.
+func buildIssueTaskTitle(number int, title string) string {
+	return service.TruncateTaskTitle(fmt.Sprintf("Issue #%d: %s", number, title))
+}
+
+// shouldAutoStartStep checks if the workflow step has the OnEnterAutoStartAgent action.
+func (s *Service) shouldAutoStartStep(ctx context.Context, stepID string) bool {
+	if s.workflowStepGetter == nil || stepID == "" {
+		return false
+	}
+	step, err := s.workflowStepGetter.GetStep(ctx, stepID)
+	if err != nil {
+		s.logger.Warn("failed to get workflow step for auto-start check",
+			zap.String("step_id", stepID),
+			zap.Error(err))
+		return false
+	}
+	return step.HasOnEnterAction(wfmodels.OnEnterAutoStartAgent)
+}
+
+func (s *Service) autoStartReviewTask(
+	ctx context.Context, evt *github.NewReviewPREvent, task *models.Task,
+) {
+	if taskRequiresManualForkPRStart(task) {
+		s.logger.Info("fork review task is waiting for a manual start",
+			zap.String("task_id", task.ID), zap.Int("pr_number", evt.PR.Number))
+		return
+	}
+	if s.shouldSkipTerminalPRAutoStart(ctx, task) {
+		return
+	}
+	createAutoStartOwned := s.ownsAutoStartOnCreateInFlight(task.ID)
+	// Compete for the one-shot auto-start token set at task creation.
+	// The promotion that ran inside CreateTask may have already triggered
+	// autoStartTaskForStep (Path A) asynchronously; only the first claimer
+	// launches so exactly one session is created for the task.
+	if !s.claimAutoStart(ctx, task.ID, "review.auto_start") {
+		s.logger.Debug("review auto-start claim unavailable; skipping automatic launch",
+			zap.String("task_id", task.ID),
+			zap.Int("pr_number", evt.PR.Number))
+		return
+	}
+
+	_, err := s.StartTask(
+		ctx,
+		task.ID,
+		evt.AgentProfileID,
+		"",
+		evt.ExecutorProfileID,
+		"",
+		task.Description,
+		task.WorkflowStepID,
+		false,
+		true,
+		nil,
+	)
+	if errors.Is(err, ErrCeilingLaunchDeferred) {
+		s.logger.Info("review auto-start deferred by session ceiling; will replay once capacity frees up",
+			zap.String("task_id", task.ID),
+			zap.Int("pr_number", evt.PR.Number))
+		s.completeAutoStartOnCreate(ctx, task.ID, "review.auto_start")
+		return
+	}
+	if err != nil {
+		s.logger.Error("failed to auto-start review task",
+			zap.String("task_id", task.ID),
+			zap.Error(err))
+		s.restoreAutoStartClaim(ctx, task.ID, "review.auto_start")
+		if createAutoStartOwned || s.ownsAutoStartOnCreateInFlight(task.ID) {
+			s.restoreAutoStartOnCreate(ctx, task.ID, "review.auto_start")
+		}
+		return
+	}
+	// The watcher path can win the permanent review guard while the
+	// create-time path is still preparing its detached launch. A successful
+	// watcher launch satisfies that intent too, so clear the durable marker
+	// owned by the other path.
+	s.completeAutoStartOnCreate(ctx, task.ID, "review.auto_start")
+	s.logger.Info("auto-started review task",
+		zap.String("task_id", task.ID),
+		zap.Int("pr_number", evt.PR.Number))
+}
+
+// resolveReviewRepository attempts to resolve and clone the PR's repository.
+// Returns a slice with one entry on success, or nil on failure (graceful degradation).
+func (s *Service) resolveReviewRepository(ctx context.Context, workspaceID string, pr *github.PR) []ReviewTaskRepository {
+	if s.repositoryResolver == nil {
+		return nil
+	}
+	repoSlug := fmt.Sprintf("%s/%s", pr.RepoOwner, pr.RepoName)
+	s.logger.Debug("resolving review repository",
+		zap.String("repo", repoSlug),
+		zap.String("pr_base_branch", pr.BaseBranch),
+		zap.String("pr_head_branch", pr.HeadBranch))
+
+	repoID, baseBranch, err := s.repositoryResolver.ResolveForReview(
+		ctx, workspaceID, "github", pr.RepoOwner, pr.RepoName, pr.BaseBranch,
+	)
+	if err != nil {
+		s.logger.Warn("failed to resolve repository for review task (continuing without repo)",
+			zap.String("repo", repoSlug),
+			zap.Error(err))
+		return nil
+	}
+	if repoID == "" {
+		return nil
+	}
+	s.logger.Debug("resolved review repository",
+		zap.String("repo", repoSlug),
+		zap.String("repo_id", repoID),
+		zap.String("base_branch", baseBranch))
+	// SECURITY (defense-in-depth): the PR head branch is attacker-controlled for
+	// fork PRs and flows unescaped-at-source into executor prepare scripts via
+	// {{worktree.branch}} / {{repository.branch}}. Reject any head branch that
+	// isn't a plain, safe git ref before it ever reaches CheckoutBranch. We still
+	// create the review task (just without a checkout) so a malicious ref cannot
+	// suppress review entirely; the scriptengine now also shell-escapes values.
+	if !securityutil.IsValidBranchName(pr.HeadBranch) {
+		s.logger.Warn("PR head branch failed branch-name validation; creating review task without checkout branch",
+			zap.String("repo", repoSlug),
+			zap.String("pr_head_branch", pr.HeadBranch),
+			zap.Int("pr_number", pr.Number))
+		return []ReviewTaskRepository{{RepositoryID: repoID, BaseBranch: baseBranch, PRNumber: pr.Number}}
+	}
+	// BaseBranch = repo default branch (e.g. "main") for worktree creation.
+	// CheckoutBranch = PR head branch to fetch and checkout after worktree is created.
+	return []ReviewTaskRepository{{RepositoryID: repoID, BaseBranch: baseBranch, CheckoutBranch: pr.HeadBranch, PRNumber: pr.Number}}
+}
+
+// detectPushAndAssociatePR checks if a push happened and looks for a PR on
+// that branch. If no PR is found immediately, retries after a delay to handle
+// the case where the user creates the PR on GitHub shortly after pushing.
+//
+// The pushTracker entry is intentionally NOT deleted on return: leaving the
+// stored ahead=0 in place causes subsequent status events to fall into the
+// `prevAhead <= 0` skip in trackPushAndAssociatePR, which prevents repeated
+// firing on every status event for a synced branch. The tracker is cleaned
+// up at session-deletion time via pushTrackerForget.
+//
+// Multi-repo: repositoryName scopes the lookup so each repo's push is detected
+// and associated independently. Empty repositoryName falls back to the
+// session's primary repo (legacy single-repo path).
+func (s *Service) detectPushAndAssociatePR(
+	ctx context.Context, sessionID, taskID, repositoryName, branch string,
+) {
+	if s.githubService == nil {
+		return
+	}
+	identity := s.resolvePushRepositoryIdentity(ctx, sessionID, taskID, repositoryName)
+	s.detectPushAndAssociatePRWithIdentity(ctx, sessionID, taskID, repositoryName, branch, identity)
+}
+
+func (s *Service) detectPushAndAssociatePRWithIdentity(
+	ctx context.Context, sessionID, taskID, repositoryName, branch string, identity pushRepositoryIdentity,
+) {
+	workspaceID := s.taskWorkspaceID(ctx, taskID)
+	if workspaceID == "" {
+		return
+	}
+
+	if identity.owner == "" || identity.name == "" {
+		return
+	}
+	if prDiscoveryContextCanceled(ctx) {
+		return
+	}
+
+	// Check if we already have a watch for this (session, repo, branch).
+	// Multi-branch: keying by branch as well means a secondary branch's
+	// push doesn't get short-circuited by the primary's already-found
+	// watch (which previously dropped #1218-style PRs on the floor).
+	// If the watch already has a PR number, the PR was found — nothing to do.
+	// If the watch has pr_number=0, it's still searching — do an immediate
+	// search (faster than waiting for the 1-minute poller).
+	existing, err := s.githubService.GetPRWatchBySessionRepoAndBranch(ctx, sessionID, identity.repositoryID, branch)
+	if prDiscoveryContextCanceled(ctx) {
+		return
+	}
+	if err == nil && existing != nil {
+		if existing.PRNumber > 0 {
+			return // PR already found and being monitored
+		}
+		s.searchPRForExistingWatch(ctx, workspaceID, existing, sessionID, taskID, branch)
+		return
+	}
+
+	foundPR := s.discoverPRAfterPush(ctx, workspaceID, sessionID, taskID, identity, branch)
+	if foundPR == nil {
+		return
+	}
+	s.logger.Info("PR found after push, associating with task",
+		zap.String("session_id", sessionID),
+		zap.String("task_id", taskID),
+		zap.String("repository_name", repositoryName),
+		zap.Int("pr_number", foundPR.Number),
+		zap.String("branch", branch))
+	s.associatePRFromPushScoped(ctx, workspaceID, sessionID, taskID, identity.owner, identity.name, identity.repositoryID, branch, foundPR)
+}
+
+func (s *Service) discoverPRAfterPush(
+	ctx context.Context,
+	workspaceID, sessionID, taskID string,
+	identity pushRepositoryIdentity,
+	branch string,
+) *github.PR {
+	const prDiscoveryOutcomeFailed = "failed"
+	delays := []time.Duration{0, 30 * time.Second, 60 * time.Second}
+	attemptCount := 0
+	errorCount := 0
+	emptyCount := 0
+	lastOutcome := ""
+	for attempt, delay := range delays {
+		if delay > 0 {
+			if !s.waitForPRDiscoveryRetry(ctx, delay) {
+				return nil
+			}
+			// Re-check if a watch was created in the meantime (e.g. by CreatePR callback).
+			if ex, err := s.githubService.GetPRWatchBySessionRepoAndBranch(ctx, sessionID, identity.repositoryID, branch); prDiscoveryContextCanceled(ctx) {
+				return nil
+			} else if err == nil && ex != nil {
+				return nil
+			}
+		}
+		if prDiscoveryContextCanceled(ctx) {
+			return nil
+		}
+		attemptCount++
+		foundPR, findErr := s.githubService.FindPRByBranchForWorkspace(
+			ctx, workspaceID, identity.owner, identity.name, branch,
+		)
+		if prDiscoveryContextCanceled(ctx) {
+			return nil
+		}
+		if findErr != nil {
+			errorCount++
+			lastOutcome = prDiscoveryOutcomeFailed
+			s.logger.Warn("PR discovery lookup failed after push",
+				zap.String("operation", "post_push_branch_lookup"),
+				zap.String("workspace_id", workspaceID),
+				zap.String("session_id", sessionID),
+				zap.String("task_id", taskID),
+				zap.String("repository_id", identity.repositoryID),
+				zap.String("owner", identity.owner),
+				zap.String("repo", identity.name),
+				zap.String("branch", branch),
+				zap.String("category", string(github.ClassifyPRDiscoveryError(findErr))),
+				zap.Int("attempt", attempt+1))
+			continue
+		}
+		if foundPR == nil {
+			emptyCount++
+			lastOutcome = "empty"
+			s.logger.Debug("no PR found for branch (will retry)",
+				zap.String("operation", "post_push_branch_lookup"),
+				zap.String("workspace_id", workspaceID),
+				zap.String("session_id", sessionID),
+				zap.String("task_id", taskID),
+				zap.String("repository_id", identity.repositoryID),
+				zap.String("owner", identity.owner),
+				zap.String("repo", identity.name),
+				zap.String("branch", branch),
+				zap.Int("attempt", attempt+1),
+				zap.Duration("delay", delay))
+			continue
+		}
+		return foundPR
+	}
+	s.logPRDiscoveryExhausted(workspaceID, sessionID, taskID, identity, branch,
+		attemptCount, errorCount, emptyCount, lastOutcome)
+	return nil
+}
+
+func (s *Service) logPRDiscoveryExhausted(
+	workspaceID, sessionID, taskID string,
+	identity pushRepositoryIdentity,
+	branch string,
+	attemptCount, errorCount, emptyCount int,
+	lastOutcome string,
+) {
+	s.logger.Debug("exhausted all retries, no PR found after push",
+		zap.String("operation", "post_push_branch_lookup"),
+		zap.String("workspace_id", workspaceID),
+		zap.String("session_id", sessionID),
+		zap.String("task_id", taskID),
+		zap.String("repository_id", identity.repositoryID),
+		zap.String("owner", identity.owner),
+		zap.String("repo", identity.name),
+		zap.String("branch", branch),
+		zap.Int("attempt_count", attemptCount),
+		zap.Int("error_count", errorCount),
+		zap.Int("empty_count", emptyCount),
+		zap.String("last_outcome", lastOutcome))
+}
+
+func (s *Service) waitForPRDiscoveryRetry(ctx context.Context, delay time.Duration) bool {
+	if s.prDiscoveryWait != nil {
+		return s.prDiscoveryWait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func prDiscoveryContextCanceled(ctx context.Context) bool {
+	// Provider clients can use their own timeout context and return a wrapped
+	// context error while the caller remains active. Only the caller context
+	// decides whether discovery should stop quietly.
+	return ctx.Err() != nil
+}
+
+// resolvePushRepo returns (owner, name, repository_id) for the per-repo push
+// detection.
+//
+//   - Empty repositoryName → session's primary repo (legacy single-repo).
+//   - Exact match on repoObj.Name → multi-repo path: that repository.
+//   - Subdir prefix match (`<repo.Name>-<branch-slug>`) → multi-branch path:
+//     the named subdir belongs to a sibling worktree of the same repo, so
+//     resolve back to that repository's id. Without this fallback the
+//     secondary branch's push event arrives with a tracker-tag that no
+//     `task_repositories` row matches, push detection short-circuits, and
+//     the secondary PR never registers.
+func (s *Service) resolvePushRepo(
+	ctx context.Context, sessionID, taskID, repositoryName string,
+) (owner, repo, repositoryID string) {
+	if repositoryName == "" {
+		o, r := s.resolveSessionRepo(ctx, sessionID)
+		return o, r, s.resolvePrimaryTaskRepositoryID(ctx, taskID)
+	}
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return "", "", ""
+	}
+	links, err := store.ListTaskRepositories(ctx, taskID)
+	if err != nil {
+		return "", "", ""
+	}
+	// Two passes: exact name first so a repo whose name is a prefix of a
+	// sibling (e.g. "backend" vs "backend-admin") doesn't swallow a push
+	// tagged with the longer name via isMultiBranchSubdir.
+	if owner, repo, id := matchPushRepo(ctx, s, store, links, repositoryName, true); id != "" {
+		return owner, repo, id
+	}
+	return matchPushRepo(ctx, s, store, links, repositoryName, false)
+}
+
+// matchPushRepo walks links once and returns the first matching repo. When
+// exactOnly is true only Name == repositoryName matches; otherwise the
+// multi-branch subdir prefix is also accepted.
+func matchPushRepo(
+	ctx context.Context,
+	s *Service,
+	store repoStore,
+	links []*models.TaskRepository,
+	repositoryName string,
+	exactOnly bool,
+) (owner, repo, repositoryID string) {
+	for _, link := range links {
+		repoObj, err := store.GetRepository(ctx, link.RepositoryID)
+		if err != nil || repoObj == nil {
+			continue
+		}
+		matched := repoObj.Name == repositoryName
+		if !matched && !exactOnly {
+			matched = isMultiBranchSubdir(repositoryName, repoObj.Name)
+		}
+		if !matched {
+			continue
+		}
+		if repoObj.ProviderOwner == "" && repoObj.LocalPath != "" {
+			if p, o, n := service.ResolveGitRemoteProvider(repoObj.LocalPath); o != "" {
+				repoObj.Provider = p
+				repoObj.ProviderOwner = o
+				repoObj.ProviderName = n
+				go s.backfillRepoProvider(store, repoObj)
+			}
+		}
+		return repoObj.ProviderOwner, repoObj.ProviderName, link.RepositoryID
+	}
+	return "", "", ""
+}
+
+// isMultiBranchSubdir reports whether subdir is a multi-branch sibling of
+// repoName (formatted as `<repoName>-<slug>`). Used by resolvePushRepo to
+// route a tracker event tagged with the subdir name back to the underlying
+// repository row.
+func isMultiBranchSubdir(subdir, repoName string) bool {
+	if repoName == "" {
+		return false
+	}
+	prefix := repoName + "-"
+	return len(subdir) > len(prefix) && subdir[:len(prefix)] == prefix
+}
+
+// searchPRForExistingWatch handles the case where a PR watch exists with pr_number=0
+// (still searching). It updates the watch branch if the agent pushed from a different
+// branch, then does a single immediate search so we don't wait for the 1-minute poller.
+func (s *Service) searchPRForExistingWatch(
+	ctx context.Context, workspaceID string, watch *github.PRWatch,
+	sessionID, taskID, branch string,
+) {
+	// Update branch if the agent switched branches since the watch was created.
+	// Use the atomic variant to guard against a concurrent PR association.
+	if watch.Branch != branch {
+		if err := s.githubService.UpdatePRWatchBranchIfSearching(ctx, watch.ID, branch); err != nil {
+			s.logger.Warn("failed to update PR watch branch",
+				zap.String("watch_id", watch.ID),
+				zap.String("old_branch", watch.Branch),
+				zap.String("new_branch", branch),
+				zap.Error(err))
+		}
+	}
+	// Immediate search — if found, update the existing watch and associate.
+	// We must not call associatePRFromPush here because it calls CreatePRWatch,
+	// which would fail with a UNIQUE constraint since the watch already exists.
+	foundPR, findErr := s.githubService.FindPRByBranchForWorkspace(
+		ctx, workspaceID, watch.Owner, watch.Repo, branch,
+	)
+	if prDiscoveryContextCanceled(ctx) {
+		return
+	}
+	if findErr != nil {
+		s.logger.Warn("PR discovery lookup failed for existing watch",
+			zap.String("operation", "existing_watch_branch_lookup"),
+			zap.String("workspace_id", workspaceID),
+			zap.String("session_id", sessionID),
+			zap.String("task_id", taskID),
+			zap.String("repository_id", watch.RepositoryID),
+			zap.String("owner", watch.Owner),
+			zap.String("repo", watch.Repo),
+			zap.String("branch", branch),
+			zap.String("category", string(github.ClassifyPRDiscoveryError(findErr))))
+		return
+	}
+	if foundPR == nil {
+		s.logger.Debug("no PR found for existing watch",
+			zap.String("operation", "existing_watch_branch_lookup"),
+			zap.String("workspace_id", workspaceID),
+			zap.String("session_id", sessionID),
+			zap.String("task_id", taskID),
+			zap.String("repository_id", watch.RepositoryID),
+			zap.String("owner", watch.Owner),
+			zap.String("repo", watch.Repo),
+			zap.String("branch", branch))
+		return
+	}
+	if foundPR.RepoOwner != "" && foundPR.RepoName != "" &&
+		(!strings.EqualFold(watch.Owner, foundPR.RepoOwner) || !strings.EqualFold(watch.Repo, foundPR.RepoName)) {
+		if err := s.githubService.UpdatePRWatchRepository(ctx, watch.ID, foundPR.RepoOwner, foundPR.RepoName); err != nil {
+			s.logger.Warn("failed to rebind PR watch repository",
+				zap.String("watch_id", watch.ID),
+				zap.String("owner", foundPR.RepoOwner),
+				zap.String("repo", foundPR.RepoName),
+				zap.Error(err))
+			return
+		}
+		watch.Owner = foundPR.RepoOwner
+		watch.Repo = foundPR.RepoName
+	}
+	if err := s.githubService.UpdatePRWatchPRNumber(ctx, watch.ID, foundPR.Number); err != nil {
+		s.logger.Warn("failed to update PR watch number",
+			zap.String("watch_id", watch.ID),
+			zap.Int("pr_number", foundPR.Number),
+			zap.Error(err))
+	}
+	// Use the watch's own repository_id so the association lands on the
+	// correct per-repo TaskPR row (matters once multi-repo watches exist;
+	// for legacy single-repo watches this is empty and matches the old
+	// "delete all" behavior).
+	if _, err := s.githubService.AssociatePRWithTaskForWorkspace(
+		ctx, workspaceID, taskID, watch.RepositoryID, foundPR,
+	); err != nil {
+		s.logger.Error("failed to associate PR with task",
+			zap.String("task_id", taskID),
+			zap.Int("pr_number", foundPR.Number),
+			zap.Error(err))
+	}
+	s.logger.Info("auto-detected PR from push (existing watch)",
+		zap.String("session_id", sessionID),
+		zap.Int("pr_number", foundPR.Number),
+		zap.String("branch", branch))
+}
+
+// resolveSessionRepo looks up the repository owner and name for a session.
+// If provider info is missing but a local path exists, it detects from the git remote
+// and backfills the DB record for future calls.
+func (s *Service) resolveSessionRepo(ctx context.Context, sessionID string) (string, string) {
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil || session == nil || session.RepositoryID == "" {
+		return "", ""
+	}
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return "", ""
+	}
+	repoObj, err := store.GetRepository(ctx, session.RepositoryID)
+	if err != nil || repoObj == nil {
+		return "", ""
+	}
+	if repoObj.ProviderOwner == "" && repoObj.LocalPath != "" {
+		if p, o, n := service.ResolveGitRemoteProvider(repoObj.LocalPath); o != "" {
+			repoObj.Provider = p
+			repoObj.ProviderOwner = o
+			repoObj.ProviderName = n
+			go s.backfillRepoProvider(store, repoObj)
+		}
+	}
+	return repoObj.ProviderOwner, repoObj.ProviderName
+}
+
+// backfillRepoProvider persists auto-detected provider info to the DB.
+func (s *Service) backfillRepoProvider(store repoStore, repo *models.Repository) {
+	if err := store.UpdateRepository(context.Background(), repo); err != nil {
+		s.logger.Warn("failed to backfill repository provider info",
+			zap.String("repository_id", repo.ID),
+			zap.Error(err))
+	} else {
+		s.logger.Info("backfilled repository provider info from git remote",
+			zap.String("repository_id", repo.ID),
+			zap.String("provider", repo.Provider),
+			zap.String("owner", repo.ProviderOwner),
+			zap.String("name", repo.ProviderName))
+	}
+}
+
+// ensureSessionPRWatch creates one PRWatch (pr_number=0) per repository in
+// the task so the poller will search GitHub for each repo's PR. Runs as a
+// background goroutine.
+//
+// Multi-repo: each repository gets its own watch row because the table is
+// keyed UNIQUE(session_id, repository_id). Without this, only the primary
+// repo's PR was ever discovered — secondary repos in a multi-repo task
+// silently dropped their associations.
+//
+// `fallbackBranch` is used only when a task_repository has no checkout_branch
+// AND the session worktree for that repo has no branch (rare; ensures
+// backwards compatibility with single-repo callers that pass the resolved
+// branch directly).
+//
+// The watch's task_id is redirected via resolveEffectivePushTaskID, same as
+// push detection: this runs on every session start, so without the redirect
+// a subtask sharing its parent's worktree gets its own member-attributed
+// watch here even when push detection itself is fixed — the watch the
+// poller then associates the PR under (see poller.go's detectPRForWatch).
+func (s *Service) ensureSessionPRWatch(ctx context.Context, taskID, sessionID, fallbackBranch string) {
+	if s.githubService == nil {
+		return
+	}
+	workspaceID := s.taskWorkspaceID(ctx, taskID)
+	if workspaceID == "" {
+		return
+	}
+	targets := s.resolveSessionWatchTargets(ctx, taskID, sessionID, fallbackBranch)
+	for _, t := range targets {
+		effectiveTaskID := s.resolveEffectivePushTaskIDForSession(ctx, sessionID, taskID, t.RepositoryID)
+		if _, err := s.githubService.EnsurePRWatchForWorkspace(
+			ctx, workspaceID, sessionID, effectiveTaskID, t.RepositoryID, t.Owner, t.Repo, t.Branch,
+		); err != nil {
+			s.logger.Warn("failed to ensure PR watch for session",
+				zap.String("session_id", sessionID),
+				zap.String("repository_id", t.RepositoryID),
+				zap.String("branch", t.Branch),
+				zap.Error(err))
+		}
+	}
+}
+
+func (s *Service) taskWorkspaceID(ctx context.Context, taskID string) string {
+	task, err := s.repo.GetTask(ctx, taskID)
+	if err != nil || task == nil {
+		return ""
+	}
+	return strings.TrimSpace(task.WorkspaceID)
+}
+
+// sessionWatchTarget describes one (session, repo) pair that should have a
+// PR watch. Built by walking the task's repositories and matching each to
+// the session's worktree (branch) and the repo (owner/name).
+type sessionWatchTarget struct {
+	RepositoryID string
+	Owner        string
+	Repo         string
+	Branch       string
+}
+
+// resolveSessionWatchTargets walks the task's repositories and produces one
+// target per repo whose owner/name and branch resolve. Skips repos for which
+// any of those fields are empty — they can't be searched on GitHub.
+//
+// Branch resolution per repo (matches the legacy single-repo
+// resolvePRWatchBranch priority so PR-review-style synthetic worktree
+// branches don't override the task's real branch):
+//
+//  1. task_repository.checkout_branch (set at task creation — authoritative)
+//  2. caller's fallbackBranch, but only for the primary repo (legacy signature)
+//  3. session worktree's branch (last-resort guess from the worktree)
+//
+// Applying the fallback to non-primary repos would assign every repo the same
+// branch and corrupt cross-repo watches.
+func (s *Service) resolveSessionWatchTargets(
+	ctx context.Context, taskID, sessionID, fallbackBranch string,
+) []sessionWatchTarget {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return nil
+	}
+	// Multi-branch: when a session has TWO OR MORE worktrees on the same
+	// repository, derive targets from the worktree rows directly. Each
+	// worktree's actual branch (worktree_branch) is the right key because
+	// task_repositories.checkout_branch may differ when the worktree
+	// manager suffixed a collision, and the agent pushes the actual name.
+	// Single-branch tasks (including PR-review tasks with a synthetic
+	// worktree branch + an authoritative checkout_branch) fall through to
+	// the legacy task_repositories walk.
+	if targets := s.targetsFromMultiBranchWorktrees(ctx, store, sessionID); len(targets) > 0 {
+		return targets
+	}
+	taskRepos, err := store.ListTaskRepositories(ctx, taskID)
+	if err != nil || len(taskRepos) == 0 {
+		return nil
+	}
+	branchByRepo := s.branchByRepoForSession(ctx, sessionID)
+
+	var targets []sessionWatchTarget
+	for _, tr := range taskRepos {
+		owner, repoName := s.resolveRepoOwnerName(ctx, store, tr.RepositoryID)
+		if owner == "" || repoName == "" {
+			continue
+		}
+		branch := strings.TrimSpace(tr.CheckoutBranch)
+		if branch == "" && tr.Position == 0 {
+			branch = fallbackBranch
+		}
+		if branch == "" {
+			branch = branchByRepo[tr.RepositoryID]
+		}
+		if branch == "" {
+			continue
+		}
+		targets = append(targets, sessionWatchTarget{
+			RepositoryID: tr.RepositoryID,
+			Owner:        owner,
+			Repo:         repoName,
+			Branch:       branch,
+		})
+	}
+	return targets
+}
+
+// targetsFromMultiBranchWorktrees emits one target per environment repository
+// row, but ONLY when at least one repository has more than one worktree —
+// the multi-branch case. The worktree's actual branch (worktree_branch) is
+// the authoritative key because the worktree manager may suffix a
+// requested checkout_branch on collision, and the agent pushes the
+// suffixed name; using task_repositories.checkout_branch would search
+// GitHub for a branch name that doesn't exist.
+//
+// Returns nil for single-branch sessions so callers keep the legacy
+// task_repositories walk (which honors PR-review tasks' authoritative
+// checkout_branch over their synthetic worktree branch).
+func (s *Service) targetsFromMultiBranchWorktrees(ctx context.Context, store repoStore, sessionID string) []sessionWatchTarget {
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil || session == nil || len(session.Worktrees) < 2 {
+		return nil
+	}
+	repoCount := make(map[string]int, len(session.Worktrees))
+	for _, wt := range session.Worktrees {
+		if wt.RepositoryID == "" {
+			continue
+		}
+		repoCount[wt.RepositoryID]++
+	}
+	multiBranch := false
+	for _, n := range repoCount {
+		if n > 1 {
+			multiBranch = true
+			break
+		}
+	}
+	if !multiBranch {
+		return nil
+	}
+	var targets []sessionWatchTarget
+	for _, wt := range session.Worktrees {
+		branch := strings.TrimSpace(wt.WorktreeBranch)
+		if branch == "" || wt.RepositoryID == "" {
+			continue
+		}
+		owner, repoName := s.resolveRepoOwnerName(ctx, store, wt.RepositoryID)
+		if owner == "" || repoName == "" {
+			continue
+		}
+		targets = append(targets, sessionWatchTarget{
+			RepositoryID: wt.RepositoryID,
+			Owner:        owner,
+			Repo:         repoName,
+			Branch:       branch,
+		})
+	}
+	return targets
+}
+
+// branchByRepoForSession returns repository_id → worktree_branch for every
+// worktree on the session. Empty map if the session can't be loaded — caller
+// falls back to the task_repository's configured branch.
+func (s *Service) branchByRepoForSession(ctx context.Context, sessionID string) map[string]string {
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil || session == nil {
+		return nil
+	}
+	out := make(map[string]string, len(session.Worktrees))
+	for _, wt := range session.Worktrees {
+		if wt.WorktreeBranch == "" || wt.RepositoryID == "" {
+			continue
+		}
+		out[wt.RepositoryID] = wt.WorktreeBranch
+	}
+	return out
+}
+
+// resolveRepoOwnerName returns (owner, name) for a repository, backfilling
+// provider info from the local git remote when missing. Mirrors what
+// resolveTaskRepo does for the primary repo, but works against any repo id.
+func (s *Service) resolveRepoOwnerName(
+	ctx context.Context, store repoStore, repositoryID string,
+) (string, string) {
+	if repositoryID == "" {
+		return "", ""
+	}
+	repoObj, err := store.GetRepository(ctx, repositoryID)
+	if err != nil || repoObj == nil {
+		return "", ""
+	}
+	if repoObj.ProviderOwner == "" && repoObj.LocalPath != "" {
+		if p, o, n := service.ResolveGitRemoteProvider(repoObj.LocalPath); o != "" {
+			repoObj.Provider = p
+			repoObj.ProviderOwner = o
+			repoObj.ProviderName = n
+			go s.backfillRepoProvider(store, repoObj)
+		}
+	}
+	if repoObj.Provider != "github" {
+		return "", ""
+	}
+	return repoObj.ProviderOwner, repoObj.ProviderName
+}
+
+// resolvePrimaryTaskRepositoryID returns the primary task_repository's
+// repository_id for a task, or "" on miss / error. Used to scope PR
+// watches and TaskPR rows to the correct per-repo row in multi-repo tasks
+// (and to the single repo's row in single-repo tasks). Empty preserves the
+// legacy single-repo behavior at the store layer.
+func (s *Service) resolvePrimaryTaskRepositoryID(ctx context.Context, taskID string) string {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return ""
+	}
+	taskRepo, err := store.GetPrimaryTaskRepository(ctx, taskID)
+	if err != nil || taskRepo == nil {
+		return ""
+	}
+	return taskRepo.RepositoryID
+}
+
+func (s *Service) resolvePRWatchBranch(ctx context.Context, taskID, sessionID, fallback string) string {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return fallback
+	}
+
+	taskRepo, err := store.GetPrimaryTaskRepository(ctx, taskID)
+	if err == nil && taskRepo != nil && strings.TrimSpace(taskRepo.CheckoutBranch) != "" {
+		return strings.TrimSpace(taskRepo.CheckoutBranch)
+	}
+
+	if fallback != "" {
+		return fallback
+	}
+
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil || session == nil {
+		return ""
+	}
+	for _, wt := range session.Worktrees {
+		if wt.WorktreeBranch != "" {
+			return wt.WorktreeBranch
+		}
+	}
+	return ""
+}
+
+// resolveTaskRepo looks up the GitHub owner and repo name for a task's primary repository.
+// If provider info is missing but a local path exists, it detects from the git remote
+// and backfills the DB record for future calls.
+func (s *Service) resolveTaskRepo(ctx context.Context, taskID string) (string, string) {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return "", ""
+	}
+	taskRepo, err := store.GetPrimaryTaskRepository(ctx, taskID)
+	if err != nil || taskRepo == nil {
+		return "", ""
+	}
+	repoObj, err := store.GetRepository(ctx, taskRepo.RepositoryID)
+	if err != nil || repoObj == nil {
+		return "", ""
+	}
+	if repoObj.ProviderOwner == "" && repoObj.LocalPath != "" {
+		if p, o, n := service.ResolveGitRemoteProvider(repoObj.LocalPath); o != "" {
+			repoObj.Provider = p
+			repoObj.ProviderOwner = o
+			repoObj.ProviderName = n
+			go s.backfillRepoProvider(store, repoObj)
+		}
+	}
+	if repoObj.Provider != "github" {
+		return "", ""
+	}
+	return repoObj.ProviderOwner, repoObj.ProviderName
+}
+
+// associatePRFromPushScoped creates the PR watch and task-PR association
+// after push detection, scoped to a specific repository_id. Multi-repo callers
+// pass the per-repo id resolved from the git event's repository_name; the
+// legacy single-repo path passes the primary task_repository id.
+func (s *Service) associatePRFromPushScoped(
+	ctx context.Context, workspaceID, sessionID, taskID, owner, repoName, repositoryID, branch string, pr *github.PR,
+) {
+	watchOwner, watchRepo := owner, repoName
+	if pr != nil && pr.RepoOwner != "" && pr.RepoName != "" {
+		watchOwner, watchRepo = pr.RepoOwner, pr.RepoName
+	}
+	watch, watchErr := s.githubService.CreatePRWatchForWorkspace(
+		ctx, workspaceID, sessionID, taskID, repositoryID, watchOwner, watchRepo, pr.Number, branch,
+	)
+	if watchErr != nil {
+		s.logger.Error("failed to create PR watch on push detection",
+			zap.String("session_id", sessionID),
+			zap.String("repository_id", repositoryID),
+			zap.Error(watchErr))
+	} else if watch != nil && watch.ID != "" &&
+		(!strings.EqualFold(watch.Owner, watchOwner) || !strings.EqualFold(watch.Repo, watchRepo)) {
+		if err := s.githubService.UpdatePRWatchRepository(ctx, watch.ID, watchOwner, watchRepo); err != nil {
+			s.logger.Warn("failed to rebind existing PR watch repository",
+				zap.String("watch_id", watch.ID), zap.Error(err))
+		}
+	}
+
+	if _, assocErr := s.githubService.AssociatePRWithTaskForWorkspace(
+		ctx, workspaceID, taskID, repositoryID, pr,
+	); assocErr != nil {
+		s.logger.Error("failed to associate PR with task on push detection",
+			zap.String("task_id", taskID),
+			zap.String("repository_id", repositoryID),
+			zap.Error(assocErr))
+	}
+
+	s.logger.Info("auto-detected PR from push",
+		zap.String("session_id", sessionID),
+		zap.String("repository_id", repositoryID),
+		zap.Int("pr_number", pr.Number),
+		zap.String("branch", branch))
+}
+
+// CheckSessionPR checks if a PR exists for a session's branch and associates it
+// if found. This provides an on-demand alternative to the background poller,
+// allowing the frontend to trigger immediate PR detection.
+func (s *Service) CheckSessionPR(ctx context.Context, taskID, sessionID string) (bool, error) {
+	// Per-user scoping first, before any early return: this both reveals PR
+	// association and installs a PR watch, so it must be owner-only. Report
+	// "no PR" rather than an error so a foreign session leaks nothing about
+	// its existence.
+	//
+	// Both IDs, not just the session: everything below (GetTaskPR,
+	// resolveTaskRepo, EnsurePRWatch, resolvePrimaryTaskRepositoryID) is keyed
+	// off taskID, so authorizing only the session would let a caller pair one
+	// of their own sessions with another user's task.
+	if err := s.authorizeTaskSessionPair(ctx, taskID, sessionID); err != nil {
+		return false, nil
+	}
+
+	if s.githubService == nil {
+		return false, nil
+	}
+
+	// The watch/association write destination is redirected the same way as
+	// push detection (resolveEffectivePushTaskID): this is the frontend's
+	// on-demand alternative to that same detection, so without the redirect a
+	// user opening a shared-worktree subtask reproduces the multi-binding on
+	// demand. Resolved first, ahead of resolveTaskRepo/branch below, so the
+	// already-associated short-circuit only needs a repositoryID lookup, not
+	// a full owner/repo/branch resolution.
+	repositoryID := s.resolvePrimaryTaskRepositoryID(ctx, taskID)
+	effectiveTaskID := s.resolveEffectivePushTaskIDForSession(ctx, sessionID, taskID, repositoryID)
+
+	// Check if a PR is already associated with the effective task.
+	existing, err := s.githubService.GetTaskPR(ctx, effectiveTaskID)
+	if err == nil && existing != nil {
+		return true, nil
+	}
+
+	// Resolve the GitHub owner/repo from the task's repository. This, and
+	// branch resolution below, stay keyed off the observing taskID: the
+	// physical checkout and task_repositories rows belong to whichever task's
+	// session the frontend is checking, same as dispatchPushDetection.
+	owner, repoName := s.resolveTaskRepo(ctx, taskID)
+	if owner == "" || repoName == "" {
+		return false, nil
+	}
+
+	branch := s.resolvePRWatchBranch(ctx, taskID, sessionID, "")
+	if branch == "" {
+		return false, nil
+	}
+
+	// Ensure a PR watch exists so the background poller will keep checking
+	workspaceID := s.taskWorkspaceID(ctx, taskID)
+	if workspaceID == "" {
+		return false, github.ErrGitHubWorkspaceRequired
+	}
+	if _, watchErr := s.githubService.EnsurePRWatchForWorkspace(
+		ctx, workspaceID, sessionID, effectiveTaskID, repositoryID, owner, repoName, branch,
+	); watchErr != nil {
+		s.logger.Warn("failed to ensure PR watch during check",
+			zap.String("session_id", sessionID),
+			zap.Error(watchErr))
+	}
+
+	// Try to find the PR immediately
+	pr, findErr := s.githubService.FindPRByBranchForWorkspace(
+		ctx, workspaceID, owner, repoName, branch,
+	)
+	if findErr != nil || pr == nil {
+		return false, nil
+	}
+
+	// Found a PR — associate it with the effective task.
+	s.associatePRFromPushScoped(ctx, workspaceID, sessionID, effectiveTaskID, owner, repoName, repositoryID, branch, pr)
+	return true, nil
+}
+
+// ListTasksNeedingPRWatch returns task-session pairs that have worktree branches
+// but no existing PR watch. This satisfies the github.TaskBranchProvider interface.
+func (s *Service) ListTasksNeedingPRWatch(ctx context.Context) ([]github.TaskBranchInfo, error) {
+	if s.githubService == nil {
+		return nil, nil
+	}
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return nil, nil
+	}
+	return s.buildTaskBranchList(ctx, store)
+}
+
+// ResolveBranchForRepository returns the current desired branch for a task's
+// repository, independent of which session (if any) created the watch.
+// Session identity does not participate in canonical PR-watch identity or
+// polling (task/repository/branch owns searching watches), so a still-
+// searching watch's branch must be re-derived from the task's own
+// configuration, not from whichever session happened to create it — a prior
+// per-session resolver ignored watch.RepositoryID entirely and always
+// resolved against the task's PRIMARY repository, corrupting secondary-repo
+// watches on multi-repo tasks. This satisfies the github.TaskBranchProvider
+// interface.
+func (s *Service) ResolveBranchForRepository(ctx context.Context, taskID, repositoryID string) string {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return ""
+	}
+	if branch := s.checkoutBranchForRepository(ctx, store, taskID, repositoryID); branch != "" {
+		return branch
+	}
+	// Fallback: any currently-active session's worktree branch for this
+	// specific repository. Session identity is a best-effort provenance
+	// candidate only here (checkout_branch is authoritative once set).
+	return s.activeWorktreeBranchForRepository(ctx, taskID, repositoryID)
+}
+
+// ResolveBranchesForRepository returns every authoritative checkout branch
+// configured for a task/repository pair. Multi-branch tasks may legitimately
+// have several rows for the same repository, so PR-watch reconciliation must
+// preserve each matching watch instead of collapsing the repository to the
+// first row returned by ListTaskRepositories.
+func (s *Service) ResolveBranchesForRepository(ctx context.Context, taskID, repositoryID string) []string {
+	store, ok := s.repo.(repoStore)
+	if !ok {
+		return nil
+	}
+	branches := s.checkoutBranchesForRepository(ctx, store, taskID, repositoryID)
+	if len(branches) > 0 {
+		return branches
+	}
+	if branch := s.activeWorktreeBranchForRepository(ctx, taskID, repositoryID); branch != "" {
+		return []string{branch}
+	}
+	return nil
+}
+
+// checkoutBranchForRepository returns the authoritative checkout_branch
+// configured for a specific task/repository pair, or "" if unset or missing.
+func (s *Service) checkoutBranchForRepository(ctx context.Context, store repoStore, taskID, repositoryID string) string {
+	branches := s.checkoutBranchesForRepository(ctx, store, taskID, repositoryID)
+	if len(branches) == 0 {
+		return ""
+	}
+	return branches[0]
+}
+
+func (s *Service) checkoutBranchesForRepository(ctx context.Context, store repoStore, taskID, repositoryID string) []string {
+	taskRepos, err := store.ListTaskRepositories(ctx, taskID)
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var branches []string
+	for _, tr := range taskRepos {
+		if tr.RepositoryID == repositoryID {
+			branch := strings.TrimSpace(tr.CheckoutBranch)
+			if branch == "" || seen[branch] {
+				continue
+			}
+			seen[branch] = true
+			branches = append(branches, branch)
+		}
+	}
+	return branches
+}
+
+// activeWorktreeBranchForRepository returns the worktree branch of any
+// currently-active session on the task whose worktree targets the given
+// repository. Best-effort fallback only.
+func (s *Service) activeWorktreeBranchForRepository(ctx context.Context, taskID, repositoryID string) string {
+	sessions, err := s.repo.ListActiveTaskSessionsByTaskID(ctx, taskID)
+	if err != nil {
+		return ""
+	}
+	for _, sess := range sessions {
+		for _, wt := range sess.Worktrees {
+			if wt.RepositoryID == repositoryID && strings.TrimSpace(wt.WorktreeBranch) != "" {
+				return strings.TrimSpace(wt.WorktreeBranch)
+			}
+		}
+	}
+	return ""
+}
+
+// buildTaskBranchList walks sessions × their repositories and emits one
+// TaskBranchInfo per (task, repository, branch) that doesn't already have a
+// PR watch. Session identity does not own canonical PR-watch identity, so
+// multiple sessions resolving to the same (task, repository, branch) target
+// collapse to a single emission here — one lookup per canonical target per
+// cycle, regardless of how many sessions are active on it.
+//
+// TaskID is redirected via resolveEffectivePushTaskID (to the workspace-group
+// owner task) before the dedup key is computed and before the caller
+// (poller.reconcileWatches) creates the watch, same as ensureSessionPRWatch:
+// this is the third and last producer that would otherwise write a
+// member-attributed watch for a shared-worktree subtask. Deduping on the
+// pre-redirect sess.TaskID would let a member and its owner both emit a
+// TaskBranchInfo for the same underlying repository/branch, so the redirect
+// must run first — canonical identity is (effective task, repository,
+// branch), never session or pre-redirect task.
+func (s *Service) buildTaskBranchList(ctx context.Context, store repoStore) ([]github.TaskBranchInfo, error) {
+	sessions, err := store.ListSessionsWithBranches(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions with branches: %w", err)
+	}
+	if len(sessions) == 0 {
+		return nil, nil
+	}
+
+	// Batch fetch existing watches to avoid N+1 queries.
+	watchedKeys := s.buildWatchedTaskRepoBranchSet(ctx)
+	emitted := make(map[string]bool)
+
+	var result []github.TaskBranchInfo
+	seenSessions := make(map[string]struct{})
+	for _, sess := range sessions {
+		if _, seen := seenSessions[sess.SessionID]; seen {
+			continue
+		}
+		seenSessions[sess.SessionID] = struct{}{}
+		// Inventory rows can carry any repository's branch. Resolve each session
+		// once from its per-repository targets, as watch refresh does.
+		targets := s.resolveSessionWatchTargets(ctx, sess.TaskID, sess.SessionID, "")
+		for _, t := range targets {
+			effectiveTaskID := s.resolveEffectivePushTaskIDForSession(ctx, sess.SessionID, sess.TaskID, t.RepositoryID)
+			key := watchedTaskRepoBranchKey(effectiveTaskID, t.RepositoryID, t.Branch)
+			if watchedKeys[key] || emitted[key] {
+				continue
+			}
+			emitted[key] = true
+			result = append(result, github.TaskBranchInfo{
+				WorkspaceID:  sess.WorkspaceID,
+				TaskID:       effectiveTaskID,
+				SessionID:    sess.SessionID,
+				RepositoryID: t.RepositoryID,
+				Owner:        t.Owner,
+				Repo:         t.Repo,
+				Branch:       t.Branch,
+			})
+		}
+	}
+	return result, nil
+}
+
+// buildWatchedTaskRepoBranchSet returns the set of (task_id, repository_id,
+// branch) triples that already have a PR watch row. Canonical searching
+// watches are owned by task/repository/branch, not session_id, so dedup here
+// must key on the same triple to avoid re-creating a watch that another
+// session already established for the same task/repo/branch.
+func (s *Service) buildWatchedTaskRepoBranchSet(ctx context.Context) map[string]bool {
+	watches, err := s.githubService.ListActivePRWatches(ctx)
+	if err != nil {
+		s.logger.Debug("failed to list PR watches for reconciliation", zap.Error(err))
+		return nil
+	}
+	set := make(map[string]bool, len(watches))
+	for _, w := range watches {
+		set[watchedTaskRepoBranchKey(w.TaskID, w.RepositoryID, w.Branch)] = true
+	}
+	return set
+}
+
+// watchedTaskRepoBranchKey builds the per-(task, repo, branch) dedup key.
+func watchedTaskRepoBranchKey(taskID, repositoryID, branch string) string {
+	return taskID + "|" + repositoryID + "|" + branch
+}
+
+// subscribeGitHubEvents subscribes to GitHub-related events on the event bus.
+func (s *Service) subscribeGitHubEvents() {
+	if s.eventBus == nil {
+		return
+	}
+	if _, err := s.eventBus.Subscribe(events.GitHubPRFeedback, s.handlePRFeedback); err != nil {
+		s.logger.Error("failed to subscribe to github.pr_feedback events", zap.Error(err))
+	}
+	if _, err := s.eventBus.Subscribe(events.GitHubTaskPRUpdated, s.handleTaskPRUpdated); err != nil {
+		s.logger.Error("failed to subscribe to github.task_pr.updated events", zap.Error(err))
+	}
+	if _, err := s.eventBus.Subscribe(events.GitHubTaskCIOptionsUpdated, s.handleTaskCIOptionsUpdated); err != nil {
+		s.logger.Error("failed to subscribe to github.task_ci_options.updated events", zap.Error(err))
+	}
+	if _, err := s.eventBus.Subscribe(events.GitHubNewReviewPR, s.handleNewReviewPR); err != nil {
+		s.logger.Error("failed to subscribe to github.new_pr_to_review events", zap.Error(err))
+	}
+	if _, err := s.eventBus.Subscribe(events.GitHubNewIssue, s.handleNewIssue); err != nil {
+		s.logger.Error("failed to subscribe to github.new_issue events", zap.Error(err))
+	}
+}
+
+// handleNewIssue creates a task for a new GitHub issue matching an issue watch.
+func (s *Service) handleNewIssue(ctx context.Context, event *bus.Event) error {
+	issueEvt, ok := event.Data.(*github.NewIssueEvent)
+	if !ok {
+		return nil
+	}
+
+	issue := issueEvt.Issue
+	s.logger.Info("new issue detected from watch",
+		zap.String(issueWatchIDKey, issueEvt.IssueWatchID),
+		zap.String("repo", fmt.Sprintf("%s/%s", issue.RepoOwner, issue.RepoName)),
+		zap.Int(issueNumberKey, issue.Number))
+
+	if s.issueTaskCreator == nil {
+		s.logger.Warn("issue task creator not configured, skipping task creation")
+		return nil
+	}
+
+	go s.createIssueTask(context.Background(), issueEvt)
+	return nil
+}
+
+func (s *Service) createIssueTask(ctx context.Context, evt *github.NewIssueEvent) {
+	issue := evt.Issue
+	repoSlug := fmt.Sprintf("%s/%s", issue.RepoOwner, issue.RepoName)
+
+	if s.preflightDeletedProfileForGitHubIssue(ctx, evt) {
+		return
+	}
+
+	if !s.reserveIssueWatch(ctx, evt) {
+		return
+	}
+
+	repositories := s.resolveIssueRepository(ctx, evt.WorkspaceID, issue)
+
+	req := &IssueTaskRequest{
+		WorkspaceID:    evt.WorkspaceID,
+		WorkflowID:     evt.WorkflowID,
+		WorkflowStepID: evt.WorkflowStepID,
+		Title:          buildIssueTaskTitle(issue.Number, issue.Title),
+		Description:    interpolateIssuePrompt(evt.Prompt, issue),
+		Metadata: map[string]interface{}{
+			issueWatchIDKey:       evt.IssueWatchID,
+			issueNumberKey:        issue.Number,
+			"issue_url":           issue.HTMLURL,
+			"issue_repo":          repoSlug,
+			"issue_author":        issue.AuthorLogin,
+			"agent_profile_id":    evt.AgentProfileID,
+			"executor_profile_id": evt.ExecutorProfileID,
+		},
+		Repositories: repositories,
+	}
+
+	task, err := s.issueTaskCreator.CreateIssueTask(ctx, req)
+	if err != nil {
+		if isWatcherCapacityRejection(err) {
+			s.logger.Info("issue workflow step at capacity; deferring issue task",
+				zap.String(issueWatchIDKey, evt.IssueWatchID),
+				zap.Int(issueNumberKey, issue.Number),
+				zap.String("workflow_step_id", evt.WorkflowStepID),
+				zap.Error(err))
+		} else {
+			s.logger.Error("failed to create issue task",
+				zap.String(issueWatchIDKey, evt.IssueWatchID),
+				zap.Int(issueNumberKey, issue.Number),
+				zap.Error(err))
+		}
+		s.releaseIssueWatch(ctx, evt)
+		return
+	}
+
+	s.attachIssueTaskToReservation(ctx, evt, task.ID)
+
+	s.logger.Info("created issue task",
+		zap.String("task_id", task.ID),
+		zap.Int(issueNumberKey, issue.Number),
+		zap.String("repo", repoSlug))
+
+	if task.QueuedForStepID != "" || !s.shouldAutoStartStep(ctx, task.WorkflowStepID) {
+		return
+	}
+	s.autoStartIssueTask(ctx, evt, task)
+}
+
+func (s *Service) reserveIssueWatch(ctx context.Context, evt *github.NewIssueEvent) bool {
+	if s.githubService == nil {
+		return true
+	}
+	issue := evt.Issue
+	reserved, err := s.githubService.ReserveIssueWatchTask(
+		ctx, evt.IssueWatchID, issue.RepoOwner, issue.RepoName, issue.Number, issue.HTMLURL,
+	)
+	if err != nil {
+		s.logger.Error("failed to reserve issue watch slot",
+			zap.String(issueWatchIDKey, evt.IssueWatchID),
+			zap.Int(issueNumberKey, issue.Number),
+			zap.Error(err))
+		return false
+	}
+	if !reserved {
+		s.logger.Debug("issue already reserved by concurrent handler, skipping",
+			zap.String(issueWatchIDKey, evt.IssueWatchID),
+			zap.Int(issueNumberKey, issue.Number))
+		return false
+	}
+	return true
+}
+
+func (s *Service) releaseIssueWatch(ctx context.Context, evt *github.NewIssueEvent) {
+	if s.githubService == nil {
+		return
+	}
+	issue := evt.Issue
+	if err := s.githubService.ReleaseIssueWatchTask(
+		ctx, evt.IssueWatchID, issue.RepoOwner, issue.RepoName, issue.Number,
+	); err != nil {
+		s.logger.Warn("failed to release issue watch reservation after task-create failure",
+			zap.Int(issueNumberKey, issue.Number),
+			zap.Error(err))
+	}
+}
+
+func (s *Service) attachIssueTaskToReservation(ctx context.Context, evt *github.NewIssueEvent, taskID string) {
+	if s.githubService == nil {
+		return
+	}
+	issue := evt.Issue
+	if err := s.githubService.AssignIssueWatchTaskID(
+		ctx, evt.IssueWatchID, issue.RepoOwner, issue.RepoName, issue.Number, taskID,
+	); err != nil {
+		s.logger.Error("failed to assign task ID to issue watch reservation",
+			zap.String("task_id", taskID),
+			zap.Int(issueNumberKey, issue.Number),
+			zap.Error(err))
+	}
+}
+
+// resolveIssueRepository attempts to resolve and clone the issue's repository.
+// Returns a slice with one entry on success, or nil on failure (graceful degradation).
+func (s *Service) resolveIssueRepository(ctx context.Context, workspaceID string, issue *github.Issue) []IssueTaskRepository {
+	if s.repositoryResolver == nil {
+		return nil
+	}
+	repoSlug := fmt.Sprintf("%s/%s", issue.RepoOwner, issue.RepoName)
+	s.logger.Debug("resolving issue repository", zap.String("repo", repoSlug))
+
+	repoID, baseBranch, err := s.repositoryResolver.ResolveForReview(
+		ctx, workspaceID, "github", issue.RepoOwner, issue.RepoName, "",
+	)
+	if err != nil {
+		s.logger.Warn("failed to resolve repository for issue task (continuing without repo)",
+			zap.String("repo", repoSlug),
+			zap.Error(err))
+		return nil
+	}
+	if repoID == "" {
+		return nil
+	}
+	s.logger.Debug("resolved issue repository",
+		zap.String("repo", repoSlug),
+		zap.String("repo_id", repoID),
+		zap.String("base_branch", baseBranch))
+	return []IssueTaskRepository{{RepositoryID: repoID, BaseBranch: baseBranch}}
+}
+
+func (s *Service) autoStartIssueTask(
+	ctx context.Context, evt *github.NewIssueEvent, task *models.Task,
+) {
+	_, err := s.StartTask(
+		ctx,
+		task.ID,
+		evt.AgentProfileID,
+		"",
+		evt.ExecutorProfileID,
+		"",
+		task.Description,
+		task.WorkflowStepID,
+		false,
+		true,
+		nil,
+	)
+	if errors.Is(err, ErrCeilingLaunchDeferred) {
+		s.logger.Info("issue auto-start deferred by session ceiling; will replay once capacity frees up",
+			zap.String("task_id", task.ID),
+			zap.Int(issueNumberKey, evt.Issue.Number))
+		return
+	}
+	if err != nil {
+		s.logger.Error("failed to auto-start issue task",
+			zap.String("task_id", task.ID),
+			zap.Error(err))
+		return
+	}
+	s.logger.Info("auto-started issue task",
+		zap.String("task_id", task.ID),
+		zap.Int(issueNumberKey, evt.Issue.Number))
+}
+
+// interpolateReviewPrompt replaces {{pr.*}} placeholders in the prompt template with actual PR values.
+// When the prompt template is empty (user didn't configure a custom prompt), it uses the
+// embedded default that provides useful PR context to the agent.
+func interpolateReviewPrompt(promptTemplate string, pr *github.PR) string {
+	if promptTemplate == "" {
+		promptTemplate = promptcfg.Get("pr-review-watch-default")
+	}
+	repoSlug := fmt.Sprintf("%s/%s", pr.RepoOwner, pr.RepoName)
+	replacer := strings.NewReplacer(
+		"{{pr.link}}", pr.HTMLURL,
+		"{{pr.number}}", strconv.Itoa(pr.Number),
+		"{{pr.title}}", pr.Title,
+		"{{pr.author}}", pr.AuthorLogin,
+		"{{pr.repo}}", repoSlug,
+		"{{pr.branch}}", pr.HeadBranch,
+		"{{pr.base_branch}}", pr.BaseBranch,
+	)
+	return replacer.Replace(promptTemplate)
+}
+
+// interpolateIssuePrompt replaces {{issue.*}} placeholders in the prompt template with actual issue values.
+func interpolateIssuePrompt(promptTemplate string, issue *github.Issue) string {
+	if promptTemplate == "" {
+		promptTemplate = promptcfg.Get("issue-watch-default")
+	}
+	repoSlug := fmt.Sprintf("%s/%s", issue.RepoOwner, issue.RepoName)
+	labelsStr := strings.Join(issue.Labels, ", ")
+	replacer := strings.NewReplacer(
+		"{{issue.link}}", issue.HTMLURL,
+		"{{issue.number}}", strconv.Itoa(issue.Number),
+		"{{issue.title}}", issue.Title,
+		"{{issue.author}}", issue.AuthorLogin,
+		"{{issue.repo}}", repoSlug,
+		"{{issue.labels}}", labelsStr,
+		"{{issue.body}}", issue.Body,
+	)
+	return replacer.Replace(promptTemplate)
+}

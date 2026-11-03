@@ -1,0 +1,97 @@
+package shared
+
+import (
+	"time"
+
+	"github.com/kandev/kandev/internal/common/acpprovider"
+)
+
+// DefaultPermissionTimeout is the default timeout for permission requests (5 minutes).
+const DefaultPermissionTimeout = 5 * time.Minute
+
+// Config holds configuration for creating transport adapters.
+// This is passed to transport adapters by the factory.
+type Config struct {
+	// WorkDir is the working directory for the agent
+	WorkDir string
+
+	// AutoApprove automatically approves permission requests
+	AutoApprove bool
+
+	// PermissionTimeout is the maximum time to wait for a permission response.
+	// After timeout, the request is auto-denied with interrupt. Defaults to DefaultPermissionTimeout.
+	PermissionTimeout time.Duration
+
+	// McpServers is a list of MCP servers to configure for the agent
+	McpServers []McpServerConfig
+
+	// AgentID is the agent identifier from the registry (e.g., "auggie", "amp", "claude-code").
+	// Used for logging and debug capture. Adapters should use this instead of hardcoded names.
+	AgentID string
+
+	// AgentName is the human-readable agent name (e.g., "Auggie", "AMP", "Claude Code").
+	// Used for display purposes.
+	AgentName string
+
+	// BaseURL, AuthHeader, AuthValue, and Headers are unused by any adapter
+	// today (no HTTP-based transport exists). Populated by
+	// adapter.Config.ToSharedConfig but never read by a transport.
+	BaseURL    string            // Base URL of the agent's HTTP API
+	AuthHeader string            // Optional auth header name
+	AuthValue  string            // Optional auth header value
+	Headers    map[string]string // Additional headers
+
+	// Protocol-specific configuration
+	Extra map[string]string
+
+	// AssumeMcpSse overrides MCP capability filtering to assume SSE support.
+	AssumeMcpSse bool
+
+	// AssumeMcpHttp overrides MCP capability filtering to assume HTTP support.
+	AssumeMcpHttp bool
+
+	// RequiresProcessKill is returned verbatim from the adapter's
+	// RequiresProcessKill() method. Set true for agents whose subprocess does
+	// not exit on stdin close (opencode acp). The process manager uses the
+	// adapter's return value to decide whether to kill the entire process
+	// group on shutdown so MCP child processes don't leak.
+	RequiresProcessKill bool
+
+	// NotificationQueueCapacity is the resolved ACP inbound notification queue
+	// capacity. Zero keeps compatibility for directly constructed test configs.
+	NotificationQueueCapacity int
+
+	// PromptCancelJoinTimeout is an optional per-adapter ACP cancellation join bound.
+	PromptCancelJoinTimeout          time.Duration
+	ProviderInterruptionContinuation bool
+
+	// ProviderGatewayAuth, when set, makes the ACP adapter authenticate the
+	// agent against an OpenAI-compatible gateway right after initialize.
+	ProviderGatewayAuth *acpprovider.GatewayAuth
+}
+
+// GetPermissionTimeout returns the configured permission timeout or the default.
+func (c *Config) GetPermissionTimeout() time.Duration {
+	if c.PermissionTimeout > 0 {
+		return c.PermissionTimeout
+	}
+	return DefaultPermissionTimeout
+}
+
+// McpServerConfig holds configuration for an MCP server.
+type McpServerConfig struct {
+	// Name is the human-readable name of the MCP server
+	Name string `json:"name"`
+	// URL is the URL for HTTP/SSE transport
+	URL string `json:"url,omitempty"`
+	// Type is the transport type: "stdio", "sse", "http", or "streamable_http"
+	Type string `json:"type,omitempty"`
+	// Command is the command for stdio transport
+	Command string `json:"command,omitempty"`
+	// Args are the arguments for stdio transport
+	Args []string `json:"args,omitempty"`
+	// Env holds environment variables for stdio transport
+	Env map[string]string `json:"env,omitempty"`
+	// Headers holds HTTP headers for SSE/HTTP transport
+	Headers map[string]string `json:"headers,omitempty"`
+}

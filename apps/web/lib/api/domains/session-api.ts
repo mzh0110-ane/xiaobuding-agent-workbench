@@ -1,0 +1,288 @@
+import { ApiError, fetchConditionalJson, fetchJson, type ApiRequestOptions } from "../client";
+import type {
+  TaskSessionsResponse,
+  TaskSessionResponse,
+  MarkSessionReadResponse,
+  ListMessagesResponse,
+  ListTurnsResponse,
+} from "@/lib/types/http";
+import { getWebSocketClient } from "@/lib/ws/connection";
+
+export type ShellCommandOutput = {
+  exit_code?: number;
+  stdout?: string;
+  stderr?: string;
+  truncated?: boolean;
+};
+
+export type ShellCommandOutputSnapshot = {
+  message_id: string;
+  status: string;
+  updated_at: string;
+  output: ShellCommandOutput;
+};
+
+export type MessageSearchHit = {
+  id: string;
+  turn_id?: string;
+  author_type: string;
+  type: string;
+  snippet: string;
+  created_at: string;
+};
+
+export type SearchMessagesResponse = {
+  hits: MessageSearchHit[];
+  total: number;
+};
+
+export type AgentMcpAuthenticateResponse = {
+  terminal_id: string;
+  task_environment_id: string;
+  label: string;
+  reused: boolean;
+};
+
+export type AgentMcpRetryResponse = {
+  provider_id: "cursor";
+  server_id: string;
+  status:
+    | "ready"
+    | "authentication_required"
+    | "approval_failed"
+    | "connection_failed"
+    | "unavailable";
+  reason_code?: string;
+  tool_count?: number;
+};
+
+export function isAgentMcpRecoveryBusyError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    error.errorCode === "mcp_recovery_session_busy"
+  );
+}
+
+export function authenticateAgentMcp(
+  taskSessionId: string,
+  serverId: string,
+  options?: ApiRequestOptions,
+): Promise<AgentMcpAuthenticateResponse> {
+  return fetchJson<AgentMcpAuthenticateResponse>(
+    `/api/v1/task-sessions/${encodeURIComponent(taskSessionId)}/mcp/authenticate`,
+    {
+      ...options,
+      init: {
+        ...(options?.init ?? {}),
+        method: "POST",
+        body: JSON.stringify({ server_id: serverId }),
+      },
+    },
+  );
+}
+
+export function retryAgentMcpConnection(
+  taskSessionId: string,
+  serverId: string,
+  options?: ApiRequestOptions,
+): Promise<AgentMcpRetryResponse> {
+  return fetchJson<AgentMcpRetryResponse>(
+    `/api/v1/task-sessions/${encodeURIComponent(taskSessionId)}/mcp/retry`,
+    {
+      ...options,
+      init: {
+        ...(options?.init ?? {}),
+        method: "POST",
+        body: JSON.stringify({ server_id: serverId }),
+      },
+    },
+  );
+}
+
+/** Search messages in a single session via WebSocket. */
+export async function searchSessionMessages(
+  sessionId: string,
+  query: string,
+  limit = 50,
+): Promise<SearchMessagesResponse> {
+  const client = getWebSocketClient();
+  if (!client) return { hits: [], total: 0 };
+  return client.request<SearchMessagesResponse>(
+    "message.search",
+    { session_id: sessionId, query, limit },
+    10000,
+  );
+}
+
+/**
+ * Rename a session's tab label. Pass an empty string to clear the custom
+ * name and revert to the derived agent/model title. The backend broadcasts
+ * a session.state_changed event so every client picks up the new label.
+ */
+export async function renameSession(sessionId: string, name: string): Promise<void> {
+  const client = getWebSocketClient();
+  if (!client) throw new Error("WebSocket unavailable");
+  await client.request("session.rename", { session_id: sessionId, name });
+}
+
+// Session operations
+export async function listTaskSessions(taskId: string, options?: ApiRequestOptions) {
+  return fetchJson<TaskSessionsResponse>(`/api/v1/tasks/${taskId}/sessions`, options);
+}
+
+export async function fetchTaskSession(taskSessionId: string, options?: ApiRequestOptions) {
+  return fetchJson<TaskSessionResponse>(`/api/v1/task-sessions/${taskSessionId}`, options);
+}
+
+export function fetchTaskSessionConditional(taskSessionId: string, etag?: string) {
+  return fetchConditionalJson<TaskSessionResponse>(`/api/v1/task-sessions/${taskSessionId}`, {
+    cache: "no-store",
+    ...(etag ? { init: { headers: { "If-None-Match": etag } } } : {}),
+  });
+}
+
+export async function dismissLastAgentError(
+  taskSessionId: string,
+  stamp: string,
+  options?: ApiRequestOptions,
+) {
+  return fetchJson<TaskSessionResponse>(
+    `/api/v1/task-sessions/${taskSessionId}/last-agent-error/dismiss`,
+    {
+      ...options,
+      init: { ...(options?.init ?? {}), method: "POST", body: JSON.stringify({ stamp }) },
+    },
+  );
+}
+
+/**
+ * Advances the session's Slack-style read cursor to messageId. Called when a
+ * session becomes the visible chat panel — the caller must snapshot the
+ * session's PRIOR last_read_message_id (to position the unread divider)
+ * before invoking this. The response is intentionally narrow (just the
+ * updated cursor, not a full session) — apply it with a narrow store update
+ * (e.g. updateSessionReadCursor), never a full-session merge, so it can't
+ * clobber a newer field written by a concurrent WebSocket update.
+ */
+export async function markSessionRead(
+  taskSessionId: string,
+  messageId: string,
+  options?: ApiRequestOptions,
+) {
+  return fetchJson<MarkSessionReadResponse>(`/api/v1/task-sessions/${taskSessionId}/mark-read`, {
+    ...options,
+    init: {
+      ...(options?.init ?? {}),
+      method: "POST",
+      body: JSON.stringify({ message_id: messageId }),
+    },
+  });
+}
+
+/** Lists session messages with optional prompt filtering and around-window lookup. */
+export async function listTaskSessionMessages(
+  taskSessionId: string,
+  params?: {
+    limit?: number;
+    before?: string;
+    after?: string;
+    around?: string;
+    author_type?: "user";
+    sort?: "asc" | "desc";
+  },
+  options?: ApiRequestOptions,
+) {
+  const query = new URLSearchParams();
+  if (params?.limit !== undefined) query.set("limit", String(params.limit));
+  if (params?.before) query.set("before", params.before);
+  if (params?.after) query.set("after", params.after);
+  if (params?.around) query.set("around", params.around);
+  if (params?.author_type) query.set("author_type", params.author_type);
+  if (params?.sort) query.set("sort", params.sort);
+  const suffix = query.toString();
+  const url = `/api/v1/task-sessions/${taskSessionId}/messages${suffix ? `?${suffix}` : ""}`;
+  return fetchJson<ListMessagesResponse>(url, options);
+}
+
+export async function fetchShellCommandOutput(
+  taskSessionId: string,
+  messageId: string,
+  options?: ApiRequestOptions,
+) {
+  return fetchJson<ShellCommandOutputSnapshot>(
+    `/api/v1/task-sessions/${taskSessionId}/messages/${messageId}/shell-output`,
+    options,
+  );
+}
+
+export async function listSessionTurns(taskSessionId: string, options?: ApiRequestOptions) {
+  return fetchJson<ListTurnsResponse>(`/api/v1/task-sessions/${taskSessionId}/turns`, options);
+}
+
+export async function openSessionInEditor(
+  sessionId: string,
+  payload: Partial<{
+    editor_id: string;
+    editor_type: string;
+    file_path: string;
+    line: number;
+    column: number;
+    worktree_id: string;
+  }>,
+  options?: ApiRequestOptions,
+) {
+  return fetchJson<{ url?: string }>(`/api/v1/task-sessions/${sessionId}/open-editor`, {
+    ...options,
+    init: { method: "POST", body: JSON.stringify(payload), ...(options?.init ?? {}) },
+  });
+}
+
+export async function openSessionFolder(
+  sessionId: string,
+  options?: ApiRequestOptions,
+  payload?: { worktree_id?: string },
+) {
+  return fetchJson<{ success: boolean }>(`/api/v1/task-sessions/${sessionId}/open-folder`, {
+    ...options,
+    init: {
+      method: "POST",
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
+      ...(options?.init ?? {}),
+    },
+  });
+}
+
+export async function setSessionMode(sessionId: string, modeId: string) {
+  return fetchJson<{ ok: boolean }>(`/api/v1/task-sessions/${sessionId}/set-mode`, {
+    init: { method: "POST", body: JSON.stringify({ mode_id: modeId }) },
+  });
+}
+
+export async function setSessionModel(sessionId: string, modelId: string) {
+  return fetchJson<{ ok: boolean }>(`/api/v1/task-sessions/${sessionId}/set-model`, {
+    init: { method: "POST", body: JSON.stringify({ model_id: modelId }) },
+  });
+}
+
+export async function setSessionConfigOption(sessionId: string, configId: string, value: string) {
+  return fetchJson<{ ok: boolean }>(`/api/v1/task-sessions/${sessionId}/set-config-option`, {
+    init: { method: "POST", body: JSON.stringify({ config_id: configId, value }) },
+  });
+}
+
+export async function authenticateSession(sessionId: string, methodId: string) {
+  return fetchJson<{ ok: boolean }>(`/api/v1/task-sessions/${sessionId}/authenticate`, {
+    init: { method: "POST", body: JSON.stringify({ method_id: methodId }) },
+  });
+}
+
+export { launchSession, type LaunchSessionResponse } from "@/lib/services/session-launch-service";
+export {
+  buildPRPrepareRequest,
+  buildPrepareRequest,
+  buildStartRequest,
+  buildStartCreatedRequest,
+  buildResumeRequest,
+  buildWorkflowStepRequest,
+} from "@/lib/services/session-launch-helpers";

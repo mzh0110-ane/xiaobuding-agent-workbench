@@ -1,0 +1,733 @@
+package sentry
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/integrations/optional"
+)
+
+// withSearchResults returns a fakeClient that always returns the given issues
+// for SearchIssues, ignoring the filter.
+func (c *fakeClient) withSearchResults(issues []SentryIssue) *fakeClient {
+	c.searchIssuesFn = func(_ SearchFilter, _ string) (*SearchResult, error) {
+		return &SearchResult{Issues: issues, IsLast: true}, nil
+	}
+	return c
+}
+
+func validFilter() SearchFilter {
+	return SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend"}}
+}
+func intPtr(value int) *int {
+	return &value
+}
+
+func TestService_CreateIssueWatch_DefaultsAndValidation(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	instID := f.ensureInstance(t, "ws-1")
+
+	// Bad filters are rejected before the instance check, so no instance needed.
+	for name, filter := range map[string]SearchFilter{
+		"empty":          {},
+		"org only":       {OrgSlug: "acme"},
+		"whitespace org": {OrgSlug: "   ", ProjectSlugs: []string{"frontend"}},
+		"multi status":   {OrgSlug: "acme", ProjectSlugs: []string{"frontend"}, Statuses: []string{"unresolved", "ignored"}},
+	} {
+		if _, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+			WorkspaceID: "ws-1", SentryInstanceID: instID,
+			WorkflowID: "wf", WorkflowStepID: "step", Filter: filter,
+		}); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%s filter should be rejected, got %v", name, err)
+		}
+	}
+
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: instID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if w.ID == "" || !w.Enabled {
+		t.Fatalf("unexpected created watch: %+v", w)
+	}
+	if w.SentryInstanceID != instID {
+		t.Errorf("expected instance %q bound, got %q", instID, w.SentryInstanceID)
+	}
+}
+
+// TestService_CreateIssueWatch_InstanceValidation pins the required + owned
+// contract on the bound instance.
+func TestService_CreateIssueWatch_InstanceValidation(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	other := f.seedInstance(t, "ws-2", "Other", "")
+
+	// Missing instance → ErrInstanceRequired.
+	if _, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	}); !errors.Is(err, ErrInstanceRequired) {
+		t.Errorf("expected ErrInstanceRequired for missing instance, got %v", err)
+	}
+	// Instance from another workspace → ErrInstanceNotFound.
+	if _, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: other.ID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	}); !errors.Is(err, ErrInstanceNotFound) {
+		t.Errorf("expected ErrInstanceNotFound for cross-workspace instance, got %v", err)
+	}
+}
+
+func TestService_UpdateIssueWatch_LegacyMultiStatusToggle(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+
+	// Seed a legacy watch (unbound, multi-status) directly through the store.
+	w := newTestIssueWatch("ws-1")
+	w.Filter.Statuses = []string{"unresolved", "ignored"}
+	if err := f.store.CreateIssueWatch(ctx, w); err != nil {
+		t.Fatalf("seed watch: %v", err)
+	}
+	disabled := false
+	if _, err := f.svc.UpdateIssueWatch(ctx, w.ID, &UpdateIssueWatchRequest{Enabled: &disabled}); err != nil {
+		t.Fatalf("toggle on legacy multi-status watch should succeed, got %v", err)
+	}
+	bad := SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend"}, Statuses: []string{"unresolved", "ignored"}}
+	if _, err := f.svc.UpdateIssueWatch(ctx, w.ID, &UpdateIssueWatchRequest{Filter: &bad}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("filter patch with multiple statuses should be rejected, got %v", err)
+	}
+}
+
+// TestService_UpdateIssueWatch_PersistsLookbackPeriod covers the update half of
+// the offered-token contract: a filter-carrying update stores the selected
+// lookback unchanged, so a non-default choice survives the write path.
+//
+// @covers AC-INTEGRATIONS-SENTRY-WATCHER-LOOKBACK-PERIODS-001.1
+func TestService_UpdateIssueWatch_PersistsLookbackPeriod(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	created, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: f.ensureInstance(t, "ws-1"),
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	filter := validFilter()
+	filter.StatsPeriod = "30d"
+	if _, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{Filter: &filter}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	reloaded, err := f.store.GetIssueWatch(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Filter.StatsPeriod != "30d" {
+		t.Errorf("stored lookback = %q, want %q", reloaded.Filter.StatsPeriod, "30d")
+	}
+}
+
+// TestService_IssueWatch_LookbackPeriodValidation covers the two guards that
+// replace the project-scoped request parameter as the rejection point for a
+// lookback outside Kandev's supported syntax (a whole number of hours, days,
+// or weeks): the write sites reject it, an empty value stays acceptable, an
+// unrelated partial update never re-validates a stored value, and a row that
+// already stores one fails its poll closed without searching.
+//
+// @covers AC-INTEGRATIONS-SENTRY-WATCHER-LOOKBACK-PERIODS-001.4, AC-INTEGRATIONS-SENTRY-WATCHER-LOOKBACK-PERIODS-001.6
+func TestService_IssueWatch_LookbackPeriodValidation(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	instID := f.ensureInstance(t, "ws-1")
+	createReq := func(filter SearchFilter) *CreateIssueWatchRequest {
+		return &CreateIssueWatchRequest{
+			WorkspaceID: "ws-1", SentryInstanceID: instID,
+			WorkflowID: "wf", WorkflowStepID: "step", Filter: filter,
+		}
+	}
+
+	// 30m is a valid Sentry relative duration but outside the accepted set. Both
+	// write sites must reject it: the shared parser derives nothing from it, so
+	// the stored search would carry no age term at all and the watch would match
+	// issues of any age.
+	unsupported := validFilter()
+	unsupported.StatsPeriod = "30m"
+	if _, err := f.svc.CreateIssueWatch(ctx, createReq(unsupported)); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("create with a 30m lookback must be rejected, got %v", err)
+	}
+
+	created, err := f.svc.CreateIssueWatch(ctx, createReq(validFilter()))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{
+		Filter: &unsupported,
+	}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("filter-carrying update with a 30m lookback must be rejected, got %v", err)
+	}
+
+	// An empty lookback stays accepted: the field is optional and a legacy row
+	// may store it.
+	for _, empty := range []string{"", "   "} {
+		filter := validFilter()
+		filter.StatsPeriod = empty
+		if _, err := f.svc.CreateIssueWatch(ctx, createReq(filter)); err != nil {
+			t.Errorf("empty lookback %q must be accepted, got %v", empty, err)
+		}
+	}
+
+	// A row that already stores an unsupported value is neither rewritten nor
+	// re-validated by an update that omits the filter.
+	stored := newTestIssueWatch("ws-1")
+	stored.Filter.StatsPeriod = "30m"
+	if err := f.store.CreateIssueWatch(ctx, stored); err != nil {
+		t.Fatalf("seed watch: %v", err)
+	}
+	disabled := false
+	if _, err := f.svc.UpdateIssueWatch(ctx, stored.ID, &UpdateIssueWatchRequest{
+		Enabled: &disabled,
+	}); err != nil {
+		t.Errorf("unrelated partial update must not re-validate the stored lookback, got %v", err)
+	}
+
+	// That row's poll fails closed: the error is recorded and no search is
+	// issued, so an old issue cannot become a task through an age-less query.
+	searched := false
+	f.client.searchIssuesFn = func(_ SearchFilter, _ string) (*SearchResult, error) {
+		searched = true
+		return &SearchResult{IsLast: true}, nil
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, stored); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("poll with a stored 30m lookback must fail closed, got %v", err)
+	}
+	if searched {
+		t.Error("poll must not search when the stored lookback is outside the supported syntax")
+	}
+	refreshed, err := f.store.GetIssueWatch(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("reload watch: %v", err)
+	}
+	if refreshed.LastError == "" {
+		t.Error("expected the poll failure recorded on the watch")
+	}
+}
+
+func TestService_UpdateIssueWatch_PartialPatch(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	created, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: f.ensureInstance(t, "ws-1"),
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(), Prompt: "original",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	newPrompt := "updated"
+	updated, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{Prompt: &newPrompt})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Prompt != "updated" {
+		t.Errorf("prompt not updated: got %q, want %q", updated.Prompt, "updated")
+	}
+	if updated.Filter.OrgSlug != "acme" {
+		t.Errorf("filter changed by prompt-only patch: got orgSlug %q, want %q", updated.Filter.OrgSlug, "acme")
+	}
+	if updated.WorkspaceID != created.WorkspaceID {
+		t.Errorf("workspace id changed: got %q, want %q", updated.WorkspaceID, created.WorkspaceID)
+	}
+	empty := SearchFilter{}
+	if _, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{Filter: &empty}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for empty filter patch, got %v", err)
+	}
+}
+
+// TestService_UpdateIssueWatch_InstanceImmutable pins acceptance (g): the bound
+// instance is absent from the update request, so it cannot be changed.
+func TestService_UpdateIssueWatch_InstanceImmutable(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	instA := f.seedInstance(t, "ws-1", "A", "")
+	created, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: instA.ID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	prompt := "changed"
+	updated, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{Prompt: &prompt})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.SentryInstanceID != instA.ID {
+		t.Errorf("instance changed on update: got %q want %q", updated.SentryInstanceID, instA.ID)
+	}
+	reloaded, _ := f.store.GetIssueWatch(ctx, created.ID)
+	if reloaded.SentryInstanceID != instA.ID {
+		t.Errorf("persisted instance changed: got %q want %q", reloaded.SentryInstanceID, instA.ID)
+	}
+}
+
+func TestService_IssueWatch_MaxInflightTasks(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	instID := f.ensureInstance(t, "ws-1")
+	base := func() *CreateIssueWatchRequest {
+		return &CreateIssueWatchRequest{
+			WorkspaceID: "ws-1", SentryInstanceID: instID,
+			WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+		}
+	}
+
+	req := base()
+	req.MaxInflightTasks = intPtr(0)
+	if _, err := f.svc.CreateIssueWatch(ctx, req); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for non-positive cap, got %v", err)
+	}
+	req = base()
+	req.MaxInflightTasks = intPtr(3)
+	created, err := f.svc.CreateIssueWatch(ctx, req)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	reloaded, _ := f.svc.GetIssueWatch(ctx, created.ID)
+	if reloaded.MaxInflightTasks == nil || *reloaded.MaxInflightTasks != 3 {
+		t.Fatalf("expected cap 3 persisted, got %v", reloaded.MaxInflightTasks)
+	}
+	unchanged, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{})
+	if err != nil || unchanged.MaxInflightTasks == nil || *unchanged.MaxInflightTasks != 3 {
+		t.Errorf("omitted cap should stay 3, got %v (err %v)", unchanged.MaxInflightTasks, err)
+	}
+	uncapped, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{
+		MaxInflightTasks: optional.Int{Present: true, Value: nil},
+	})
+	if err != nil || uncapped.MaxInflightTasks != nil {
+		t.Errorf("null cap should clear to uncapped, got %v (err %v)", uncapped.MaxInflightTasks, err)
+	}
+	if _, err := f.svc.UpdateIssueWatch(ctx, created.ID, &UpdateIssueWatchRequest{
+		MaxInflightTasks: optional.Int{Present: true, Value: intPtr(-1)},
+	}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for negative cap patch, got %v", err)
+	}
+}
+
+func TestService_CreateIssueWatch_RejectsOutOfRangeInterval(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	instID := f.ensureInstance(t, "ws-1")
+	for _, n := range []int{1, 30, 59, 3601, 86400} {
+		if _, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+			WorkspaceID: "ws-1", SentryInstanceID: instID,
+			WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(), PollIntervalSeconds: n,
+		}); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("expected ErrInvalidConfig for pollIntervalSeconds=%d, got %v", n, err)
+		}
+	}
+	if _, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: instID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	}); err != nil {
+		t.Errorf("expected zero pollIntervalSeconds to be accepted, got %v", err)
+	}
+}
+
+func TestService_UpdateIssueWatch_RejectsEmptyWorkflowFields(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	created, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: f.ensureInstance(t, "ws-1"),
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	empty := ""
+	for _, req := range []*UpdateIssueWatchRequest{{WorkflowID: &empty}, {WorkflowStepID: &empty}} {
+		if _, err := f.svc.UpdateIssueWatch(ctx, created.ID, req); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("expected ErrInvalidConfig for %+v, got %v", req, err)
+		}
+	}
+}
+
+func TestService_UpdateIssueWatch_NotFound(t *testing.T) {
+	f := newSvcFixture(t)
+	prompt := "x"
+	if _, err := f.svc.UpdateIssueWatch(context.Background(), "ghost", &UpdateIssueWatchRequest{Prompt: &prompt}); !errors.Is(err, ErrIssueWatchNotFound) {
+		t.Errorf("expected ErrIssueWatchNotFound, got %v", err)
+	}
+}
+
+func TestService_CheckIssueWatch_FiltersAlreadySeen(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+	f.client.withSearchResults([]SentryIssue{
+		{ShortID: "PROJ-1", Title: "one", Permalink: "https://sentry.io/issues/PROJ-1"},
+		{ShortID: "PROJ-2", Title: "two", Permalink: "https://sentry.io/issues/PROJ-2"},
+		{ShortID: "PROJ-3", Title: "three", Permalink: "https://sentry.io/issues/PROJ-3"},
+	})
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: inst.ID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create watch: %v", err)
+	}
+	if _, err := f.store.ReserveIssueWatchTask(ctx, w.ID, "PROJ-2", "https://sentry.io/issues/PROJ-2"); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	_, got, err := f.svc.CheckIssueWatch(ctx, w)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unseen issues, got %d", len(got))
+	}
+	for _, i := range got {
+		if i.ShortID == "PROJ-2" {
+			t.Error("PROJ-2 should have been filtered as already seen")
+		}
+	}
+	refreshed, _ := f.store.GetIssueWatch(ctx, w.ID)
+	if refreshed.LastPolledAt == nil {
+		t.Error("expected last_polled_at stamped after check")
+	}
+}
+
+func TestService_CheckIssueWatch_StampsLastPolledOnError(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+	f.client.searchIssuesFn = func(_ SearchFilter, _ string) (*SearchResult, error) {
+		return nil, errors.New("upstream 500")
+	}
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: inst.ID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, w); err == nil {
+		t.Error("expected error from search to surface to caller")
+	}
+	refreshed, _ := f.store.GetIssueWatch(ctx, w.ID)
+	if refreshed.LastPolledAt == nil {
+		t.Error("expected last_polled_at stamped even on search failure (liveness signal)")
+	}
+}
+
+func TestService_CheckIssueWatch_ClearsLastErrorAfterSuccess(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: inst.ID,
+		WorkflowID: "wf", WorkflowStepID: "step", Filter: validFilter(),
+	})
+	if err != nil {
+		t.Fatalf("create watch: %v", err)
+	}
+	if err := f.store.StampIssueWatchError(ctx, w.ID, "upstream 500"); err != nil {
+		t.Fatalf("stamp initial error: %v", err)
+	}
+
+	f.client.withSearchResults(nil)
+	if _, _, err := f.svc.CheckIssueWatch(ctx, w); err != nil {
+		t.Fatalf("check recovered watch: %v", err)
+	}
+	reloaded, err := f.store.GetIssueWatch(ctx, w.ID)
+	if err != nil {
+		t.Fatalf("reload watch: %v", err)
+	}
+	if reloaded.LastError != "" {
+		t.Errorf("last error = %q, want cleared after success", reloaded.LastError)
+	}
+	if reloaded.LastErrorAt != nil {
+		t.Errorf("last error timestamp = %v, want cleared after success", reloaded.LastErrorAt)
+	}
+}
+
+// TestService_CheckIssueWatch_PollsStoredLookbackPeriod proves an existing
+// watch keeps polling with the lookback token it stored: the row round-trips
+// through the store unaltered and the search client receives that token.
+//
+// @covers AC-INTEGRATIONS-SENTRY-WATCHER-LOOKBACK-PERIODS-001.3
+func TestService_CheckIssueWatch_PollsStoredLookbackPeriod(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	f.seedInstance(t, "ws-1", "Primary", "tok")
+	w := newTestIssueWatch("ws-1")
+	w.Filter.StatsPeriod = "30d"
+	if err := f.store.CreateIssueWatch(ctx, w); err != nil {
+		t.Fatalf("seed watch: %v", err)
+	}
+
+	var polled []string
+	f.client.searchIssuesFn = func(filter SearchFilter, _ string) (*SearchResult, error) {
+		polled = append(polled, filter.StatsPeriod)
+		return &SearchResult{IsLast: true}, nil
+	}
+
+	reloaded, err := f.store.GetIssueWatch(ctx, w.ID)
+	if err != nil {
+		t.Fatalf("reload watch: %v", err)
+	}
+	if reloaded.Filter.StatsPeriod != "30d" {
+		t.Fatalf("stored lookback = %q, want %q", reloaded.Filter.StatsPeriod, "30d")
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, reloaded); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if len(polled) != 1 || polled[0] != "30d" {
+		t.Errorf("search client received lookbacks %v, want [30d]", polled)
+	}
+}
+
+// TestService_CheckIssueWatch_ResolvesSoleInstance pins acceptance (b): an
+// unbound (NULL-instance) watch resolves to its workspace's sole instance at
+// poll time.
+func TestService_CheckIssueWatch_ResolvesSoleInstance(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "Primary", "tok") // the sole healthy instance, with a secret
+	if err := f.store.UpdateAuthHealthForInstance(ctx, inst.ID, true, "", time.Now().UTC()); err != nil {
+		t.Fatalf("mark instance healthy: %v", err)
+	}
+	f.client.withSearchResults([]SentryIssue{
+		{ShortID: "PROJ-1", Title: "one", Permalink: "https://sentry.io/issues/PROJ-1"},
+	})
+	// Watch created directly with a NULL instance (migrated legacy row).
+	w := newTestIssueWatch("ws-1")
+	if err := f.store.CreateIssueWatch(ctx, w); err != nil {
+		t.Fatalf("seed unbound watch: %v", err)
+	}
+	if w.SentryInstanceID != "" {
+		t.Fatalf("expected unbound watch, got instance %q", w.SentryInstanceID)
+	}
+	gotInstanceID, got, err := f.svc.CheckIssueWatch(ctx, w)
+	if err != nil {
+		t.Fatalf("check unbound watch: %v", err)
+	}
+	if gotInstanceID != inst.ID {
+		t.Errorf("resolved instance = %q, want sole instance %q", gotInstanceID, inst.ID)
+	}
+	if len(got) != 1 || got[0].ShortID != "PROJ-1" {
+		t.Fatalf("expected sole-instance resolution to return PROJ-1, got %+v", got)
+	}
+}
+
+// TestService_ResolveWatchInstanceID_SoleInstanceIgnoresHealth pins the
+// ADR-0030 single-instance contract: an unbound watch resolves to its
+// workspace's only instance even when that instance has never been health
+// probed (LastOk still false) — matching the pre-existing behavior every
+// poller test's saveConfigForWorkspace helper relies on.
+func TestService_ResolveWatchInstanceID_SoleInstanceIgnoresHealth(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "Primary", "tok")
+
+	instanceID, err := f.svc.resolveWatchInstanceID(ctx, newTestIssueWatch("ws-1"))
+	if err != nil {
+		t.Fatalf("resolve watch instance: %v", err)
+	}
+	if instanceID != inst.ID {
+		t.Errorf("resolved instance = %q, want sole instance %q", instanceID, inst.ID)
+	}
+}
+
+func TestService_ResolveWatchInstanceID_AmbiguousMultiInstancePrefersHealthy(t *testing.T) {
+	t.Run("selects the sole healthy instance among several", func(t *testing.T) {
+		f := newSvcFixture(t)
+		ctx := context.Background()
+		f.seedInstance(t, "ws-1", "Unhealthy", "tok")
+		healthy := f.seedInstance(t, "ws-1", "Healthy", "tok")
+		if err := f.store.UpdateAuthHealthForInstance(ctx, healthy.ID, true, "", time.Now().UTC()); err != nil {
+			t.Fatalf("mark instance healthy: %v", err)
+		}
+
+		instanceID, err := f.svc.resolveWatchInstanceID(ctx, newTestIssueWatch("ws-1"))
+		if err != nil {
+			t.Fatalf("resolve watch instance: %v", err)
+		}
+		if instanceID != healthy.ID {
+			t.Errorf("resolved instance = %q, want healthy instance %q", instanceID, healthy.ID)
+		}
+	})
+
+	t.Run("rejects when several instances exist and none is healthy", func(t *testing.T) {
+		f := newSvcFixture(t)
+		ctx := context.Background()
+		f.seedInstance(t, "ws-1", "A", "tok")
+		f.seedInstance(t, "ws-1", "B", "tok")
+
+		if _, err := f.svc.resolveWatchInstanceID(ctx, newTestIssueWatch("ws-1")); !errors.Is(err, ErrNotConfigured) {
+			t.Errorf("expected ErrNotConfigured with no healthy instance among several, got %v", err)
+		}
+	})
+
+	t.Run("rejects when multiple instances are healthy", func(t *testing.T) {
+		f := newSvcFixture(t)
+		ctx := context.Background()
+		for _, name := range []string{"A", "B"} {
+			instance := f.seedInstance(t, "ws-1", name, "tok")
+			if err := f.store.UpdateAuthHealthForInstance(ctx, instance.ID, true, "", time.Now().UTC()); err != nil {
+				t.Fatalf("mark %s healthy: %v", name, err)
+			}
+		}
+
+		if _, err := f.svc.resolveWatchInstanceID(ctx, newTestIssueWatch("ws-1")); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("expected ErrInvalidConfig with multiple healthy instances, got %v", err)
+		}
+	})
+}
+
+// TestService_CheckIssueWatch_UnboundNoInstanceStampsError pins the other half
+// of acceptance (b): an unbound watch whose workspace has no instance stamps a
+// last_error and skips, without disabling the watch.
+func TestService_CheckIssueWatch_UnboundNoInstanceStampsError(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	w := newTestIssueWatch("ws-empty") // workspace has zero instances
+	if err := f.store.CreateIssueWatch(ctx, w); err != nil {
+		t.Fatalf("seed watch: %v", err)
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, w); err == nil {
+		t.Error("expected an error when no instance can be resolved")
+	}
+	refreshed, _ := f.store.GetIssueWatch(ctx, w.ID)
+	if refreshed.LastError == "" {
+		t.Error("expected last_error stamped when resolution fails")
+	}
+	if !refreshed.Enabled {
+		t.Error("watch must stay enabled (stamp + skip, not disable) so it auto-heals")
+	}
+}
+
+// TestService_CheckIssueWatch_PollsEveryConfiguredProject pins multi-project
+// support: a watch bound to several projects issues one SearchIssues call per
+// project and merges the results into a single unseen-issue list.
+func TestService_CheckIssueWatch_PollsEveryConfiguredProject(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+
+	var seenFilters []SearchFilter
+	f.client.searchIssuesFn = func(filter SearchFilter, _ string) (*SearchResult, error) {
+		seenFilters = append(seenFilters, filter)
+		if len(filter.ProjectSlugs) != 1 {
+			t.Fatalf("expected exactly one project slug per request, got %+v", filter)
+		}
+		switch filter.ProjectSlugs[0] {
+		case "frontend":
+			return &SearchResult{Issues: []SentryIssue{{ShortID: "FE-1", Title: "fe issue"}}, IsLast: true}, nil
+		case "backend":
+			return &SearchResult{Issues: []SentryIssue{{ShortID: "BE-1", Title: "be issue"}}, IsLast: true}, nil
+		default:
+			t.Fatalf("unexpected project slug forwarded: %q", filter.ProjectSlugs[0])
+			return nil, nil
+		}
+	}
+
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: inst.ID,
+		WorkflowID: "wf", WorkflowStepID: "step",
+		Filter: SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend", "backend"}},
+	})
+	if err != nil {
+		t.Fatalf("create watch: %v", err)
+	}
+
+	_, got, err := f.svc.CheckIssueWatch(ctx, w)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if len(seenFilters) != 2 {
+		t.Fatalf("expected one SearchIssues call per project, got %d", len(seenFilters))
+	}
+	gotIDs := make([]string, 0, len(got))
+	for _, i := range got {
+		gotIDs = append(gotIDs, i.ShortID)
+	}
+	if !sameStrings(gotIDs, []string{"FE-1", "BE-1"}) {
+		t.Errorf("expected issues merged across both projects, got %v", gotIDs)
+	}
+}
+
+// TestService_CheckIssueWatch_ProjectFailureAbortsCheck pins that a search
+// failure on any one of a watch's several projects surfaces to the caller
+// (fail-fast, matching the single-project behavior) rather than silently
+// returning a partial result.
+func TestService_CheckIssueWatch_ProjectFailureAbortsCheck(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+	f.client.searchIssuesFn = func(filter SearchFilter, _ string) (*SearchResult, error) {
+		if len(filter.ProjectSlugs) == 1 && filter.ProjectSlugs[0] == "backend" {
+			return nil, errors.New("upstream 500")
+		}
+		return &SearchResult{Issues: []SentryIssue{{ShortID: "FE-1"}}, IsLast: true}, nil
+	}
+	w, err := f.svc.CreateIssueWatch(ctx, &CreateIssueWatchRequest{
+		WorkspaceID: "ws-1", SentryInstanceID: inst.ID,
+		WorkflowID: "wf", WorkflowStepID: "step",
+		Filter: SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend", "backend"}},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, w); err == nil {
+		t.Error("expected error when any configured project's search fails")
+	}
+}
+
+// TestService_CheckIssueWatch_NoProjectConfigured_ReturnsError pins the
+// safety rule for corrupted/legacy data: a watch that somehow persisted with
+// zero project slugs must fail loudly, never fall back to polling (and
+// creating tasks for) every project in the org.
+func TestService_CheckIssueWatch_NoProjectConfigured_ReturnsError(t *testing.T) {
+	f := newSvcFixture(t)
+	ctx := context.Background()
+	inst := f.seedInstance(t, "ws-1", "A", "sntrys_abc")
+	w := newTestIssueWatch("ws-1")
+	w.SentryInstanceID = inst.ID
+	w.Filter.ProjectSlugs = nil
+	if err := f.store.CreateIssueWatch(ctx, w); err != nil {
+		t.Fatalf("seed watch: %v", err)
+	}
+	if _, _, err := f.svc.CheckIssueWatch(ctx, w); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for watch with no configured project, got %v", err)
+	}
+	refreshed, _ := f.store.GetIssueWatch(ctx, w.ID)
+	if refreshed.LastError == "" {
+		t.Error("expected last_error stamped for unpollable watch")
+	}
+}
+
+func TestValidateFilter_RequiresAtLeastOneProjectSlug(t *testing.T) {
+	if err := validateFilter(SearchFilter{OrgSlug: "acme"}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for filter with no projects, got %v", err)
+	}
+	if err := validateFilter(SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend"}}); err != nil {
+		t.Errorf("expected valid single-project filter to pass, got %v", err)
+	}
+	if err := validateFilter(SearchFilter{OrgSlug: "acme", ProjectSlugs: []string{"frontend", "backend"}}); err != nil {
+		t.Errorf("expected valid multi-project filter to pass, got %v", err)
+	}
+}
+
+func TestNormalizeFilter_TrimsDedupesAndDropsEmptyProjectSlugs(t *testing.T) {
+	got := normalizeFilter(SearchFilter{
+		OrgSlug:      "acme",
+		ProjectSlugs: []string{" frontend ", "backend", "", "frontend", "  "},
+	})
+	if !sameStrings(got.ProjectSlugs, []string{"frontend", "backend"}) {
+		t.Errorf("expected [frontend backend], got %v", got.ProjectSlugs)
+	}
+}

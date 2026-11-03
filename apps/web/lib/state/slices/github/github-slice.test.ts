@@ -1,0 +1,651 @@
+import { describe, it, expect } from "vitest";
+import { create } from "zustand";
+import { immer } from "zustand/middleware/immer";
+import { createGitHubSlice } from "./github-slice";
+import type { GitHubSlice } from "./types";
+import type {
+  GitHubPRDiscoveryHealth,
+  GitHubStatus,
+  TaskCIAutomationOptions,
+  TaskIssueLink,
+  TaskPR,
+} from "@/lib/types/github";
+
+function makePR(overrides: Partial<TaskPR> = {}): TaskPR {
+  return {
+    id: "id",
+    workspace_id: "workspace-1",
+    task_id: "task-1",
+    owner: "o",
+    repo: "r",
+    pr_number: 1,
+    pr_url: "",
+    pr_title: "Test PR",
+    head_branch: "feat",
+    base_branch: "main",
+    author_login: "alice",
+    state: "open",
+    review_state: "",
+    checks_state: "",
+    mergeable_state: "",
+    review_count: 0,
+    pending_review_count: 0,
+    comment_count: 0,
+    unresolved_review_threads: 0,
+    checks_total: 0,
+    checks_passing: 0,
+    additions: 0,
+    deletions: 0,
+    created_at: "",
+    merged_at: null,
+    closed_at: null,
+    last_synced_at: null,
+    updated_at: "",
+    ...overrides,
+  };
+}
+
+function makeStore() {
+  return create<GitHubSlice>()(immer((...a) => createGitHubSlice(...a)));
+}
+
+function makeCIOptions(overrides: Partial<TaskCIAutomationOptions> = {}): TaskCIAutomationOptions {
+  return {
+    task_id: "task-1",
+    auto_fix_enabled: false,
+    auto_merge_enabled: false,
+    auto_fix_prompt_override: null,
+    effective_auto_fix_prompt: "Default CI prompt",
+    using_default_prompt: true,
+    updated_at: "2026-06-18T10:00:00Z",
+    pr_states: [],
+    pr_options: [],
+    ...overrides,
+  };
+}
+
+const FUTURE_RESET = "2030-01-01T00:00:00Z";
+const NOW = "2026-05-04T12:00:00Z";
+const WORKSPACE_A = "workspace-a";
+const WORKSPACE_B = "workspace-b";
+
+const baseStatus: GitHubStatus = {
+  authenticated: true,
+  username: "octocat",
+  auth_method: "pat",
+  token_configured: true,
+  required_scopes: ["repo"],
+};
+
+const legacyStatus: GitHubStatus = {
+  ...baseStatus,
+  automation: {
+    workspace_id: "ws-1",
+    source: "legacy_shared",
+    github_host: "github.com",
+    status: "active",
+    credential_generation: 1,
+  },
+};
+
+describe("applyGitHubRateLimitUpdate", () => {
+  it("merges incoming snapshots into the existing status", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus("ws-1");
+    store.getState().setGitHubStatus("ws-1", { ...legacyStatus });
+    store.getState().resetGitHubStatus("ws-2");
+    store.getState().setGitHubStatus("ws-2", { ...baseStatus });
+
+    store.getState().applyGitHubRateLimitUpdate({
+      trigger: "graphql",
+      snapshots: [
+        {
+          resource: "graphql",
+          remaining: 0,
+          limit: 5000,
+          reset_at: FUTURE_RESET,
+          updated_at: NOW,
+        },
+        {
+          resource: "core",
+          remaining: 4500,
+          limit: 5000,
+          reset_at: FUTURE_RESET,
+          updated_at: NOW,
+        },
+      ],
+    });
+
+    const status = store.getState().githubStatus.byWorkspaceId["ws-1"]?.status;
+    expect(status?.rate_limit?.graphql?.remaining).toBe(0);
+    expect(status?.rate_limit?.graphql?.limit).toBe(5000);
+    expect(status?.rate_limit?.core?.remaining).toBe(4500);
+    expect(store.getState().githubStatus.byWorkspaceId["ws-2"]?.status?.rate_limit).toBeUndefined();
+  });
+
+  it("overwrites only the resources present in the update", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus("ws-1");
+    store.getState().setGitHubStatus("ws-1", {
+      ...legacyStatus,
+      rate_limit: {
+        core: {
+          resource: "core",
+          remaining: 4500,
+          limit: 5000,
+          reset_at: FUTURE_RESET,
+          updated_at: NOW,
+        },
+      },
+    });
+
+    store.getState().applyGitHubRateLimitUpdate({
+      trigger: "graphql",
+      snapshots: [
+        {
+          resource: "graphql",
+          remaining: 100,
+          limit: 5000,
+          reset_at: FUTURE_RESET,
+          updated_at: NOW,
+        },
+      ],
+    });
+
+    const rl = store.getState().githubStatus.byWorkspaceId["ws-1"]?.status?.rate_limit;
+    expect(rl?.core?.remaining).toBe(4500); // untouched
+    expect(rl?.graphql?.remaining).toBe(100);
+  });
+
+  it("is a no-op when status has not been hydrated yet", () => {
+    const store = makeStore();
+    expect(store.getState().githubStatus.byWorkspaceId).toEqual({});
+
+    store.getState().applyGitHubRateLimitUpdate({
+      trigger: "core",
+      snapshots: [
+        {
+          resource: "core",
+          remaining: 0,
+          limit: 5000,
+          reset_at: FUTURE_RESET,
+          updated_at: NOW,
+        },
+      ],
+    });
+
+    expect(store.getState().githubStatus.byWorkspaceId).toEqual({});
+  });
+});
+
+describe("workspace-scoped GitHub status", () => {
+  it("keeps workspace actors isolated", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().setGitHubStatus(WORKSPACE_A, { ...baseStatus, username: "alice" });
+
+    store.getState().resetGitHubStatus(WORKSPACE_B);
+
+    expect(store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]).toMatchObject({
+      status: { username: "alice" },
+      loaded: true,
+    });
+    expect(store.getState().githubStatus.byWorkspaceId[WORKSPACE_B]).toMatchObject({
+      status: null,
+      loaded: false,
+      loading: false,
+    });
+  });
+
+  it("stores a late response under its original workspace", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().resetGitHubStatus(WORKSPACE_B);
+
+    store.getState().setGitHubStatus(WORKSPACE_A, { ...baseStatus, username: "alice" });
+
+    expect(store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.username).toBe(
+      "alice",
+    );
+    expect(store.getState().githubStatus.byWorkspaceId[WORKSPACE_B]?.status).toBeNull();
+  });
+});
+
+describe("discovery health ordering", () => {
+  it("does not let an older HTTP status replace newer discovery health", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    const currentHealth: GitHubPRDiscoveryHealth = {
+      state: "degraded",
+      failed_target_count: 1,
+      category: "invalid_query",
+      revision: 4,
+      credential_generation: 2,
+    };
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: currentHealth,
+    });
+
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      username: "stale-http",
+      pr_discovery_health: { ...currentHealth, revision: 3 },
+    });
+
+    expect(store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status).toMatchObject({
+      username: "stale-http",
+      pr_discovery_health: currentHealth,
+    });
+  });
+
+  it("accepts a newer credential generation even with a lower revision", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "unavailable",
+        revision: 9,
+        credential_generation: 1,
+      },
+    });
+
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "unknown",
+        failed_target_count: 0,
+        revision: 1,
+        credential_generation: 2,
+      },
+    });
+
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toMatchObject({ state: "unknown", credential_generation: 2 });
+  });
+});
+
+describe("discovery health merge", () => {
+  it("lets a newer pending websocket health update beat an older HTTP status", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "unavailable",
+        revision: 4,
+        credential_generation: 2,
+        runtime_epoch: 10,
+      },
+    });
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().applyGitHubPRDiscoveryHealthUpdate({
+      workspace_id: WORKSPACE_A,
+      health: {
+        state: "healthy",
+        failed_target_count: 0,
+        revision: 5,
+        credential_generation: 2,
+        runtime_epoch: 10,
+      },
+    });
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "unavailable",
+        revision: 4,
+        credential_generation: 2,
+        runtime_epoch: 10,
+      },
+    });
+
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toMatchObject({ state: "healthy", revision: 5 });
+  });
+
+  it("preserves current health when an authenticated HTTP status omits it", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    const health: GitHubPRDiscoveryHealth = {
+      state: "degraded",
+      failed_target_count: 1,
+      category: "rate_limited",
+      revision: 8,
+      credential_generation: 3,
+      runtime_epoch: 10,
+    };
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: health,
+    });
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+    });
+
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toEqual(health);
+  });
+});
+
+describe("runtime epoch health ordering", () => {
+  it("accepts a lower revision from a newer runtime and rejects delayed old-runtime events", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "unavailable",
+        revision: 100,
+        credential_generation: 7,
+        runtime_epoch: 10,
+      },
+    });
+
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "healthy",
+        failed_target_count: 0,
+        revision: 1,
+        credential_generation: 7,
+        runtime_epoch: 11,
+      },
+    });
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toMatchObject({ state: "healthy", revision: 1, runtime_epoch: 11 });
+
+    store.getState().applyGitHubPRDiscoveryHealthUpdate({
+      workspace_id: WORKSPACE_A,
+      health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "unavailable",
+        revision: 101,
+        credential_generation: 7,
+        runtime_epoch: 10,
+      },
+    });
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toMatchObject({ state: "healthy", revision: 1, runtime_epoch: 11 });
+  });
+
+  it("clears discovery health on an authoritative disconnected status", () => {
+    const store = makeStore();
+    store.getState().resetGitHubStatus(WORKSPACE_A);
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      workspace_id: WORKSPACE_A,
+      pr_discovery_health: {
+        state: "degraded",
+        failed_target_count: 1,
+        category: "rate_limited",
+        revision: 2,
+        credential_generation: 1,
+        runtime_epoch: 10,
+      },
+    });
+
+    store.getState().setGitHubStatus(WORKSPACE_A, {
+      ...baseStatus,
+      authenticated: false,
+      token_configured: false,
+      workspace_id: WORKSPACE_A,
+    });
+
+    expect(
+      store.getState().githubStatus.byWorkspaceId[WORKSPACE_A]?.status?.pr_discovery_health,
+    ).toBeUndefined();
+  });
+});
+
+describe("setTaskPR", () => {
+  it("appends a PR when the task has no rows yet", () => {
+    const store = makeStore();
+    const pr = makePR({ repository_id: "repo-a" });
+
+    store.getState().setTaskPR("task-1", pr);
+
+    expect(store.getState().taskPRs.byTaskId["task-1"]).toEqual([pr]);
+  });
+
+  it("upserts by repository_id so multi-repo PRs coexist", () => {
+    const store = makeStore();
+    const prA = makePR({ id: "a", repository_id: "repo-a", pr_number: 1 });
+    const prB = makePR({ id: "b", repository_id: "repo-b", pr_number: 2 });
+    const prAUpdated = makePR({ id: "a", repository_id: "repo-a", pr_number: 1, additions: 10 });
+
+    store.getState().setTaskPR("task-1", prA);
+    store.getState().setTaskPR("task-1", prB);
+    store.getState().setTaskPR("task-1", prAUpdated);
+
+    const list = store.getState().taskPRs.byTaskId["task-1"];
+    expect(list).toHaveLength(2);
+    expect(list.find((p) => p.repository_id === "repo-a")?.additions).toBe(10);
+    expect(list.find((p) => p.repository_id === "repo-b")?.id).toBe("b");
+  });
+
+  it("keeps multi-branch PRs as siblings (same repo, different pr_number)", () => {
+    const store = makeStore();
+    const pr1 = makePR({ id: "p1", repository_id: "repo-a", pr_number: 1221 });
+    const pr2 = makePR({ id: "p2", repository_id: "repo-a", pr_number: 1222 });
+    const pr1Updated = makePR({
+      id: "p1",
+      repository_id: "repo-a",
+      pr_number: 1221,
+      additions: 99,
+    });
+
+    store.getState().setTaskPR("task-1", pr1);
+    store.getState().setTaskPR("task-1", pr2);
+    store.getState().setTaskPR("task-1", pr1Updated);
+
+    const list = store.getState().taskPRs.byTaskId["task-1"];
+    expect(list).toHaveLength(2);
+    expect(list.find((p) => p.pr_number === 1221)?.additions).toBe(99);
+    expect(list.find((p) => p.pr_number === 1222)?.id).toBe("p2");
+  });
+
+  it("heals a corrupted non-array entry instead of throwing", () => {
+    // Simulates a stray payload landing in byTaskId[taskId] as something other
+    // than an array (e.g. a partial hydration). The next setTaskPR call must
+    // recover rather than propagate the bad shape, otherwise downstream
+    // renderers crash with `prs is not iterable`.
+    const store = makeStore();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    store.getState().setTaskPRs({ "task-1": {} as any });
+
+    const pr = makePR({ repository_id: "repo-a" });
+    expect(() => store.getState().setTaskPR("task-1", pr)).not.toThrow();
+
+    expect(Array.isArray(store.getState().taskPRs.byTaskId["task-1"])).toBe(true);
+    expect(store.getState().taskPRs.byTaskId["task-1"]).toEqual([pr]);
+  });
+});
+
+describe("removeTaskPR", () => {
+  it("removes only the selected association and preserves sibling tasks", () => {
+    const store = makeStore();
+    const first = makePR({ id: "remove", pr_number: 1 });
+    const sibling = makePR({ id: "keep", pr_number: 2 });
+    const otherTask = makePR({ id: "other", task_id: "task-2", pr_number: 3 });
+    store.getState().setTaskPRs({
+      "task-1": [first, sibling],
+      "task-2": [otherTask],
+    });
+
+    store.getState().removeTaskPR("task-1", "remove");
+
+    expect(store.getState().taskPRs.byTaskId["task-1"]?.map((pr) => pr.id)).toEqual(["keep"]);
+    expect(store.getState().taskPRs.byTaskId["task-2"]?.map((pr) => pr.id)).toEqual(["other"]);
+  });
+
+  it("removes an empty task bucket after the last association is detached", () => {
+    const store = makeStore();
+    store.getState().setTaskPRs({ "task-1": [makePR({ id: "remove" })] });
+
+    store.getState().removeTaskPR("task-1", "remove");
+
+    expect(store.getState().taskPRs.byTaskId["task-1"]).toBeUndefined();
+  });
+});
+
+describe("setTaskIssues", () => {
+  const link: TaskIssueLink = {
+    task_id: "task-1",
+    task_title: "Fix issue",
+    owner: "kdlbs",
+    repo: "kandev",
+    issue_number: 1672,
+    issue_url: "https://github.com/kdlbs/kandev/issues/1672",
+    issue_title: "Issue title",
+  };
+
+  it("replaces workspace issue links by task id", () => {
+    const store = makeStore();
+
+    store.getState().setTaskIssues("ws-1", { "task-1": link });
+
+    expect(store.getState().taskIssues).toEqual({
+      workspaceId: "ws-1",
+      byTaskId: { "task-1": link },
+    });
+  });
+
+  it("upserts issue links only for the active workspace", () => {
+    const store = makeStore();
+    store.getState().setTaskIssues("ws-1", {});
+
+    store.getState().upsertTaskIssue("ws-2", link);
+    expect(store.getState().taskIssues.byTaskId).toEqual({});
+
+    store.getState().upsertTaskIssue("ws-1", link);
+    expect(store.getState().taskIssues.byTaskId).toEqual({ "task-1": link });
+  });
+
+  it("initializes an unloaded workspace with a newly linked issue", () => {
+    const store = makeStore();
+
+    store.getState().upsertTaskIssue("ws-1", link);
+
+    expect(store.getState().taskIssues).toEqual({
+      workspaceId: "ws-1",
+      byTaskId: { "task-1": link },
+    });
+  });
+});
+
+describe("setPendingPrUrlForTask", () => {
+  it("stores a pending PR URL until TaskPR sync clears it", () => {
+    const store = makeStore();
+
+    store
+      .getState()
+      .setPendingPrUrlForTask("task-1", "", "https://dev.azure.com/o/p/_git/r/pullrequest/1");
+    expect(store.getState().pendingPrUrlByTaskId.byTaskId["task-1"]?.[""]).toBe(
+      "https://dev.azure.com/o/p/_git/r/pullrequest/1",
+    );
+
+    store.getState().setTaskPR("task-1", makePR());
+    expect(store.getState().pendingPrUrlByTaskId.byTaskId["task-1"]).toBeUndefined();
+  });
+
+  it("clears only the synced repo pending URL in multi-repo tasks", () => {
+    const store = makeStore();
+    const urlA = "https://dev.azure.com/o/p/_git/a/pullrequest/1";
+    const urlB = "https://dev.azure.com/o/p/_git/b/pullrequest/2";
+
+    store.getState().setPendingPrUrlForTask("task-1", "repo-a", urlA);
+    store.getState().setPendingPrUrlForTask("task-1", "repo-b", urlB);
+    store.getState().setTaskPR("task-1", makePR({ repository_id: "repo-a", pr_url: urlA }));
+
+    expect(store.getState().pendingPrUrlByTaskId.byTaskId["task-1"]?.["repo-b"]).toBe(urlB);
+    expect(store.getState().pendingPrUrlByTaskId.byTaskId["task-1"]?.["repo-a"]).toBeUndefined();
+  });
+});
+
+describe("task CI automation options", () => {
+  it("stores task options and per-task loading/saving/error state", () => {
+    const store = makeStore();
+    const options = makeCIOptions({ auto_fix_enabled: true });
+
+    store.getState().setTaskCIAutomationLoading("task-1", true);
+    store.getState().setTaskCIAutomationSaving("task-1", true);
+    store.getState().setTaskCIAutomationError("task-1", "failed");
+    store.getState().setTaskCIAutomationOptions("task-1", options);
+
+    const state = store.getState().taskCIAutomation;
+    expect(state.loading["task-1"]).toBe(true);
+    expect(state.saving["task-1"]).toBe(true);
+    expect(state.errors["task-1"]).toBe("failed");
+    expect(state.byTaskId["task-1"]).toEqual(options);
+  });
+
+  it("keeps newer CI options when delayed, equal, or unversioned updates arrive", () => {
+    const store = makeStore();
+    const newer = makeCIOptions({
+      auto_fix_enabled: true,
+      updated_at: "2026-06-18T10:01:00Z",
+    });
+    store.getState().setTaskCIAutomationOptions("task-1", newer);
+
+    store
+      .getState()
+      .setTaskCIAutomationOptions(
+        "task-1",
+        makeCIOptions({ auto_fix_enabled: false, updated_at: "2026-06-18T10:00:00Z" }),
+      );
+    store
+      .getState()
+      .setTaskCIAutomationOptions(
+        "task-1",
+        makeCIOptions({ auto_fix_enabled: false, updated_at: newer.updated_at }),
+      );
+    store
+      .getState()
+      .setTaskCIAutomationOptions(
+        "task-1",
+        makeCIOptions({ auto_fix_enabled: false, updated_at: "" }),
+      );
+
+    expect(store.getState().taskCIAutomation.byTaskId["task-1"]).toEqual(newer);
+  });
+
+  it("accepts a timestamped update after an unversioned initial value", () => {
+    const store = makeStore();
+    store
+      .getState()
+      .setTaskCIAutomationOptions(
+        "task-1",
+        makeCIOptions({ auto_fix_enabled: false, updated_at: "" }),
+      );
+    const timestamped = makeCIOptions({ auto_fix_enabled: true });
+
+    store.getState().setTaskCIAutomationOptions("task-1", timestamped);
+
+    expect(store.getState().taskCIAutomation.byTaskId["task-1"]).toEqual(timestamped);
+  });
+});

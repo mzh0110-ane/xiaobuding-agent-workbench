@@ -1,0 +1,326 @@
+package v1
+
+import "time"
+
+// TaskState represents the state of a task
+type TaskState string
+
+const (
+	TaskStateTODO            TaskState = "TODO"
+	TaskStateCreated         TaskState = "CREATED"
+	TaskStateScheduling      TaskState = "SCHEDULING"
+	TaskStateInProgress      TaskState = "IN_PROGRESS"
+	TaskStateReview          TaskState = "REVIEW"
+	TaskStateBlocked         TaskState = "BLOCKED"
+	TaskStateWaitingForInput TaskState = "WAITING_FOR_INPUT"
+	TaskStateCompleted       TaskState = "COMPLETED"
+	TaskStateFailed          TaskState = "FAILED"
+	TaskStateCancelled       TaskState = "CANCELLED"
+)
+
+// TaskChangeRequestSummary is a compact provider-neutral view of a pull or
+// merge request associated with a task.
+type TaskChangeRequestSummary struct {
+	Provider     string     `json:"provider"`
+	RepositoryID string     `json:"repository_id,omitempty"`
+	Number       int        `json:"number"`
+	URL          string     `json:"url"`
+	Title        string     `json:"title,omitempty"`
+	State        string     `json:"state"`
+	Draft        *bool      `json:"draft,omitempty"`
+	BaseRef      string     `json:"base_ref,omitempty"`
+	BaseSHA      string     `json:"base_sha"`
+	HeadRef      string     `json:"head_ref,omitempty"`
+	HeadSHA      string     `json:"head_sha"`
+	MergedAt     *time.Time `json:"merged_at,omitempty"`
+	ClosedAt     *time.Time `json:"closed_at,omitempty"`
+}
+
+// TaskPRSummary is a compact view of a GitHub pull request associated with a
+// task. Surfaced through the task-listing MCP tools for compatibility with
+// existing agents. State is one of "open", "closed", "merged"; MergedAt is set
+// only when the PR has merged, so agents can report when the work landed.
+type TaskPRSummary struct {
+	Number   int        `json:"number"`
+	URL      string     `json:"url"`
+	Title    string     `json:"title,omitempty"`
+	State    string     `json:"state"`
+	MergedAt *time.Time `json:"merged_at,omitempty"`
+}
+
+// TaskSessionState represents the state of an agent session.
+type TaskSessionState string
+
+const (
+	TaskSessionStateCreated         TaskSessionState = "CREATED"
+	TaskSessionStateStarting        TaskSessionState = "STARTING"
+	TaskSessionStateRunning         TaskSessionState = "RUNNING"
+	TaskSessionStateWaitingForInput TaskSessionState = "WAITING_FOR_INPUT"
+	TaskSessionStateCompleted       TaskSessionState = "COMPLETED"
+	TaskSessionStateFailed          TaskSessionState = "FAILED"
+	TaskSessionStateCancelled       TaskSessionState = "CANCELLED"
+)
+
+// ForegroundActivity is the fine-grained busy substate of a session
+// (ADR-0049). It distinguishes a foreground turn that is
+// actively generating from one that is idle, held open only by spawned
+// background work (a subagent task, a run-in-background shell, an active
+// Monitor). "generating" is only meaningful while the session state is
+// RUNNING, but "background" can outlive the foreground turn: detached work
+// keeps it set after the coarse state settles (e.g. WAITING_FOR_INPUT), and
+// consumers must not assume RUNNING when they see it.
+type ForegroundActivity string
+
+const (
+	// ForegroundActivityGenerating means the foreground agent is producing
+	// output — the historical "busy" condition; input stays gated.
+	ForegroundActivityGenerating ForegroundActivity = "generating"
+	// ForegroundActivityBackground means the foreground turn has yielded to
+	// outstanding background work; input is accepted even though the session
+	// still reads RUNNING and the "working" affordance stays up.
+	ForegroundActivityBackground ForegroundActivity = "background"
+)
+
+// AggregateForegroundActivity reduces the per-session foreground activities of a
+// task's RUNNING sessions to a single task-level value using MOST-ACTIVE-WINS
+// The aggregate is:
+//
+//   - ForegroundActivityGenerating — any session is generating;
+//   - ForegroundActivityBackground — none is generating but at least one is
+//     holding a turn open for background work;
+//   - ""                           — neither, so task-level surfaces fall through
+//     to the coarse task state (done / waiting / failed).
+//
+// Callers pass only the activities of RUNNING sessions (a non-RUNNING session
+// carries no busy substate); empty values are ignored, so passing "" for a
+// non-RUNNING session is harmless. The background tier is inserted BETWEEN
+// generating and done and does not redefine the other states.
+func AggregateForegroundActivity(activities []ForegroundActivity) ForegroundActivity {
+	sawBackground := false
+	for _, activity := range activities {
+		switch activity {
+		case ForegroundActivityGenerating:
+			return ForegroundActivityGenerating
+		case ForegroundActivityBackground:
+			sawBackground = true
+		}
+	}
+	if sawBackground {
+		return ForegroundActivityBackground
+	}
+	return ""
+}
+
+// MessageType represents a normalized session message type.
+type MessageType string
+
+const (
+	MessageTypeMessage  MessageType = "message"
+	MessageTypeContent  MessageType = "content"
+	MessageTypeToolCall MessageType = "tool_call"
+	MessageTypeProgress MessageType = "progress"
+	MessageTypeLog      MessageType = "log"
+	MessageTypeError    MessageType = "error"
+	MessageTypeStatus   MessageType = "status"
+	MessageTypeThinking MessageType = "thinking"
+	MessageTypeTodo     MessageType = "todo"
+)
+
+// RepositoryCheckoutOptions configures one task attachment's materialization.
+type RepositoryCheckoutOptions struct {
+	Version           int      `json:"version"`
+	DownloadMode      string   `json:"download_mode"`
+	SparseDirectories []string `json:"sparse_directories"`
+}
+
+// TaskRepository represents a repository associated with a task
+type TaskRepository struct {
+	CheckoutOptions *RepositoryCheckoutOptions `json:"checkout_options,omitempty"`
+	ID              string                     `json:"id"`
+	TaskID          string                     `json:"task_id"`
+	RepositoryID    string                     `json:"repository_id"`
+	BaseBranch      string                     `json:"base_branch"`
+	Position        int                        `json:"position"`
+	Metadata        map[string]interface{}     `json:"metadata,omitempty"`
+	CreatedAt       time.Time                  `json:"created_at"`
+	UpdatedAt       time.Time                  `json:"updated_at"`
+}
+
+// TaskWorkspaceFolder represents a non-Git folder associated with a task.
+type TaskWorkspaceFolder struct {
+	ID          string    `json:"id"`
+	TaskID      string    `json:"task_id"`
+	LocalPath   string    `json:"local_path"`
+	DisplayName string    `json:"display_name"`
+	Position    int       `json:"position"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// Task represents a Kanban task
+type Task struct {
+	ID               string                 `json:"id"`
+	WorkspaceID      string                 `json:"workspace_id"`
+	WorkflowID       string                 `json:"workflow_id"`
+	Title            string                 `json:"title"`
+	Description      string                 `json:"description"`
+	State            TaskState              `json:"state"`
+	Priority         string                 `json:"priority"`
+	Repositories     []TaskRepository       `json:"repositories,omitempty"`
+	WorkspaceFolders []TaskWorkspaceFolder  `json:"workspace_folders,omitempty"`
+	CreatedBy        string                 `json:"created_by"`
+	CreatedAt        time.Time              `json:"created_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
+	StartedAt        *time.Time             `json:"started_at,omitempty"`
+	CompletedAt      *time.Time             `json:"completed_at,omitempty"`
+	Metadata         map[string]interface{} `json:"metadata,omitempty"`
+	// Interrupted reports that the task's session was mid-turn (STARTING/RUNNING)
+	// when the backend died and has not been resumed since. Derived from the
+	// interrupted_at metadata key at DTO conversion time; the orchestrator
+	// clears it when a session of the task next enters STARTING/RUNNING.
+	Interrupted bool `json:"interrupted,omitempty"`
+	// AutoStartFailed reports that a workflow step's auto_start_agent on_enter
+	// action failed to launch a run for this task. Derived from the
+	// auto_start_failed metadata key at DTO conversion time; the orchestrator
+	// clears it when a session of the task next enters STARTING/RUNNING.
+	AutoStartFailed bool `json:"auto_start_failed,omitempty"`
+	// WorkspaceOrphaned reports that this task's materialized workspace was
+	// removed when its parent was archived (metadata.workspace.orphaned),
+	// while workspace.mode is still inherit_parent, so the task cannot start.
+	// Derived at DTO conversion time; a re-parent, detach or unarchive that
+	// resolves the state clears it without touching the underlying keys.
+	WorkspaceOrphaned bool   `json:"workspace_orphaned,omitempty"`
+	IsEphemeral       bool   `json:"is_ephemeral"`        // Ephemeral tasks are not shown in kanban, used for quick chat
+	ParentID          string `json:"parent_id,omitempty"` // FK to parent task for subtasks
+	Autopilot         bool   `json:"autopilot"`
+	Identifier        string `json:"identifier,omitempty"`
+}
+
+// TaskRepositoryInput for creating/updating task repositories
+type TaskRepositoryInput struct {
+	CheckoutOptions *RepositoryCheckoutOptions `json:"checkout_options,omitempty"`
+	RepositoryID    string                     `json:"repository_id" binding:"required"`
+	BaseBranch      string                     `json:"base_branch" binding:"required"`
+	BranchPolicyID  string                     `json:"branch_policy_id,omitempty"`
+}
+
+// CreateTaskRequest for creating a new task
+type CreateTaskRequest struct {
+	Title          string                 `json:"title" binding:"required,max=500"`
+	Description    string                 `json:"description" binding:"required"`
+	Priority       string                 `json:"priority,omitempty" binding:"omitempty,oneof=critical high medium low"`
+	Repositories   []TaskRepositoryInput  `json:"repositories,omitempty"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	StartAgent     bool                   `json:"start_agent,omitempty"`
+	AgentProfileID string                 `json:"agent_profile_id,omitempty"`
+}
+
+// UpdateTaskRequest for updating an existing task
+type UpdateTaskRequest struct {
+	Title        *string                `json:"title,omitempty" binding:"omitempty,max=500"`
+	Description  *string                `json:"description,omitempty"`
+	Priority     *string                `json:"priority,omitempty" binding:"omitempty,oneof=critical high medium low"`
+	Repositories []TaskRepositoryInput  `json:"repositories,omitempty"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// UpdateTaskStateRequest for changing task state
+type UpdateTaskStateRequest struct {
+	State TaskState `json:"state" binding:"required"`
+}
+
+// TaskEvent for task history/audit
+type TaskEvent struct {
+	ID        int64                  `json:"id"`
+	TaskID    string                 `json:"task_id"`
+	EventType string                 `json:"event_type"`
+	OldState  *TaskState             `json:"old_state,omitempty"`
+	NewState  *TaskState             `json:"new_state,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	CreatedBy *string                `json:"created_by,omitempty"`
+	CreatedAt time.Time              `json:"created_at"`
+}
+
+// MessageAttachment represents an attachment (image, file, etc.) to a message.
+// Type determines the ACP content block: "image" → ImageBlock, "audio" → AudioBlock,
+// "resource" → ResourceBlock (text or blob based on MIME type).
+type MessageAttachment struct {
+	Type         string `json:"type"`                    // "image", "audio", "resource"
+	AttachmentID string `json:"attachment_id,omitempty"` // File-backed attachment descriptor ID
+	Data         string `json:"data,omitempty"`          // Base64-encoded data
+	MimeType     string `json:"mime_type,omitempty"`     // MIME type (e.g., "image/png")
+	Name         string `json:"name,omitempty"`          // Display name (e.g., filename)
+	SizeBytes    int64  `json:"size_bytes,omitempty"`    // Raw byte size for file-backed descriptors
+	DeliveryMode string `json:"delivery_mode,omitempty"` // "prompt" (native/default) or "path"
+}
+
+func (a MessageAttachment) HasValidDeliveryMode() bool {
+	return a.DeliveryMode == "" || a.DeliveryMode == "prompt" || a.DeliveryMode == "path"
+}
+
+// ContextFileMeta represents a context file reference attached to a message.
+// IsDirectory is optional for compatibility with older file-only entries.
+type ContextFileMeta struct {
+	Path        string `json:"path"`
+	Name        string `json:"name"`
+	IsDirectory *bool  `json:"is_directory,omitempty"`
+}
+
+// Message represents a message in a task session (user or agent)
+type Message struct {
+	ID            string                 `json:"id"`
+	TaskSessionID string                 `json:"session_id"`
+	TaskID        string                 `json:"task_id,omitempty"`
+	TurnID        string                 `json:"turn_id,omitempty"` // FK to task_session_turns
+	AuthorType    string                 `json:"author_type"`       // "user" or "agent"
+	Type          string                 `json:"type,omitempty"`
+	AuthorID      string                 `json:"author_id,omitempty"`
+	Content       string                 `json:"content"`
+	RawContent    string                 `json:"raw_content,omitempty"`
+	RequestsInput bool                   `json:"requests_input"` // True if agent is requesting user input
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt     time.Time              `json:"created_at"`
+	UpdatedAt     time.Time              `json:"updated_at,omitempty"` // Authoritative per-message change signal
+	// PromptIndex is the 1-based ordinal of the message among ALL user
+	// messages of its session (ordered by normalized-microsecond created_at
+	// ascending, ties by id ascending), present only on user messages
+	// produced by an indexed server payload; omitted when zero.
+	PromptIndex int `json:"prompt_index,omitempty"`
+}
+
+// CreateMessageRequest for adding a message to a task session
+type CreateMessageRequest struct {
+	TaskSessionID string                 `json:"session_id" binding:"required"`
+	Content       string                 `json:"content" binding:"required"`
+	AuthorType    string                 `json:"author_type,omitempty"` // Defaults to "user" if not specified
+	Type          string                 `json:"type,omitempty"`
+	RequestsInput bool                   `json:"requests_input,omitempty"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// PermissionOption represents a permission choice presented to the user
+type PermissionOption struct {
+	OptionID string `json:"option_id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"` // allow_once, allow_always, reject_once, reject_always
+}
+
+// PermissionRequest represents an agent's request for user permission
+type PermissionRequest struct {
+	RequestID   string             `json:"request_id"`            // Unique ID for this request (JSON-RPC ID)
+	TaskID      string             `json:"task_id"`               // Task the agent is working on
+	InstanceID  string             `json:"instance_id"`           // Agent instance ID
+	SessionID   string             `json:"session_id"`            // ACP session ID
+	ToolCallID  string             `json:"tool_call_id"`          // Tool call requesting permission
+	Title       string             `json:"title"`                 // Human-readable title
+	Description string             `json:"description,omitempty"` // Additional context
+	Options     []PermissionOption `json:"options"`               // Available choices
+	CreatedAt   time.Time          `json:"created_at"`
+}
+
+// PermissionResponse represents the user's response to a permission request
+type PermissionResponse struct {
+	RequestID string `json:"request_id" binding:"required"` // The request being responded to
+	OptionID  string `json:"option_id,omitempty"`           // Selected option (if not cancelled)
+	Cancelled bool   `json:"cancelled,omitempty"`           // True if user cancelled
+}

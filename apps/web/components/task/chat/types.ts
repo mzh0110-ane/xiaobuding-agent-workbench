@@ -1,0 +1,387 @@
+"use client";
+
+import type { ClarificationRequestMetadata, Message, TaskPendingAction } from "@/lib/types/http";
+import type { TaskStatusSummaryActiveError } from "@/lib/types/task-status-summary";
+import { extractKandevStem } from "./messages/kandev/parse";
+
+export type SubagentTaskPayload = {
+  description?: string;
+  prompt?: string;
+  subagent_type?: string;
+  status?: string; // result lifecycle, e.g. "complete" | "error" | "async_launched"
+  agent_id?: string; // Claude
+  model?: string; // OpenCode, e.g. "opencode/big-pickle"
+  child_session_id?: string; // OpenCode child session
+  duration_ms?: number; // Claude (totalDurationMs) + Cursor (durationMs)
+  total_tokens?: number; // Claude
+  tool_use_count?: number; // Claude
+  // Backgrounded subagent fields (Claude Code Task with run_in_background=true):
+  // the dispatch is terminal for the Task card, but the subagent itself keeps
+  // running and writes its result to output_file out-of-band.
+  is_async?: boolean;
+  output_file?: string;
+  can_read_output_file?: boolean;
+  // Final summary returned by silent subagents (Auggie) that don't stream
+  // intermediate tool calls. Rendered inline when there are no child messages.
+  result_text?: string;
+};
+
+export type GenericPayload = {
+  name?: string;
+  input?: unknown;
+  output?: unknown;
+};
+
+// MonitorView is the structured shape the kandev ACP adapter writes into the
+// Generic tool payload's `output.monitor` field for Claude-acp's `Monitor`
+// tool. The adapter mutates this in place across tool_call_updates so the
+// UI sees a stable view of the Monitor's state (event count, recent tail,
+// terminal flag) without needing a custom NormalizedPayload kind.
+export type MonitorView = {
+  kind?: string;
+  task_id?: string;
+  command?: string;
+  event_count?: number;
+  recent_events?: string[];
+  ended?: boolean;
+  end_reason?: string;
+};
+
+// Output wrapper helper: when the adapter attaches a Monitor view, it lands
+// at `generic.output.monitor`. Frontend code should narrow via this guard
+// rather than casting on its own.
+export function readMonitorView(payload: GenericPayload | undefined): MonitorView | null {
+  const out = payload?.output;
+  if (!out || typeof out !== "object") return null;
+  const wrapper = out as { monitor?: unknown };
+  if (!wrapper.monitor || typeof wrapper.monitor !== "object") return null;
+  return wrapper.monitor as MonitorView;
+}
+
+export type ReadFileOutput = {
+  content?: string;
+  line_count?: number;
+  truncated?: boolean;
+  language?: string;
+};
+
+export type ReadFilePayload = {
+  file_path?: string;
+  offset?: number;
+  limit?: number;
+  output?: ReadFileOutput;
+};
+
+export type CodeSearchOutput = {
+  files?: string[];
+  file_count?: number;
+  truncated?: boolean;
+};
+
+export type CodeSearchPayload = {
+  query?: string;
+  pattern?: string;
+  path?: string;
+  glob?: string;
+  output?: CodeSearchOutput;
+};
+
+export type FileMutation = {
+  type?: string;
+  content?: string;
+  old_content?: string;
+  new_content?: string;
+  diff?: string;
+};
+
+export type ModifyFilePayload = {
+  file_path?: string;
+  mutations?: FileMutation[];
+};
+
+export type ShellExecOutputSummary = {
+  exit_code?: number;
+  has_output?: boolean;
+  stdout_bytes?: number;
+  stderr_bytes?: number;
+  truncated?: boolean;
+};
+
+export function hasProjectedShellOutput(output: ShellExecOutputSummary | undefined): boolean {
+  return (
+    Boolean(output?.has_output) ||
+    (output?.stdout_bytes ?? 0) > 0 ||
+    (output?.stderr_bytes ?? 0) > 0
+  );
+}
+
+/** Shared composer eligibility predicates belong to the chat domain, not a rendering surface. */
+export function shouldShowProceed(
+  nextStepName: string | null,
+  isAgentBusy: boolean,
+  hasPendingClarification: boolean,
+): boolean {
+  return !!nextStepName && !isAgentBusy && !hasPendingClarification;
+}
+
+/** Uses the durable session projection until message hydration can supply its fallback. */
+export function hasPendingClarification(
+  hasPendingClarificationMessage: boolean,
+  pendingAction: TaskPendingAction | null | undefined,
+): boolean {
+  return hasPendingClarificationMessage || pendingAction === "clarification";
+}
+
+export function shouldShowCancelAgent(
+  isWorking: boolean,
+  pendingClarification: Message | null | undefined,
+  sessionId: string | null,
+): boolean {
+  if (!sessionId) return false;
+  if (!pendingClarification) return isWorking;
+  return !(pendingClarification.metadata as ClarificationRequestMetadata | undefined)
+    ?.agent_disconnected;
+}
+
+export type ShellExecPayload = {
+  command?: string;
+  work_dir?: string;
+  description?: string;
+  timeout?: number;
+  background?: boolean;
+  output?: ShellExecOutputSummary;
+};
+
+export type HttpRequestPayload = {
+  url?: string;
+  method?: string;
+  response?: string;
+  is_error?: boolean;
+};
+
+export type NormalizedPayload = {
+  kind?: string;
+  subagent_task?: SubagentTaskPayload;
+  generic?: GenericPayload;
+  read_file?: ReadFilePayload;
+  code_search?: CodeSearchPayload;
+  modify_file?: ModifyFilePayload;
+  shell_exec?: ShellExecPayload;
+  http_request?: HttpRequestPayload;
+};
+
+export type ToolCallMetadata = {
+  tool_call_id?: string;
+  parent_tool_call_id?: string; // For subagent nesting
+  tool_name?: string;
+  title?: string;
+  status?:
+    | "pending"
+    | "running"
+    | "in_progress"
+    | "complete"
+    | "completed"
+    | "success"
+    | "error"
+    | "failed"
+    | "cancelled";
+  args?: Record<string, unknown>;
+  result?: string;
+  normalized?: NormalizedPayload;
+};
+
+// Tool names are duplicated across transport fields. Keep one scanner so
+// renderer dispatch and transcript grouping cannot disagree.
+function hasForeignKandevProvider(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const rawInput = (input as Record<string, unknown>).raw_input;
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return false;
+  const rawInputRecord = rawInput as Record<string, unknown>;
+  if (!Object.hasOwn(rawInputRecord, "providerIdentifier")) return false;
+  const provider = rawInputRecord.providerIdentifier;
+  return typeof provider !== "string" || provider.trim() !== "kandev";
+}
+
+function legacyKandevToolCandidates(
+  metadata: ToolCallMetadata | undefined,
+  message: Message,
+): Array<string | undefined> {
+  if (hasForeignKandevProvider(metadata?.normalized?.generic?.input)) return [];
+  return [metadata?.tool_name, metadata?.title, message.content || undefined];
+}
+
+export function kandevToolStemOf(message: Message): string | null {
+  const metadata = message.metadata as ToolCallMetadata | undefined;
+  const normalizedName = metadata?.normalized?.generic?.name;
+  const normalizedStem = extractKandevStem(normalizedName);
+  if (normalizedStem) return normalizedStem;
+  if (normalizedName && /\/|__|\./.test(normalizedName)) return null;
+  const candidates = legacyKandevToolCandidates(metadata, message);
+  for (const candidate of candidates) {
+    const stem = extractKandevStem(candidate);
+    if (stem) return stem;
+  }
+  return null;
+}
+
+export function isRichOutputMessage(message: Message): boolean {
+  return message.type === "tool_call" && kandevToolStemOf(message) === "show_rich_output";
+}
+
+/** A subagent is another agent's turn, so it remains standalone in the transcript. */
+export function isSubagentMessage(message: Message): boolean {
+  const metadata = message.metadata as ToolCallMetadata | undefined;
+  return metadata?.normalized?.kind === "subagent_task";
+}
+
+export type TaskLaunchErrorIdentity = Pick<TaskStatusSummaryActiveError, "session_id" | "stamp">;
+
+export function shouldRenderStoppedSessionBanner(input: {
+  isFailed: boolean;
+  isCompleted: boolean;
+  executorUnavailable: boolean;
+  launchErrorOwned?: boolean;
+}): boolean {
+  return (
+    !input.launchErrorOwned && (input.isFailed || input.isCompleted || input.executorUnavailable)
+  );
+}
+
+export function shouldHideChatInputForLaunchError(input: {
+  isFailed: boolean;
+  launchErrorOwned?: boolean;
+}): boolean {
+  return input.launchErrorOwned === true && input.isFailed;
+}
+
+/** Matches one rendered error surface to the task-owned launch error. */
+export function isMatchingTaskLaunchError(
+  activeError: TaskLaunchErrorIdentity | null | undefined,
+  candidate: { sessionId?: string | null; errorStamp?: string | null },
+): boolean {
+  if (!activeError?.stamp || !candidate.errorStamp) return false;
+  return (
+    (activeError.session_id ?? null) === (candidate.sessionId ?? null) &&
+    activeError.stamp === candidate.errorStamp
+  );
+}
+
+/** A task-wide launch error stays visible while any prior session is selected. */
+export function isTaskLaunchErrorVisibleForSession(
+  activeError: TaskLaunchErrorIdentity | null | undefined,
+  sessionId: string | null | undefined,
+): boolean {
+  if (!activeError?.stamp) return false;
+  if (sessionId === undefined || activeError.session_id == null) return true;
+  return activeError.session_id === sessionId;
+}
+
+/** Whether the active launch error owns the selected session's surfaces. */
+export function isTaskLaunchErrorOwnedBySession(
+  activeError: TaskLaunchErrorIdentity | null | undefined,
+  sessionId: string | null | undefined,
+): boolean {
+  if (!activeError?.stamp) return false;
+  if (activeError.session_id == null) return sessionId == null;
+  return sessionId != null && activeError.session_id === sessionId;
+}
+
+/** Messages that are only useful while a launch failure has no typed owner. */
+export function isLaunchErrorSurfaceMessage(message: Message): boolean {
+  const metadata = message.metadata as Record<string, unknown> | undefined;
+  return metadata?.empty_turn === true || metadata?.failure_kind === "missing_pr_branch";
+}
+
+export type StatusMetadata = {
+  progress?: number;
+  status?: string;
+  stage?: string;
+  message?: string;
+  variant?: "default" | "warning" | "error" | "resume_settings_provider_restored";
+  cancelled?: boolean;
+  // Transient provider-error retry state. Present on the yellow "retrying"
+  // status message the orchestrator emits during backoff.
+  retrying?: boolean;
+  attempt?: number;
+  max_attempts?: number;
+  retry_in_seconds?: number;
+  retry_at?: string;
+  failure_code?: string;
+  effective_model_known?: boolean;
+  effective_model_id?: string;
+  effective_model_name?: string;
+  effective_mode_known?: boolean;
+  effective_mode_id?: string;
+  resolved_error_stamp?: string;
+  // Running-only action notices are hidden once the session settles. They use
+  // compact neutral presentation instead of the normal recovery/error card.
+  action_visibility?: "running";
+};
+
+export type RecoveryAuthMethod = {
+  id: string;
+  name: string;
+  description?: string;
+  terminal_auth?: { command: string; args?: string[]; label?: string };
+  meta?: Record<string, unknown>;
+};
+
+export type RecoveryMetadata = StatusMetadata & {
+  recovery_actions: true;
+  session_id: string;
+  task_id: string;
+  has_resume_token: boolean;
+  is_auth_error?: boolean;
+  auth_methods?: RecoveryAuthMethod[];
+  failure_kind?: "provider_quota_limited" | "missing_pr_branch" | string;
+  provider_name?: string;
+  model_id?: string;
+  reset_at?: string;
+  error_output?: string;
+  failure_code?: string;
+  failure_details?: string;
+};
+
+export type MessageAction = {
+  type: "archive_task" | "delete_task" | "ws_request";
+  label: string;
+  tooltip?: string;
+  tooltip_key?: string;
+  variant?: "default" | "destructive";
+  icon?: string;
+  params?: Record<string, unknown>;
+  test_id?: string;
+};
+
+export type TodoMetadata = { text: string; done?: boolean } | string;
+
+export type TodoSnapshot = {
+  todos: TodoMetadata[];
+  created_at: string;
+};
+
+export type ContentBlock = {
+  type: string; // "text", "image", "audio", "resource_link", "resource"
+  text?: string;
+  data?: string; // base64 for image/audio
+  mime_type?: string;
+  uri?: string;
+  name?: string;
+  title?: string;
+  description?: string;
+  size?: number;
+};
+
+export type RichMetadata = {
+  thinking?: string;
+  todos?: TodoMetadata[];
+  previous_todo_snapshots?: TodoSnapshot[];
+  diff?: unknown;
+  content_blocks?: ContentBlock[];
+};
+
+export type DiffPayload = {
+  hunks: string[];
+  oldFile?: { fileName?: string; fileLang?: string };
+  newFile?: { fileName?: string; fileLang?: string };
+};

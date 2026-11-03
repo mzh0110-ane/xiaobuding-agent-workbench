@@ -1,0 +1,80 @@
+import { fetchJson, type ApiRequestOptions } from "../client";
+
+// Result of the bootstrap fork-capability probe; mirrors backend ForkStatus.
+// "writable": user has push access to upstream, no fork needed.
+// "ready":    a verified fork already exists in the canonical repository's
+//             fork network, including forks whose names were changed.
+// "creatable": managed workspace automation can create the exact fork during
+// task creation.
+// "blocked_emu": user looks like an Enterprise Managed User and likely
+//              cannot fork repositories outside their owning enterprise.
+// "blocked_managed": managed workspace automation cannot prepare a verified
+//                     fork; implementation reports must stay blocked.
+// "unknown":  bootstrap could not determine fork eligibility; proceed and
+//             rely on the PR step to surface any errors.
+export type ForkStatus =
+  | "writable"
+  | "ready"
+  | "creatable"
+  | "blocked_emu"
+  | "blocked_managed"
+  | "unknown";
+
+export type ImproveKandevForkReasonCode =
+  | "account_cannot_fork"
+  | "app_unsupported"
+  | "fork_conflict"
+  | "fork_not_writable"
+  | "fork_not_ready"
+  | "managed_unavailable";
+
+export type ImproveKandevBootstrapResponse = {
+  /** Dedicated Improve Kandev workspace the task must be created in. */
+  workspace_id: string;
+  repository_id: string;
+  workflow_id: string;
+  issue_workflow_id: string;
+  branch: string;
+  bundle_dir: string;
+  bundle_file: string;
+  github_login: string;
+  has_write_access: boolean;
+  fork_status: ForkStatus;
+  fork_reason_code?: ImproveKandevForkReasonCode;
+};
+
+export async function bootstrapImproveKandev(
+  workspaceId: string,
+  options?: ApiRequestOptions & { createWorkspace?: boolean },
+): Promise<ImproveKandevBootstrapResponse> {
+  const { createWorkspace, ...requestOptions } = options ?? {};
+  return fetchJson<ImproveKandevBootstrapResponse>("/api/v1/system/improve-kandev/bootstrap", {
+    ...requestOptions,
+    init: {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        ...(createWorkspace === undefined ? {} : { create_workspace: createWorkspace }),
+      }),
+      ...(requestOptions.init ?? {}),
+    },
+  });
+}
+
+export async function leaseDiagnosticBundle(
+  bundleDir: string,
+  bundleId: string,
+  options?: ApiRequestOptions,
+): Promise<{ path: string; status: "ready" | "partial"; sources: string[] }> {
+  return fetchJson<{ path: string; status: "ready" | "partial"; sources: string[] }>(
+    "/api/v1/system/improve-kandev/bundle/lease",
+    {
+      ...options,
+      init: {
+        method: "POST",
+        body: JSON.stringify({ bundle_dir: bundleDir, bundle_id: bundleId }),
+        ...(options?.init ?? {}),
+      },
+    },
+  );
+}

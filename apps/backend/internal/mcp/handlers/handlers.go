@@ -1,0 +1,5419 @@
+// Package handlers provides WebSocket handlers for MCP tool requests.
+// These handlers are called by agentctl via the WS tunnel and execute
+// operations against the backend services directly.
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	agentsettingscontroller "github.com/kandev/kandev/internal/agent/settings/controller"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/auth/authn"
+	"github.com/kandev/kandev/internal/clarification"
+	"github.com/kandev/kandev/internal/common/constants"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	mcpscope "github.com/kandev/kandev/internal/mcp/scope"
+	"github.com/kandev/kandev/internal/orchestrator"
+	"github.com/kandev/kandev/internal/orchestrator/executor"
+	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
+	"github.com/kandev/kandev/internal/plugins"
+	promptmodels "github.com/kandev/kandev/internal/prompts/models"
+	promptservice "github.com/kandev/kandev/internal/prompts/service"
+	"github.com/kandev/kandev/internal/settingscatalog"
+	"github.com/kandev/kandev/internal/steptelemetry"
+	"github.com/kandev/kandev/internal/sysprompt"
+	taskcontract "github.com/kandev/kandev/internal/task/contract"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/planws"
+	taskrepository "github.com/kandev/kandev/internal/task/repository"
+	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/task/service"
+	usermodels "github.com/kandev/kandev/internal/user/models"
+	workflowctrl "github.com/kandev/kandev/internal/workflow/controller"
+	workflowmodels "github.com/kandev/kandev/internal/workflow/models"
+	workflowsvc "github.com/kandev/kandev/internal/workflow/service"
+	"github.com/kandev/kandev/internal/workflow/signalmetrics"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+// ClarificationService defines the interface for clarification operations.
+type ClarificationService interface {
+	CreateRequest(req *clarification.Request) (string, bool)
+	WaitForResponse(ctx context.Context, pendingID string) (*clarification.Response, error)
+	CancelRequest(pendingID string) bool
+}
+
+type workspaceSourceJSON struct {
+	Kind           string `json:"kind"`
+	RepositoryID   string `json:"repository_id"`
+	LocalPath      string `json:"local_path"`
+	GitHubURL      string `json:"github_url"`
+	RemoteURL      string `json:"remote_url"`
+	Provider       string `json:"provider"`
+	ProviderHost   string `json:"provider_host"`
+	ProviderScope  string `json:"provider_scope"`
+	ProviderRepoID string `json:"provider_repo_id"`
+	ProviderOwner  string `json:"provider_owner"`
+	ProviderName   string `json:"provider_name"`
+	BaseBranch     string `json:"base_branch"`
+	CheckoutBranch string `json:"checkout_branch"`
+	DisplayName    string `json:"display_name"`
+}
+
+// SessionCanceller detaches in-memory clarification waiters while keeping DB
+// messages pending. Used by the MCP-timeout handler.
+type SessionCanceller interface {
+	DetachSessionAndNotify(ctx context.Context, sessionID string) (int, error)
+}
+
+// ClarificationInputPauser performs the orchestrator-owned hard pause for
+// ask_user_question calls that end without an answer. The returned int is the
+// number of clarification bundles detached while pausing.
+type ClarificationInputPauser interface {
+	PauseForClarificationInput(ctx context.Context, sessionID string) (int, error)
+}
+
+// SessionCeilingReleaser releases the orchestrator's session-ceiling
+// reservation for a session that this package just moved out of the counted
+// population (STARTING/RUNNING) directly against the repository, bypassing
+// the orchestrator's own persistence funnels.
+type SessionCeilingReleaser interface {
+	ReleaseCeilingReservation(sessionID string)
+}
+
+type clarificationInputPauserWithOptions interface {
+	PauseForClarificationInputWithOptions(
+		ctx context.Context,
+		sessionID string,
+		options orchestrator.ClarificationPauseOptions,
+	) (int, error)
+}
+
+// MessageCreator creates messages for clarification requests.
+type MessageCreator interface {
+	CreateClarificationRequestMessages(ctx context.Context, taskID, sessionID, pendingID string, questions []clarification.Question, clarificationContext string) ([]string, error)
+}
+
+// SessionRepository interface for updating session state.
+type SessionRepository interface {
+	UpdateTaskSessionState(ctx context.Context, sessionID string, state models.TaskSessionState, errorMessage string) error
+	GetTaskSession(ctx context.Context, id string) (*models.TaskSession, error)
+	// SetSessionMetadataKeyIfAbsentOrDifferentStep atomically claims the
+	// pending-completion bag for a step. It preserves first-signal-wins for
+	// concurrent requests and replaces a stale signal from an older step.
+	SetSessionMetadataKeyIfAbsentOrDifferentStep(ctx context.Context, sessionID, key, stepID string, value interface{}) (bool, error)
+}
+
+// stepCompletionTurnReader exposes the immutable workflow-step stamp on the
+// latest turn. Production SQLite implements this through the turn repository,
+// while small handler fakes can omit it and retain legacy behavior.
+type stepCompletionTurnReader interface {
+	ListTurnsBySession(ctx context.Context, sessionID string) ([]*models.Turn, error)
+}
+
+// stepCompletionSignalClaimer binds the metadata write to the task step that
+// launched the calling turn. Production SQLite performs the task-step check
+// and metadata claim in one transaction.
+type stepCompletionSignalClaimer interface {
+	SetSessionMetadataKeyIfAbsentOrDifferentStepIfTaskAtStep(
+		ctx context.Context,
+		taskID, sessionID, key, stepID string,
+		value interface{},
+	) (bool, error)
+}
+
+// conditionalSessionStateUpdater is implemented by repositories that can
+// reject stale session-state writers. Keeping it optional preserves existing
+// handler fakes and alternate repositories while production SQLite gets CAS
+// protection against coordinator stops.
+type conditionalSessionStateUpdater interface {
+	UpdateTaskSessionStateIfCurrent(
+		ctx context.Context,
+		sessionID string,
+		expected, state models.TaskSessionState,
+		errorMessage string,
+	) (bool, time.Time, error)
+}
+
+// TaskRepository interface for updating task state.
+type TaskRepository interface {
+	UpdateTaskState(ctx context.Context, taskID string, state v1.TaskState) error
+}
+
+// RemoteContributionService resolves provider URLs before task creation and
+// associates an already-existing PR/MR after the target task-repository row
+// exists. Implementations must return only server-authored identity data.
+type RemoteContributionService interface {
+	Resolve(ctx context.Context, workspaceID, userID, rawURL string) (*models.RemoteContributionResolution, bool, error)
+	// Associate's repositoryID is repositories.ID — the repository_id COLUMN
+	// on the task's task_repositories row, not that row's own id. Callers
+	// must pass task.Repositories[i].RepositoryID, never .ID.
+	Associate(ctx context.Context, workspaceID, userID, taskID, repositoryID string, resolution *models.RemoteContributionResolution) error
+}
+
+// sessionOwnedTaskStateUpdater atomically guards a task-state write with the
+// current state of its owning session. Production SQLite implements this so a
+// clarification answer cannot restore IN_PROGRESS after coordinator stop has
+// already committed CANCELLED.
+type sessionOwnedTaskStateUpdater interface {
+	UpdateTaskStateIfSessionState(
+		ctx context.Context,
+		taskID, sessionID string,
+		expectedSessionState models.TaskSessionState,
+		state v1.TaskState,
+	) (v1.TaskState, bool, error)
+}
+
+// EventBus interface for publishing events.
+type EventBus interface {
+	Publish(ctx context.Context, topic string, event *bus.Event) error
+}
+
+// SessionLauncher provides session launch and prompt-dispatch capabilities.
+// Implemented by *orchestrator.Service.
+type SessionLauncher interface {
+	LaunchSession(ctx context.Context, req *orchestrator.LaunchSessionRequest) (*orchestrator.LaunchSessionResponse, error)
+	PromptTask(ctx context.Context, taskID, sessionID, prompt, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool) (*orchestrator.PromptResult, error)
+	StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment, references []v1.EntityReference) (*executor.TaskExecution, error)
+	StartCreatedSessionForPeerMessage(ctx context.Context, identity messagequeue.QueueSessionIdentity, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment, references []v1.EntityReference) (*executor.TaskExecution, error)
+	ResumeTaskSession(ctx context.Context, taskID, sessionID string) (*executor.TaskExecution, error)
+	ProcessOnTurnStart(ctx context.Context, taskID, sessionID string) (orchestrator.ProcessOnTurnStartResult, error)
+	QueueUserPrompt(ctx context.Context, taskID, sessionID, prompt, model string, planMode bool, attachments []v1.MessageAttachment, metadata map[string]interface{}, userMessageRecorded bool) error
+	GetMessageQueue() *messagequeue.Service
+	// CheckQueueAdmissionReadiness rechecks automatic dispatch for the exact
+	// session incarnation admitted by a queue operation.
+	CheckQueueAdmissionReadiness(context.Context, messagequeue.QueueSessionIdentity)
+	// QueueAndInterruptForPeerMessage atomically queues prompt for sessionID
+	// then interrupts the session's in-flight turn to dispatch it right
+	// away, bypassing FIFO order. Used only by queueThenInterruptTaskMessage
+	// when the message_task_kandev sender is the target task's parent (see
+	// handleMessageTask) — see the orchestrator implementation's doc
+	// comment for why "queue" and "interrupt" must be one atomic call
+	// rather than two separate steps. The returned bool reports whether
+	// this call actually dispatched the message immediately; callers must
+	// not report "sent" when it's false — the message is still only
+	// queued, to be delivered later by whichever drain gets to it.
+	QueueAndInterruptForPeerMessage(ctx context.Context, identity messagequeue.QueueSessionIdentity, prompt string, metadata map[string]interface{}) (*messagequeue.QueuedMessage, bool, error)
+	// RenameSession sets the user-visible session tab label and broadcasts
+	// the change. Used by spawn_session_kandev's optional name parameter.
+	RenameSession(ctx context.Context, sessionID, name string) error
+}
+
+type peerMessageStartAdmissionProvider interface {
+	BeginPeerMessageStart(
+		context.Context,
+		messagequeue.QueueSessionIdentity,
+	) (orchestrator.PeerMessageStartAdmission, error)
+}
+
+// TaskStopper exposes the narrow coordinator halt operation used by
+// stop_task_kandev. The MCP layer owns authorization; lifecycle semantics stay
+// in the orchestrator.
+type TaskStopper interface {
+	StopTaskForCoordinator(ctx context.Context, taskID string) (orchestrator.CoordinatorTaskStopResult, error)
+}
+
+// AgentPermissionService is the authorized domain boundary for external
+// permission discovery and one-shot resolution. MCP handlers never reach into
+// agentctl or UI state directly.
+type AgentPermissionService interface {
+	ListPendingAgentPermissions(ctx context.Context, taskID, sessionID string) ([]streams.PendingAgentPermission, error)
+	ResolveAgentPermission(ctx context.Context, request orchestrator.ResolveAgentPermissionRequest) (*orchestrator.ResolveAgentPermissionResult, error)
+}
+
+// TaskTitleBranchRenamer performs the best-effort branch side effect after an
+// owner session accepts a prompt-first task title.
+type TaskTitleBranchRenamer interface {
+	RenameGeneratedBranchesForTaskTitle(ctx context.Context, taskID, sessionID, title string) (orchestrator.TitleBranchRenameResult, error)
+}
+
+// MessageQueuer owns session-incarnation-bound move handoffs and pending moves.
+type MessageQueuer interface {
+	QueueMessage(ctx context.Context, sessionID, taskID, content, model, userID string, planMode bool, attachments []messagequeue.MessageAttachment) (*messagequeue.QueuedMessage, error)
+	SetPendingMove(ctx context.Context, sessionID string, move *messagequeue.PendingMove) error
+	RemoveEntryForSession(ctx context.Context, identity messagequeue.QueueSessionIdentity, entryID string) (*messagequeue.QueueRemovalResult, error)
+}
+
+// messageMetadataQueuer is an optional extension implemented by the
+// production queue service. Keeping metadata out of MessageQueuer preserves
+// compatibility with lightweight test and alternate queue implementations.
+type messageMetadataQueuer interface {
+	QueueMessageWithMetadata(ctx context.Context, sessionID, taskID, content, model, userID string, planMode bool, attachments []messagequeue.MessageAttachment, metadata map[string]interface{}) (*messagequeue.QueuedMessage, error)
+}
+
+// PromptReferenceResolver expands saved prompt references that appear inside
+// agent-sent prompts while preserving the original @mentions in the visible
+// prompt body.
+type PromptReferenceResolver interface {
+	ResolvePromptReferences(ctx context.Context, content string) ([]promptservice.PromptReferenceExpansion, error)
+}
+
+// PromptReader provides the read-only saved prompt access exposed by
+// configuration and external MCP surfaces.
+type PromptReader interface {
+	ListPrompts(ctx context.Context) ([]*promptmodels.Prompt, error)
+	GetPromptByName(ctx context.Context, name string) (*promptmodels.Prompt, error)
+}
+
+// UserSettingsProvider supplies the single portable preference used when an
+// MCP-created task omits agent_profile_id.
+type UserSettingsProvider interface {
+	GetUserSettings(ctx context.Context) (*usermodels.UserSettings, error)
+}
+
+// AgentProfileVerifier reports whether an agent profile ID names an existing
+// profile. It exists so create-task can refuse an unresolvable profile before
+// it writes anything, rather than failing later in the asynchronous launch.
+type AgentProfileVerifier interface {
+	AgentProfileExists(ctx context.Context, profileID string) (bool, error)
+}
+
+// Handlers provides MCP WebSocket handlers.
+type Handlers struct {
+	automationCreator      AutomationCreator
+	taskSvc                *service.Service
+	workflowCtrl           *workflowctrl.Controller
+	clarificationSvc       ClarificationService
+	sessionCanceller       SessionCanceller
+	inputPauser            ClarificationInputPauser
+	sessionCeilingReleaser SessionCeilingReleaser
+	messageCreator         MessageCreator
+	sessionRepo            SessionRepository
+	taskRepo               TaskRepository
+	eventBus               EventBus
+	planService            *service.PlanService
+	walkthroughService     *service.WalkthroughService
+	sessionLauncher        SessionLauncher
+	taskStopper            TaskStopper
+	titleBranchRenamer     TaskTitleBranchRenamer
+	stopTaskGetter         func(context.Context, string) (*models.Task, error)
+	messageQueue           MessageQueuer
+	promptResolver         PromptReferenceResolver
+	promptReader           PromptReader
+	promptWriter           PromptWriter
+	promptAuthEnabled      func() bool
+	userSettingsProvider   UserSettingsProvider
+	agentProfileVerifier   AgentProfileVerifier
+	settingsRegistry       *settingscatalog.Registry
+	settingsOperations     SettingsOperations
+	logger                 *logger.Logger
+
+	// Config-mode dependencies (optional, set via SetConfigDeps)
+	workflowSvc         *workflowsvc.Service
+	agentSettingsCtrl   *agentsettingscontroller.Controller
+	mcpConfigSvc        *mcpconfig.Service
+	settingsBroadcaster interface {
+		Broadcast(*ws.Message)
+	}
+
+	// Cross-task handoff service (optional, set via SetHandoffService).
+	// Wires the list_related_tasks_kandev / *_task_document_kandev
+	// MCP tools introduced in office task handoffs phase 2.
+	handoffSvc *service.HandoffService
+
+	// Optional PR lister (set via SetTaskPRLister) used to enrich
+	// task-listing responses with associated pull requests.
+	taskPRLister TaskPRLister
+	taskMRLister TaskMRLister
+	// Native code review (optional, set via SetReviewService /
+	// SetReviewRunner). Without them the review actions are simply not
+	// registered — see registerReviewHandlers.
+	reviewService      *service.ReviewService
+	reviewRunner       ReviewRunner
+	pluginSvc          *plugins.Service
+	canvasAuthoringSvc CanvasAuthoringService
+
+	// Optional task-bound GitHub PR automation controls.
+	taskPRAutomation            TaskPRAutomationService
+	taskChangeLinks             TaskChangeLinkService
+	taskChangeRequestReader     TaskChangeRequestReadService
+	taskChangeRequestAutomation TaskChangeRequestAutomationService
+	taskPRAutoFixOutcome        TaskPRAutoFixOutcomeService
+	remoteContributionSvc       RemoteContributionService
+	diagnosticBundles           DiagnosticBundleProvider
+	diagnosticMaterializer      DiagnosticBundleMaterializer
+	// Optional task-bound GitLab MR automation controls.
+	taskMRAutomation TaskMRAutomationService
+
+	// Optional list_pending_questions_kandev / answer_question_kandev
+	// dependencies (external MCP surface only, set via
+	// SetClarificationResolver).
+	clarificationResolver *clarification.Resolver
+	clarificationBundles  ClarificationBundleLister
+
+	// Optional list_pending_agent_permissions_kandev / resolve_agent_permission_kandev
+	// dependency (external MCP surface only, set via SetAgentPermissionService).
+	agentPermissionSvc AgentPermissionService
+}
+
+func (h *Handlers) releaseWorkspacePolicyAfterCreateRollback(ctx context.Context, taskID string) {
+	if h.handoffSvc == nil || taskID == "" {
+		return
+	}
+	if err := h.handoffSvc.ReleaseWorkspacePolicy(context.WithoutCancel(ctx), taskID, "create_rollback"); err != nil {
+		h.logger.Warn("rollback workspace membership cleanup failed",
+			zap.String("task_id", taskID), zap.Error(err))
+	}
+}
+
+// SetTaskChangeLinkService wires provider-neutral PR/MR association changes.
+func (h *Handlers) SetTaskChangeLinkService(links TaskChangeLinkService) {
+	h.taskChangeLinks = links
+}
+
+// NewHandlers creates new MCP handlers.
+func NewHandlers(
+	taskSvc *service.Service,
+	workflowCtrl *workflowctrl.Controller,
+	clarificationSvc ClarificationService,
+	sessionCanceller SessionCanceller,
+	messageCreator MessageCreator,
+	sessionRepo SessionRepository,
+	taskRepo TaskRepository,
+	eventBus EventBus,
+	planService *service.PlanService,
+	walkthroughService *service.WalkthroughService,
+	sessionLauncher SessionLauncher,
+	messageQueue MessageQueuer,
+	log *logger.Logger,
+) *Handlers {
+	h := &Handlers{
+		taskSvc:            taskSvc,
+		workflowCtrl:       workflowCtrl,
+		clarificationSvc:   clarificationSvc,
+		sessionCanceller:   sessionCanceller,
+		messageCreator:     messageCreator,
+		sessionRepo:        sessionRepo,
+		taskRepo:           taskRepo,
+		eventBus:           eventBus,
+		planService:        planService,
+		walkthroughService: walkthroughService,
+		sessionLauncher:    sessionLauncher,
+		messageQueue:       messageQueue,
+		logger:             log.WithFields(zap.String("component", "mcp-handlers")),
+	}
+	if taskSvc != nil {
+		h.stopTaskGetter = taskSvc.GetTask
+	}
+	if stopper, ok := sessionLauncher.(TaskStopper); ok {
+		h.taskStopper = stopper
+	}
+	return h
+}
+
+// SetClarificationInputPauser wires the orchestrator-owned hard pause used when
+// a clarification tool call ends without delivering an answer to the agent.
+func (h *Handlers) SetClarificationInputPauser(pauser ClarificationInputPauser) {
+	h.inputPauser = pauser
+}
+
+// SetSessionCeilingReleaser wires the orchestrator-owned session-ceiling
+// release used when this package's own clarification write moves a session
+// out of the counted population.
+func (h *Handlers) SetSessionCeilingReleaser(releaser SessionCeilingReleaser) {
+	h.sessionCeilingReleaser = releaser
+}
+
+func (h *Handlers) SetPromptReferenceResolver(resolver PromptReferenceResolver) {
+	h.promptResolver = resolver
+}
+
+// SetPromptReader wires read-only saved prompt access into config-mode MCP.
+func (h *Handlers) SetPromptReader(reader PromptReader) {
+	h.promptReader = reader
+}
+
+// SetTaskStopper wires the orchestrator-owned halt operation.
+func (h *Handlers) SetTaskStopper(stopper TaskStopper) {
+	h.taskStopper = stopper
+}
+
+// SetAgentPermissionService wires the authorized permission domain service.
+func (h *Handlers) SetAgentPermissionService(svc AgentPermissionService) {
+	h.agentPermissionSvc = svc
+}
+
+// SetTaskTitleBranchRenamer wires the best-effort branch rename performed
+// after an accepted agent-generated title.
+func (h *Handlers) SetTaskTitleBranchRenamer(renamer TaskTitleBranchRenamer) {
+	h.titleBranchRenamer = renamer
+}
+
+// SetUserSettingsProvider wires portable user preferences into MCP task creation.
+func (h *Handlers) SetUserSettingsProvider(provider UserSettingsProvider) {
+	h.userSettingsProvider = provider
+}
+
+// SetRemoteContributionService wires provider-backed PR/MR resolution for
+// repository_url values that identify an existing contribution.
+func (h *Handlers) SetRemoteContributionService(svc RemoteContributionService) {
+	h.remoteContributionSvc = svc
+}
+
+// SetConfigDeps sets the config-mode dependencies for agent-native configuration handlers.
+// These are optional and only needed when config-mode MCP sessions are used.
+func (h *Handlers) SetConfigDeps(
+	workflowSvc *workflowsvc.Service,
+	agentSettingsCtrl *agentsettingscontroller.Controller,
+	mcpConfigSvc *mcpconfig.Service,
+) {
+	h.workflowSvc = workflowSvc
+	h.agentSettingsCtrl = agentSettingsCtrl
+	h.mcpConfigSvc = mcpConfigSvc
+}
+
+// SetAgentProfileVerifier wires the profile-existence check used to refuse a
+// caller-supplied agent_profile_id before a task is created. Task modes need it
+// too, so it is not part of SetConfigDeps.
+func (h *Handlers) SetAgentProfileVerifier(verifier AgentProfileVerifier) {
+	h.agentProfileVerifier = verifier
+}
+
+// SetSettingsBroadcaster wires the notification path used by settings writes
+// that originate in legacy MCP configuration tools.
+func (h *Handlers) SetSettingsBroadcaster(broadcaster interface{ Broadcast(*ws.Message) }) {
+	h.settingsBroadcaster = broadcaster
+}
+
+// SetPluginService wires the plugin agent-tool catalog and invocation bridge.
+func (h *Handlers) SetPluginService(svc *plugins.Service) {
+	h.pluginSvc = svc
+}
+
+// SetCanvasAuthoringService wires the feature-gated, task-scoped canvas
+// authoring boundary. Leave it unset when canvas support is disabled so raw WS
+// canvas actions are not registered either.
+func (h *Handlers) SetCanvasAuthoringService(svc CanvasAuthoringService) {
+	h.canvasAuthoringSvc = svc
+}
+
+// RegisterHandlers registers all MCP handlers with the dispatcher.
+func (h *Handlers) RegisterHandlers(dispatcher *ws.Dispatcher) {
+	d := &guardedMCPDispatcher{Dispatcher: dispatcher, handlers: h}
+	before := d.HandlerCount()
+	h.registerTaskModeHandlers(d)
+	h.registerConfigModeHandlers(d)
+
+	after := d.HandlerCount()
+	h.logger.Info("registered MCP handlers", zap.Int("count", after-before))
+}
+
+func (h *Handlers) registerTaskModeHandlers(d *guardedMCPDispatcher) {
+	h.registerTaskReadHandlers(d)
+	h.registerTaskMutationHandlers(d)
+	h.registerTaskPlanHandlers(d)
+	h.registerTaskQuestionHandlers(d)
+	h.registerReviewHandlers(d)
+	h.registerCanvasHandlers(d)
+}
+
+func (h *Handlers) registerTaskReadHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPListWorkspaces, h.handleListWorkspaces)
+	if h.pluginSvc != nil {
+		d.RegisterFunc(ws.ActionMCPListPluginTools, h.handleListPluginTools)
+		d.RegisterFunc(ws.ActionMCPInvokePluginTool, h.handleInvokePluginTool)
+	}
+	d.RegisterFunc(ws.ActionMCPListWorkflows, h.handleListWorkflows)
+	d.RegisterFunc(ws.ActionMCPListWorkflowSteps, h.handleListWorkflowSteps)
+	d.RegisterFunc(ws.ActionMCPListRepositories, h.handleListRepositories)
+	d.RegisterFunc(ws.ActionMCPListTasks, h.handleListTasks)
+	d.RegisterFunc(ws.ActionMCPGetTaskChangeRequests, h.handleGetTaskChangeRequests)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskChangeRequestAutomation, h.handleUpdateTaskChangeRequestAutomation)
+	d.RegisterFunc(ws.ActionMCPGetTaskPRAutomation, h.handleGetTaskPRAutomation)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskPRAutomation, h.handleUpdateTaskPRAutomation)
+	d.RegisterFunc(ws.ActionMCPReportPRAutoFixOutcome, h.handleReportTaskPRAutoFixOutcome)
+	d.RegisterFunc(ws.ActionMCPReportTaskChangeRequestAutoFixOutcome, h.handleReportTaskChangeRequestAutoFixOutcome)
+	d.RegisterFunc(ws.ActionMCPGetTaskMRAutomation, h.handleGetTaskMRAutomation)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskMRAutomation, h.handleUpdateTaskMRAutomation)
+	d.RegisterFunc(ws.ActionMCPGetTaskConversation, h.handleGetTaskConversation)
+	d.RegisterFunc(ws.ActionMCPListTaskSessions, h.handleListTaskSessions)
+	d.RegisterFunc(ws.ActionMCPListPendingAgentPermissions, h.handleListPendingAgentPermissions)
+	d.RegisterFunc(ws.ActionMCPResolveAgentPermission, h.handleResolveAgentPermission)
+}
+
+func (h *Handlers) registerTaskMutationHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPCreateTask, h.handleCreateTask)
+	d.RegisterFunc(ws.ActionMCPUpdateTask, h.handleUpdateTask)
+	d.RegisterFunc(ws.ActionMCPSetTaskTitle, h.handleSetTaskTitle)
+	d.RegisterFunc(ws.ActionMCPGetTaskPRAutomation, h.handleGetTaskPRAutomation)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskPRAutomation, h.handleUpdateTaskPRAutomation)
+	d.RegisterFunc(ws.ActionMCPGetTaskMRAutomation, h.handleGetTaskMRAutomation)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskMRAutomation, h.handleUpdateTaskMRAutomation)
+	d.RegisterFunc(ws.ActionMCPLinkTaskPR, h.handleLinkTaskPR)
+	d.RegisterFunc(ws.ActionMCPUnlinkTaskPR, h.handleUnlinkTaskPR)
+	d.RegisterFunc(ws.ActionMCPReplaceTaskPR, h.handleReplaceTaskPR)
+	d.RegisterFunc(ws.ActionMCPManageTaskChangeRequest, h.handleManageTaskChangeRequest)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskChangeRequestAutomation, h.handleUpdateTaskChangeRequestAutomation)
+	d.RegisterFunc(ws.ActionMCPAddTaskDependency, h.handleAddTaskDependency)
+	d.RegisterFunc(ws.ActionMCPRemoveTaskDependency, h.handleRemoveTaskDependency)
+	d.RegisterFunc(ws.ActionMCPAddBranchToTask, h.handleAddBranchToTask)
+	d.RegisterFunc(ws.ActionMCPAddWorkspaceSources, h.handleAddWorkspaceSources)
+	d.RegisterFunc(ws.ActionMCPUpdateRepositoryBaseBranch, h.handleUpdateRepositoryBaseBranch)
+	d.RegisterFunc(ws.ActionMCPStepComplete, h.handleStepComplete)
+	d.RegisterFunc(ws.ActionMCPMessageTask, h.handleMessageTask)
+	d.RegisterFunc(ws.ActionMCPStopTask, h.handleStopTask)
+	d.RegisterFunc(ws.ActionMCPSpawnSession, h.handleSpawnSession)
+}
+
+func (h *Handlers) registerTaskPlanHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPCreateTaskPlan, h.handleCreateTaskPlan)
+	d.RegisterFunc(ws.ActionMCPGetTaskPlan, h.handleGetTaskPlan)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskPlan, h.handleUpdateTaskPlan)
+	d.RegisterFunc(ws.ActionMCPEditTaskPlan, h.handleEditTaskPlan)
+	d.RegisterFunc(ws.ActionMCPListTaskPlanRevisions, h.handleListTaskPlanRevisions)
+	d.RegisterFunc(ws.ActionMCPGetTaskPlanRevision, h.handleGetTaskPlanRevision)
+	d.RegisterFunc(ws.ActionMCPRestoreTaskPlanRevision, h.handleRestoreTaskPlanRevision)
+	d.RegisterFunc(ws.ActionMCPDeleteTaskPlan, h.handleDeleteTaskPlan)
+	d.RegisterFunc(ws.ActionMCPShowWalkthrough, h.handleShowWalkthrough)
+	d.RegisterFunc(ws.ActionMCPGetWalkthrough, h.handleGetWalkthrough)
+	d.RegisterFunc(ws.ActionMCPDeleteWalkthrough, h.handleDeleteWalkthrough)
+	// Plain actions let the web UI backfill or remove the current walkthrough
+	// when its subscription was established after the creation event.
+	d.RegisterFunc(ws.ActionTaskWalkthroughGet, h.handleGetWalkthrough)
+	d.RegisterFunc(ws.ActionTaskWalkthroughDelete, h.handleDeleteWalkthrough)
+}
+
+func (h *Handlers) registerTaskQuestionHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPAskUserQuestion, h.handleAskUserQuestion)
+	d.RegisterFunc(ws.ActionMCPAskParentQuestion, h.handleAskParentQuestion)
+	d.RegisterFunc(ws.ActionMCPClarificationTimeout, h.handleClarificationTimeout)
+	if h.diagnosticBundles != nil && h.diagnosticMaterializer != nil {
+		d.RegisterFunc(ws.ActionMCPGetDiagnosticBundle, h.handleGetDiagnosticBundle)
+	}
+	if h.clarificationResolver != nil && h.clarificationBundles != nil {
+		d.RegisterFunc(ws.ActionMCPListPendingQuestions, h.handleListPendingQuestions)
+		d.RegisterFunc(ws.ActionMCPAnswerQuestion, h.handleAnswerQuestion)
+	}
+}
+
+func (h *Handlers) registerConfigModeHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPCreateAutomation, h.handleCreateAutomation)
+	if h.settingsRegistry != nil {
+		h.registerSettingsHandlers(d)
+	}
+	if h.promptReader != nil {
+		h.registerPromptHandlers(d)
+	}
+	if h.promptWriter != nil {
+		d.RegisterFunc(ws.ActionMCPCreateSharedPrompt, h.handleCreateSharedPrompt)
+		d.RegisterFunc(ws.ActionMCPUpdateSharedPrompt, h.handleUpdateSharedPrompt)
+	}
+	if h.workflowSvc != nil {
+		h.registerWorkflowHandlers(d)
+	}
+	if h.agentSettingsCtrl != nil {
+		h.registerAgentHandlers(d)
+	}
+	// Executor discovery/profile listing is always available for task-mode
+	// create_task, while executor mutations remain config-mode only.
+	if h.taskSvc != nil {
+		d.RegisterFunc(ws.ActionMCPListExecutors, h.handleListExecutors)
+		d.RegisterFunc(ws.ActionMCPListExecutorProfiles, h.handleListExecutorProfiles)
+	}
+	if h.mcpConfigSvc != nil {
+		d.RegisterFunc(ws.ActionMCPGetMcpConfig, h.handleGetMcpConfig)
+		d.RegisterFunc(ws.ActionMCPUpdateMcpConfig, h.handleUpdateMcpConfig)
+	}
+	if h.handoffSvc != nil {
+		d.RegisterFunc(ws.ActionMCPListRelatedTasks, h.handleListRelatedTasks)
+		d.RegisterFunc(ws.ActionMCPListTaskDocuments, h.handleListTaskDocuments)
+		d.RegisterFunc(ws.ActionMCPGetTaskDocument, h.handleGetTaskDocument)
+		d.RegisterFunc(ws.ActionMCPWriteTaskDocument, h.handleWriteTaskDocument)
+	}
+	if h.taskSvc != nil {
+		h.registerTaskConfigMutationHandlers(d)
+	}
+}
+
+func (h *Handlers) registerWorkflowHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPCreateWorkflow, h.handleCreateWorkflow)
+	d.RegisterFunc(ws.ActionMCPUpdateWorkflow, h.handleUpdateWorkflow)
+	d.RegisterFunc(ws.ActionMCPDeleteWorkflow, h.handleDeleteWorkflow)
+	d.RegisterFunc(ws.ActionMCPImportWorkflow, h.handleImportWorkflow)
+	d.RegisterFunc(ws.ActionMCPExportWorkflow, h.handleExportWorkflow)
+	d.RegisterFunc(ws.ActionMCPCreateWorkflowStep, h.handleCreateWorkflowStep)
+	d.RegisterFunc(ws.ActionMCPUpdateWorkflowStep, h.handleUpdateWorkflowStep)
+	d.RegisterFunc(ws.ActionMCPDeleteWorkflowStep, h.handleDeleteWorkflowStep)
+	d.RegisterFunc(ws.ActionMCPReorderWorkflowStep, h.handleReorderWorkflowSteps)
+}
+
+func (h *Handlers) registerAgentHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPListAgents, h.handleListAgents)
+	d.RegisterFunc(ws.ActionMCPUpdateAgent, h.handleUpdateAgent)
+	d.RegisterFunc(ws.ActionMCPListAgentProfiles, h.handleListAgentProfiles)
+	d.RegisterFunc(ws.ActionMCPCreateAgentProfile, h.handleCreateAgentProfile)
+	d.RegisterFunc(ws.ActionMCPUpdateAgentProfile, h.handleUpdateAgentProfile)
+	d.RegisterFunc(ws.ActionMCPDeleteAgentProfile, h.handleDeleteAgentProfile)
+}
+
+func (h *Handlers) registerTaskConfigMutationHandlers(d *guardedMCPDispatcher) {
+	d.RegisterFunc(ws.ActionMCPMoveTask, h.handleMoveTask)
+	d.RegisterFunc(ws.ActionMCPDeleteTask, h.handleDeleteTask)
+	d.RegisterFunc(ws.ActionMCPArchiveTask, h.handleArchiveTask)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskState, h.handleUpdateTaskState)
+	if h.workflowSvc != nil {
+		d.RegisterFunc(ws.ActionMCPCreateExecutorProfile, h.handleCreateExecutorProfile)
+		d.RegisterFunc(ws.ActionMCPUpdateExecutorProfile, h.handleUpdateExecutorProfile)
+		d.RegisterFunc(ws.ActionMCPDeleteExecutorProfile, h.handleDeleteExecutorProfile)
+	}
+}
+
+// handleListWorkspaces lists all workspaces.
+func (h *Handlers) handleListWorkspaces(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	workspaces, err := h.taskSvc.ListWorkspaces(ctx)
+	if err != nil {
+		h.logger.Error("failed to list workspaces", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list workspaces", nil)
+	}
+	if principal, ok := mcpscope.PrincipalFromContext(ctx); ok && principal.IsAutomation() {
+		filtered := make([]*models.Workspace, 0, 1)
+		for _, workspace := range workspaces {
+			if workspace != nil && workspace.ID == principal.WorkspaceID {
+				filtered = append(filtered, workspace)
+			}
+		}
+		workspaces = filtered
+	}
+	dtos := make([]dto.WorkspaceDTO, 0, len(workspaces))
+	for _, w := range workspaces {
+		dtos = append(dtos, dto.FromWorkspace(w))
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.ListWorkspacesResponse{Workspaces: dtos, Total: len(dtos)})
+}
+
+// unmarshalStringField unmarshals a JSON payload and returns the value of a single string field.
+func unmarshalStringField(payload json.RawMessage, fieldName string) (string, error) {
+	var m map[string]string
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return "", err
+	}
+	return m[fieldName], nil
+}
+
+// handleListByField is a generic handler for listing resources identified by a single string field.
+func (h *Handlers) handleListByField(
+	ctx context.Context, msg *ws.Message,
+	fieldName, logErrMsg, clientErrMsg string,
+	fn func(context.Context, string) (any, error),
+) (*ws.Message, error) {
+	value, err := unmarshalStringField(msg.Payload, fieldName)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if value == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, fieldName+" is required", nil)
+	}
+	resp, err := fn(ctx, value)
+	if err != nil {
+		h.logger.Error(logErrMsg, zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, clientErrMsg, nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, resp)
+}
+
+// handleDeleteByField is a generic handler for deleting a resource identified by a single string field.
+func (h *Handlers) handleDeleteByField(
+	ctx context.Context, msg *ws.Message,
+	fieldName, logErrMsg, clientErrMsg string,
+	fn func(context.Context, string) error,
+) (*ws.Message, error) {
+	value, err := unmarshalStringField(msg.Payload, fieldName)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if value == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, fieldName+" is required", nil)
+	}
+	if err := fn(ctx, value); err != nil {
+		h.logger.Error(logErrMsg, zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, clientErrMsg+": "+err.Error(), nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{"success": true})
+}
+
+// handleListWorkflows lists workflows for a workspace.
+func (h *Handlers) handleListWorkflows(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.handleListByField(ctx, msg, "workspace_id", "failed to list workflows", "Failed to list workflows",
+		func(ctx context.Context, workspaceID string) (any, error) {
+			workflows, err := h.taskSvc.ListWorkflows(ctx, workspaceID, false)
+			if err != nil {
+				return nil, err
+			}
+			dtos := make([]dto.WorkflowDTO, 0, len(workflows))
+			for _, w := range workflows {
+				dtos = append(dtos, dto.FromWorkflow(w))
+			}
+			return dto.ListWorkflowsResponse{Workflows: dtos, Total: len(dtos)}, nil
+		})
+}
+
+// handleListWorkflowSteps lists workflow steps for a workflow.
+func (h *Handlers) handleListWorkflowSteps(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.handleListByField(ctx, msg, "workflow_id", "failed to list workflow steps", "Failed to list workflow steps",
+		func(ctx context.Context, workflowID string) (any, error) {
+			return h.workflowCtrl.ListStepsByWorkflow(ctx, workflowctrl.ListStepsRequest{WorkflowID: workflowID})
+		})
+}
+
+// handleListRepositories lists repositories for a workspace. Exposes the same
+// data the kanban "Edit task → Repositories" picker reads, so an MCP-driven
+// agent can match a request against an actual repo instead of guessing or
+// making up an ID.
+func (h *Handlers) handleListRepositories(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.handleListByField(ctx, msg, "workspace_id", "failed to list repositories", "Failed to list repositories",
+		func(ctx context.Context, workspaceID string) (any, error) {
+			repos, err := h.taskSvc.ListRepositories(ctx, workspaceID)
+			if err != nil {
+				return nil, err
+			}
+			dtos := make([]dto.RepositoryDTO, 0, len(repos))
+			for _, r := range repos {
+				dtos = append(dtos, dto.FromRepository(r))
+			}
+			return dto.ListRepositoriesResponse{Repositories: dtos, Total: len(dtos)}, nil
+		})
+}
+
+// handleListTasks lists tasks for a workflow.
+func (h *Handlers) handleListTasks(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return h.handleListByField(ctx, msg, "workflow_id", "failed to list tasks", "Failed to list tasks",
+		func(ctx context.Context, workflowID string) (any, error) {
+			tasks, err := h.taskSvc.ListTasks(ctx, workflowID)
+			if err != nil {
+				return nil, err
+			}
+			dtos := make([]dto.TaskDTO, 0, len(tasks))
+			for _, t := range tasks {
+				dtos = append(dtos, dto.FromTask(t))
+			}
+			h.enrichTasksWithPendingActions(ctx, tasks, dtos)
+			h.enrichTasksWithPRs(ctx, dtos)
+			return dto.ListTasksResponse{Tasks: dtos, Total: len(dtos)}, nil
+		})
+}
+
+// mcpRepositoryInput matches the repository input structure from MCP create_task
+type mcpRepositoryInput struct {
+	RepositoryID string `json:"repository_id"`
+	LocalPath    string `json:"local_path"`
+	GitHubURL    string `json:"github_url"`
+	BaseBranch   string `json:"base_branch"`
+}
+
+// handleCreateTask creates a new task and optionally auto-starts an agent session.
+func (h *Handlers) handleCreateTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	// Use local struct with JSON tags since dto.CreateTaskRequest lacks them
+	var req mcpCreateTaskRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.Title == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "title is required", nil)
+	}
+	if req.AssigneeAgentProfileID != "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "assignee_agent_profile_id is office-only and cannot be set via create_task_kandev", nil)
+	}
+
+	// Default start_agent to true for backward compatibility
+	startAgent := req.StartAgent == nil || *req.StartAgent
+	explicitWorkspaceID := req.WorkspaceID != ""
+	explicitWorkflowID := req.WorkflowID != ""
+	explicitWorkflowStep := req.WorkflowStepID != ""
+
+	// Only require description for subtasks if we're starting an agent
+	if req.ParentID != "" && req.Description == "" && startAgent {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "description is required for subtasks: it is the task agent's initial prompt and the only context it receives to start working", nil)
+	}
+	admission, err := h.admitMCPCreateTask(ctx, &req)
+	if err != nil {
+		code := mcpCreateTaskAdmissionErrorCode(err)
+		message := mcpCreateTaskAdmissionErrorMessage(err)
+		h.logMCPCreateAdmissionRejection(ctx, code, message)
+		return ws.NewError(msg.ID, msg.Action, code, message, nil)
+	}
+
+	// Resolve repositories and default workspace/workflow from parent if needed.
+	resolved, err := h.resolveTaskRepositories(ctx, req.ParentID, req.SourceTaskID, req.Repositories)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+	if admission.discardInheritedSourceRepositories {
+		resolved.Repos = nil
+	}
+	repos := resolved.Repos
+	// Top-level base_branch override: when the caller passes base_branch
+	// without any per-repo entries, apply it to every repo in the resolved
+	// list. This is the only path that lets a same-repo subtask override
+	// the parent's inherited base_branch without also restating the
+	// repository identifier. When the caller provided explicit per-repo
+	// entries we leave their BaseBranch alone — those are authoritative.
+	if req.BaseBranch != "" && len(req.Repositories) == 0 {
+		for i := range repos {
+			repos[i].BaseBranch = req.BaseBranch
+		}
+	}
+	req.WorkspaceID, req.WorkflowID, req.WorkflowStepID = applyMCPTaskScopeDefaults(
+		req.ParentID,
+		req.WorkspaceID,
+		req.WorkflowID,
+		req.WorkflowStepID,
+		explicitWorkspaceID,
+		explicitWorkflowID,
+		resolved,
+	)
+
+	// Auto-resolve workspace/workflow when not provided and there's exactly one option.
+	if req.WorkspaceID == "" && h.taskSvc != nil {
+		if workspaces, wsErr := h.taskSvc.ListWorkspaces(ctx); wsErr != nil {
+			h.logger.Warn("failed to auto-resolve workspace", zap.Error(wsErr))
+		} else if len(workspaces) == 1 {
+			req.WorkspaceID = workspaces[0].ID
+		}
+	}
+	if req.WorkspaceID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workspace_id is required", nil)
+	}
+
+	if req.WorkflowID == "" && h.taskSvc != nil {
+		if workflows, wfErr := h.taskSvc.ListWorkflows(ctx, req.WorkspaceID, false); wfErr != nil {
+			h.logger.Warn("failed to auto-resolve workflow", zap.String("workspace_id", req.WorkspaceID), zap.Error(wfErr))
+		} else if len(workflows) == 1 {
+			req.WorkflowID = workflows[0].ID
+		}
+	}
+	if req.WorkflowID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workflow_id is required", nil)
+	}
+	if code, message, err := h.validateMCPWorkflowWorkspace(ctx, req.WorkflowID, req.WorkspaceID); code != "" {
+		if err != nil && h.logger != nil {
+			h.logger.Error("failed to validate MCP workflow workspace",
+				zap.String("workflow_id", req.WorkflowID),
+				zap.String("workspace_id", req.WorkspaceID),
+				zap.Error(err))
+		}
+		return ws.NewError(msg.ID, msg.Action, code, message, nil)
+	}
+
+	workspacePolicy, err := h.resolveMCPWorkspacePolicy(req.ParentID, req.WorkspaceMode)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+
+	identity, _ := authn.IdentityFromContext(ctx)
+	contributions, err := h.resolveMCPRemoteContributions(ctx, req.WorkspaceID, identity.UserID, repos)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+	if workspacePolicy.Mode == mcpWorkspaceModeInheritParent &&
+		(len(req.Repositories) > 0 || req.BaseBranch != "") {
+		if err := h.taskSvc.ValidateInheritedWorkspaceRepositorySelection(ctx, req.ParentID, repos); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+	}
+
+	// Resolve the destination step before launch metadata. The profile lookup
+	// below reads it off pendingTask, and CreateTask sends an agent start to
+	// the first auto_start_agent step rather than to the start step — leaving
+	// this empty pinned the metadata and the deferred-launch record to the
+	// start step's profile while the task landed somewhere else.
+	resolvedStepID := req.WorkflowStepID
+	if resolvedStepID == "" {
+		resolvedStepID = h.resolveMCPDestinationStep(ctx, req.WorkflowID, startAgent)
+	}
+	pendingTask := &models.Task{
+		ParentID:       req.ParentID,
+		WorkspaceID:    req.WorkspaceID,
+		WorkflowID:     req.WorkflowID,
+		WorkflowStepID: resolvedStepID,
+	}
+	if err := h.validateExplicitAgentProfile(ctx, req.AgentProfileID); err != nil {
+		code := ws.ErrorCodeInternalError
+		if errors.Is(err, errMCPAgentProfileInvalid) {
+			code = ws.ErrorCodeValidation
+		}
+		return ws.NewError(msg.ID, msg.Action, code, err.Error(), nil)
+	}
+	launchConfig, metadata, err := h.resolveMCPLaunchMetadataWithSource(
+		ctx, pendingTask, req.AgentProfileID, req.ExecutorProfileID, req.SourceTaskID, req.SourceSessionID,
+	)
+	if err != nil {
+		code := ws.ErrorCodeInternalError
+		if errors.Is(err, errMCPAgentProfileRequired) {
+			code = ws.ErrorCodeValidation
+		}
+		return ws.NewError(msg.ID, msg.Action, code, err.Error(), nil)
+	}
+	launchConfig.InitialCreatePrompt = startAgent && explicitWorkflowStep && req.WorkflowStepID != "" && strings.TrimSpace(req.Description) != ""
+	metadata = workspacePolicy.MergeMetadataBlock(metadata)
+	var deferredLaunch map[string]interface{}
+	if startAgent {
+		deferredLaunch = map[string]interface{}{
+			"intent": "start", "agent_profile_id": launchConfig.AgentProfileID,
+			"executor_id": launchConfig.ExecutorID, "executor_profile_id": launchConfig.ExecutorProfileID,
+			"prompt": req.Description,
+		}
+	}
+
+	// The source session is the causal actor for this task's genesis ledger
+	// row — resolveMCPLaunchMetadataWithSource already validated it belongs
+	// to req.SourceTaskID above (resolveMCPCreatorSession errors out
+	// otherwise, so CreateTask is never reached with an unverified session
+	// here). Session-bound Kanban admission fills this field from the verified
+	// principal; external callers remain source-free and use the existing
+	// auth/user attribution fallback.
+	createCtx := ctx
+	if req.SourceSessionID != "" {
+		createCtx = steptelemetry.WithAttribution(ctx, steptelemetry.Attribution{
+			ActorKind: steptelemetry.ActorAgent,
+			ActorID:   req.SourceSessionID,
+			SessionID: req.SourceSessionID,
+		})
+	}
+	createReq := &service.CreateTaskRequest{
+		ParentID:               req.ParentID,
+		WorkspaceID:            req.WorkspaceID,
+		WorkflowID:             req.WorkflowID,
+		WorkflowStepID:         resolvedStepID,
+		Title:                  req.Title,
+		Description:            req.Description,
+		Autopilot:              req.Autopilot,
+		Repositories:           repos,
+		BlockedBy:              req.BlockedBy,
+		StartWhenUnblocked:     req.StartWhenUnblocked,
+		AssigneeAgentProfileID: req.AssigneeAgentProfileID,
+		Metadata:               metadata,
+		DeferredLaunch:         deferredLaunch,
+		StartAgent:             startAgent,
+		ExternalID:             req.ExternalID,
+		WorkspacePolicy:        &workspacePolicy,
+	}
+	result, err := h.taskSvc.CreateTask(createCtx, createReq)
+	if err != nil {
+		h.logger.Error("failed to create task", zap.Error(err))
+		code := classifyCreateTaskError(err)
+		message := "Failed to create task"
+		if code != ws.ErrorCodeInternalError {
+			message = err.Error()
+		}
+		return ws.NewError(msg.ID, msg.Action, code, message, nil)
+	}
+
+	// The MCP skip is a data-loss guard, not just an optimization: the steps
+	// below resolve remote contributions from the REQUEST (resolveMCPRemote
+	// Contributions above) but index them against the RETURNED task's
+	// repositories, and every rollback path on a mismatch uses the lifecycle
+	// coordinator when one is wired.
+	// A retry landing on a Found outcome — the existing task, whose
+	// repository list need not match this retry's payload — would then
+	// misindex, roll back, and delete the task the caller was trying to
+	// recover. Both Found outcomes have no side effects, so skip everything
+	// below and return the existing task as-is.
+	if result.Outcome != service.CreateTaskOutcomeCreated {
+		if err := h.validateMCPFoundCreateTask(ctx, &req, result.Task); err != nil {
+			code := mcpCreateTaskAdmissionErrorCode(err)
+			message := mcpCreateTaskAdmissionErrorMessage(err)
+			h.logMCPCreateAdmissionRejection(ctx, code, message)
+			return ws.NewError(msg.ID, msg.Action, code, message, nil)
+		}
+		return ws.NewResponse(msg.ID, msg.Action, mcpCreateTaskResult{
+			TaskDTO:          dto.FromTask(result.Task),
+			Deduplicated:     true,
+			CreationComplete: result.Outcome == service.CreateTaskOutcomeFoundSettled,
+			ParentResolution: admission.parentResolution.forOutcome(false),
+		})
+	}
+	task := result.Task
+
+	for index, resolution := range contributions {
+		if resolution == nil {
+			continue
+		}
+		if index >= len(task.Repositories) || task.Repositories[index] == nil {
+			if delErr := h.taskSvc.DeleteTaskWithLifecycle(ctx, task.ID); delErr != nil {
+				h.logger.Error("rollback delete failed after missing task repository",
+					zap.String("task_id", task.ID), zap.Error(delErr))
+			}
+			h.releaseWorkspacePolicyAfterCreateRollback(ctx, task.ID)
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to attach remote contribution: task repository is missing", nil)
+		}
+		if err := h.remoteContributionSvc.Associate(ctx, req.WorkspaceID, identity.UserID, task.ID, task.Repositories[index].RepositoryID, resolution); err != nil {
+			h.logger.Error("associate remote contribution; rolling back task creation",
+				zap.String("task_id", task.ID), zap.Error(err))
+			if delErr := h.taskSvc.DeleteTaskWithLifecycle(ctx, task.ID); delErr != nil {
+				h.logger.Error("rollback delete failed after contribution association error",
+					zap.String("task_id", task.ID), zap.Error(delErr))
+			}
+			h.releaseWorkspacePolicyAfterCreateRollback(ctx, task.ID)
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to attach remote contribution: "+err.Error(), nil)
+		}
+	}
+
+	// Settlement (create-sequence step 7): after policy attach, before
+	// auto-start dispatch. The normalized request identity survives a release
+	// during synchronous creation, even when the refreshed task has lost it.
+	settled, survivor, settleErr := h.taskSvc.SettleExternalID(ctx, task.ID, createReq.ExternalID)
+	if settleErr != nil {
+		if errors.Is(settleErr, taskrepo.ErrTaskNotFound) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "task not found", nil)
+		}
+		h.logger.Error("failed to settle external_id", zap.String("task_id", task.ID), zap.Error(settleErr))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to create task", nil)
+	}
+	if !settled {
+		// CreatedIdentityLost: another actor released the identity while
+		// this create was running. The task survives holding no
+		// external_id; per the spec, no asynchronous work (auto-start) is
+		// dispatched for it.
+		return ws.NewResponse(msg.ID, msg.Action, mcpCreateTaskResult{
+			TaskDTO:          dto.FromTask(survivor),
+			Deduplicated:     false,
+			CreationComplete: true,
+			ParentResolution: admission.parentResolution.forOutcome(true),
+		})
+	}
+
+	// Auto-start agent session asynchronously only if requested and admitted.
+	//
+	// A create that declared dependencies does NOT launch now: the start intent
+	// was recorded as a start-when-unblocked deferred launch and dependency
+	// resolution consumes it. Agents pass start_agent=true by habit, so without
+	// this every step of an agent-built chain would launch at once.
+	startWhenUnblocked := service.ResolveStartWhenUnblocked(&service.CreateTaskRequest{
+		BlockedBy:          req.BlockedBy,
+		StartWhenUnblocked: req.StartWhenUnblocked,
+	})
+	// Blockers suppress the immediate launch on their own. start_when_unblocked
+	// only decides whether a DEFERRED launch is recorded, so `false` means "no
+	// automatic start at all" — launching now would start a task that is blocked.
+	if startAgent && len(req.BlockedBy) == 0 && task.QueuedForStepID == "" && h.sessionLauncher != nil {
+		h.launchAutoStartTask(ctx, task, launchConfig)
+	}
+
+	response := dto.FromTask(task)
+	// Report the deferred start so the caller does not have to infer whether the
+	// task launched or is waiting on its dependencies.
+	response.StartWhenUnblocked = startWhenUnblocked
+	return ws.NewResponse(msg.ID, msg.Action, mcpCreateTaskResult{
+		TaskDTO:          response,
+		Deduplicated:     false,
+		CreationComplete: true,
+		ParentResolution: admission.parentResolution.forOutcome(true),
+	})
+}
+
+// mcpCreateTaskResult is create_task_kandev's tool-result shape: the task
+// DTO plus deduplicated/creation_complete, per
+// docs/specs/tasks/system-design/external-id-idempotency.md, "MCP" — required
+// booleans, not presence-only markers, mirroring the REST create response.
+type mcpCreateTaskResult struct {
+	dto.TaskDTO
+	Deduplicated     bool                           `json:"deduplicated"`
+	CreationComplete bool                           `json:"creation_complete"`
+	ParentResolution *mcpCreateTaskParentResolution `json:"parent_resolution,omitempty"`
+}
+
+func classifyCreateTaskError(err error) string {
+	switch {
+	case errors.Is(err, service.ErrWIPLimitExceeded):
+		return ws.ErrorCodeConflict
+	case errors.Is(err, service.ErrTaskTitleTooLong):
+		return ws.ErrorCodeValidation
+	case errors.Is(err, service.ErrSubtaskDepthExceeded),
+		errors.Is(err, service.ErrInvalidTaskWorkflow),
+		errors.Is(err, service.ErrExternalIDInvalid),
+		// A reference the caller supplied that does not resolve is a
+		// validation failure, not an internal one. Classifying it as
+		// INTERNAL_ERROR discarded err.Error() and left the caller with a
+		// bare "Failed to create task" naming neither the field nor the
+		// offending value — the cause reached the backend log and nowhere else.
+		errors.Is(err, service.ErrTaskReferenceNotFound),
+		isMCPWorkflowNotFoundError(err):
+		return ws.ErrorCodeValidation
+	default:
+		return ws.ErrorCodeInternalError
+	}
+}
+
+// taskRepoResult holds the output of resolveTaskRepositories.
+type taskRepoResult struct {
+	Repos       []service.TaskRepositoryInput
+	WorkspaceID string // inherited from parent, empty otherwise
+	WorkflowID  string // inherited from parent, empty otherwise
+}
+
+func (h *Handlers) resolveMCPRemoteContributions(
+	ctx context.Context, workspaceID, userID string, repos []service.TaskRepositoryInput,
+) ([]*models.RemoteContributionResolution, error) {
+	resolutions := make([]*models.RemoteContributionResolution, len(repos))
+	if h.remoteContributionSvc == nil {
+		return resolutions, nil
+	}
+	for index := range repos {
+		rawURL := strings.TrimSpace(repos[index].RemoteURL)
+		if rawURL == "" {
+			rawURL = strings.TrimSpace(repos[index].GitHubURL)
+		}
+		if rawURL == "" {
+			continue
+		}
+		resolution, matched, err := h.remoteContributionSvc.Resolve(ctx, workspaceID, userID, rawURL)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			continue
+		}
+		if resolution == nil {
+			return nil, errors.New("remote contribution resolver returned no binding")
+		}
+		owner, name, err := splitRemoteContributionTarget(resolution.TargetPath)
+		if err != nil {
+			return nil, err
+		}
+		repo := &repos[index]
+		repo.RepositoryID = ""
+		repo.LocalPath = ""
+		repo.GitHubURL = ""
+		repo.RemoteURL = resolution.TargetRemoteURL
+		repo.Provider = resolution.TargetProvider
+		repo.ProviderHost = resolution.TargetHost
+		repo.ProviderRepoID = resolution.TargetProviderID
+		repo.ProviderOwner = owner
+		repo.ProviderName = name
+		if resolution.TargetDefaultBranch != "" {
+			repo.DefaultBranch = resolution.TargetDefaultBranch
+		}
+		repo.BaseBranch = resolution.Binding.BaseBranch
+		repo.CheckoutBranch = resolution.Binding.HeadBranch
+		repo.RemoteContribution = &resolution.Binding
+		repo.TrustedRemote = true
+		resolutions[index] = resolution
+	}
+	return resolutions, nil
+}
+
+func splitRemoteContributionTarget(path string) (string, string, error) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 || parts[len(parts)-1] == "" {
+		return "", "", fmt.Errorf("remote contribution target repository %q is invalid", path)
+	}
+	return strings.Join(parts[:len(parts)-1], "/"), parts[len(parts)-1], nil
+}
+
+// resolveTaskRepositories builds the repository list for a new task.
+//
+// For subtasks (parentID set), workspace and workflow default from the parent
+// when the caller omits explicit scope. Explicit repositories override the
+// parent's repos when supplied, otherwise the parent's repos are inherited
+// verbatim — letting an agent spin up a subtask that targets a sibling repo
+// while staying in the same workspace/workflow by default.
+//
+// For top-level tasks (parentID empty) explicit repos win over source-task
+// inheritance; workspace falls back to the source task when available.
+func (h *Handlers) resolveTaskRepositories(
+	ctx context.Context,
+	parentID, sourceTaskID string,
+	explicit []mcpRepositoryInput,
+) (taskRepoResult, error) {
+	explicitRepos := h.explicitRepoInputsWithDefaults(ctx, explicit)
+
+	if parentID != "" {
+		parent, err := h.taskSvc.GetTask(ctx, parentID)
+		if err != nil {
+			return taskRepoResult{}, fmt.Errorf("invalid parent_id: %w", err)
+		}
+		if parent.IsEphemeral {
+			return taskRepoResult{}, fmt.Errorf("cannot create subtasks of an ephemeral task (quick chat); omit parent_id to create a top-level task")
+		}
+		if parent.ParentID != "" && !parent.IsFromOffice {
+			return taskRepoResult{}, service.ErrSubtaskDepthExceeded
+		}
+		repos := explicitRepos
+		if repos == nil {
+			repos = inheritedRepoInputs(parent.Repositories)
+		}
+		return taskRepoResult{
+			Repos:       repos,
+			WorkspaceID: parent.WorkspaceID,
+			WorkflowID:  parent.WorkflowID,
+		}, nil
+	}
+
+	if explicitRepos != nil {
+		result := taskRepoResult{Repos: explicitRepos}
+		// Inherit workspace from source task so multi-workspace installs don't
+		// fail auto-resolution when the agent supplies an explicit repository.
+		if sourceTaskID != "" && h.taskSvc != nil {
+			src, srcErr := h.taskSvc.GetTask(ctx, sourceTaskID)
+			if srcErr != nil {
+				h.logger.Warn("source task lookup failed, skipping workspace inheritance",
+					zap.String("source_task_id", sourceTaskID), zap.Error(srcErr))
+			} else {
+				result.WorkspaceID = src.WorkspaceID
+			}
+		}
+		return result, nil
+	}
+
+	// For top-level tasks, inherit repos and workspace from the calling agent's current task.
+	if sourceTaskID != "" {
+		sourceTask, err := h.taskSvc.GetTask(ctx, sourceTaskID)
+		if err != nil {
+			h.logger.Warn("source task not found, skipping inheritance",
+				zap.String("source_task_id", sourceTaskID), zap.Error(err))
+			return taskRepoResult{}, nil
+		}
+		return taskRepoResult{
+			Repos:       inheritedRepoInputs(sourceTask.Repositories),
+			WorkspaceID: sourceTask.WorkspaceID,
+		}, nil
+	}
+
+	return taskRepoResult{}, nil
+}
+
+const (
+	mcpWorkspaceModeInheritParent = "inherit_parent"
+	mcpWorkspaceModeNewWorkspace  = "new_workspace"
+)
+
+func (h *Handlers) resolveMCPWorkspacePolicy(parentID, workspaceMode string) (service.WorkspacePolicy, error) {
+	mode := strings.TrimSpace(workspaceMode)
+	if mode == "" && parentID != "" {
+		mode = mcpWorkspaceModeInheritParent
+	}
+	if mode == "" {
+		return service.WorkspacePolicy{}, nil
+	}
+
+	switch mode {
+	case mcpWorkspaceModeInheritParent:
+		if parentID == "" {
+			return service.WorkspacePolicy{}, fmt.Errorf("workspace_mode=%s requires parent_id", mcpWorkspaceModeInheritParent)
+		}
+	case mcpWorkspaceModeNewWorkspace:
+	default:
+		return service.WorkspacePolicy{}, fmt.Errorf("invalid workspace_mode: %s (allowed: inherit_parent, new_workspace)", mode)
+	}
+
+	return service.WorkspacePolicy{Mode: mode}, nil
+}
+
+func applyMCPTaskScopeDefaults(parentID, workspaceID, workflowID, workflowStepID string, explicitWorkspaceID, explicitWorkflowID bool, resolved taskRepoResult) (string, string, string) {
+	if parentID == "" {
+		return firstNonEmptyString(workspaceID, resolved.WorkspaceID), firstNonEmptyString(workflowID, resolved.WorkflowID), workflowStepID
+	}
+
+	workspaceID = firstNonEmptyString(workspaceID, resolved.WorkspaceID)
+	if workflowID == "" && !explicitWorkspaceID {
+		workflowID = resolved.WorkflowID
+	}
+	// A caller-supplied step is only safe when the caller also supplies the
+	// workflow it belongs to. Otherwise the target workflow is inherited or
+	// auto-resolved and the step can straddle workflow boundaries.
+	if !explicitWorkflowID {
+		workflowStepID = ""
+	}
+	return workspaceID, workflowID, workflowStepID
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (h *Handlers) validateMCPWorkflowWorkspace(ctx context.Context, workflowID, workspaceID string) (string, string, error) {
+	if h.taskSvc == nil || workflowID == "" || workspaceID == "" {
+		return "", "", nil
+	}
+	workflow, err := h.taskSvc.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		if isMCPWorkflowNotFoundError(err) {
+			return ws.ErrorCodeValidation, fmt.Sprintf("workflow_id %q was not found", workflowID), nil
+		}
+		return ws.ErrorCodeInternalError, "Failed to validate workflow_id", err
+	}
+	if workflow.WorkspaceID != workspaceID {
+		return ws.ErrorCodeValidation, fmt.Sprintf("workflow_id %q belongs to workspace_id %q, not %q", workflowID, workflow.WorkspaceID, workspaceID), nil
+	}
+	return "", "", nil
+}
+
+func isMCPWorkflowNotFoundError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "workflow not found")
+}
+
+// explicitRepoInputsWithDefaults maps the MCP-side explicit repo list to
+// service inputs. Returns nil when no explicit repos were supplied so callers
+// can distinguish "agent didn't pass repos" from "agent passed an empty list".
+//
+// When an explicit entry pins a repository_id without a base_branch, the
+// repository's default_branch is filled in. This anchors cross-repo subtasks
+// (a parent on feature/foo creating a child in another repo) to a known-good
+// branch instead of an empty value that would force every downstream consumer
+// to recompute the default.
+func (h *Handlers) explicitRepoInputsWithDefaults(ctx context.Context, explicit []mcpRepositoryInput) []service.TaskRepositoryInput {
+	if len(explicit) == 0 {
+		return nil
+	}
+	repos := make([]service.TaskRepositoryInput, 0, len(explicit))
+	for _, r := range explicit {
+		baseBranch := r.BaseBranch
+		if baseBranch == "" && r.RepositoryID != "" && h.taskSvc != nil {
+			if repo, err := h.taskSvc.GetRepository(ctx, r.RepositoryID); err == nil && repo != nil {
+				baseBranch = repo.DefaultBranch
+			}
+		}
+		repos = append(repos, service.TaskRepositoryInput{
+			RepositoryID: r.RepositoryID,
+			LocalPath:    r.LocalPath,
+			GitHubURL:    r.GitHubURL,
+			BaseBranch:   baseBranch,
+		})
+	}
+	return repos
+}
+
+// inheritedRepoInputs maps an existing task's repository list onto service
+// inputs for a new task that inherits from it. RepositoryID and BaseBranch
+// carry over so a same-repo subtask branches off the same point as the
+// parent (sibling branches off the same base, ergonomically aligned for
+// stacked PRs). CheckoutBranch is dropped on purpose: two worktrees cannot
+// share a working branch, so the subtask's session generates a fresh one.
+// Agents that need a different base for a same-repo subtask must pass
+// base_branch explicitly. If the inherited base_branch is missing on the
+// remote at launch time, the worktree manager's fallback recovers to the
+// repository's default_branch and surfaces a warning.
+func inheritedRepoInputs(src []*models.TaskRepository) []service.TaskRepositoryInput {
+	if len(src) == 0 {
+		return nil
+	}
+	repos := make([]service.TaskRepositoryInput, 0, len(src))
+	for _, r := range src {
+		if r == nil {
+			continue
+		}
+		repos = append(repos, service.TaskRepositoryInput{
+			RepositoryID: r.RepositoryID,
+			BaseBranch:   r.BaseBranch,
+		})
+	}
+	return repos
+}
+
+type mcpAutoStartConfig struct {
+	AgentProfileID       string
+	ExecutorID           string
+	ExecutorProfileID    string
+	InitialRuntimeConfig *models.SessionRuntimeConfig
+	InitialCreatePrompt  bool
+}
+
+var errMCPAgentProfileRequired = errors.New("agent_profile_id is required because the selected task profile policy, workflow, and workspace defaults did not resolve a profile")
+
+// errMCPAgentProfileInvalid marks a caller-supplied agent_profile_id that does
+// not name an existing profile. It is a validation failure, not a server error.
+var errMCPAgentProfileInvalid = errors.New("invalid agent_profile_id")
+
+// mcpReasonKey is the field name used for a machine-readable cause in MCP
+// result payloads.
+const mcpReasonKey = "reason"
+
+// mcpTaskAgentProfilePolicyValues are the two values of the per-user
+// mcp_task_agent_profile_default setting. The create-task tool description
+// names them, so callers reasonably pass them as the argument; they are not
+// argument values and must be refused with a message that says so.
+var mcpTaskAgentProfilePolicyValues = map[string]struct{}{
+	string(usermodels.MCPTaskAgentProfileDefaultCurrentTask):      {},
+	string(usermodels.MCPTaskAgentProfileDefaultWorkspaceDefault): {},
+}
+
+// validateExplicitAgentProfile resolves a caller-supplied agent_profile_id
+// before anything is created.
+//
+// An unresolvable value used to survive the whole create path: it counted as an
+// explicit profile, which skipped creating-session, parent and workspace-default
+// resolution, and only failed later inside the fire-and-forget auto-start
+// goroutine, whose error reached the log and nothing else. The caller already
+// had a success result and a task stuck in CREATED with no session.
+//
+// An omitted argument is not validated: it keeps the documented resolution
+// precedence.
+func (h *Handlers) validateExplicitAgentProfile(ctx context.Context, agentProfileID string) error {
+	if agentProfileID == "" {
+		return nil
+	}
+	if _, isPolicy := mcpTaskAgentProfilePolicyValues[agentProfileID]; isPolicy {
+		return fmt.Errorf(
+			"%w: %q is a value of the mcp_task_agent_profile_default user setting, not an agent profile ID; "+
+				"omit agent_profile_id to use the configured policy",
+			errMCPAgentProfileInvalid, agentProfileID)
+	}
+	if h.agentProfileVerifier == nil {
+		return nil
+	}
+	exists, err := h.agentProfileVerifier.AgentProfileExists(ctx, agentProfileID)
+	if err != nil {
+		return fmt.Errorf("verify agent_profile_id: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("%w: no agent profile %q exists", errMCPAgentProfileInvalid, agentProfileID)
+	}
+	return nil
+}
+
+// autoStartTask launches an agent session for a newly created task in the background.
+// It is kept as a small compatibility wrapper for direct tests; handleCreateTask
+// uses resolveMCPAutoStartConfig before persisting so invalid auto-start
+// requests fail synchronously.
+func (h *Handlers) autoStartTask(task *models.Task, agentProfileID, executorProfileID, sourceTaskID string) {
+	ctx := context.Background()
+	config := h.resolveMCPAutoStartConfig(ctx, task, agentProfileID, executorProfileID, sourceTaskID)
+	h.launchAutoStartTask(ctx, task, config)
+}
+
+// resolveMCPAutoStartConfig resolves the agent profile and executor for
+// create_task_kandev auto-start. Agent profile resolution follows the MCP
+// ergonomics first (explicit > parent/source session), then the same durable
+// defaults used by task opening where this handler can see them (workflow step
+// when a workflow controller is wired, workflow default, workspace default).
+func (h *Handlers) resolveMCPAutoStartConfig(ctx context.Context, task *models.Task, agentProfileID, executorProfileID, sourceTaskID string) mcpAutoStartConfig {
+	config, _ := h.resolveMCPAutoStartConfigWithError(ctx, task, agentProfileID, executorProfileID, sourceTaskID)
+	return config
+}
+
+func (h *Handlers) resolveMCPLaunchMetadata(ctx context.Context, task *models.Task, agentProfileID, executorProfileID, sourceTaskID string) (mcpAutoStartConfig, map[string]interface{}, error) {
+	return h.resolveMCPLaunchMetadataWithSource(ctx, task, agentProfileID, executorProfileID, sourceTaskID, "")
+}
+
+func (h *Handlers) resolveMCPLaunchMetadataWithSource(
+	ctx context.Context,
+	task *models.Task,
+	agentProfileID, executorProfileID, sourceTaskID, sourceSessionID string,
+) (mcpAutoStartConfig, map[string]interface{}, error) {
+	launchConfig, err := h.resolveMCPAutoStartConfigWithSource(
+		ctx, task, agentProfileID, executorProfileID, sourceTaskID, sourceSessionID,
+	)
+	if err != nil {
+		return mcpAutoStartConfig{}, nil, fmt.Errorf("failed to resolve launch profile: %w", err)
+	}
+	if launchConfig.AgentProfileID == "" {
+		return mcpAutoStartConfig{}, nil, errMCPAgentProfileRequired
+	}
+	metadata := map[string]interface{}{
+		models.MetaKeyAgentProfileID: launchConfig.AgentProfileID,
+	}
+	if launchConfig.ExecutorID != "" {
+		metadata[models.MetaKeyExecutorID] = launchConfig.ExecutorID
+	}
+	if launchConfig.ExecutorProfileID != "" {
+		metadata[models.MetaKeyExecutorProfileID] = launchConfig.ExecutorProfileID
+	}
+	if launchConfig.InitialRuntimeConfig != nil {
+		metadata[models.MetaKeyInitialSessionRuntimeConfig] = *launchConfig.InitialRuntimeConfig
+		metadata[models.MetaKeyInitialSessionRuntimeConfigProfileID] = launchConfig.AgentProfileID
+	}
+	return launchConfig, metadata, nil
+}
+
+func (h *Handlers) resolveMCPAutoStartConfigWithError(ctx context.Context, task *models.Task, agentProfileID, executorProfileID, sourceTaskID string) (mcpAutoStartConfig, error) {
+	return h.resolveMCPAutoStartConfigWithSource(ctx, task, agentProfileID, executorProfileID, sourceTaskID, "")
+}
+
+func (h *Handlers) resolveMCPAutoStartConfigWithSource(
+	ctx context.Context,
+	task *models.Task,
+	agentProfileID, executorProfileID, sourceTaskID, sourceSessionID string,
+) (mcpAutoStartConfig, error) {
+	creatorSession, err := h.resolveMCPCreatorSession(ctx, sourceTaskID, sourceSessionID)
+	if err != nil {
+		return mcpAutoStartConfig{}, err
+	}
+	profileDefault, err := h.mcpTaskAgentProfileDefault(ctx, agentProfileID)
+	if err != nil {
+		return mcpAutoStartConfig{}, fmt.Errorf("read MCP task agent profile default: %w", err)
+	}
+	useCreatorRuntime := creatorSession != nil &&
+		profileDefault == usermodels.MCPTaskAgentProfileDefaultCurrentTask &&
+		agentProfileID == "" && creatorSession.AgentProfileID != ""
+	if useCreatorRuntime {
+		agentProfileID = creatorSession.AgentProfileID
+	}
+	profileForInheritance := &agentProfileID
+	// Workspace-default mode keeps executor inheritance but discards inherited agent profiles.
+	ignoredInheritedProfile := ""
+	if profileDefault == usermodels.MCPTaskAgentProfileDefaultWorkspaceDefault {
+		profileForInheritance = &ignoredInheritedProfile
+	}
+
+	executorID, executorProfileID, err := h.resolveMCPInheritedExecutors(
+		ctx, task, profileForInheritance, executorProfileID, sourceTaskID,
+	)
+	if err != nil {
+		return mcpAutoStartConfig{}, err
+	}
+	if profileDefault != usermodels.MCPTaskAgentProfileDefaultWorkspaceDefault {
+		agentProfileID = *profileForInheritance
+	}
+
+	// Mirror the orchestrator's launch-time precedence so the profile reported
+	// back to the caller (and stored in task metadata) equals the one that will
+	// actually run. At launch resolveEffectiveAgentProfile applies the step's
+	// launch profile (the step's pinned profile, or the workflow default when the
+	// step has none) over any caller-provided profile, but only when the task
+	// sits on a workflow step. A create_task_kandev task lands on a step whenever
+	// its workflow has steps: the explicit workflow_step_id, or the start step
+	// CreateTask assigns when the step is omitted. When the task will be on a
+	// step, the workflow-derived profile overrides the caller; otherwise it only
+	// fills an omitted profile.
+	agentProfileID, useCreatorRuntime, err = h.resolveMCPFinalAgentProfile(
+		ctx, task, agentProfileID, useCreatorRuntime,
+	)
+	if err != nil {
+		return mcpAutoStartConfig{}, err
+	}
+	if executorID == "" && executorProfileID == "" {
+		executorID = models.ExecutorIDWorktree
+	}
+
+	config := mcpAutoStartConfig{
+		AgentProfileID:    agentProfileID,
+		ExecutorID:        executorID,
+		ExecutorProfileID: executorProfileID,
+	}
+	if useCreatorRuntime {
+		if runtimeConfig, ok := models.LoadEffectiveSessionRuntimeConfig(creatorSession); ok {
+			config.InitialRuntimeConfig = &runtimeConfig
+		}
+	}
+	return config, nil
+}
+
+func (h *Handlers) resolveMCPInheritedExecutors(
+	ctx context.Context,
+	task *models.Task,
+	agentProfileID *string,
+	executorProfileID, sourceTaskID string,
+) (string, string, error) {
+	executorID, err := h.inheritFromTask(ctx, task.ParentID, agentProfileID, &executorProfileID)
+	if err != nil {
+		return "", "", fmt.Errorf("inherit from parent task %s: %w", task.ParentID, err)
+	}
+	if task.ParentID == "" && sourceTaskID != "" {
+		sourceExecutorID, sourceErr := h.inheritFromTask(ctx, sourceTaskID, agentProfileID, &executorProfileID)
+		if sourceErr != nil {
+			return "", "", fmt.Errorf("inherit from source task %s: %w", sourceTaskID, sourceErr)
+		}
+		if executorID == "" {
+			executorID = sourceExecutorID
+		}
+	}
+	return executorID, executorProfileID, nil
+}
+
+func (h *Handlers) resolveMCPFinalAgentProfile(
+	ctx context.Context,
+	task *models.Task,
+	agentProfileID string,
+	useCreatorRuntime bool,
+) (string, bool, error) {
+	workflowProfileID, onStepAtLaunch, err := h.resolveWorkflowLaunchProfile(ctx, task.WorkflowStepID, task.WorkflowID)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve workflow agent profile: %w", err)
+	}
+	if workflowProfileID != "" && (onStepAtLaunch || agentProfileID == "") {
+		// The workflow-selected profile owns this launch, so creator runtime
+		// values must not be copied into it.
+		return workflowProfileID, false, nil
+	}
+	if agentProfileID != "" || h.taskSvc == nil {
+		return agentProfileID, useCreatorRuntime, nil
+	}
+	workspace, err := h.taskSvc.GetWorkspace(ctx, task.WorkspaceID)
+	if err != nil {
+		return "", false, fmt.Errorf("get workspace %s: %w", task.WorkspaceID, err)
+	}
+	if workspace != nil && workspace.DefaultAgentProfileID != nil {
+		return *workspace.DefaultAgentProfileID, false, nil
+	}
+	return agentProfileID, false, nil
+}
+
+func (h *Handlers) resolveMCPCreatorSession(ctx context.Context, sourceTaskID, sourceSessionID string) (*models.TaskSession, error) {
+	if sourceSessionID == "" {
+		return nil, nil
+	}
+	if sourceTaskID == "" {
+		return nil, errors.New("source_session_id requires source_task_id")
+	}
+	if h.taskSvc == nil {
+		return nil, errors.New("cannot verify source_session_id without task service")
+	}
+	session, err := h.taskSvc.GetTaskSession(ctx, sourceSessionID)
+	if err != nil {
+		return nil, fmt.Errorf("verify source session %s: %w", sourceSessionID, err)
+	}
+	if session == nil || session.TaskID != sourceTaskID {
+		return nil, fmt.Errorf("source session %s does not belong to source task %s", sourceSessionID, sourceTaskID)
+	}
+	return session, nil
+}
+
+func (h *Handlers) mcpTaskAgentProfileDefault(ctx context.Context, explicitAgentProfileID string) (string, error) {
+	if explicitAgentProfileID != "" || h.userSettingsProvider == nil {
+		return usermodels.MCPTaskAgentProfileDefaultCurrentTask, nil
+	}
+	settings, err := h.userSettingsProvider.GetUserSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	if settings == nil {
+		return usermodels.MCPTaskAgentProfileDefaultCurrentTask, nil
+	}
+	return usermodels.NormalizeMCPTaskAgentProfileDefault(settings.MCPTaskAgentProfileDefault), nil
+}
+
+// resolveWorkflowLaunchProfile returns the workflow-derived agent profile a task
+// launches with and whether the task will sit on a workflow step at launch.
+// onStepAtLaunch is true when the task has an explicit step, or when it has no
+// step yet but its workflow has at least one step (CreateTask assigns that start
+// step). Callers apply the returned profile over an explicit caller profile only
+// when onStepAtLaunch is true; off a step it may only fill an omitted profile.
+func (h *Handlers) resolveWorkflowLaunchProfile(ctx context.Context, workflowStepID, workflowID string) (string, bool, error) {
+	profileID, err := h.resolveWorkflowAgentProfileWithError(ctx, workflowStepID, workflowID)
+	if err != nil {
+		return "", false, err
+	}
+	if workflowStepID != "" {
+		return profileID, true, nil
+	}
+	return profileID, h.workflowHasSteps(ctx, workflowID), nil
+}
+
+// workflowHasSteps reports whether the workflow has at least one step, i.e. a
+// stepless task created on it will be assigned a start step at CreateTask time.
+func (h *Handlers) workflowHasSteps(ctx context.Context, workflowID string) bool {
+	if workflowID == "" || h.workflowCtrl == nil {
+		return false
+	}
+	resp, err := h.workflowCtrl.ListStepsByWorkflow(ctx, workflowctrl.ListStepsRequest{WorkflowID: workflowID})
+	if err != nil || resp == nil {
+		return false
+	}
+	return len(resp.Steps) > 0
+}
+
+func (h *Handlers) resolveWorkflowAgentProfileWithError(ctx context.Context, workflowStepID, workflowID string) (string, error) {
+	profileID, resolvedWorkflowID := h.resolveWorkflowControllerAgentProfile(ctx, workflowStepID, workflowID)
+	if profileID != "" {
+		return profileID, nil
+	}
+	if workflowID == "" {
+		workflowID = resolvedWorkflowID
+	}
+	profileID, err := h.workflowDefaultAgentProfileWithError(ctx, workflowID)
+	if err != nil {
+		return "", err
+	}
+	return profileID, nil
+}
+
+func (h *Handlers) resolveWorkflowControllerAgentProfile(ctx context.Context, workflowStepID, workflowID string) (string, string) {
+	if h.workflowCtrl == nil {
+		return "", workflowID
+	}
+	if workflowStepID != "" {
+		return h.resolveWorkflowStepAgentProfile(ctx, workflowStepID, workflowID)
+	}
+	if workflowID == "" {
+		return "", ""
+	}
+	return h.resolveWorkflowStartStepAgentProfile(ctx, workflowID), workflowID
+}
+
+func (h *Handlers) resolveWorkflowStepAgentProfile(ctx context.Context, workflowStepID, workflowID string) (string, string) {
+	resp, err := h.workflowCtrl.GetStep(ctx, workflowStepID)
+	if err != nil || resp == nil || resp.Step == nil {
+		return "", workflowID
+	}
+	if workflowID == "" {
+		workflowID = resp.Step.WorkflowID
+	}
+	return resp.Step.AgentProfileID, workflowID
+}
+
+// resolveMCPDestinationStep pre-resolves the step a new task will be created
+// on, mirroring the task service's rules: an agent start goes to the first
+// auto_start_agent step, anything else to the start step. Both are computed by
+// the shared selectors, so the two implementations cannot drift. Returns "" when
+// the workflow has no steps or cannot be read, which leaves resolution to
+// CreateTask exactly as before.
+func (h *Handlers) resolveMCPDestinationStep(ctx context.Context, workflowID string, startAgent bool) string {
+	if h.workflowCtrl == nil || workflowID == "" {
+		return ""
+	}
+	resp, err := h.workflowCtrl.ListStepsByWorkflow(ctx, workflowctrl.ListStepsRequest{WorkflowID: workflowID})
+	if err != nil || resp == nil {
+		return ""
+	}
+	if startAgent {
+		if step := workflowmodels.SelectAutoStartStep(resp.Steps); step != nil {
+			return step.ID
+		}
+	}
+	if step := workflowmodels.SelectStartStep(resp.Steps); step != nil {
+		return step.ID
+	}
+	return ""
+}
+
+func (h *Handlers) resolveWorkflowStartStepAgentProfile(ctx context.Context, workflowID string) string {
+	resp, err := h.workflowCtrl.ListStepsByWorkflow(ctx, workflowctrl.ListStepsRequest{WorkflowID: workflowID})
+	if err != nil || resp == nil {
+		return ""
+	}
+	return startStepAgentProfile(resp.Steps)
+}
+
+func (h *Handlers) workflowDefaultAgentProfileWithError(ctx context.Context, workflowID string) (string, error) {
+	if workflowID == "" || h.taskSvc == nil {
+		return "", nil
+	}
+	workflow, err := h.taskSvc.GetWorkflow(ctx, workflowID)
+	if err != nil || workflow == nil {
+		return "", err
+	}
+	return workflow.AgentProfileID, nil
+}
+
+func startStepAgentProfile(steps []*workflowmodels.WorkflowStep) string {
+	if len(steps) == 0 {
+		return ""
+	}
+	var firstByPosition *workflowmodels.WorkflowStep
+	for _, step := range steps {
+		if step == nil {
+			continue
+		}
+		if firstByPosition == nil || step.Position < firstByPosition.Position {
+			firstByPosition = step
+		}
+		if step.IsStartStep {
+			return step.AgentProfileID
+		}
+	}
+	if firstByPosition == nil {
+		return ""
+	}
+	return firstByPosition.AgentProfileID
+}
+
+func (h *Handlers) launchAutoStartTask(ctx context.Context, task *models.Task, config mcpAutoStartConfig) {
+	if h.sessionLauncher == nil {
+		return
+	}
+	if config.AgentProfileID == "" {
+		h.logger.Warn("no agent profile available, skipping auto-start",
+			zap.String("task_id", task.ID))
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), constants.AgentLaunchTimeout)
+		defer cancel()
+
+		launchReq := &orchestrator.LaunchSessionRequest{
+			TaskID:            task.ID,
+			Intent:            orchestrator.IntentStart,
+			AgentProfileID:    config.AgentProfileID,
+			ExecutorID:        config.ExecutorID,
+			ExecutorProfileID: config.ExecutorProfileID,
+			WorkflowStepID:    task.WorkflowStepID,
+			Prompt:            task.Description,
+		}
+		if config.InitialCreatePrompt {
+			prepResp, prepErr := h.sessionLauncher.LaunchSession(ctx, &orchestrator.LaunchSessionRequest{
+				TaskID:               task.ID,
+				Intent:               orchestrator.IntentPrepare,
+				AgentProfileID:       config.AgentProfileID,
+				ExecutorID:           config.ExecutorID,
+				ExecutorProfileID:    config.ExecutorProfileID,
+				WorkflowStepID:       task.WorkflowStepID,
+				InitialPromptPreview: models.NewInitialPromptPreview(strings.TrimSpace(task.Description), nil),
+				DeferredStart:        true,
+			})
+			if prepErr != nil {
+				h.logger.Error("failed to prepare initial MCP creation prompt",
+					zap.String("task_id", task.ID), zap.Error(prepErr))
+				return
+			}
+			if prepResp == nil || prepResp.SessionID == "" {
+				h.logger.Error("initial MCP creation prompt preparation returned no session",
+					zap.String("task_id", task.ID))
+				return
+			}
+			launchReq = &orchestrator.LaunchSessionRequest{
+				TaskID:              task.ID,
+				Intent:              orchestrator.IntentStartCreated,
+				SessionID:           prepResp.SessionID,
+				AgentProfileID:      config.AgentProfileID,
+				ExecutorID:          config.ExecutorID,
+				ExecutorProfileID:   config.ExecutorProfileID,
+				WorkflowStepID:      task.WorkflowStepID,
+				Prompt:              task.Description,
+				InitialCreatePrompt: true,
+			}
+		}
+
+		resp, err := h.sessionLauncher.LaunchSession(ctx, launchReq)
+		if err != nil {
+			h.logger.Error("failed to auto-start task",
+				zap.String("task_id", task.ID), zap.Error(err))
+			h.recordAutoStartFailure(ctx, task.ID, err.Error())
+			return
+		}
+		if resp == nil {
+			h.logger.Error("auto-start returned no response",
+				zap.String("task_id", task.ID))
+			h.recordAutoStartFailure(ctx, task.ID, "auto-start returned no session")
+			return
+		}
+		h.logger.Info("auto-started agent for MCP-created task",
+			zap.String("task_id", task.ID),
+			zap.String("session_id", resp.SessionID))
+	}()
+}
+
+// recordAutoStartFailure stores why an auto-start failed on the task itself.
+//
+// The launch runs in a goroutine after the creating tool call has already
+// returned success, so its error otherwise reaches only the backend log. Going
+// through the task service means the failure also travels on the task event
+// stream, which is what makes it visible to the kanban and to a caller polling
+// the task.
+func (h *Handlers) recordAutoStartFailure(ctx context.Context, taskID, reason string) {
+	if h.taskSvc == nil || taskID == "" {
+		return
+	}
+	task, err := h.taskSvc.GetTask(ctx, taskID)
+	if err != nil || task == nil {
+		h.logger.Warn("could not read task to record auto-start failure",
+			zap.String("task_id", taskID), zap.Error(err))
+		return
+	}
+	metadata := make(map[string]interface{}, len(task.Metadata)+1)
+	for key, value := range task.Metadata {
+		metadata[key] = value
+	}
+	metadata[models.MetaKeyAutoStartError] = map[string]interface{}{
+		mcpReasonKey:  reason,
+		"occurred_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	if _, err := h.taskSvc.UpdateTask(ctx, taskID, &service.UpdateTaskRequest{Metadata: metadata}); err != nil {
+		h.logger.Warn("failed to record auto-start failure on task",
+			zap.String("task_id", taskID), zap.Error(err))
+	}
+}
+
+// inheritFromTask fills agentProfileID and executorProfileID from another task's
+// durable launch metadata or primary session when not explicitly provided. It
+// returns a bare ExecutorID only when no executor profile was resolved, because
+// an executor profile already encodes its executor reference.
+func (h *Handlers) inheritFromTask(ctx context.Context, taskID string, agentProfileID, executorProfileID *string) (string, error) {
+	if taskID == "" || h.taskSvc == nil {
+		return "", nil
+	}
+
+	agentProfileExplicit := *agentProfileID != ""
+	executorProfileExplicit := *executorProfileID != ""
+	executorID := h.inheritFromTaskMetadata(ctx, taskID, agentProfileID, executorProfileID, "")
+	session, err := h.taskSvc.GetPrimarySession(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, taskrepo.ErrNoPrimarySession) {
+			return executorID, nil
+		}
+		return "", err
+	}
+	if session != nil {
+		executorID = inheritWorkflowRoutedSession(session, agentProfileID, executorProfileID, executorID, agentProfileExplicit, executorProfileExplicit)
+		sessionExecutorID := inheritFromSession(session, agentProfileID, executorProfileID, executorID == "")
+		if executorID == "" {
+			executorID = sessionExecutorID
+		}
+	}
+
+	if *executorProfileID != "" {
+		return "", nil
+	}
+	return executorID, nil
+}
+
+func inheritWorkflowRoutedSession(
+	session *models.TaskSession,
+	agentProfileID, executorProfileID *string,
+	executorID string,
+	agentProfileExplicit, executorProfileExplicit bool,
+) string {
+	if !isWorkflowSwitchedSession(session) {
+		return executorID
+	}
+	if !agentProfileExplicit && session.AgentProfileID != "" {
+		*agentProfileID = session.AgentProfileID
+	}
+	if executorProfileExplicit {
+		return executorID
+	}
+	if session.ExecutorProfileID != "" {
+		*executorProfileID = session.ExecutorProfileID
+		return ""
+	}
+	if session.ExecutorID != "" {
+		*executorProfileID = ""
+		return session.ExecutorID
+	}
+	return executorID
+}
+
+func isWorkflowSwitchedSession(session *models.TaskSession) bool {
+	if session == nil {
+		return false
+	}
+	return metadataString(session.Metadata, models.SessionMetaKeyCreatedBy) == models.SessionCreatedByWorkflowSwitch
+}
+
+func inheritFromSession(session *models.TaskSession, agentProfileID, executorProfileID *string, inheritExecutor bool) string {
+	if *agentProfileID == "" {
+		*agentProfileID = session.AgentProfileID
+	}
+	if !inheritExecutor {
+		return ""
+	}
+	if *executorProfileID == "" {
+		*executorProfileID = session.ExecutorProfileID
+	}
+	if *executorProfileID != "" {
+		return ""
+	}
+	return session.ExecutorID
+}
+
+func (h *Handlers) inheritFromTaskMetadata(ctx context.Context, taskID string, agentProfileID, executorProfileID *string, executorID string) string {
+	task, err := h.taskSvc.GetTask(ctx, taskID)
+	if err != nil || task == nil {
+		return executorID
+	}
+	inheritMetadataValue(task.Metadata, models.MetaKeyAgentProfileID, agentProfileID)
+	inheritMetadataValue(task.Metadata, models.MetaKeyExecutorProfileID, executorProfileID)
+	if executorID == "" && *executorProfileID == "" {
+		executorID = metadataString(task.Metadata, models.MetaKeyExecutorID)
+	}
+	return executorID
+}
+
+func inheritMetadataValue(metadata map[string]interface{}, key string, target *string) {
+	if *target != "" {
+		return
+	}
+	*target = metadataString(metadata, key)
+}
+
+func metadataString(metadata map[string]interface{}, key string) string {
+	if v, ok := metadata[key].(string); ok && v != "" {
+		return v
+	}
+	return ""
+}
+
+// handleUpdateTask updates an existing task.
+func (h *Handlers) handleUpdateTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	// Use local struct with JSON tags since dto.UpdateTaskRequest lacks them
+	var req struct {
+		TaskID               string  `json:"task_id"`
+		Title                *string `json:"title"`
+		Description          *string `json:"description"`
+		State                *string `json:"state"`
+		DeferredLaunchPrompt *string `json:"deferred_launch_prompt"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+
+	// Applied before the ordinary field update so a rejected prompt edit does
+	// not half-apply the call: a caller correcting a stale brief needs to know
+	// the prompt did not change, and a partially applied update hides that.
+	if req.DeferredLaunchPrompt != nil {
+		if errResp := h.applyDeferredLaunchPromptUpdate(ctx, msg, req.TaskID, *req.DeferredLaunchPrompt); errResp != nil {
+			return errResp, nil
+		}
+	}
+
+	var state *v1.TaskState
+	if req.State != nil {
+		normalized := normalizeTaskState(*req.State)
+		if !isValidTaskState(normalized) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "invalid task state: "+*req.State, nil)
+		}
+		state = &normalized
+	}
+
+	task, err := h.taskSvc.UpdateTask(ctx, req.TaskID, &service.UpdateTaskRequest{
+		Title:       req.Title,
+		Description: req.Description,
+		State:       state,
+	})
+	if err != nil {
+		h.logger.Error("failed to update task", zap.Error(err))
+		if errors.Is(err, service.ErrTaskTitleTooLong) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update task", nil)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromTask(task))
+}
+
+// handleSetTaskTitle resolves the one-shot provisional title created for a
+// prompt-first task. The MCP server supplies the bound task and session IDs;
+// only the atomically claimed owner may resolve it.
+func (h *Handlers) handleSetTaskTitle(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID    string `json:"task_id"`
+		SessionID string `json:"session_id"`
+		Title     string `json:"title"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	if req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session_id is required", nil)
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "title is required", nil)
+	}
+
+	task, accepted, reason, err := h.taskSvc.SetPendingAgentTitle(ctx, req.TaskID, req.SessionID, req.Title)
+	if err != nil {
+		if errors.Is(err, taskrepo.ErrTaskNotFound) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "task not found", nil)
+		}
+		if errors.Is(err, service.ErrTaskTitleTooLong) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+		h.logger.Error("failed to set pending task title", zap.String("task_id", req.TaskID), zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to set task title", nil)
+	}
+	result := map[string]interface{}{
+		"accepted": accepted,
+		"task_id":  req.TaskID,
+		"title":    task.Title,
+	}
+	if !accepted {
+		result[mcpReasonKey] = reason
+		return ws.NewResponse(msg.ID, msg.Action, result)
+	}
+	if h.titleBranchRenamer != nil {
+		branchResult, branchErr := h.titleBranchRenamer.RenameGeneratedBranchesForTaskTitle(ctx, req.TaskID, req.SessionID, task.Title)
+		if branchErr != nil {
+			h.logger.Warn("failed to rename generated task branches", zap.String("task_id", req.TaskID), zap.Error(branchErr))
+			branchResult = orchestrator.TitleBranchRenameResult{
+				Status: orchestrator.TitleBranchStatusFailed,
+				Failed: []orchestrator.TitleBranchFailure{{Message: branchErr.Error()}},
+			}
+		}
+		result["branch_rename"] = branchResult
+	} else {
+		result["branch_rename"] = orchestrator.TitleBranchRenameResult{Status: orchestrator.TitleBranchStatusNotApplicable}
+	}
+	return ws.NewResponse(msg.ID, msg.Action, result)
+}
+
+// handleAddBranchToTask attaches a new (repository, checkout_branch) pair to
+// an existing task. Mirrors create-time multi-repo attachment but additive:
+// the same repository may be added on a different branch, materializing a
+// second worktree under the task's directory.
+func (h *Handlers) handleAddBranchToTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID         string `json:"task_id"`
+		RepositoryID   string `json:"repository_id"`
+		LocalPath      string `json:"local_path"`
+		GitHubURL      string `json:"github_url"`
+		BaseBranch     string `json:"base_branch"`
+		CheckoutBranch string `json:"checkout_branch"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	// Mutual exclusion across the three repo identifiers. resolveRepoInput
+	// applies a silent precedence (repository_id > github_url > local_path),
+	// so an agent that accidentally passes two of them gets a behaviour
+	// change with no signal. Reject early instead so the agent sees the
+	// mistake.
+	if locatorCount := boolCount(req.RepositoryID != "", req.LocalPath != "", req.GitHubURL != ""); locatorCount > 1 {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+			"pass at most one of repository_id, github_url, local_path", nil)
+	}
+	// repository_id / local_path / github_url are all optional: the service
+	// defaults to the task's only repository (or its primary row) when none
+	// is supplied. Multi-repo tasks force the agent to pass one explicitly
+	// via the service-level error. local_path and github_url are
+	// agent-ergonomic alternatives — when supplied the service resolves
+	// them through the same workspace-scoped find-or-create path used by
+	// create_task.
+	taskRepo, err := h.taskSvc.AddBranchToTask(ctx, service.AddBranchToTaskRequest{
+		TaskID:         req.TaskID,
+		RepositoryID:   req.RepositoryID,
+		LocalPath:      req.LocalPath,
+		GitHubURL:      req.GitHubURL,
+		BaseBranch:     req.BaseBranch,
+		CheckoutBranch: req.CheckoutBranch,
+	})
+	if err != nil {
+		h.logger.Error("failed to add branch to task", zap.Error(err))
+		code := classifyAddBranchError(err)
+		return ws.NewError(msg.ID, msg.Action, code, "Failed to add branch: "+err.Error(), nil)
+	}
+	response := map[string]interface{}{
+		"id":                taskRepo.ID,
+		keyTaskID:           taskRepo.TaskID,
+		keyRepositoryID:     taskRepo.RepositoryID,
+		keyBaseBranch:       taskRepo.BaseBranch,
+		keyCheckoutBranch:   taskRepo.CheckoutBranch,
+		keyPosition:         taskRepo.Position,
+		"agent_cwd_changed": taskRepo.AgentCWDChanged,
+	}
+	if taskRepo.WorktreePath != "" {
+		response["worktree_path"] = taskRepo.WorktreePath
+	}
+	if taskRepo.TaskWorkspacePath != "" {
+		response["task_workspace_path"] = taskRepo.TaskWorkspacePath
+	}
+	return ws.NewResponse(msg.ID, msg.Action, response)
+}
+
+// handleAddWorkspaceSources forwards the documented discriminated source
+// union to the shared attachment service. It deliberately rejects fields from
+// the other variant so callers cannot get a silently ambiguous attachment.
+func (h *Handlers) handleAddWorkspaceSources(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	req, sources, response := parseAddWorkspaceSourcesRequest(msg)
+	if response != nil {
+		return response, nil
+	}
+	caller, response := h.verifyWorkspaceSourceCaller(ctx, msg, req)
+	if response != nil {
+		return response, nil
+	}
+	_, isChildTarget, response := h.authorizeWorkspaceSourceTarget(ctx, msg, req, caller)
+	if response != nil {
+		return response, nil
+	}
+	attachReq := service.AttachWorkspaceSourcesRequest{TaskID: req.TaskID, Sources: sources}
+	if isChildTarget {
+		attachReq.ExpectedParentID = caller.ID
+		attachReq.ExpectedParentWorkspaceID = caller.WorkspaceID
+	}
+	result, err := h.taskSvc.AttachWorkspaceSources(ctx, attachReq)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, classifyWorkspaceSourceError(err), "Failed to attach workspace sources: "+err.Error(), nil)
+	}
+	if h.logger != nil {
+		h.logger.Info("workspace sources attached through task MCP",
+			zap.String("caller_task_id", req.CallerTaskID), zap.String("caller_session_id", req.CallerSessionID),
+			zap.String("target_task_id", req.TaskID), zap.Int("requested_source_count", len(req.Sources)), zap.Bool("durable_state_changed", result.Changed))
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+		"task_id": result.Task.ID, "repositories": result.Task.Repositories, "workspace_folders": result.Task.WorkspaceFolders, "workspace_path": result.WorkspacePath, "session_ids": result.SessionIDs,
+	})
+}
+
+type addWorkspaceSourcesRequest struct {
+	TaskID          string            `json:"task_id"`
+	CallerTaskID    string            `json:"caller_task_id"`
+	CallerSessionID string            `json:"caller_session_id"`
+	Sources         []json.RawMessage `json:"sources"`
+}
+
+func parseAddWorkspaceSourcesRequest(msg *ws.Message) (addWorkspaceSourcesRequest, []service.WorkspaceSourceInput, *ws.Message) {
+	var req addWorkspaceSourcesRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return req, nil, newWorkspaceSourceError(msg, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error())
+	}
+	if req.TaskID == "" || req.CallerTaskID == "" || req.CallerSessionID == "" || len(req.Sources) == 0 {
+		return req, nil, newWorkspaceSourceError(msg, ws.ErrorCodeValidation, "task_id, caller provenance, and at least one source are required")
+	}
+	sources, err := parseWorkspaceSources(req.Sources)
+	if err != nil {
+		return req, nil, newWorkspaceSourceError(msg, ws.ErrorCodeValidation, err.Error())
+	}
+	return req, sources, nil
+}
+
+func (h *Handlers) verifyWorkspaceSourceCaller(ctx context.Context, msg *ws.Message, req addWorkspaceSourcesRequest) (*models.Task, *ws.Message) {
+	if h.sessionRepo == nil || h.taskSvc == nil {
+		return nil, newWorkspaceSourceError(msg, ws.ErrorCodeInternalError, "workspace source authorization is not configured")
+	}
+	callerSession, err := h.sessionRepo.GetTaskSession(ctx, req.CallerSessionID)
+	if err != nil {
+		if errors.Is(err, models.ErrTaskSessionNotFound) {
+			return nil, newWorkspaceSourceError(msg, ws.ErrorCodeForbidden, "caller session is not authorized for the calling task")
+		}
+		return nil, newWorkspaceSourceError(msg, ws.ErrorCodeInternalError, "failed to verify caller session")
+	}
+	if callerSession == nil || callerSession.TaskID != req.CallerTaskID {
+		return nil, newWorkspaceSourceError(msg, ws.ErrorCodeForbidden, "caller session is not authorized for the calling task")
+	}
+	caller, err := h.taskSvc.GetTask(ctx, req.CallerTaskID)
+	if err != nil {
+		if errors.Is(err, taskrepository.ErrTaskNotFound) {
+			return nil, newWorkspaceSourceError(msg, ws.ErrorCodeForbidden, "caller task is not authorized")
+		}
+		return nil, newWorkspaceSourceError(msg, ws.ErrorCodeInternalError, "failed to verify caller task")
+	}
+	if caller == nil {
+		return nil, newWorkspaceSourceError(msg, ws.ErrorCodeForbidden, "caller task is not authorized")
+	}
+	return caller, nil
+}
+
+func (h *Handlers) authorizeWorkspaceSourceTarget(ctx context.Context, msg *ws.Message, req addWorkspaceSourcesRequest, caller *models.Task) (*models.Task, bool, *ws.Message) {
+	target, err := h.taskSvc.GetTask(ctx, req.TaskID)
+	if err != nil {
+		if errors.Is(err, taskrepository.ErrTaskNotFound) {
+			return nil, false, newWorkspaceSourceError(msg, ws.ErrorCodeNotFound, "target task not found")
+		}
+		return nil, false, newWorkspaceSourceError(msg, ws.ErrorCodeInternalError, "failed to load target task")
+	}
+	if target == nil {
+		return nil, false, newWorkspaceSourceError(msg, ws.ErrorCodeNotFound, "target task not found")
+	}
+	isChildTarget := req.TaskID != req.CallerTaskID
+	if isChildTarget && !canDirectParentAccess(caller, target) {
+		return nil, false, newWorkspaceSourceError(msg, ws.ErrorCodeForbidden, "only a task's direct parent in the same workspace can attach its sources")
+	}
+	return target, isChildTarget, nil
+}
+
+func newWorkspaceSourceError(msg *ws.Message, code, message string) *ws.Message {
+	response, _ := ws.NewError(msg.ID, msg.Action, code, message, nil)
+	return response
+}
+
+func parseWorkspaceSources(raw []json.RawMessage) ([]service.WorkspaceSourceInput, error) {
+	sources := make([]service.WorkspaceSourceInput, 0, len(raw))
+	for _, item := range raw {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item, &fields); err != nil {
+			return nil, fmt.Errorf("source must be an object")
+		}
+		var kind string
+		if err := json.Unmarshal(fields["kind"], &kind); err != nil {
+			return nil, fmt.Errorf("source kind is required")
+		}
+		allowed := map[string]bool{"kind": true, "local_path": true}
+		switch kind {
+		case string(service.WorkspaceSourceRepository):
+			for _, key := range []string{"repository_id", "remote_url", "github_url", "provider", "provider_host", "provider_scope", "provider_repo_id", "provider_owner", "provider_name", "base_branch", "checkout_branch"} {
+				allowed[key] = true
+			}
+		case string(service.WorkspaceSourceFolder):
+			allowed["display_name"] = true
+		default:
+			return nil, fmt.Errorf("unsupported workspace source kind %q", kind)
+		}
+		for key := range fields {
+			if !allowed[key] {
+				return nil, fmt.Errorf("field %q is not allowed for %s source", key, kind)
+			}
+		}
+		var source workspaceSourceJSON
+		if err := json.Unmarshal(item, &source); err != nil {
+			return nil, err
+		}
+		sources = append(sources, service.WorkspaceSourceInput{Kind: service.WorkspaceSourceKind(source.Kind), RepositoryID: source.RepositoryID, LocalPath: source.LocalPath, GitHubURL: source.GitHubURL, RemoteURL: source.RemoteURL, Provider: source.Provider, ProviderHost: source.ProviderHost, ProviderScope: source.ProviderScope, ProviderRepoID: source.ProviderRepoID, ProviderOwner: source.ProviderOwner, ProviderName: source.ProviderName, BaseBranch: source.BaseBranch, CheckoutBranch: source.CheckoutBranch, DisplayName: source.DisplayName})
+	}
+	return sources, nil
+}
+
+func classifyWorkspaceSourceError(err error) string {
+	switch {
+	case errors.Is(err, taskrepository.ErrTaskParentMismatch):
+		return ws.ErrorCodeForbidden
+	case errors.Is(err, service.ErrInvalidWorkspaceSource):
+		return ws.ErrorCodeValidation
+	case errors.Is(err, taskrepo.ErrTaskNotFound), errors.Is(err, taskrepository.ErrRepositoryNotFound), errors.Is(err, service.ErrTaskRepositoryNotFound):
+		return ws.ErrorCodeNotFound
+	case errors.Is(err, service.ErrWorkspaceSourceConflict), errors.Is(err, service.ErrWorkspaceSourceActive):
+		return ws.ErrorCodeConflict
+	case errors.Is(err, service.ErrUnsupportedWorkspaceSource), errors.Is(err, service.ErrWorkspaceSourceMaterialize):
+		return ws.ErrorCodeValidation
+	default:
+		return ws.ErrorCodeInternalError
+	}
+}
+
+// handleUpdateRepositoryBaseBranch updates the base_branch on a single
+// task_repositories row. The agentctl side is notified live via the service's
+// AgentBaseBranchPusher hook so the changes-panel diff stats reflect the new
+// base immediately, not just at next session start.
+func (h *Handlers) handleUpdateRepositoryBaseBranch(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID           string `json:"task_id"`
+		TaskRepositoryID string `json:"task_repository_id"`
+		BaseBranch       string `json:"base_branch"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	if req.TaskRepositoryID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_repository_id is required", nil)
+	}
+	taskRepo, err := h.taskSvc.UpdateRepositoryBaseBranch(ctx, service.UpdateRepositoryBaseBranchRequest{
+		TaskID:           req.TaskID,
+		TaskRepositoryID: req.TaskRepositoryID,
+		BaseBranch:       req.BaseBranch,
+	})
+	if err != nil {
+		h.logger.Error("failed to update repository base branch", zap.Error(err))
+		if errors.Is(err, service.ErrTaskRepositoryNotFound) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, err.Error(), nil)
+		}
+		// Caller-facing validation messages (required-field, invalid ref
+		// name) pass through verbatim so MCP agents can react; internal
+		// faults stay opaque so DB-level details don't leak.
+		if isValidationError(err) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update base branch", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+		"id":              taskRepo.ID,
+		keyTaskID:         taskRepo.TaskID,
+		keyRepositoryID:   taskRepo.RepositoryID,
+		keyBaseBranch:     taskRepo.BaseBranch,
+		keyCheckoutBranch: taskRepo.CheckoutBranch,
+		keyPosition:       taskRepo.Position,
+	})
+}
+
+// boolCount returns how many of the supplied boolean flags are true. Used
+// to enforce mutual exclusion across optional input fields without a chain
+// of nested ifs.
+func boolCount(flags ...bool) int {
+	n := 0
+	for _, b := range flags {
+		if b {
+			n++
+		}
+	}
+	return n
+}
+
+// isValidationError matches the user-facing fragments emitted by the
+// service-layer validators (required fields, invalid ref names). Shared by
+// every MCP write handler so service-side message tweaks need only one
+// place to flow through to the MCP error classification. Kept narrow on
+// purpose — DB / IO failures often carry "invalid" in their message and
+// must surface as InternalError, not Validation.
+func isValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "is required") ||
+		strings.Contains(msg, "not allowed in a git ref name")
+}
+
+// classifyAddBranchError maps service-layer add_branch failures to ws error
+// codes so MCP agents can react to user-fixable input mistakes (missing
+// task, duplicate branch, wrong executor) instead of treating them as
+// backend faults.
+func classifyAddBranchError(err error) string {
+	if err == nil {
+		return ws.ErrorCodeInternalError
+	}
+	if errors.Is(err, taskrepo.ErrTaskNotFound) {
+		return ws.ErrorCodeNotFound
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "does not belong to task's workspace"):
+		return ws.ErrorCodeNotFound
+	case strings.Contains(msg, "is already attached"),
+		strings.Contains(msg, "conflicts with existing branch"):
+		return ws.ErrorCodeConflict
+	case strings.Contains(msg, "repository_id is required"),
+		strings.Contains(msg, "only supported on the worktree executor"),
+		strings.Contains(msg, "task_id is required"),
+		strings.Contains(msg, "cannot resolve base_branch"):
+		return ws.ErrorCodeValidation
+	case strings.Contains(msg, "GitHub URL"),
+		strings.Contains(msg, "github.com/owner/repo"),
+		strings.Contains(msg, "does not belong to workspace"):
+		// User-fixable failures from ResolveRepositoryRef / parseGitHubRepoURL:
+		// malformed URL, non-github host, cross-workspace repository_id.
+		// Narrow patterns (not a broad "resolve repository:" prefix) so
+		// downstream DB / system errors from CreateRepository / ListRepositories
+		// still classify as InternalError.
+		return ws.ErrorCodeValidation
+	}
+	return ws.ErrorCodeInternalError
+}
+
+// handleStepComplete records the agent's explicit step-completion signal
+// (ADR 0015). The handler:
+//
+//   - Loads the session and the task to identify the current workflow step.
+//   - Atomically claims the pending signal for the current step. A signal for
+//     an older step is replaced, but concurrent signals for the same step use
+//     the first successful database claim.
+//   - If the current step is already claimed, returns {accepted: false,
+//     reason: "already_signaled"}. When the session is WAITING_FOR_INPUT, the
+//     bus event is re-published so a failed first-attempt publish can still
+//     drive the subscriber.
+//   - Publishes events.WorkflowStepCompletionSignaled so the orchestrator
+//     subscriber can drive the on_turn_complete transition for steps with
+//     AutoAdvanceRequiresSignal=true. Steps that don't opt in ignore the
+//     signal entirely; the bag entry is cleared on the next turn start
+//     (no separate audit trail is persisted).
+//
+// Idempotency is intentionally lossy — a second call within the same step
+// silently keeps the first signal's payload (summary/handoff/blockers). The
+// orchestrator treats the first signal as authoritative.
+func (h *Handlers) handleStepComplete(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID    string `json:"task_id"`
+		SessionID string `json:"session_id"`
+		Summary   string `json:"summary"`
+		Handoff   string `json:"handoff"`
+		Blockers  string `json:"blockers"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" || req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id and session_id are required", nil)
+	}
+	if strings.TrimSpace(req.Summary) == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "summary is required", nil)
+	}
+
+	session, task, errMsg, err := h.resolveStepCompleteTarget(ctx, msg, req.TaskID, req.SessionID)
+	if errMsg != nil {
+		return errMsg, err
+	}
+
+	launchStepID, err := h.stepCompletionLaunchStep(ctx, req.SessionID, task.WorkflowStepID)
+	if err != nil {
+		h.logger.Error("failed to resolve step-completion turn",
+			zap.String("task_id", req.TaskID),
+			zap.String("session_id", req.SessionID),
+			zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to resolve calling turn", nil)
+	}
+	if launchStepID != task.WorkflowStepID {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, fmt.Sprintf(
+			"workflow step changed before signal was recorded. This turn started in step %s. "+
+				"The current step is %s. No signal was recorded. Retrying in this turn cannot recover. "+
+				"End this turn and ask the user to resume this session for the current step. "+
+				"After satisfying that step, signal completion from the new turn. "+
+				"Do not move the task solely to bypass this error.",
+			launchStepID, task.WorkflowStepID), nil)
+	}
+
+	boundedHandoff, handoffTruncated := boundStepCompletionSignalField(strings.TrimSpace(req.Handoff))
+	boundedBlockers, blockersTruncated := boundStepCompletionSignalField(strings.TrimSpace(req.Blockers))
+	signal := models.PendingStepCompletionSignal{
+		StepID:     launchStepID,
+		Source:     models.StepCompletionSourceAgent,
+		Summary:    strings.TrimSpace(req.Summary),
+		Handoff:    boundedHandoff,
+		Blockers:   boundedBlockers,
+		SignaledAt: time.Now().UTC(),
+	}
+	stored, err := h.claimStepCompletionSignal(ctx, req.TaskID, req.SessionID, launchStepID, signal)
+	if err != nil {
+		h.logger.Error("failed to persist step-completion signal",
+			zap.String("task_id", req.TaskID),
+			zap.String("session_id", req.SessionID),
+			zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to record signal", nil)
+	}
+	if !stored {
+		return h.handleDuplicateStepComplete(ctx, msg, req.TaskID, req.SessionID, launchStepID, session)
+	}
+
+	// Counted here, at the durable bag write, not after publishStepCompletionEvent
+	// below: publish is a delivery concern, and a publish failure sends the agent
+	// down the already_signaled dedup retry path, which never reaches this call
+	// again for the same signal.
+	//
+	// agent_name, not agent_id: agent_id is the store's auto-generated UUID for
+	// the agent row (internal/agent/settings/store/sqlite.go CreateAgent), unique
+	// per install and per re-creation. agent_name is the registry-facing type
+	// ("claude", "codex") that internal/agent/runtime/lifecycle/manager_profile.go
+	// keys the agent registry on.
+	agentType, _ := session.AgentProfileSnapshot["agent_name"].(string)
+	signalmetrics.RecordSignalReceived(signal.Source, agentType)
+
+	if errMsg, err := h.publishStepCompletionEvent(ctx, msg, req.TaskID, req.SessionID, task.WorkflowStepID, signal); errMsg != nil {
+		return errMsg, err
+	}
+
+	response := map[string]interface{}{
+		"accepted":    true,
+		"step_id":     task.WorkflowStepID,
+		"signaled_at": signal.SignaledAt,
+	}
+	if advances, note, ok := h.resolveStepCompletionAdvances(ctx, task.WorkflowStepID); ok {
+		response["advances"] = advances
+		if note != "" {
+			response["note"] = note
+		}
+	}
+	var truncatedFields []string
+	if handoffTruncated {
+		truncatedFields = append(truncatedFields, "handoff")
+	}
+	if blockersTruncated {
+		truncatedFields = append(truncatedFields, "blockers")
+	}
+	if len(truncatedFields) > 0 {
+		response["truncated"] = truncatedFields
+		response["truncation_limit_bytes"] = stepCompletionSignalFieldLimitBytes
+	}
+	return ws.NewResponse(msg.ID, msg.Action, response)
+}
+
+// resolveStepCompletionAdvances reports whether the just-recorded signal will
+// actually move the task, alongside the accepted:true response
+// handleStepComplete always returns. accepted only means the signal was
+// durably recorded — a step whose AutoAdvanceRequiresSignal is false never
+// reads it, and a signal-gated step whose on_turn_complete has no move that
+// runs automatically reads it without transitioning, so the caller can accept
+// a signal that changes nothing. ok is false (both other return values
+// ignored) when the current step cannot be resolved: the caller must never
+// guess this field into existence.
+func (h *Handlers) resolveStepCompletionAdvances(ctx context.Context, workflowStepID string) (advances bool, note string, ok bool) {
+	if h.workflowCtrl == nil || workflowStepID == "" {
+		return false, "", false
+	}
+	resp, err := h.workflowCtrl.GetStep(ctx, workflowStepID)
+	if err != nil || resp == nil || resp.Step == nil {
+		return false, "", false
+	}
+	if !resp.Step.AutoAdvanceRequiresSignal {
+		return false, "this step does not advance on a completion signal", true
+	}
+	if !resp.Step.AdvancesOnTurnComplete() {
+		return false, "this step has no on_turn_complete move that runs automatically, " +
+			"so the signal will not move the task", true
+	}
+	return true, "", true
+}
+
+func (h *Handlers) stepCompletionLaunchStep(ctx context.Context, sessionID, fallback string) (string, error) {
+	reader, ok := h.sessionRepo.(stepCompletionTurnReader)
+	if !ok {
+		return fallback, nil
+	}
+	turns, err := reader.ListTurnsBySession(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if len(turns) == 0 {
+		return fallback, nil
+	}
+	latest := turns[len(turns)-1]
+	if latest == nil {
+		return "", errors.New("latest turn is missing")
+	}
+	if stepID := models.StringFromAny(latest.Metadata[models.TurnMetaKeyWorkflowStepIDAtStart]); stepID != "" {
+		return stepID, nil
+	}
+	return "", errors.New("latest turn has no workflow-step stamp")
+}
+
+func (h *Handlers) claimStepCompletionSignal(
+	ctx context.Context,
+	taskID, sessionID, stepID string,
+	signal models.PendingStepCompletionSignal,
+) (bool, error) {
+	if claimer, ok := h.sessionRepo.(stepCompletionSignalClaimer); ok {
+		return claimer.SetSessionMetadataKeyIfAbsentOrDifferentStepIfTaskAtStep(
+			ctx, taskID, sessionID, models.SessionMetaKeyPendingStepCompletion, stepID, signal,
+		)
+	}
+	return h.sessionRepo.SetSessionMetadataKeyIfAbsentOrDifferentStep(
+		ctx, sessionID, models.SessionMetaKeyPendingStepCompletion, stepID, signal,
+	)
+}
+
+func (h *Handlers) handleDuplicateStepComplete(
+	ctx context.Context,
+	msg *ws.Message,
+	taskID, sessionID, stepID string,
+	session *models.TaskSession,
+) (*ws.Message, error) {
+	// If the initial snapshot already contained this step's signal, this is a
+	// retry after a possible publish failure and the event must be re-published
+	// while the session waits. If the initial snapshot was empty, another
+	// concurrent request won the claim and will publish the event itself.
+	existing, ok := models.LoadPendingStepSignal(session.Metadata)
+	if ok && existing.StepID == stepID && session.State == models.TaskSessionStateWaitingForInput {
+		if errMsg, err := h.publishStepCompletionEvent(ctx, msg, taskID, sessionID, stepID, existing); errMsg != nil {
+			return errMsg, err
+		}
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+		"accepted":   false,
+		mcpReasonKey: "already_signaled",
+	})
+}
+
+// resolveStepCompleteTarget loads the session + task the signal applies to
+// and runs the up-front validation (ownership, terminal-state guard,
+// workflow-step presence). Returns a populated session+task pair on success,
+// or a ready-to-send WS error envelope (and its marshal error if any) on
+// any failed precondition.
+func (h *Handlers) resolveStepCompleteTarget(
+	ctx context.Context, msg *ws.Message, taskID, sessionID string,
+) (*models.TaskSession, *models.Task, *ws.Message, error) {
+	session, err := h.sessionRepo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		// Session repo has no exported not-found sentinel; classify by
+		// substring and treat anything else as transient so the agent
+		// retries instead of abandoning the session.
+		if strings.Contains(err.Error(), "not found") {
+			errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "session not found", nil)
+			return nil, nil, errMsg, mErr
+		}
+		h.logger.Error("step_complete: failed to load session",
+			zap.String("session_id", sessionID), zap.Error(err))
+		errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to load session", nil)
+		return nil, nil, errMsg, mErr
+	}
+	if session.TaskID != taskID {
+		errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session does not belong to task", nil)
+		return nil, nil, errMsg, mErr
+	}
+	// Terminal sessions cannot consume a signal: the orchestrator's
+	// out-of-band subscriber short-circuits on every state other than
+	// WAITING_FOR_INPUT, and no future turn-end will fire on a closed
+	// session. Reject up front so the agent gets a clear error instead of
+	// `accepted: true` followed by silent no-op.
+	switch session.State {
+	case models.TaskSessionStateCompleted,
+		models.TaskSessionStateFailed,
+		models.TaskSessionStateCancelled:
+		errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+			"cannot signal completion for a terminal session (state: "+string(session.State)+")", nil)
+		return nil, nil, errMsg, mErr
+	}
+
+	task, err := h.taskSvc.GetTask(ctx, taskID)
+	if err != nil {
+		// Task repo exports ErrTaskNotFound; anything else is a transient
+		// load failure that the agent should retry rather than interpret
+		// as "task gone".
+		if errors.Is(err, taskrepo.ErrTaskNotFound) {
+			errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "task not found", nil)
+			return nil, nil, errMsg, mErr
+		}
+		h.logger.Error("step_complete: failed to load task",
+			zap.String("task_id", taskID), zap.Error(err))
+		errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to load task", nil)
+		return nil, nil, errMsg, mErr
+	}
+	if task.WorkflowStepID == "" {
+		errMsg, mErr := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task has no current workflow step", nil)
+		return nil, nil, errMsg, mErr
+	}
+	return session, task, nil, nil
+}
+
+// publishStepCompletionEvent emits the bus event the orchestrator's
+// out-of-band subscriber listens for. If publish fails the bag is already
+// persisted but the subscriber will not fire — surface the error to the
+// agent so it can retry. The handler-level idempotency guard guarantees the
+// retry either succeeds end-to-end or short-circuits with `already_signaled`
+// once the publish lands. Returns (nil, nil) on success or when no bus is wired.
+func (h *Handlers) publishStepCompletionEvent(
+	ctx context.Context, msg *ws.Message, taskID, sessionID, stepID string,
+	signal models.PendingStepCompletionSignal,
+) (*ws.Message, error) {
+	if h.eventBus == nil {
+		return nil, nil
+	}
+	if err := h.eventBus.Publish(ctx, events.WorkflowStepCompletionSignaled, bus.NewEvent(
+		events.WorkflowStepCompletionSignaled, "mcp-handlers",
+		map[string]interface{}{
+			"task_id":     taskID,
+			"session_id":  sessionID,
+			"step_id":     stepID,
+			"source":      signal.Source,
+			"summary":     signal.Summary,
+			"signaled_at": signal.SignaledAt,
+		},
+	)); err != nil {
+		h.logger.Error("failed to publish step-completion signal",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"failed to notify orchestrator (signal persisted; retry)", nil)
+	}
+	return nil, nil
+}
+
+// handleMessageTask sends a prompt to an existing task on behalf of an agent
+// in another task. The MCP server (agentctl) injects the sender's task_id and
+// session_id into the payload; this handler validates the sender, looks up its
+// title, wraps the prompt in a <kandev-system> attribution block (so the
+// receiving agent knows the message is from a peer agent), and dispatches via
+// one of three paths depending on the target session state:
+//
+//   - RUNNING/STARTING : message is queued and drained at turn end
+//   - WAITING/COMPLETED: message is recorded and the agent is prompted (auto-resuming if needed)
+//   - CREATED          : message is recorded then the agent is started with it as initial prompt
+//
+// Strict validation: missing sender_task_id, same-session targets, and unknown
+// sender tasks reject with an MCP error. Same-task messages are allowed only
+// when session_id names a distinct sibling session.
+func (h *Handlers) handleMessageTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID            string `json:"task_id"`
+		SessionID         string `json:"session_id"`
+		Prompt            string `json:"prompt"`
+		SenderTaskID      string `json:"sender_task_id"`
+		SenderSessionID   string `json:"sender_session_id"`
+		DeliveryMode      string `json:"delivery_mode"`
+		ReplyToQuestionID string `json:"reply_to_question_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	if req.Prompt == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "prompt is required", nil)
+	}
+	if req.SenderTaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "sender_task_id is required (the calling agent's MCP server must supply this)", nil)
+	}
+	// Same-task messaging is allowed only between distinct sibling sessions:
+	// an explicit session_id proves the sender is targeting a specific peer
+	// rather than echoing into its own conversation.
+	if req.SenderTaskID == req.TaskID && req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+			"task cannot send a message to itself (pass session_id to message a sibling session on your own task)", nil)
+	}
+	if req.SessionID != "" && req.SessionID == req.SenderSessionID {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session cannot send a message to itself", nil)
+	}
+	if req.DeliveryMode != "" && req.DeliveryMode != deliveryModeQueued && req.DeliveryMode != deliveryModeInterrupt {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+			fmt.Sprintf("delivery_mode must be %q or %q", deliveryModeQueued, deliveryModeInterrupt), nil)
+	}
+
+	// Sender lookup is global, not workspace-scoped: cross-workspace agent
+	// messaging is intentionally allowed (badge URL handles cross-workspace
+	// nav). Task IDs are UUIDs, so this is not exploitable in practice — and
+	// scoping would require a product-level decision about cross-workspace
+	// auth/visibility/discovery that we don't want to bake in here.
+	senderTask, err := h.taskSvc.GetTask(ctx, req.SenderTaskID)
+	if err != nil || senderTask == nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "sender task not found", nil)
+	}
+
+	// Verify the target task exists before looking up its session, so a bad
+	// task_id (e.g. a truncated UUID prefix) reports "task not found" instead
+	// of the misleading "no primary session" error from the session lookup.
+	// This is purely an existence check — GetTask returns a wrapped
+	// ErrTaskNotFound on no-rows, never (nil, nil). The loaded task's
+	// ParentID also tells us whether the sender is the target's parent,
+	// which decides interrupt eligibility below.
+	targetTask, err := h.taskSvc.GetTask(ctx, req.TaskID)
+	if err != nil {
+		if errors.Is(err, taskrepo.ErrTaskNotFound) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound,
+				"target task not found: "+req.TaskID+" (pass the full task UUID, not a truncated prefix)", nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"failed to look up target task: "+err.Error(), nil)
+	}
+
+	parentReply, err := h.validateParentQuestionReply(ctx, req.ReplyToQuestionID, req.TaskID, senderTask, targetTask)
+	if err != nil {
+		var parentQuestionErr *parentQuestionError
+		if errors.As(err, &parentQuestionErr) {
+			return ws.NewError(msg.ID, msg.Action, parentQuestionErr.code, parentQuestionErr.message, nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+	if parentReply != nil && parentReply.alreadyAnswered {
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+			"task_id":              req.TaskID,
+			"reply_to_question_id": req.ReplyToQuestionID,
+			stopTaskStatusKey:      "already_answered",
+		})
+	}
+
+	session, pinnedTarget, errResp := h.resolveMessageTargetSession(ctx, msg, req.TaskID, req.SessionID)
+	if errResp != nil {
+		return errResp, nil
+	}
+
+	prompt := h.appendPromptReferenceExpansionContext(ctx, req.Prompt)
+	senderSessionName := h.lookupSenderSessionName(ctx, req.SenderTaskID, req.SenderSessionID)
+	wrappedPrompt, senderMeta := wrapAgentMessage(prompt, senderTask, req.SenderSessionID, senderSessionName, req.SenderTaskID == req.TaskID)
+	if req.ReplyToQuestionID != "" {
+		senderMeta[models.MetaKeyParentQuestionID] = req.ReplyToQuestionID
+		senderMeta[models.MetaKeyParentQuestionResponse] = req.Prompt
+	}
+
+	// Interrupt intent is explicit, never inferred: a parent/child
+	// relationship alone no longer drives interruption (see
+	// dispatchTaskMessage's interruptIfBusy parameter and
+	// queueThenInterruptTaskMessage). The server still authorizes
+	// delivery_mode="interrupt" only when the sender is the target's
+	// direct parent — the same relationship check as before, now gating
+	// an explicit request instead of driving an implicit one. A non-parent
+	// sender explicitly requesting "interrupt" is hard-rejected rather than
+	// silently downgraded to "queued": a silent downgrade would misreport
+	// what happened and hide caller misuse instead of telling the caller
+	// its request was rejected. Omitted or "queued" keeps the default
+	// queue-and-wait behavior documented on message_task_kandev, even for
+	// a parent sender.
+	isParentToChild := targetTask.ParentID != "" && targetTask.ParentID == senderTask.ID
+	wantsInterrupt := req.DeliveryMode == deliveryModeInterrupt
+	if wantsInterrupt && !isParentToChild {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeForbidden,
+			`delivery_mode="interrupt" is only allowed when the sender is the target task's direct parent`, nil)
+	}
+	if parentReply != nil {
+		// Claim the durable question before dispatch. A failed status update after
+		// delivery would make a retry send the same answer a second time.
+		if err := h.markParentQuestionAnswered(ctx, parentReply.message, req.Prompt); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "parent question could not be claimed: "+err.Error(), nil)
+		}
+	}
+
+	// The sender session is the causal actor for anything this dispatch does
+	// on its own behalf, including RestoreTaskMessageRollback if a later
+	// step fails — thread it onto ctx so that rollback's ledger row (if any)
+	// attributes the agent that sent this message, not the session-less
+	// authn seam. Conditional: SenderSessionID isn't validated non-empty
+	// above, so a caller that omits it falls back to the existing default.
+	dispatchCtx := ctx
+	if req.SenderSessionID != "" {
+		dispatchCtx = steptelemetry.WithAttribution(ctx, steptelemetry.Attribution{
+			ActorKind: steptelemetry.ActorAgent,
+			ActorID:   req.SenderSessionID,
+			SessionID: req.SenderSessionID,
+		})
+	}
+	// pinnedTarget, not `req.SessionID != ""`: a fallback chosen because the
+	// primary is terminal is pinned too, or the idle dispatch path re-resolves
+	// it straight back to that terminal primary.
+	result, err := h.dispatchTaskMessage(dispatchCtx, req.TaskID, session, wrappedPrompt, senderMeta, wantsInterrupt, pinnedTarget)
+	if err != nil {
+		if parentReply != nil {
+			if restoreErr := h.restoreParentQuestionPending(ctx, parentReply.message); restoreErr != nil {
+				h.logger.Error("failed to restore parent question after answer dispatch failure",
+					zap.String(parentQuestionIDKey, parentReply.message.ID), zap.Error(restoreErr))
+			}
+		}
+		var qfErr *queueFullDispatchError
+		if errors.As(err, &qfErr) {
+			return ws.NewError(msg.ID, msg.Action, messagequeue.QueueFullErrorCode,
+				fmt.Sprintf("target task has %d queued messages (max %d) — retry after the next turn completes", qfErr.queueSize, qfErr.max),
+				qfErr.toPayload())
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, err.Error(), nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+		"task_id":         req.TaskID,
+		"session_id":      result.sessionID,
+		stopTaskStatusKey: result.status,
+	})
+}
+
+// lookupSenderSessionName resolves the sender session's user-supplied name for
+// badge metadata. Best-effort: returns "" when the session is unknown, unnamed,
+// or does not belong to the claimed sender task (so a caller can't stamp an
+// arbitrary session's name onto its messages).
+func (h *Handlers) lookupSenderSessionName(ctx context.Context, senderTaskID, senderSessionID string) string {
+	if senderSessionID == "" || h.taskSvc == nil {
+		return ""
+	}
+	session, err := h.taskSvc.GetTaskSession(ctx, senderSessionID)
+	if err != nil || session == nil || session.TaskID != senderTaskID {
+		return ""
+	}
+	return session.Name
+}
+
+// appendPromptReferenceExpansionContext expands "@name" saved-prompt
+// references found in prompt via h.promptResolver. The formatting logic
+// lives in promptservice.FormatPromptReferenceExpansions (shared with
+// promptservice.Service.AppendReferenceExpansions) so this stays a thin
+// wiring layer over the resolver interface, which in tests may be a fake
+// that only implements ResolvePromptReferences.
+func (h *Handlers) appendPromptReferenceExpansionContext(ctx context.Context, prompt string) string {
+	if h.promptResolver == nil {
+		return prompt
+	}
+	if !strings.Contains(prompt, "@") {
+		return prompt
+	}
+	expansions, err := h.promptResolver.ResolvePromptReferences(ctx, prompt)
+	if err != nil {
+		h.logger.Warn("failed to resolve prompt references for message_task", zap.Error(err))
+		return prompt
+	}
+	if len(expansions) == 0 {
+		return prompt
+	}
+	return prompt + "\n\n" + sysprompt.Wrap(formatPromptReferenceExpansions(expansions))
+}
+
+// formatPromptReferenceExpansions delegates to the shared formatter in
+// prompts/service so the rendered block stays byte-identical across callers.
+func formatPromptReferenceExpansions(expansions []promptservice.PromptReferenceExpansion) string {
+	return promptservice.FormatPromptReferenceExpansions(expansions)
+}
+
+// handleGetTaskConversation returns paginated conversation history for a task.
+// If session_id is omitted, it uses the task's primary session and falls back
+// to the latest session when no primary session exists.
+func (h *Handlers) handleGetTaskConversation(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	req, errResp := parseTaskConversationRequest(msg)
+	if errResp != nil {
+		return errResp, nil
+	}
+
+	session, errResp := h.resolveConversationSession(ctx, msg, req.TaskID, req.SessionID)
+	if errResp != nil {
+		return errResp, nil
+	}
+
+	messages, hasMore, err := h.taskSvc.ListMessagesPaginated(ctx, service.ListMessagesRequest{
+		TaskSessionID: session.ID,
+		Limit:         conversationLimit(req.Limit),
+		Before:        req.Before,
+		After:         req.After,
+		Sort:          req.Sort,
+	})
+	if err != nil {
+		h.logger.Error("failed to list task conversation", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list task conversation", nil)
+	}
+
+	result := filterAndConvertMessages(messages, req.Types)
+	cursor := conversationCursor(messages)
+
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+		"task_id":    req.TaskID,
+		"session_id": session.ID,
+		"messages":   result,
+		"total":      len(result),
+		"has_more":   hasMore,
+		"cursor":     cursor,
+	})
+}
+
+type taskConversationRequest struct {
+	TaskID    string   `json:"task_id"`
+	SessionID string   `json:"session_id"`
+	Limit     int      `json:"limit"`
+	Before    string   `json:"before"`
+	After     string   `json:"after"`
+	Sort      string   `json:"sort"`
+	Types     []string `json:"message_types"`
+}
+
+func parseTaskConversationRequest(msg *ws.Message) (*taskConversationRequest, *ws.Message) {
+	var req taskConversationRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error())
+	}
+	if req.TaskID == "" {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required")
+	}
+	if req.Before != "" && req.After != "" {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeValidation, "only one of before or after can be set")
+	}
+	if req.Sort != "" && req.Sort != "asc" && req.Sort != "desc" {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeValidation, "sort must be asc or desc")
+	}
+	if req.Limit < 0 {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeValidation, "limit must be non-negative")
+	}
+	return &req, nil
+}
+
+func (h *Handlers) resolveConversationSession(ctx context.Context, msg *ws.Message, taskID, sessionID string) (*models.TaskSession, *ws.Message) {
+	if sessionID != "" {
+		session, err := h.taskSvc.GetTaskSession(ctx, sessionID)
+		if err != nil || session == nil {
+			return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "session not found")
+		}
+		if session.TaskID != taskID {
+			return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session_id does not belong to task_id")
+		}
+		return session, nil
+	}
+	session, err := h.taskSvc.GetPrimarySession(ctx, taskID)
+	if err == nil && session != nil {
+		return session, nil
+	}
+	if err != nil && !errors.Is(err, taskrepo.ErrNoPrimarySession) {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to get task session")
+	}
+	sessions, listErr := h.taskSvc.ListTaskSessions(ctx, taskID)
+	if listErr != nil {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "failed to list task sessions")
+	}
+	if len(sessions) == 0 {
+		return nil, wsError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "task has no session")
+	}
+	return sessions[0], nil
+}
+
+func wsError(id, action, code, message string) *ws.Message {
+	resp, _ := ws.NewError(id, action, code, message, nil)
+	return resp
+}
+
+func filterAndConvertMessages(messages []*models.Message, types []string) []*v1.Message {
+	filterTypes := make(map[string]struct{}, len(types))
+	for _, mt := range types {
+		if mt == "" {
+			continue
+		}
+		filterTypes[mt] = struct{}{}
+	}
+
+	result := make([]*v1.Message, 0, len(messages))
+	for _, message := range messages {
+		if len(filterTypes) > 0 {
+			if _, ok := filterTypes[string(message.Type)]; !ok {
+				continue
+			}
+		}
+		result = append(result, message.ToAPI())
+	}
+	return result
+}
+
+func conversationLimit(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	return service.DefaultMessagesPageSize
+}
+
+func conversationCursor(messages []*models.Message) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	return messages[len(messages)-1].ID
+}
+
+// queueFullDispatchError is returned by dispatchTaskMessage when an inter-task
+// message can't be queued because the target session's queue is full. It
+// carries enough metadata for handleMessageTask to surface a structured
+// "queue_full" error to the calling agent so its LLM can decide whether to
+// retry, abort, or message a different task.
+type queueFullDispatchError struct {
+	sessionID string
+	queueSize int
+	max       int
+	entries   []messagequeue.QueuedMessage
+}
+
+type unownedPeerMessageStartError struct{ cause error }
+
+func (e *unownedPeerMessageStartError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *unownedPeerMessageStartError) Unwrap() error { return e.cause }
+
+func isUnownedPeerMessageStartError(err error) bool {
+	var unowned *unownedPeerMessageStartError
+	return errors.As(err, &unowned)
+}
+
+func (e *queueFullDispatchError) Error() string {
+	return fmt.Sprintf("queue full: %d/%d messages pending for session %s", e.queueSize, e.max, e.sessionID)
+}
+
+// toPayload builds the structured "data" body for the MCP error response.
+// Sender / queued_at fields surface enough context for the LLM to reason about
+// the wedge state without leaking the queued message contents.
+func (e *queueFullDispatchError) toPayload() map[string]interface{} {
+	queued := make([]map[string]interface{}, 0, len(e.entries))
+	for _, entry := range e.entries {
+		queued = append(queued, map[string]interface{}{
+			"id":        entry.ID,
+			"sender":    entry.QueuedBy,
+			"queued_at": entry.QueuedAt,
+		})
+	}
+	// The WS error envelope already carries the code; we duplicate it here so
+	// callers reading the structured details body still see it without parsing
+	// the envelope. Tests assert on details.error directly.
+	return map[string]interface{}{
+		errorField:        messagequeue.QueueFullErrorCode,
+		"queue_size":      e.queueSize,
+		"max":             e.max,
+		"retry_after":     "next_turn",
+		"queued_messages": queued,
+	}
+}
+
+// errorField names the well-known structured details key used to surface error
+// codes in MCP tool responses (extracted to satisfy goconst's repeated-string rule).
+const errorField = "error"
+
+// MCP payload / response keys reused across multiple handlers. Extracted so
+// goconst doesn't flag the literals as repeated, and so a future rename of
+// a wire-protocol key updates every handler in one place.
+const (
+	keyTaskID           = "task_id"
+	keySessionID        = "session_id"
+	keyTotal            = "total"
+	keyRepositoryID     = "repository_id"
+	keyTaskRepositoryID = "task_repository_id"
+	keyBaseBranch       = "base_branch"
+	keyCheckoutBranch   = "checkout_branch"
+	keyPosition         = "position"
+	keyAutoMergeEnabled = "auto_merge_enabled"
+	keySuccess          = "success"
+	keyPending          = "pending"
+)
+
+// taskMessageStatusSent is the taskMessageDispatchResult.status value used
+// when a message_task_kandev prompt was dispatched immediately rather than
+// left in the FIFO queue for later delivery — either because the target
+// session was idle (promptWithAutoResume) or because a parent's interrupt
+// just dispatched it (queueThenInterruptTaskMessage). Extracted to satisfy
+// goconst's repeated-string rule; see dispatchTaskMessage's doc comment for
+// the full status enum ("queued", "sent", "started").
+const taskMessageStatusSent = "sent"
+
+// taskMessageStatusQueued is the taskMessageDispatchResult.status value
+// used when a message_task_kandev prompt is left in the FIFO queue for
+// later delivery rather than dispatched immediately. Extracted alongside
+// taskMessageStatusSent to satisfy goconst's repeated-string rule.
+const taskMessageStatusQueued = "queued"
+
+// deliveryModeQueued and deliveryModeInterrupt are the two accepted values
+// for message_task_kandev's delivery_mode request parameter — distinct
+// from taskMessageStatusQueued/taskMessageStatusSent above, which describe
+// the *response* status enum instead. "queued" happens to be a shared
+// literal between the two concepts (a delivery_mode request value and a
+// dispatch-result status value), but they are different fields on
+// different structs (request vs. response) and are kept as separate
+// constants so a change to one enum's spelling can't silently drift the
+// other.
+const (
+	deliveryModeQueued    = "queued"
+	deliveryModeInterrupt = "interrupt"
+)
+
+// queuedEntryID is set only by queueTaskMessage (the message queue's
+// returned entry id) so queueThenInterruptTaskMessage can target that exact
+// entry when interrupting instead of the FIFO head — see
+// InterruptForPeerMessage's doc comment. Never serialized to the wire; the
+// MCP response only reads status/sessionID (see handleMessageTask).
+type taskMessageDispatchResult struct {
+	status        string
+	sessionID     string
+	queuedEntryID string
+}
+
+type taskMessageReviewRollback struct {
+	taskID                 string
+	targetSessionID        string
+	changed                bool
+	restoreTask            bool
+	taskState              v1.TaskState
+	workflowStepID         string
+	expectedTaskState      v1.TaskState
+	expectedWorkflowStepID string
+	hasExpectedTaskState   bool
+	sessions               []taskMessageSessionRollback
+	sessionIDs             map[string]struct{}
+	selectedID             string
+	selectedState          models.TaskSessionState
+	hasSelectedState       bool
+	queues                 map[string]taskMessageQueueRollback
+}
+
+type taskMessageSessionRollback struct {
+	sessionID                    string
+	taskID                       string
+	sessionIncarnationID         string
+	state                        models.TaskSessionState
+	expectedState                models.TaskSessionState
+	expectedUpdatedAt            time.Time
+	hasExpectedState             bool
+	allowOwnedRevisionAdvance    bool
+	expectedError                string
+	expectedCompletedAt          *time.Time
+	expectedIsPrimary            bool
+	expectedAgentProfileID       string
+	expectedExecutorProfileID    string
+	expectedAgentProfileSnapshot map[string]interface{}
+	expectedMetadata             map[string]interface{}
+	error                        string
+	completedAt                  *time.Time
+	isPrimary                    bool
+	agentProfileID               string
+	executorProfileID            string
+	agentProfileSnapshot         map[string]interface{}
+	metadata                     map[string]interface{}
+}
+
+type taskMessageQueueRollback struct {
+	identity       messagequeue.QueueSessionIdentity
+	entries        []messagequeue.QueuedMessage
+	hadPendingMove bool
+	pendingMove    *messagequeue.PendingMove
+}
+
+type taskMessageSessionRollbackRepository interface {
+	GetTaskSession(ctx context.Context, id string) (*models.TaskSession, error)
+	ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error)
+	UpdateTaskSessionIfCurrentState(
+		ctx context.Context,
+		session *models.TaskSession,
+		expected models.TaskSessionState,
+	) (bool, error)
+	UpdateTaskSessionIfCurrentSnapshot(
+		ctx context.Context,
+		session *models.TaskSession,
+		expected models.TaskSessionState,
+		expectedUpdatedAt time.Time,
+		metadata map[string]interface{},
+	) (bool, error)
+	SetSessionPrimary(ctx context.Context, sessionID string) error
+	DeleteTaskSession(ctx context.Context, session *models.TaskSession) error
+	UpdateSessionMetadata(ctx context.Context, sessionID string, metadata map[string]interface{}) error
+}
+
+type taskMessageSessionAttachmentDeleter interface {
+	DeleteTaskSessionWithAttachments(ctx context.Context, session *models.TaskSession) ([]*models.TaskMessageAttachment, error)
+}
+
+var errTaskMessageRollbackSuperseded = errors.New("task message rollback superseded by coordinator cancellation")
+
+type taskMessageExecutorReader interface {
+	GetExecutorRunningBySessionID(ctx context.Context, sessionID string) (*models.ExecutorRunning, error)
+}
+
+func (r *taskMessageReviewRollback) captureSessions(ctx context.Context, repo SessionRepository, taskID string, fallback *models.TaskSession) error {
+	if !r.changed || fallback == nil {
+		return nil
+	}
+	sessions := []*models.TaskSession{fallback}
+	if snapshotRepo, ok := repo.(interface {
+		ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error)
+	}); ok {
+		listed, err := snapshotRepo.ListTaskSessions(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		sessions = listed
+	}
+	r.sessionIDs = make(map[string]struct{}, len(sessions))
+	r.sessions = make([]taskMessageSessionRollback, 0, len(sessions))
+	for _, session := range sessions {
+		if session == nil {
+			continue
+		}
+		r.sessionIDs[session.ID] = struct{}{}
+		r.sessions = append(r.sessions, captureTaskMessageSession(session))
+	}
+	return nil
+}
+
+func (r *taskMessageReviewRollback) captureQueues(ctx context.Context, queue *messagequeue.Service) error {
+	if !r.changed || queue == nil || len(r.sessions) == 0 {
+		return nil
+	}
+	queues := make(map[string]taskMessageQueueRollback, len(r.sessions))
+	for _, session := range r.sessions {
+		identity, err := queue.ResolveSessionIdentity(ctx, session.taskID, session.sessionID)
+		if err != nil {
+			return fmt.Errorf("resolve session queue identity: %w", err)
+		}
+		if session.sessionIncarnationID != "" &&
+			identity.SessionIncarnationID != session.sessionIncarnationID {
+			return messagequeue.ErrSessionIdentityMismatch
+		}
+		entries, move, err := queue.SnapshotSessionForIdentity(ctx, identity)
+		if err != nil {
+			return err
+		}
+		snapshot := taskMessageQueueRollback{
+			identity: identity,
+			entries:  cloneTaskMessageQueuedMessages(entries),
+		}
+		if move != nil {
+			snapshot.hadPendingMove = true
+			snapshot.pendingMove = cloneTaskMessagePendingMove(move)
+		}
+		queues[session.sessionID] = snapshot
+	}
+	r.queues = queues
+	return nil
+}
+
+func (r *taskMessageReviewRollback) captureSelectedSession(session *models.TaskSession) {
+	if !r.changed || session == nil {
+		return
+	}
+	r.selectedID = session.ID
+	r.selectedState = session.State
+	r.hasSelectedState = true
+	for index := range r.sessions {
+		if r.sessions[index].sessionID == session.ID {
+			if session.ID == r.targetSessionID {
+				captureExpectedTaskMessageSession(&r.sessions[index], session)
+				r.sessions[index].allowOwnedRevisionAdvance = true
+			}
+		}
+	}
+}
+
+func (r *taskMessageReviewRollback) captureExpectedSessionStates(
+	ctx context.Context,
+	repo SessionRepository,
+) error {
+	if !r.changed {
+		return nil
+	}
+	for index := range r.sessions {
+		session, err := repo.GetTaskSession(ctx, r.sessions[index].sessionID)
+		if err != nil {
+			return err
+		}
+		if session == nil || session.TaskID != r.sessions[index].taskID ||
+			(r.sessions[index].sessionIncarnationID != "" && session.QueueIncarnationID != r.sessions[index].sessionIncarnationID) {
+			return messagequeue.ErrSessionIdentityMismatch
+		}
+		if session.ID == r.targetSessionID {
+			captureExpectedTaskMessageSession(&r.sessions[index], session)
+			r.sessions[index].allowOwnedRevisionAdvance = true
+		}
+	}
+	if r.selectedID != "" {
+		selected, err := repo.GetTaskSession(ctx, r.selectedID)
+		if err != nil {
+			return err
+		}
+		if selected == nil || (selected.TaskID != "" && selected.TaskID != r.taskID) {
+			return messagequeue.ErrSessionIdentityMismatch
+		}
+		r.selectedState = selected.State
+		r.hasSelectedState = true
+	}
+	return nil
+}
+
+func captureTaskMessageSession(session *models.TaskSession) taskMessageSessionRollback {
+	var completedAt *time.Time
+	if session.CompletedAt != nil {
+		copy := *session.CompletedAt
+		completedAt = &copy
+	}
+	snapshot := taskMessageSessionRollback{
+		sessionID:            session.ID,
+		taskID:               session.TaskID,
+		sessionIncarnationID: session.QueueIncarnationID,
+		state:                session.State,
+		expectedState:        session.State,
+		expectedUpdatedAt:    session.UpdatedAt,
+		hasExpectedState:     true,
+		error:                session.ErrorMessage,
+		completedAt:          completedAt,
+		isPrimary:            session.IsPrimary,
+		agentProfileID:       session.AgentProfileID,
+		executorProfileID:    session.ExecutorProfileID,
+		agentProfileSnapshot: cloneTaskMessageMetadataMap(session.AgentProfileSnapshot),
+	}
+	if session.Metadata != nil {
+		snapshot.metadata = cloneTaskMessageMetadataMap(session.Metadata)
+	}
+	captureExpectedTaskMessageSession(&snapshot, session)
+	return snapshot
+}
+
+func captureExpectedTaskMessageSession(snapshot *taskMessageSessionRollback, session *models.TaskSession) {
+	if snapshot == nil || session == nil {
+		return
+	}
+	snapshot.expectedState = session.State
+	snapshot.expectedUpdatedAt = session.UpdatedAt
+	snapshot.hasExpectedState = true
+	snapshot.expectedError = session.ErrorMessage
+	snapshot.expectedCompletedAt = cloneTaskMessageTime(session.CompletedAt)
+	snapshot.expectedIsPrimary = session.IsPrimary
+	snapshot.expectedAgentProfileID = session.AgentProfileID
+	snapshot.expectedExecutorProfileID = session.ExecutorProfileID
+	snapshot.expectedAgentProfileSnapshot = cloneTaskMessageMetadataMap(session.AgentProfileSnapshot)
+	snapshot.expectedMetadata = cloneTaskMessageMetadataMap(session.Metadata)
+}
+
+func cloneTaskMessageTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneTaskMessageMetadataMap(metadata map[string]interface{}) map[string]interface{} {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = cloneTaskMessageMetadataValue(value)
+	}
+	return cloned
+}
+
+func cloneTaskMessageMetadataValue(value interface{}) interface{} {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var cloned interface{}
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return value
+	}
+	return cloned
+}
+
+func cloneTaskMessageQueuedMessages(entries []messagequeue.QueuedMessage) []messagequeue.QueuedMessage {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]messagequeue.QueuedMessage, 0, len(entries))
+	for _, entry := range entries {
+		copy := entry
+		copy.Metadata = cloneTaskMessageMetadataMap(entry.Metadata)
+		copy.Attachments = append([]messagequeue.MessageAttachment(nil), entry.Attachments...)
+		cloned = append(cloned, copy)
+	}
+	return cloned
+}
+
+func cloneTaskMessagePendingMove(move *messagequeue.PendingMove) *messagequeue.PendingMove {
+	if move == nil {
+		return nil
+	}
+	copy := *move
+	return &copy
+}
+
+// dispatchTaskMessage routes a message to the right delivery path based on session state.
+// Returns the action taken: "queued", "sent", or "started".
+//
+// metadata is the Message.Metadata map to attach to the resulting user message
+// row (sender_task_id, sender_task_title, sender_session_id when called from
+// handleMessageTask). It is propagated to all three delivery paths so the
+// receiving task's chat displays the sender badge consistently.
+//
+// pinnedTarget marks a session the caller named explicitly (message_task's
+// session_id param). Idle-path dispatch must then stay on THAT session:
+// resolveSessionAfterTaskMessageTurnStart's primary-switch preference would
+// otherwise reroute the message to the task's primary session — which, for a
+// sibling-session message, is typically the sender itself.
+func (h *Handlers) dispatchTaskMessage(ctx context.Context, taskID string, session *models.TaskSession, prompt string, metadata map[string]interface{}, interruptIfBusy, pinnedTarget bool) (taskMessageDispatchResult, error) {
+	if h.sessionLauncher == nil {
+		return taskMessageDispatchResult{}, errors.New("orchestrator not available")
+	}
+
+	switch session.State {
+	case models.TaskSessionStateFailed, models.TaskSessionStateCancelled:
+		return taskMessageDispatchResult{}, terminalSessionDispatchError(session)
+	case models.TaskSessionStateCompleted:
+		if !pinnedTarget {
+			return taskMessageDispatchResult{}, terminalSessionDispatchError(session)
+		}
+		resumed, err := h.resumeCompletedTaskMessageSession(ctx, taskID, session.ID)
+		if err != nil {
+			return taskMessageDispatchResult{}, err
+		}
+		return h.dispatchPreparedTaskMessage(ctx, taskID, resumed, prompt, metadata)
+
+	case models.TaskSessionStateRunning, models.TaskSessionStateStarting:
+		if interruptIfBusy {
+			return h.queueThenInterruptTaskMessage(ctx, taskID, session, prompt, metadata)
+		}
+		return h.queueTaskMessage(ctx, taskID, session, prompt, metadata)
+
+	default:
+		return h.dispatchUnpreparedTaskMessage(ctx, taskID, session, prompt, metadata, pinnedTarget, interruptIfBusy)
+	}
+}
+
+func (h *Handlers) dispatchUnpreparedTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	pinnedTarget bool,
+	interruptIfBusy bool,
+) (taskMessageDispatchResult, error) {
+	admission, queued, err := h.beginUnpreparedPeerMessageStart(ctx, taskID, session, prompt, metadata, interruptIfBusy)
+	if err != nil {
+		return taskMessageDispatchResult{}, err
+	}
+	if queued != nil {
+		return *queued, nil
+	}
+	if admission != nil {
+		defer admission.Release()
+	}
+	return h.prepareAndDispatchTaskMessage(ctx, taskID, session, prompt, metadata, pinnedTarget, interruptIfBusy, admission)
+}
+
+func (h *Handlers) beginUnpreparedPeerMessageStart(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	interruptIfBusy bool,
+) (orchestrator.PeerMessageStartAdmission, *taskMessageDispatchResult, error) {
+	if !h.shouldStartTaskMessageSession(ctx, session) {
+		return nil, nil, nil
+	}
+	provider, ok := h.sessionLauncher.(peerMessageStartAdmissionProvider)
+	if !ok {
+		return nil, nil, nil
+	}
+	identity, err := h.resolveTaskMessageQueueIdentity(ctx, taskID, session)
+	if err != nil {
+		return nil, nil, err
+	}
+	admission, err := provider.BeginPeerMessageStart(ctx, identity)
+	if errors.Is(err, executor.ErrExecutionAlreadyRunning) {
+		result, queueErr := h.queueAfterUnownedPeerStart(ctx, taskID, session, identity, prompt, metadata, interruptIfBusy)
+		if queueErr != nil {
+			return nil, nil, queueErr
+		}
+		return nil, &result, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return admission, nil, nil
+}
+
+func (h *Handlers) prepareAndDispatchTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	pinnedTarget bool,
+	interruptIfBusy bool,
+	admission orchestrator.PeerMessageStartAdmission,
+) (taskMessageDispatchResult, error) {
+	reviewRollback, err := h.captureTaskMessageReviewRollback(ctx, taskID, session, admission)
+	if err != nil {
+		return taskMessageDispatchResult{}, err
+	}
+	session, turnStartResult, err := h.prepareSessionForTaskMessage(ctx, taskID, session, pinnedTarget, admission)
+	if err != nil {
+		return h.handleTaskMessagePreparationError(ctx, taskID, session, prompt, metadata, reviewRollback, admission, interruptIfBusy, err)
+	}
+	reviewRollback.captureSelectedSession(session)
+	if err := reviewRollback.captureExpectedSessionStates(ctx, h.sessionRepo); err != nil {
+		h.rollbackTaskMessageReview(ctx, taskID, reviewRollback, admission)
+		return taskMessageDispatchResult{}, err
+	}
+	if err := reviewRollback.captureExpectedTaskState(ctx, h.taskSvc); err != nil {
+		h.rollbackTaskMessageReview(ctx, taskID, reviewRollback, admission)
+		return taskMessageDispatchResult{}, err
+	}
+	if turnStartResult.Queued {
+		return h.queueTaskMessageUntilWorkflowPromotion(ctx, taskID, session, prompt, metadata, reviewRollback, admission)
+	}
+	return h.dispatchPreparedTaskMessageWithReviewRollback(ctx, taskID, session, prompt, metadata, admission, interruptIfBusy, reviewRollback)
+}
+
+func (r *taskMessageReviewRollback) captureExpectedTaskState(ctx context.Context, taskSvc *service.Service) error {
+	if r == nil || !r.restoreTask {
+		return nil
+	}
+	task, err := taskSvc.GetTask(ctx, r.taskID)
+	if err != nil {
+		return err
+	}
+	r.expectedTaskState = task.State
+	r.expectedWorkflowStepID = task.WorkflowStepID
+	r.hasExpectedTaskState = true
+	return nil
+}
+
+func (h *Handlers) captureTaskMessageReviewRollback(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	admission orchestrator.PeerMessageStartAdmission,
+) (*taskMessageReviewRollback, error) {
+	reviewRollback, err := h.ensureTaskInProgressForTaskMessage(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	reviewRollback.targetSessionID = session.ID
+	if err := reviewRollback.captureSessions(ctx, h.sessionRepo, taskID, session); err != nil {
+		h.rollbackTaskMessageReview(ctx, taskID, &reviewRollback, admission)
+		return nil, err
+	}
+	if err := reviewRollback.captureQueues(ctx, h.sessionLauncher.GetMessageQueue()); err != nil {
+		h.rollbackTaskMessageReview(ctx, taskID, &reviewRollback, admission)
+		return nil, err
+	}
+	return &reviewRollback, nil
+}
+
+func (h *Handlers) handleTaskMessagePreparationError(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	reviewRollback *taskMessageReviewRollback,
+	admission orchestrator.PeerMessageStartAdmission,
+	interruptIfBusy bool,
+	prepErr error,
+) (taskMessageDispatchResult, error) {
+	if errors.Is(prepErr, executor.ErrExecutionAlreadyRunning) && admission != nil {
+		identity := admission.SessionIdentity()
+		releasePeerMessageStartAdmission(admission)
+		return h.queueAfterUnownedPeerStart(ctx, taskID, session, identity, prompt, metadata, interruptIfBusy)
+	}
+	// Preparation can persist a workflow step before returning an error, so
+	// compensation must compare against the state left by that preparation.
+	if captureErr := reviewRollback.captureExpectedTaskState(ctx, h.taskSvc); captureErr != nil {
+		reviewRollback.hasExpectedTaskState = false
+	}
+	h.rollbackTaskMessageReview(ctx, taskID, reviewRollback, admission)
+	return taskMessageDispatchResult{}, prepErr
+}
+
+func (h *Handlers) rollbackTaskMessageReview(
+	ctx context.Context,
+	taskID string,
+	reviewRollback *taskMessageReviewRollback,
+	admission orchestrator.PeerMessageStartAdmission,
+) {
+	releasePeerMessageStartAdmission(admission)
+	h.restoreTaskReviewForTaskMessage(ctx, taskID, *reviewRollback)
+}
+
+func (h *Handlers) queueTaskMessageUntilWorkflowPromotion(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	reviewRollback *taskMessageReviewRollback,
+	admission orchestrator.PeerMessageStartAdmission,
+) (taskMessageDispatchResult, error) {
+	releasePeerMessageStartAdmission(admission)
+	if err := h.sessionLauncher.QueueUserPrompt(ctx, taskID, session.ID, prompt, "", false, nil, metadata, false); err != nil {
+		h.restoreTaskReviewForTaskMessage(ctx, taskID, *reviewRollback)
+		return taskMessageDispatchResult{}, fmt.Errorf("failed to queue prompt until workflow promotion: %w", err)
+	}
+	return taskMessageDispatchResult{status: taskMessageStatusQueued, sessionID: session.ID}, nil
+}
+
+func (h *Handlers) dispatchPreparedTaskMessageWithReviewRollback(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+	interruptIfBusy bool,
+	reviewRollback *taskMessageReviewRollback,
+) (taskMessageDispatchResult, error) {
+	result, err := h.dispatchPreparedTaskMessageWithAdmissionAndInterrupt(ctx, taskID, session, prompt, metadata, admission, interruptIfBusy)
+	if err != nil {
+		if isUnownedPeerMessageStartError(err) {
+			return taskMessageDispatchResult{}, err
+		}
+		h.restoreTaskReviewForTaskMessage(ctx, taskID, *reviewRollback)
+	}
+	return result, err
+}
+
+// resumeCompletedTaskMessageSession admits a pinned completed target through
+// the same guarded resume path as the user-facing recovery action. The session
+// is reloaded before the message is recorded so the prompt cannot be attached
+// to a different session or to the pre-resume terminal snapshot.
+func (h *Handlers) resumeCompletedTaskMessageSession(ctx context.Context, taskID, sessionID string) (*models.TaskSession, error) {
+	_, err := h.sessionLauncher.LaunchSession(ctx, &orchestrator.LaunchSessionRequest{
+		TaskID:                      taskID,
+		SessionID:                   sessionID,
+		Intent:                      orchestrator.IntentResume,
+		AllowCompletedSessionResume: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to resume completed session: %w", err)
+	}
+	resumed, err := h.taskSvc.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload completed session after resume: %w", err)
+	}
+	if resumed == nil || resumed.TaskID != taskID {
+		return nil, errors.New("completed session was not available after resume")
+	}
+	if resumed.State == models.TaskSessionStateCompleted {
+		return nil, errors.New("completed session did not become ready for a follow-up message")
+	}
+	return resumed, nil
+}
+
+func (h *Handlers) dispatchPreparedTaskMessage(ctx context.Context, taskID string, session *models.TaskSession, prompt string, metadata map[string]interface{}) (taskMessageDispatchResult, error) {
+	return h.dispatchPreparedTaskMessageWithAdmission(ctx, taskID, session, prompt, metadata, nil)
+}
+
+func (h *Handlers) dispatchPreparedTaskMessageWithAdmission(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+) (taskMessageDispatchResult, error) {
+	return h.dispatchPreparedTaskMessageWithAdmissionAndInterrupt(ctx, taskID, session, prompt, metadata, admission, false)
+}
+
+func (h *Handlers) dispatchPreparedTaskMessageWithAdmissionAndInterrupt(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+	interruptIfBusy bool,
+) (taskMessageDispatchResult, error) {
+	switch session.State {
+	case models.TaskSessionStateFailed, models.TaskSessionStateCancelled:
+		releasePeerMessageStartAdmission(admission)
+		return taskMessageDispatchResult{}, terminalSessionDispatchError(session)
+	case models.TaskSessionStateRunning, models.TaskSessionStateStarting:
+		releasePeerMessageStartAdmission(admission)
+		return h.queueTaskMessage(ctx, taskID, session, prompt, metadata)
+	default:
+		if h.shouldStartTaskMessageSession(ctx, session) {
+			return h.startPreparedPeerTaskMessage(ctx, taskID, session, prompt, metadata, admission, interruptIfBusy)
+		}
+		return h.promptPreparedTaskMessage(ctx, taskID, session, prompt, metadata, admission)
+	}
+}
+
+func releasePeerMessageStartAdmission(admission orchestrator.PeerMessageStartAdmission) {
+	if admission != nil {
+		admission.Release()
+	}
+}
+
+func (h *Handlers) startPreparedPeerTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+	interruptIfBusy bool,
+) (taskMessageDispatchResult, error) {
+	identity, admission, queued, err := h.admitPreparedPeerTaskMessage(ctx, taskID, session, prompt, metadata, admission, interruptIfBusy)
+	if err != nil {
+		return taskMessageDispatchResult{}, err
+	}
+	if queued != nil {
+		return *queued, nil
+	}
+	recorded := h.recordUserMessage(ctx, taskID, session.ID, prompt, metadata)
+	if admission != nil {
+		_, err = admission.StartCreatedSession(ctx, session.AgentProfileID, prompt, true, false, true, nil, nil)
+	} else {
+		_, err = h.sessionLauncher.StartCreatedSessionForPeerMessage(
+			ctx, identity, session.AgentProfileID, prompt, true, false, true, nil, nil,
+		)
+	}
+	if err != nil {
+		// The start admission owns cleanup for any turn it created. The handler
+		// removes only its message so it cannot abandon another launch's turn.
+		h.deleteRecordedUserMessageWithoutTurnRollback(ctx, recorded)
+		if errors.Is(err, executor.ErrExecutionAlreadyRunning) {
+			releasePeerMessageStartAdmission(admission)
+			return h.queueAfterUnownedPeerStart(ctx, taskID, session, identity, prompt, metadata, interruptIfBusy)
+		}
+		if errors.Is(err, messagequeue.ErrSessionIdentityMismatch) {
+			releasePeerMessageStartAdmission(admission)
+			return taskMessageDispatchResult{}, err
+		}
+		releasePeerMessageStartAdmission(admission)
+		return taskMessageDispatchResult{}, fmt.Errorf("failed to start session: %w", err)
+	}
+	releasePeerMessageStartAdmission(admission)
+	return taskMessageDispatchResult{status: "started", sessionID: session.ID}, nil
+}
+
+func (h *Handlers) admitPreparedPeerTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+	interruptIfBusy bool,
+) (messagequeue.QueueSessionIdentity, orchestrator.PeerMessageStartAdmission, *taskMessageDispatchResult, error) {
+	identity, err := h.resolveTaskMessageQueueIdentity(ctx, taskID, session)
+	if err != nil {
+		releasePeerMessageStartAdmission(admission)
+		return messagequeue.QueueSessionIdentity{}, nil, nil, err
+	}
+	if admission != nil && admission.SessionIdentity() != identity {
+		releasePeerMessageStartAdmission(admission)
+		admission = nil
+	}
+	if admission != nil {
+		return identity, admission, nil, nil
+	}
+	provider, ok := h.sessionLauncher.(peerMessageStartAdmissionProvider)
+	if !ok {
+		return identity, nil, nil, nil
+	}
+	admission, err = provider.BeginPeerMessageStart(ctx, identity)
+	if errors.Is(err, executor.ErrExecutionAlreadyRunning) {
+		result, queueErr := h.queueAfterUnownedPeerStart(ctx, taskID, session, identity, prompt, metadata, interruptIfBusy)
+		if queueErr != nil {
+			return messagequeue.QueueSessionIdentity{}, nil, nil, queueErr
+		}
+		return identity, nil, &result, nil
+	}
+	if err != nil {
+		return messagequeue.QueueSessionIdentity{}, nil, nil, err
+	}
+	return identity, admission, nil, nil
+}
+
+func (h *Handlers) promptPreparedTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	prompt string,
+	metadata map[string]interface{},
+	admission orchestrator.PeerMessageStartAdmission,
+) (taskMessageDispatchResult, error) {
+	releasePeerMessageStartAdmission(admission)
+	// Record before prompting so the message is tied to the turn PromptTask
+	// dispatches. If dispatch fails, remove the row before REVIEW rollback.
+	recorded := h.recordUserMessage(ctx, taskID, session.ID, prompt, metadata)
+	status, err := h.promptWithAutoResume(ctx, taskID, session.ID, prompt)
+	if err != nil {
+		h.deleteRecordedUserMessage(ctx, recorded)
+		return taskMessageDispatchResult{}, err
+	}
+	return taskMessageDispatchResult{status: status, sessionID: session.ID}, nil
+}
+
+func (h *Handlers) shouldStartTaskMessageSession(ctx context.Context, session *models.TaskSession) bool {
+	if session.State == models.TaskSessionStateCreated {
+		return true
+	}
+	// on_turn_start may mark a never-launched CREATED session as
+	// WAITING_FOR_INPUT before an executor row exists. It may also switch to a
+	// fresh waiting primary session. In both cases the first message still needs
+	// the launch path; already-bound waiting sessions use prompt/resume.
+	if session.State != models.TaskSessionStateWaitingForInput {
+		return false
+	}
+	if session.AgentExecutionID == "" {
+		return true
+	}
+	reader, ok := h.sessionRepo.(taskMessageExecutorReader)
+	if !ok {
+		return false
+	}
+	running, err := reader.GetExecutorRunningBySessionID(ctx, session.ID)
+	return err == nil && running != nil && running.Status == models.ExecutorRunningStatusPrepared
+}
+
+// queueTaskMessage appends prompt to the target session's FIFO message
+// queue for delivery on its next turn boundary (normal turn completion, or
+// an explicit interrupt — see queueThenInterruptTaskMessage). Returns the
+// queued entry's id via taskMessageDispatchResult.queuedEntryID so callers
+// that need to target this exact entry (rather than the FIFO head) can do
+// so later.
+func (h *Handlers) queueTaskMessage(ctx context.Context, taskID string, session *models.TaskSession, prompt string, metadata map[string]interface{}) (taskMessageDispatchResult, error) {
+	identity, err := h.resolveTaskMessageQueueIdentity(ctx, taskID, session)
+	if err != nil {
+		return taskMessageDispatchResult{}, err
+	}
+	return h.queueTaskMessageForIdentity(ctx, taskID, session, identity, prompt, metadata)
+}
+
+func (h *Handlers) resolveTaskMessageQueueIdentity(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+) (messagequeue.QueueSessionIdentity, error) {
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return messagequeue.QueueSessionIdentity{}, errors.New("message queue not available")
+	}
+	identity, err := queue.ResolveSessionIdentity(ctx, taskID, session.ID)
+	if err != nil {
+		return messagequeue.QueueSessionIdentity{}, fmt.Errorf("resolve queue session identity: %w", err)
+	}
+	if session.QueueIncarnationID != "" && identity.SessionIncarnationID != session.QueueIncarnationID {
+		return messagequeue.QueueSessionIdentity{}, messagequeue.ErrSessionIdentityMismatch
+	}
+	return identity, nil
+}
+
+func (h *Handlers) queueAfterUnownedPeerStart(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	identity messagequeue.QueueSessionIdentity,
+	prompt string,
+	metadata map[string]interface{},
+	interruptIfBusy bool,
+) (taskMessageDispatchResult, error) {
+	var result taskMessageDispatchResult
+	var err error
+	if interruptIfBusy {
+		result, err = h.queueAndInterruptTaskMessageForIdentity(ctx, taskID, session, identity, prompt, metadata)
+	} else {
+		result, err = h.queueTaskMessageForIdentity(ctx, taskID, session, identity, prompt, metadata)
+	}
+	if err != nil {
+		return taskMessageDispatchResult{}, &unownedPeerMessageStartError{cause: err}
+	}
+	return result, nil
+}
+
+func (h *Handlers) queueTaskMessageForIdentity(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	identity messagequeue.QueueSessionIdentity,
+	prompt string,
+	metadata map[string]interface{},
+) (taskMessageDispatchResult, error) {
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return taskMessageDispatchResult{}, errors.New("message queue not available")
+	}
+	if identity.TaskID != taskID || identity.SessionID != session.ID ||
+		(session.QueueIncarnationID != "" && identity.SessionIncarnationID != session.QueueIncarnationID) {
+		return taskMessageDispatchResult{}, messagequeue.ErrSessionIdentityMismatch
+	}
+	queued, err := queue.QueueMessageWithMetadataForSession(
+		ctx, identity, prompt, "", messagequeue.QueuedByAgent, false, nil, metadata,
+	)
+	if err != nil {
+		if errors.Is(err, messagequeue.ErrQueueFull) {
+			status, statusErr := queue.Snapshot(ctx, identity)
+			if statusErr != nil {
+				return taskMessageDispatchResult{}, fmt.Errorf("read full queue status: %w", statusErr)
+			}
+			return taskMessageDispatchResult{}, &queueFullDispatchError{
+				sessionID: session.ID,
+				queueSize: status.Count,
+				max:       status.Max,
+				entries:   status.Entries,
+			}
+		}
+		return taskMessageDispatchResult{}, fmt.Errorf("failed to queue message: %w", err)
+	}
+	h.sessionLauncher.CheckQueueAdmissionReadiness(ctx, identity)
+	h.publishQueueStatusEvent(ctx, identity, queue)
+	return taskMessageDispatchResult{status: taskMessageStatusQueued, sessionID: session.ID, queuedEntryID: queued.ID}, nil
+}
+
+// queueThenInterruptTaskMessage atomically queues prompt for a running/
+// starting session and interrupts its current turn so the message is
+// delivered right away instead of waiting for the turn to end naturally.
+// Used only when the sender is the target's parent task (see
+// handleMessageTask); regular peer messages keep the default queue-and-wait
+// behavior documented on message_task_kandev via queueTaskMessage.
+//
+// "Queue" and "interrupt" must be one atomic orchestrator call
+// (QueueAndInterruptForPeerMessage), not queueTaskMessage followed by a
+// separate interrupt call: between an insert becoming visible and a later,
+// separate interrupt call claiming the session's cancel lock, the child's
+// turn could complete naturally and the orchestrator's normal FIFO drain
+// could grab the just-queued entry and start dispatching it as an ordinary
+// turn — only for the later interrupt's cancel to land on and kill that
+// very turn, orphaning the parent's message mid-delivery. See
+// QueueAndInterruptForPeerMessage's doc comment for the full race this
+// closes.
+//
+// The returned status reflects what actually happened: "sent" only when
+// the interrupt actually dispatched the message immediately (the returned
+// bool), or "queued" when the cancel-and-take step ran but genuinely
+// failed to dispatch anything (see cancelAndTakeForPeerMessage's doc
+// comment for that case — it does not include lock contention, since
+// QueueAndInterruptForPeerMessage always waits for the lock rather than
+// skipping a busy one).
+// A failure past the queue insert is deliberately NOT surfaced as an error to the caller —
+// the message is already safely persisted and will still be delivered by
+// the normal turn-completion drain, so the interrupt is purely a latency
+// optimization on top of that always-safe default. The calling agent has
+// no useful recovery action on a hard error here besides retrying
+// message_task_kandev, and retrying would enqueue a second copy of the
+// same message since queuing is not idempotent — reporting the accurate
+// "queued" status avoids inviting that duplicate. The failure is still
+// logged server-side for operators.
+func (h *Handlers) queueThenInterruptTaskMessage(ctx context.Context, taskID string, session *models.TaskSession, prompt string, metadata map[string]interface{}) (taskMessageDispatchResult, error) {
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return taskMessageDispatchResult{}, errors.New("message queue not available")
+	}
+	identity, err := queue.ResolveSessionIdentity(ctx, taskID, session.ID)
+	if err != nil {
+		return taskMessageDispatchResult{}, fmt.Errorf("resolve queue session identity: %w", err)
+	}
+	if session.QueueIncarnationID != "" &&
+		identity.SessionIncarnationID != session.QueueIncarnationID {
+		return taskMessageDispatchResult{}, messagequeue.ErrSessionIdentityMismatch
+	}
+	return h.queueAndInterruptTaskMessageForIdentity(ctx, taskID, session, identity, prompt, metadata)
+}
+
+func (h *Handlers) queueAndInterruptTaskMessageForIdentity(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	identity messagequeue.QueueSessionIdentity,
+	prompt string,
+	metadata map[string]interface{},
+) (taskMessageDispatchResult, error) {
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return taskMessageDispatchResult{}, errors.New("message queue not available")
+	}
+	if identity.TaskID != taskID || identity.SessionID != session.ID ||
+		(session.QueueIncarnationID != "" && identity.SessionIncarnationID != session.QueueIncarnationID) {
+		return taskMessageDispatchResult{}, messagequeue.ErrSessionIdentityMismatch
+	}
+	queued, dispatched, err := h.sessionLauncher.QueueAndInterruptForPeerMessage(ctx, identity, prompt, metadata)
+	if err != nil {
+		if errors.Is(err, messagequeue.ErrQueueFull) {
+			status, statusErr := queue.Snapshot(ctx, identity)
+			if statusErr != nil {
+				return taskMessageDispatchResult{}, fmt.Errorf("read full queue status: %w", statusErr)
+			}
+			return taskMessageDispatchResult{}, &queueFullDispatchError{
+				sessionID: session.ID,
+				queueSize: status.Count,
+				max:       status.Max,
+				entries:   status.Entries,
+			}
+		}
+		if queued == nil {
+			return taskMessageDispatchResult{}, fmt.Errorf("failed to queue and interrupt message: %w", err)
+		}
+		// The message is already safely queued (queued != nil); only the
+		// interrupt step failed — see the doc comment above for why that
+		// is not surfaced as an error to the caller.
+		h.logger.Warn("failed to interrupt child session's turn; message stays queued for normal drain",
+			zap.String("task_id", taskID),
+			zap.String("session_id", session.ID),
+			zap.Error(err))
+		return taskMessageDispatchResult{status: taskMessageStatusQueued, sessionID: session.ID, queuedEntryID: queued.ID}, nil
+	}
+	result := taskMessageDispatchResult{status: taskMessageStatusQueued, sessionID: session.ID, queuedEntryID: queued.ID}
+	if dispatched {
+		result.status = taskMessageStatusSent
+	}
+	return result, nil
+}
+
+func (h *Handlers) prepareSessionForTaskMessage(
+	ctx context.Context,
+	taskID string,
+	session *models.TaskSession,
+	pinnedTarget bool,
+	admission orchestrator.PeerMessageStartAdmission,
+) (*models.TaskSession, orchestrator.ProcessOnTurnStartResult, error) {
+	var turnStartResult orchestrator.ProcessOnTurnStartResult
+	var err error
+	if admission != nil && admission.SessionIdentity().TaskID == taskID && admission.SessionIdentity().SessionID == session.ID {
+		turnStartResult, err = admission.ProcessOnTurnStart(ctx, taskID, session.ID)
+	} else {
+		turnStartResult, err = h.sessionLauncher.ProcessOnTurnStart(ctx, taskID, session.ID)
+	}
+	if err != nil {
+		return nil, orchestrator.ProcessOnTurnStartResult{}, fmt.Errorf("failed to process on_turn_start for task message: %w", err)
+	}
+	if pinnedTarget {
+		// The caller addressed this exact session — never reroute to the
+		// task's primary session, just pick up any state change from
+		// on_turn_start.
+		reloaded, err := h.taskSvc.GetTaskSession(ctx, session.ID)
+		if err != nil {
+			return nil, orchestrator.ProcessOnTurnStartResult{}, fmt.Errorf("failed to reload pinned target session after on_turn_start: %w", err)
+		}
+		return reloaded, turnStartResult, nil
+	}
+	resolved, err := h.resolveSessionAfterTaskMessageTurnStart(ctx, taskID, session)
+	if err != nil {
+		return nil, orchestrator.ProcessOnTurnStartResult{}, err
+	}
+	return resolved, turnStartResult, nil
+}
+
+func (h *Handlers) ensureTaskInProgressForTaskMessage(ctx context.Context, taskID string) (taskMessageReviewRollback, error) {
+	if h.taskSvc == nil {
+		return taskMessageReviewRollback{}, errors.New("task service not available")
+	}
+	task, err := h.taskSvc.GetTask(ctx, taskID)
+	if err != nil {
+		return taskMessageReviewRollback{}, err
+	}
+	rollback := taskMessageReviewRollback{
+		taskID:                 taskID,
+		changed:                true,
+		restoreTask:            true,
+		taskState:              task.State,
+		workflowStepID:         task.WorkflowStepID,
+		expectedTaskState:      task.State,
+		expectedWorkflowStepID: task.WorkflowStepID,
+		hasExpectedTaskState:   true,
+	}
+	if task.State != v1.TaskStateReview {
+		return rollback, nil
+	}
+	if task.IsFromOffice {
+		return rollback, nil
+	}
+	updated, err := h.taskSvc.UpdateTaskState(ctx, taskID, v1.TaskStateInProgress)
+	if err != nil {
+		return taskMessageReviewRollback{}, fmt.Errorf("failed to transition task from REVIEW to IN_PROGRESS for task message: %w", err)
+	}
+	rollback.expectedTaskState = updated.State
+	rollback.expectedWorkflowStepID = updated.WorkflowStepID
+	h.logger.Info("task transitioned from REVIEW to IN_PROGRESS for task message",
+		zap.String("task_id", taskID))
+	return rollback, nil
+}
+
+func (h *Handlers) restoreTaskReviewForTaskMessage(ctx context.Context, taskID string, rollback taskMessageReviewRollback) {
+	if !rollback.changed {
+		return
+	}
+	if err := h.restoreTaskMessageSessions(ctx, rollback); err != nil {
+		h.logger.Warn("failed to restore task session after task message dispatch failure",
+			zap.String("task_id", taskID),
+			zap.Error(err))
+		// A coordinator cancellation owns the terminal session/task state and
+		// intentionally preserves the current queue. Never continue into task
+		// or queue snapshot restoration after that ownership is observed.
+		return
+	}
+	if rollback.restoreTask {
+		if !rollback.hasExpectedTaskState {
+			h.logger.Warn("skipping task and queue rollback without an owning task state",
+				zap.String("task_id", taskID))
+			return
+		}
+		ownerID, ownerState, ok := rollback.taskRestoreOwner()
+		if !ok {
+			h.logger.Warn("skipping task message rollback without an owning session",
+				zap.String("task_id", taskID))
+			return
+		}
+		taskState := rollback.taskState
+		if taskState == "" {
+			taskState = v1.TaskStateReview
+		}
+		_, restored, err := h.taskSvc.RestoreTaskMessageRollback(
+			ctx,
+			taskID,
+			ownerID,
+			ownerState,
+			rollback.expectedTaskState,
+			rollback.expectedWorkflowStepID,
+			taskState,
+			rollback.workflowStepID,
+		)
+		if err != nil {
+			h.logger.Warn("failed to restore task after task message dispatch failure",
+				zap.String("task_id", taskID),
+				zap.Error(err))
+			return
+		}
+		if !restored {
+			h.logger.Info("skipping task and queue rollback because session ownership changed",
+				zap.String("task_id", taskID),
+				zap.String("session_id", ownerID))
+			return
+		}
+	}
+	if err := h.restoreTaskMessageQueues(ctx, rollback); err != nil {
+		h.logger.Warn("failed to restore task message queue after dispatch failure",
+			zap.String("task_id", taskID),
+			zap.Error(err))
+	}
+}
+
+func (r taskMessageReviewRollback) taskRestoreOwner() (string, models.TaskSessionState, bool) {
+	primaryID := r.primarySessionID()
+	for _, snapshot := range r.sessions {
+		if snapshot.sessionID == primaryID {
+			return snapshot.sessionID, snapshot.state, snapshot.hasExpectedState
+		}
+	}
+	if len(r.sessions) == 0 {
+		return "", "", false
+	}
+	return r.sessions[0].sessionID, r.sessions[0].state, r.sessions[0].hasExpectedState
+}
+
+func (h *Handlers) restoreTaskMessageSessions(ctx context.Context, rollback taskMessageReviewRollback) error {
+	if len(rollback.sessions) == 0 {
+		return nil
+	}
+	repo, ok := h.sessionRepo.(taskMessageSessionRollbackRepository)
+	if !ok {
+		return errors.New("session rollback repository not available")
+	}
+	for _, snapshot := range rollback.sessions {
+		if _, err := loadOwnedTaskMessageSessionSnapshot(ctx, repo, snapshot); err != nil {
+			return err
+		}
+	}
+	if rollback.selectedID != "" {
+		if _, existed := rollback.sessionIDs[rollback.selectedID]; !existed {
+			return fmt.Errorf("task message rollback cannot delete unowned selected session %q", rollback.selectedID)
+		}
+	}
+	for _, snapshot := range rollback.sessions {
+		if err := restoreTaskMessageSessionSnapshot(ctx, repo, snapshot); err != nil {
+			return err
+		}
+	}
+	return h.restoreSelectedTaskMessageSession(ctx, repo, rollback)
+}
+
+func (h *Handlers) restoreSelectedTaskMessageSession(ctx context.Context, repo taskMessageSessionRollbackRepository, rollback taskMessageReviewRollback) error {
+	if rollback.selectedID == "" {
+		return nil
+	}
+	if _, ok := rollback.sessionIDs[rollback.selectedID]; ok {
+		return nil
+	}
+	primaryID := rollback.primarySessionID()
+	selected, err := repo.GetTaskSession(ctx, rollback.selectedID)
+	if err != nil && !errors.Is(err, models.ErrTaskSessionNotFound) {
+		return err
+	}
+	if selected != nil && selected.State == models.TaskSessionStateCancelled {
+		return errTaskMessageRollbackSuperseded
+	}
+	if selected != nil && (!rollback.hasSelectedState || selected.State != rollback.selectedState) {
+		return fmt.Errorf("task message rollback lost selected session %q state ownership", rollback.selectedID)
+	}
+	taskID := rollback.taskID
+	if selected != nil && selected.TaskID != "" {
+		taskID = selected.TaskID
+	}
+	if taskID == "" {
+		if snapshot, ok := rollback.queues[rollback.selectedID]; ok {
+			for _, entry := range snapshot.entries {
+				if entry.TaskID != "" {
+					taskID = entry.TaskID
+					break
+				}
+			}
+		}
+	}
+	if primaryID != "" && rollback.selectedID != primaryID {
+		if err := h.restoreTaskMessageQueueOwner(ctx, taskID, rollback.selectedID, primaryID); err != nil {
+			return err
+		}
+	}
+	return h.deleteTaskMessageRollbackSession(ctx, repo, selected)
+}
+
+func (h *Handlers) deleteTaskMessageRollbackSession(
+	ctx context.Context,
+	repo taskMessageSessionRollbackRepository,
+	session *models.TaskSession,
+) error {
+	if deleter, ok := repo.(taskMessageSessionAttachmentDeleter); ok {
+		attachments, err := deleter.DeleteTaskSessionWithAttachments(ctx, session)
+		if err != nil {
+			return err
+		}
+		if h.taskSvc != nil {
+			if attachmentSvc := h.taskSvc.AttachmentService(); attachmentSvc != nil {
+				attachmentSvc.RemoveBytes(attachments)
+			}
+		}
+	} else if err := repo.DeleteTaskSession(ctx, session); err != nil {
+		return err
+	}
+	if h.eventBus == nil {
+		return nil
+	}
+	return h.eventBus.Publish(ctx, events.SessionRemoved, bus.NewEvent(
+		events.SessionRemoved,
+		"mcp-handlers",
+		map[string]interface{}{"session_id": session.ID, "task_id": session.TaskID},
+	))
+}
+
+func (r taskMessageReviewRollback) primarySessionID() string {
+	for _, session := range r.sessions {
+		if session.isPrimary {
+			return session.sessionID
+		}
+	}
+	return ""
+}
+
+func (h *Handlers) restoreTaskMessageQueues(ctx context.Context, rollback taskMessageReviewRollback) error {
+	if len(rollback.queues) == 0 {
+		return nil
+	}
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return nil
+	}
+	restoreCtx := context.WithoutCancel(ctx)
+	for sessionID, snapshot := range rollback.queues {
+		if err := h.restoreTaskMessageQueue(restoreCtx, queue, sessionID, snapshot); err != nil {
+			return err
+		}
+		h.publishQueueStatusEvent(restoreCtx, snapshot.identity, queue)
+	}
+	return nil
+}
+
+func (h *Handlers) restoreTaskMessageQueue(ctx context.Context, queue *messagequeue.Service, sessionID string, snapshot taskMessageQueueRollback) error {
+	var pendingMove *messagequeue.PendingMove
+	if snapshot.hadPendingMove {
+		pendingMove = cloneTaskMessagePendingMove(snapshot.pendingMove)
+	}
+	return queue.RestoreSessionForIdentity(ctx, snapshot.identity, cloneTaskMessageQueuedMessages(snapshot.entries), pendingMove)
+}
+
+//nolint:cyclop // Queue-owner restoration validates two identities and rolls back attachment transfer on failure.
+func (h *Handlers) restoreTaskMessageQueueOwner(ctx context.Context, taskID, selectedID, primaryID string) error {
+	queue := h.sessionLauncher.GetMessageQueue()
+	if queue == nil {
+		return nil
+	}
+	selected, err := h.sessionRepo.GetTaskSession(ctx, selectedID)
+	if err != nil {
+		return fmt.Errorf("load selected queue owner: %w", err)
+	}
+	if selected == nil {
+		return fmt.Errorf("load selected queue owner %q: not found", selectedID)
+	}
+	primary, err := h.sessionRepo.GetTaskSession(ctx, primaryID)
+	if err != nil {
+		return fmt.Errorf("load primary queue owner: %w", err)
+	}
+	if primary == nil {
+		return fmt.Errorf("load primary queue owner %q: not found", primaryID)
+	}
+	selectedIdentity, err := queue.ResolveSessionIdentity(ctx, selected.TaskID, selected.ID)
+	if err != nil {
+		return fmt.Errorf("resolve selected queue owner: %w", err)
+	}
+	if selected.QueueIncarnationID != "" &&
+		selectedIdentity.SessionIncarnationID != selected.QueueIncarnationID {
+		return messagequeue.ErrSessionIdentityMismatch
+	}
+	primaryIdentity, err := queue.ResolveSessionIdentity(ctx, primary.TaskID, primary.ID)
+	if err != nil {
+		return fmt.Errorf("resolve primary queue owner: %w", err)
+	}
+	if primary.QueueIncarnationID != "" &&
+		primaryIdentity.SessionIncarnationID != primary.QueueIncarnationID {
+		return messagequeue.ErrSessionIdentityMismatch
+	}
+	transferCtx := context.WithoutCancel(ctx)
+	transferErr := queue.TransferSessionWithDurableAttachmentPreparation(
+		transferCtx,
+		taskID,
+		selectedID,
+		primaryID,
+		func(admittedCtx context.Context, attachmentIDs []string) error {
+			if h.taskSvc == nil {
+				return errors.New("session attachment transfer service is unavailable")
+			}
+			if err := h.taskSvc.TransferSessionMessageAttachments(
+				admittedCtx, taskID, selectedID, primaryID, attachmentIDs,
+			); err != nil {
+				return fmt.Errorf("transfer session attachments: %w", err)
+			}
+			return nil
+		},
+		func(rollbackCtx context.Context, attachmentIDs []string) error {
+			if h.taskSvc == nil {
+				return errors.New("session attachment transfer service is unavailable")
+			}
+			return h.taskSvc.TransferSessionMessageAttachments(
+				rollbackCtx, taskID, primaryID, selectedID, attachmentIDs,
+			)
+		},
+	)
+	if transferErr != nil {
+		return transferErr
+	}
+	h.publishQueueStatusEvent(transferCtx, selectedIdentity, queue)
+	h.publishQueueStatusEvent(transferCtx, primaryIdentity, queue)
+	return nil
+}
+func restoreTaskMessageSessionSnapshot(ctx context.Context, repo taskMessageSessionRollbackRepository, rollback taskMessageSessionRollback) error {
+	session, err := loadOwnedTaskMessageSessionSnapshot(ctx, repo, rollback)
+	if err != nil {
+		return err
+	}
+	if taskMessageSessionMatchesRollbackSnapshot(session, rollback) {
+		return nil
+	}
+	expectedState := rollback.expectedState
+	session.State = rollback.state
+	session.ErrorMessage = rollback.error
+	session.CompletedAt = rollback.completedAt
+	session.IsPrimary = rollback.isPrimary
+	session.AgentProfileID = rollback.agentProfileID
+	session.ExecutorProfileID = rollback.executorProfileID
+	session.AgentProfileSnapshot = cloneTaskMessageMetadataMap(rollback.agentProfileSnapshot)
+	changed, err := repo.UpdateTaskSessionIfCurrentSnapshot(
+		ctx, session, expectedState, session.UpdatedAt, cloneTaskMessageMetadataMap(rollback.metadata),
+	)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		latest, loadErr := repo.GetTaskSession(ctx, rollback.sessionID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if latest != nil && latest.State == models.TaskSessionStateCancelled {
+			return errTaskMessageRollbackSuperseded
+		}
+		return fmt.Errorf("task message rollback lost session %q state ownership", rollback.sessionID)
+	}
+	if rollback.isPrimary {
+		if err := repo.SetSessionPrimary(ctx, rollback.sessionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadOwnedTaskMessageSessionSnapshot(
+	ctx context.Context,
+	repo taskMessageSessionRollbackRepository,
+	rollback taskMessageSessionRollback,
+) (*models.TaskSession, error) {
+	if !rollback.hasExpectedState {
+		return nil, fmt.Errorf("task message rollback has no owning state for session %q", rollback.sessionID)
+	}
+	session, err := repo.GetTaskSession(ctx, rollback.sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		return nil, fmt.Errorf("task message rollback session %q is nil", rollback.sessionID)
+	}
+	if session.TaskID != rollback.taskID ||
+		(rollback.sessionIncarnationID != "" && session.QueueIncarnationID != rollback.sessionIncarnationID) {
+		return nil, messagequeue.ErrSessionIdentityMismatch
+	}
+	if session.State == models.TaskSessionStateCancelled {
+		return nil, errTaskMessageRollbackSuperseded
+	}
+	if session.State != rollback.expectedState {
+		return nil, fmt.Errorf("task message rollback lost session %q state ownership", rollback.sessionID)
+	}
+	if !rollback.allowOwnedRevisionAdvance && !session.UpdatedAt.Equal(rollback.expectedUpdatedAt) {
+		return nil, fmt.Errorf("task message rollback lost session %q revision ownership", rollback.sessionID)
+	}
+	if !taskMessageSessionRollbackOwnsCurrentState(session, rollback) {
+		return nil, fmt.Errorf("task message rollback lost session %q field ownership", rollback.sessionID)
+	}
+	return session, nil
+}
+
+func taskMessageSessionRollbackOwnsCurrentState(session *models.TaskSession, rollback taskMessageSessionRollback) bool {
+	return session.ErrorMessage == rollback.expectedError &&
+		equalTaskMessageTime(session.CompletedAt, rollback.expectedCompletedAt) &&
+		session.IsPrimary == rollback.expectedIsPrimary &&
+		session.AgentProfileID == rollback.expectedAgentProfileID &&
+		session.ExecutorProfileID == rollback.expectedExecutorProfileID &&
+		reflect.DeepEqual(session.AgentProfileSnapshot, rollback.expectedAgentProfileSnapshot) &&
+		reflect.DeepEqual(session.Metadata, rollback.expectedMetadata)
+}
+
+func taskMessageSessionMatchesRollbackSnapshot(session *models.TaskSession, rollback taskMessageSessionRollback) bool {
+	return session.State == rollback.state &&
+		session.ErrorMessage == rollback.error &&
+		equalTaskMessageTime(session.CompletedAt, rollback.completedAt) &&
+		session.IsPrimary == rollback.isPrimary &&
+		session.AgentProfileID == rollback.agentProfileID &&
+		session.ExecutorProfileID == rollback.executorProfileID &&
+		reflect.DeepEqual(session.AgentProfileSnapshot, rollback.agentProfileSnapshot) &&
+		reflect.DeepEqual(session.Metadata, rollback.metadata)
+}
+
+func equalTaskMessageTime(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func (h *Handlers) resolveSessionAfterTaskMessageTurnStart(ctx context.Context, taskID string, submitted *models.TaskSession) (*models.TaskSession, error) {
+	if h.taskSvc == nil {
+		return nil, errors.New("task service not available")
+	}
+	reloaded, err := h.taskSvc.GetTaskSession(ctx, submitted.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload session after on_turn_start: %w", err)
+	}
+	primary, err := h.taskSvc.GetPrimarySession(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve primary session after on_turn_start: %w", err)
+	}
+	if primary != nil && primary.ID != submitted.ID {
+		return primary, nil
+	}
+	if reloaded.State != models.TaskSessionStateCompleted {
+		return reloaded, nil
+	}
+	if primary == nil {
+		return nil, errors.New("session was switched but no active session found")
+	}
+	if primary.ID != submitted.ID {
+		return primary, nil
+	}
+	if submitted.State == models.TaskSessionStateCompleted {
+		return reloaded, nil
+	}
+	return nil, errors.New("session was marked completed by on_turn_start but primary was not switched")
+}
+
+// recordUserMessage writes the prompt to the task's chat as a user message so it
+// is visible in the conversation. Mirrors the message.add path used by the UI.
+// metadata is attached to the resulting Message row (used for sender_task_id /
+// sender_task_title / sender_session_id when called from handleMessageTask).
+func (h *Handlers) recordUserMessage(ctx context.Context, taskID, sessionID, prompt string, metadata map[string]interface{}) *models.Message {
+	if h.taskSvc == nil {
+		return nil
+	}
+	message, err := h.taskSvc.CreateMessage(ctx, &service.CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        taskID,
+		Content:       prompt,
+		AuthorType:    "user",
+		Metadata:      metadata,
+	})
+	if err != nil {
+		h.logger.Warn("failed to record user message for message_task",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return nil
+	}
+	return message
+}
+
+func (h *Handlers) deleteRecordedUserMessage(ctx context.Context, message *models.Message) {
+	h.deleteRecordedUserMessageWithTurnRollback(ctx, message, true)
+}
+
+func (h *Handlers) deleteRecordedUserMessageWithoutTurnRollback(ctx context.Context, message *models.Message) {
+	h.deleteRecordedUserMessageWithTurnRollback(ctx, message, false)
+}
+
+func (h *Handlers) deleteRecordedUserMessageWithTurnRollback(ctx context.Context, message *models.Message, abandonOpenTurns bool) {
+	if h.taskSvc == nil || message == nil {
+		return
+	}
+	if err := h.taskSvc.DeleteMessage(ctx, message.ID); err != nil {
+		h.logger.Warn("failed to delete rejected user message for message_task",
+			zap.String("message_id", message.ID),
+			zap.String("task_id", message.TaskID),
+			zap.String("session_id", message.TaskSessionID),
+			zap.Error(err))
+	}
+	if abandonOpenTurns {
+		if err := h.taskSvc.AbandonOpenTurns(ctx, message.TaskSessionID); err != nil {
+			h.logger.Warn("failed to abandon rejected user message turn for message_task",
+				zap.String("message_id", message.ID),
+				zap.String("task_id", message.TaskID),
+				zap.String("session_id", message.TaskSessionID),
+				zap.Error(err))
+		}
+	}
+}
+
+// promptWithAutoResume sends a prompt to a session and resumes the agent
+// transparently if it has been torn down (mirrors message.add behaviour).
+// Uses dispatch-only mode so the MCP tool returns once the prompt is accepted
+// rather than blocking for the entire target turn.
+func (h *Handlers) promptWithAutoResume(ctx context.Context, taskID, sessionID, prompt string) (string, error) {
+	_, err := h.sessionLauncher.PromptTask(ctx, taskID, sessionID, prompt, "", false, nil, true)
+	if err == nil {
+		return taskMessageStatusSent, nil
+	}
+	if !errors.Is(err, executor.ErrExecutionNotFound) {
+		return "", fmt.Errorf("failed to send prompt: %w", err)
+	}
+	if _, resumeErr := h.sessionLauncher.ResumeTaskSession(ctx, taskID, sessionID); resumeErr != nil {
+		return "", fmt.Errorf("failed to resume session: %w", resumeErr)
+	}
+	// ResumeTaskSession starts the agent asynchronously. Poll until the session
+	// is ready to accept prompts so the retry doesn't race the agent boot.
+	if waitErr := h.taskSvc.WaitForSessionReady(ctx, sessionID); waitErr != nil {
+		return "", fmt.Errorf("session not ready after resume: %w", waitErr)
+	}
+	if _, retryErr := h.sessionLauncher.PromptTask(ctx, taskID, sessionID, prompt, "", false, nil, true); retryErr != nil {
+		return "", fmt.Errorf("failed to send prompt after resume: %w", retryErr)
+	}
+	return taskMessageStatusSent, nil
+}
+
+// publishQueueStatusEvent fires a queue.status_changed event so the frontend
+// can update the queue indicator.
+func (h *Handlers) publishQueueStatusEvent(
+	ctx context.Context,
+	identity messagequeue.QueueSessionIdentity,
+	queue *messagequeue.Service,
+) {
+	if h.eventBus == nil {
+		return
+	}
+	status, err := queue.Snapshot(ctx, identity)
+	if err != nil {
+		return
+	}
+	eventData := map[string]interface{}{
+		keyTaskID:                status.TaskID,
+		keySessionID:             status.SessionID,
+		"session_incarnation_id": status.SessionIncarnationID,
+		"status_epoch":           status.StatusEpoch,
+		"status_generation":      status.StatusGeneration,
+		"entries":                status.Entries,
+		"count":                  status.Count,
+		"max":                    status.Max,
+		"auto_run":               status.AutoRun,
+		"merge_enabled":          status.MergeEnabled,
+		"auto_merge_available":   status.AutoMergeAvailable,
+	}
+	if status.AutoMergeEnabled != nil {
+		eventData[keyAutoMergeEnabled] = *status.AutoMergeEnabled
+	}
+	if status.AutoMergeSource != "" {
+		eventData["auto_merge_source"] = status.AutoMergeSource
+	}
+	if status.AutoMergeRevision != nil {
+		eventData["auto_merge_revision"] = *status.AutoMergeRevision
+	}
+	_ = h.eventBus.Publish(ctx, events.MessageQueueStatusChanged, bus.NewEvent(
+		events.MessageQueueStatusChanged,
+		"mcp-handlers",
+		eventData,
+	))
+}
+
+// handleAskUserQuestion creates a clarification request and blocks until the user responds.
+// The agent's MCP tool call stays open (same turn) while waiting. If the agent times out,
+// the event-based fallback in the orchestrator handles resuming with a new turn.
+func (h *Handlers) handleAskUserQuestion(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		SessionID         string                   `json:"session_id"`
+		TaskID            string                   `json:"task_id"`
+		Questions         []clarification.Question `json:"questions"`
+		Context           string                   `json:"context"`
+		AllowFreeTextOnly bool                     `json:"allow_free_text_only,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session_id is required", nil)
+	}
+	// Single source of truth — same validator the HTTP handler uses, so
+	// duplicate IDs / bad option counts / empty prompts can't slip through
+	// either path.
+	validateQuestions := clarification.NormalizeAndValidateQuestions
+	if req.AllowFreeTextOnly {
+		validateQuestions = clarification.NormalizeAndValidateQuestionsAllowFreeTextOnly
+	}
+	if errMsg := validateQuestions(req.Questions); errMsg != "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, errMsg, nil)
+	}
+
+	// Look up task ID from session if not provided
+	taskID := req.TaskID
+	if taskID == "" {
+		session, err := h.sessionRepo.GetTaskSession(ctx, req.SessionID)
+		if err != nil {
+			h.logger.Warn("failed to look up task for session",
+				zap.String("session_id", req.SessionID),
+				zap.Error(err))
+		} else if session != nil {
+			taskID = session.TaskID
+		}
+	}
+
+	// Create the clarification request
+	clarificationReq := &clarification.Request{
+		SessionID: req.SessionID,
+		TaskID:    taskID,
+		Questions: req.Questions,
+		Context:   req.Context,
+	}
+	pendingID, isNew := h.clarificationSvc.CreateRequest(clarificationReq)
+
+	// Create one chat message per question (triggers WS events to frontend).
+	// If the create fails, the in-store pending entry must be cancelled too —
+	// otherwise the agent's WaitForResponse would block for the full 2-hour
+	// timeout while the user never sees clarification cards.
+	// When dedup fires (isNew=false) the messages already exist, so skip creation.
+	if isNew && h.messageCreator != nil {
+		if _, err := h.messageCreator.CreateClarificationRequestMessages(
+			ctx, taskID, req.SessionID, pendingID, req.Questions, req.Context,
+		); err != nil {
+			h.logger.Error("failed to create clarification request messages",
+				zap.String("pending_id", pendingID),
+				zap.String("session_id", req.SessionID),
+				zap.Error(err))
+			h.clarificationSvc.CancelRequest(pendingID)
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+				"failed to create clarification messages: "+err.Error(), nil)
+		}
+	}
+
+	// Update session and task states to waiting for input
+	h.setSessionWaitingForInput(ctx, taskID, req.SessionID)
+
+	h.logger.Info("clarification request created, waiting for user response",
+		zap.String("pending_id", pendingID),
+		zap.String("session_id", req.SessionID),
+		zap.String("task_id", taskID))
+
+	// WaitForResponse can outlast the agent client's idle watchdog because the
+	// MCP server emits progress while this call is blocked. If the agent
+	// cancels, cleanup and the event fallback resume the interaction on a new
+	// turn.
+	resp, err := h.clarificationSvc.WaitForResponse(ctx, pendingID)
+	if err != nil {
+		if h.inputPauser != nil {
+			if _, pauseErr := h.inputPauser.PauseForClarificationInput(context.WithoutCancel(ctx), req.SessionID); pauseErr != nil {
+				h.logger.Warn("failed to pause session after clarification ended without answer",
+					zap.String("pending_id", pendingID),
+					zap.String("session_id", req.SessionID),
+					zap.Error(pauseErr))
+			}
+		}
+		h.logger.Warn("clarification wait ended without response",
+			zap.String("pending_id", pendingID),
+			zap.String("session_id", req.SessionID),
+			zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"Clarification request timed out or was cancelled", nil)
+	}
+
+	// User responded — set session back to running
+	h.setSessionRunning(ctx, taskID, req.SessionID)
+
+	h.logger.Info("clarification answered, returning to agent",
+		zap.String("pending_id", pendingID),
+		zap.String("session_id", req.SessionID),
+		zap.Bool("rejected", resp.Rejected))
+
+	// Return response in format expected by agentctl's extractQuestionAnswer
+	return ws.NewResponse(msg.ID, msg.Action, resp)
+}
+
+// setSessionRunning restores the session state to running after a clarification is answered.
+func (h *Handlers) setSessionRunning(ctx context.Context, taskID, sessionID string) {
+	changed, updatedAt, err := h.updateClarificationSessionState(
+		ctx,
+		sessionID,
+		models.TaskSessionStateWaitingForInput,
+		models.TaskSessionStateRunning,
+	)
+	if err != nil {
+		h.logger.Warn("failed to update session state to RUNNING",
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return
+	}
+	if !changed {
+		return
+	}
+	if taskID != "" {
+		taskStateChanged, err := h.setTaskInProgressForClarification(ctx, taskID, sessionID)
+		if err != nil {
+			h.logger.Warn("failed to update task state to IN_PROGRESS",
+				zap.String("task_id", taskID),
+				zap.Error(err))
+		} else if !taskStateChanged {
+			h.logger.Debug("skipping stale clarification resume after session state changed",
+				zap.String("task_id", taskID),
+				zap.String("session_id", sessionID))
+			return
+		}
+	}
+
+	// Publish session state changed event after any task event for this task.
+	if h.eventBus == nil {
+		return
+	}
+	eventData := map[string]any{
+		"task_id":    taskID,
+		"session_id": sessionID,
+		"new_state":  string(models.TaskSessionStateRunning),
+	}
+	if !updatedAt.IsZero() {
+		eventData["updated_at"] = updatedAt.UTC().Format(time.RFC3339Nano)
+	} else if persistedUpdatedAt, ok := h.sessionUpdatedAtForStateEvent(ctx, sessionID); ok {
+		eventData["updated_at"] = persistedUpdatedAt
+	} else {
+		h.logger.Warn("skipping session state_changed publish; could not load authoritative updated_at",
+			zap.String("session_id", sessionID))
+		return
+	}
+	publish := func(publicationCtx context.Context) {
+		_ = h.eventBus.Publish(publicationCtx, events.TaskSessionStateChanged, bus.NewEvent(
+			events.TaskSessionStateChanged,
+			"mcp-handlers",
+			eventData,
+		))
+	}
+	if h.taskSvc != nil && taskID != "" {
+		h.taskSvc.PublishAfterTaskEvents(ctx, taskID, events.TaskSessionStateChanged, publish)
+		return
+	}
+	publish(ctx)
+}
+
+func (h *Handlers) setTaskInProgressForClarification(
+	ctx context.Context,
+	taskID, sessionID string,
+) (bool, error) {
+	if h.taskSvc != nil {
+		return h.taskSvc.UpdateTaskStateIfSessionState(
+			ctx,
+			taskID,
+			sessionID,
+			models.TaskSessionStateRunning,
+			v1.TaskStateInProgress,
+		)
+	}
+	if updater, ok := h.taskRepo.(sessionOwnedTaskStateUpdater); ok {
+		_, updated, err := updater.UpdateTaskStateIfSessionState(
+			ctx,
+			taskID,
+			sessionID,
+			models.TaskSessionStateRunning,
+			v1.TaskStateInProgress,
+		)
+		return updated, err
+	}
+	if err := h.taskRepo.UpdateTaskState(ctx, taskID, v1.TaskStateInProgress); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// setSessionWaitingForInput updates the session and task states to waiting for input
+func (h *Handlers) setSessionWaitingForInput(ctx context.Context, taskID, sessionID string) {
+	changed, updatedAt, err := h.updateSessionWaitingForClarification(ctx, sessionID)
+	if err != nil {
+		h.logger.Warn("failed to update session state to WAITING_FOR_INPUT",
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return
+	}
+	if !changed {
+		return
+	}
+
+	// Update task state to REVIEW. Use the task service when available so the
+	// state change publishes the pending-action projection after the
+	// clarification message is persisted. The repository fallback keeps this
+	// helper usable in small handler tests and alternate integrations.
+	if taskID != "" {
+		var stateErr error
+		if h.taskSvc != nil {
+			_, stateErr = h.taskSvc.UpdateTaskStateIfSessionState(
+				ctx,
+				taskID,
+				sessionID,
+				models.TaskSessionStateWaitingForInput,
+				v1.TaskStateReview,
+			)
+		} else if h.taskRepo != nil {
+			stateErr = h.taskRepo.UpdateTaskState(ctx, taskID, v1.TaskStateReview)
+		}
+		if stateErr != nil {
+			h.logger.Warn("failed to update task state to REVIEW",
+				zap.String("task_id", taskID),
+				zap.Error(stateErr))
+		}
+	}
+
+	// Publish session state changed event
+	if h.eventBus != nil {
+		eventData := map[string]interface{}{
+			"task_id":    taskID,
+			"session_id": sessionID,
+			"new_state":  string(models.TaskSessionStateWaitingForInput),
+		}
+		if !updatedAt.IsZero() {
+			eventData["updated_at"] = updatedAt.UTC().Format(time.RFC3339Nano)
+		} else if persistedUpdatedAt, ok := h.sessionUpdatedAtForStateEvent(ctx, sessionID); ok {
+			eventData["updated_at"] = persistedUpdatedAt
+		} else {
+			h.logger.Warn("skipping session state_changed publish; could not load authoritative updated_at",
+				zap.String("session_id", sessionID))
+			return
+		}
+		_ = h.eventBus.Publish(ctx, events.TaskSessionStateChanged, bus.NewEvent(
+			events.TaskSessionStateChanged,
+			"mcp-handlers",
+			eventData,
+		))
+	}
+}
+
+func (h *Handlers) updateSessionWaitingForClarification(
+	ctx context.Context,
+	sessionID string,
+) (bool, time.Time, error) {
+	// A fast MCP clarification can arrive before agent startup promotes the
+	// session from STARTING to RUNNING. Re-read and retry once if that promotion
+	// races the CAS; terminal states still reject the write.
+	for attempt := 0; attempt < 2; attempt++ {
+		session, err := h.sessionRepo.GetTaskSession(ctx, sessionID)
+		if err != nil {
+			return false, time.Time{}, err
+		}
+		if session == nil {
+			return false, time.Time{}, fmt.Errorf("session %q not found", sessionID)
+		}
+		if session.State != models.TaskSessionStateStarting &&
+			session.State != models.TaskSessionStateRunning {
+			return false, time.Time{}, nil
+		}
+		changed, updatedAt, err := h.updateClarificationSessionState(
+			ctx,
+			sessionID,
+			session.State,
+			models.TaskSessionStateWaitingForInput,
+		)
+		if err != nil || changed {
+			return changed, updatedAt, err
+		}
+	}
+	return false, time.Time{}, nil
+}
+
+func (h *Handlers) updateClarificationSessionState(
+	ctx context.Context,
+	sessionID string,
+	expected, state models.TaskSessionState,
+) (bool, time.Time, error) {
+	if updater, ok := h.sessionRepo.(conditionalSessionStateUpdater); ok {
+		changed, updatedAt, err := updater.UpdateTaskSessionStateIfCurrent(ctx, sessionID, expected, state, "")
+		if err == nil && changed {
+			h.releaseSessionCeilingIfLeftPopulation(sessionID, expected, state)
+		}
+		return changed, updatedAt, err
+	}
+	if err := h.sessionRepo.UpdateTaskSessionState(ctx, sessionID, state, ""); err != nil {
+		return false, time.Time{}, err
+	}
+	h.releaseSessionCeilingIfLeftPopulation(sessionID, expected, state)
+	return true, time.Time{}, nil
+}
+
+// releaseSessionCeilingIfLeftPopulation is this package's half of AC-51a's
+// "mcp/handlers/handlers.go, various, SHALL release when leaving an AC-1
+// state" row: both the CAS-preferred branch and the raw fallback above count.
+func (h *Handlers) releaseSessionCeilingIfLeftPopulation(sessionID string, priorState, nextState models.TaskSessionState) {
+	if h.sessionCeilingReleaser == nil {
+		return
+	}
+	leftPopulation := priorState == models.TaskSessionStateStarting || priorState == models.TaskSessionStateRunning
+	enteredPopulation := nextState == models.TaskSessionStateStarting || nextState == models.TaskSessionStateRunning
+	if !leftPopulation || enteredPopulation {
+		return
+	}
+	h.sessionCeilingReleaser.ReleaseCeilingReservation(sessionID)
+}
+
+func (h *Handlers) sessionUpdatedAtForStateEvent(ctx context.Context, sessionID string) (string, bool) {
+	if session, err := h.sessionRepo.GetTaskSession(ctx, sessionID); err == nil && session != nil && !session.UpdatedAt.IsZero() {
+		return session.UpdatedAt.UTC().Format(time.RFC3339Nano), true
+	}
+	return "", false
+}
+
+// handleCreateTaskPlan creates a new task plan.
+func (h *Handlers) handleCreateTaskPlan(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID          string `json:"task_id"`
+		Title           string `json:"title"`
+		Content         string `json:"content"`
+		CreatedBy       string `json:"created_by"`
+		ExpectedVersion string `json:"expected_version"`
+		AllowTruncation bool   `json:"allow_truncation"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.Content == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "content is required", nil)
+	}
+
+	createdBy := req.CreatedBy
+	if createdBy == "" {
+		createdBy = "agent"
+	}
+
+	result, err := h.planService.CreatePlan(ctx, service.CreatePlanRequest{
+		TaskID:             req.TaskID,
+		Title:              req.Title,
+		Content:            req.Content,
+		CreatedBy:          createdBy,
+		EvaluateTruncation: true,
+		AgentWrite:         true,
+		ExpectedVersion:    req.ExpectedVersion,
+		AllowTruncation:    req.AllowTruncation,
+	})
+	if err != nil {
+		return planws.CreateError(msg, err)
+	}
+
+	warning := ""
+	if result.TruncationDetected {
+		warning = planTruncationWarning(result.ReplacedRunes, result.NewRunes, result.PriorRevisionNumber)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, planWritePayload(dto.TaskPlanFromModel(result.Plan), result.Plan.WriteVersion, warning, result.PriorRevisionNumber))
+}
+
+// handleGetTaskPlan retrieves a task plan.
+func (h *Handlers) handleGetTaskPlan(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req planws.TaskIDRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+
+	options, err := taskcontract.ParsePlanReadOptions(msg.Payload)
+	if err != nil {
+		return planws.GetError(msg, err)
+	}
+	result, err := h.planService.GetPlanRead(ctx, req.TaskID, options)
+	if err != nil {
+		return planws.GetError(msg, err)
+	}
+	if result == nil {
+		// Return empty object if no plan exists
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{})
+	}
+
+	if result.Range != nil {
+		return ws.NewResponse(msg.ID, msg.Action, struct {
+			planReadResponse
+			*service.PlanReadRange
+		}{planReadResponse{TaskPlanDTO: dto.TaskPlanFromModel(result.Plan), Version: result.Plan.WriteVersion}, result.Range})
+	}
+	return ws.NewResponse(msg.ID, msg.Action, planReadPayload(result.Plan))
+}
+
+// handleUpdateTaskPlan updates an existing task plan.
+//
+// Mode validity is checked before anything else, ahead of PlanService's own
+// task-reach authorization: the tool's schema
+// already publishes the two accepted values, so rejecting an unrecognized
+// one discloses nothing about the target task. Both modes' content checks —
+// replace's "empty content" rejection and append's fragment validation — run
+// inside PlanService.UpdatePlan, after authorization, so a caller the
+// authorizer denies never learns anything about content validity for a task
+// it cannot reach.
+func (h *Handlers) handleUpdateTaskPlan(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID          string `json:"task_id"`
+		Title           string `json:"title"`
+		Content         string `json:"content"`
+		CreatedBy       string `json:"created_by"`
+		Mode            string `json:"mode"`
+		ExpectedVersion string `json:"expected_version"`
+		AllowTruncation bool   `json:"allow_truncation"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	mode, err := service.ParsePlanWriteMode(req.Mode)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+
+	createdBy := req.CreatedBy
+	if createdBy == "" {
+		createdBy = "agent"
+	}
+
+	result, err := h.planService.UpdatePlan(ctx, service.UpdatePlanRequest{
+		TaskID:             req.TaskID,
+		Title:              req.Title,
+		Content:            req.Content,
+		CreatedBy:          createdBy,
+		EvaluateTruncation: mode == service.PlanWriteModeReplace,
+		Mode:               mode,
+		AgentWrite:         true,
+		ExpectedVersion:    req.ExpectedVersion,
+		AllowTruncation:    req.AllowTruncation,
+	})
+	if err != nil {
+		return planws.UpdateError(msg, err)
+	}
+
+	warning := ""
+	if result.TruncationDetected {
+		warning = planTruncationWarning(result.ReplacedRunes, result.NewRunes, result.PriorRevisionNumber)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, planWritePayload(dto.TaskPlanFromModel(result.Plan), result.Plan.WriteVersion, warning, result.PriorRevisionNumber))
+}
+
+// handleDeleteTaskPlan deletes a task plan.
+func (h *Handlers) handleDeleteTaskPlan(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req planws.TaskIDRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+
+	err := h.planService.DeletePlan(ctx, req.TaskID)
+	if err != nil {
+		return planws.DeleteError(msg, err)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{"success": true})
+}
+
+// handleShowWalkthrough creates or replaces a task's agent-authored code walkthrough.
+func (h *Handlers) handleShowWalkthrough(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID string                   `json:"task_id"`
+		Title  string                   `json:"title"`
+		Steps  []models.WalkthroughStep `json:"steps"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if len(req.Steps) == 0 {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "at least one step is required", nil)
+	}
+
+	wt, err := h.walkthroughService.ShowWalkthrough(ctx, service.ShowWalkthroughRequest{
+		TaskID: req.TaskID,
+		Title:  req.Title,
+		Steps:  req.Steps,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrTaskIDRequired) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+		}
+		if errors.Is(err, service.ErrInvalidWalkthrough) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to save walkthrough: "+err.Error(), nil)
+	}
+
+	return ws.NewResponse(msg.ID, msg.Action, wt)
+}
+
+// parseTaskIDPayload unmarshals a `{task_id}` payload, returning a ready error
+// response (non-nil) when the payload is malformed.
+func parseTaskIDPayload(msg *ws.Message) (string, *ws.Message, error) {
+	var req struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		m, e := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+		return "", m, e
+	}
+	return req.TaskID, nil, nil
+}
+
+// handleGetWalkthrough retrieves a task's walkthrough.
+func (h *Handlers) handleGetWalkthrough(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	taskID, errMsg, errErr := parseTaskIDPayload(msg)
+	if errMsg != nil || errErr != nil {
+		return errMsg, errErr
+	}
+	wt, err := h.walkthroughService.GetWalkthrough(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, service.ErrTaskIDRequired) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to get walkthrough", nil)
+	}
+	if wt == nil {
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{})
+	}
+	return ws.NewResponse(msg.ID, msg.Action, wt)
+}
+
+// handleDeleteWalkthrough deletes a task's walkthrough.
+func (h *Handlers) handleDeleteWalkthrough(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	taskID, errMsg, errErr := parseTaskIDPayload(msg)
+	if errMsg != nil || errErr != nil {
+		return errMsg, errErr
+	}
+	switch err := h.walkthroughService.DeleteWalkthrough(ctx, taskID); {
+	case err == nil:
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{"success": true})
+	case errors.Is(err, service.ErrTaskIDRequired):
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	case errors.Is(err, service.ErrTaskWalkthroughNotFound):
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Task walkthrough not found", nil)
+	default:
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete walkthrough: "+err.Error(), nil)
+	}
+}
+
+// handleClarificationTimeout is called by agentctl when the agent's MCP client
+// disconnects while waiting for a clarification response. It cancels the pending
+// clarification so the user's eventual answer goes through the event fallback path
+// (new turn) instead of the primary path (which would be dropped).
+func (h *Handlers) handleClarificationTimeout(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	const cancelledField = "cancelled"
+	const pausedField = "paused"
+
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "session_id is required", nil)
+	}
+
+	if h.inputPauser != nil {
+		cancelled, paused, err := h.pauseOrDetachForClarificationTimeout(
+			context.WithoutCancel(ctx),
+			req.SessionID,
+		)
+		if err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, err.Error(), nil)
+		}
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+			"ok": true, cancelledField: cancelled, pausedField: paused,
+		})
+	}
+
+	if h.sessionCanceller == nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "sessionCanceller is required", nil)
+	}
+	cancelled, err := h.sessionCanceller.DetachSessionAndNotify(ctx, req.SessionID)
+	if err != nil {
+		h.logger.Warn("failed to detach clarification after MCP timeout",
+			zap.String("session_id", req.SessionID),
+			zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"failed to detach clarification after MCP timeout", nil)
+	}
+	h.logger.Info("detached pending clarifications on agent MCP timeout",
+		zap.String("session_id", req.SessionID),
+		zap.Int("count", cancelled))
+
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{"ok": true, cancelledField: cancelled})
+}
+
+func (h *Handlers) pauseOrDetachForClarificationTimeout(
+	ctx context.Context,
+	sessionID string,
+) (int, bool, error) {
+	cancelled, err := h.inputPauser.PauseForClarificationInput(ctx, sessionID)
+	if err == nil {
+		h.logger.Info("paused session after agent MCP clarification timeout",
+			zap.String("session_id", sessionID), zap.Int("count", cancelled))
+		return cancelled, true, nil
+	}
+	h.logger.Warn("failed to pause session after clarification timeout",
+		zap.String("session_id", sessionID), zap.Error(err))
+
+	// Retry the complete idempotent pause before falling back to waiter
+	// detachment. Each pauser attempt owns a fresh bounded context.
+	cancelled, err = h.inputPauser.PauseForClarificationInput(ctx, sessionID)
+	if err == nil {
+		h.logger.Info("paused session after retrying clarification timeout",
+			zap.String("session_id", sessionID), zap.Int("count", cancelled))
+		return cancelled, true, nil
+	}
+	h.logger.Warn("failed to pause session after retrying clarification timeout",
+		zap.String("session_id", sessionID), zap.Error(err))
+	if h.sessionCanceller == nil {
+		return 0, false, errors.New("failed to pause session for clarification input")
+	}
+	cancelled, err = h.sessionCanceller.DetachSessionAndNotify(ctx, sessionID)
+	if err != nil {
+		h.logger.Warn("failed to detach clarification after pause failure",
+			zap.String("session_id", sessionID), zap.Error(err))
+		return 0, false, errors.New("failed to detach clarification after pause failure")
+	}
+	h.logger.Info("detached clarification waiters after pause failure",
+		zap.String("session_id", sessionID), zap.Int("count", cancelled))
+	return cancelled, false, nil
+}

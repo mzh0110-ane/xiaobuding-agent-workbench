@@ -1,0 +1,603 @@
+package dto
+
+import (
+	"github.com/kandev/kandev/internal/agent/managedruntime"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+)
+
+type AgentProfileDTO struct {
+	ID               string `json:"id"`
+	AgentID          string `json:"agent_id"`
+	Kind             string `json:"kind"`
+	Name             string `json:"name"`
+	AgentDisplayName string `json:"agent_display_name"`
+	Model            string `json:"model"`
+	Mode             string `json:"mode,omitempty"`
+	// FallbackModel is the optional single ACP model ID the runtime switches
+	// to when the start model becomes unavailable. Ignored when
+	// auto_fallback is true.
+	FallbackModel string `json:"fallback_model,omitempty"`
+	// AutoFallback opts the profile into the legacy automatic-fallback
+	// behavior (session-start best-effort, office re-dispatch).
+	AutoFallback      bool               `json:"auto_fallback"`
+	RequireExactModel bool               `json:"require_exact_model"`
+	ConfigOptions     map[string]string  `json:"config_options,omitempty"`
+	AllowIndexing     bool               `json:"allow_indexing"` // Deprecated: use CLIFlags. Retained for legacy clients.
+	AutoApprove       bool               `json:"auto_approve"`
+	CLIFlags          []CLIFlagDTO       `json:"cli_flags"`
+	EnvVars           []ProfileEnvVarDTO `json:"env_vars,omitempty"`
+	CLIPassthrough    bool               `json:"cli_passthrough"`
+	// Enabled gates the profile from new-work selection. When false the
+	// profile is hidden from task/session creation pickers but still serves
+	// existing sessions and remains editable in settings.
+	Enabled bool `json:"enabled"`
+	// CommandPrefix is an optional launcher prefix prepended to the agent
+	// command (e.g. "greywall --"). Shell-tokenised at launch time.
+	CommandPrefix string `json:"command_prefix,omitempty"`
+	// ProviderKind is "" (native) or "openai_compatible". When
+	// "openai_compatible", Kandev injects ProviderBaseURL + the key behind
+	// ProviderAPIKeySecretID into the agent it runs.
+	ProviderKind string `json:"provider_kind,omitempty"`
+	// ProviderBaseURL is the absolute http(s) endpoint root of the
+	// OpenAI-compatible provider.
+	ProviderBaseURL string `json:"provider_base_url,omitempty"`
+	// ProviderAPIKeySecretID references the Kandev global secret holding the
+	// bearer key. The value is never returned.
+	ProviderAPIKeySecretID  string   `json:"provider_api_key_secret_id,omitempty"`
+	CursorMCPAuthEnabled    bool     `json:"cursor_mcp_auth_enabled"`
+	CursorPluginsMCPEnabled bool     `json:"cursor_plugins_mcp_enabled"`
+	MCPSelectionMode        string   `json:"mcp_selection_mode"`
+	MCPSelectedServers      []string `json:"mcp_selected_servers"`
+	// ProviderSupported is computed at read time: true when the profile's
+	// agent advertises OpenAI-compatible provider support. Not persisted.
+	ProviderSupported bool `json:"provider_supported"`
+	UserModified      bool `json:"user_modified"`
+	// WorkspaceID scopes the profile to an office workspace. Empty for
+	// shallow kanban-only profiles. Surfaced so consumers (e.g. test
+	// cleanup helpers) can distinguish office-owned profiles from
+	// kanban-only ones without a separate lookup.
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	// BillingType is computed at read time from credential files — not stored in the DB.
+	// Values: "api_key" | "subscription". Empty for agents that don't support billing type detection.
+	BillingType string                  `json:"billing_type,omitempty"`
+	CreatedAt   time.Time               `json:"created_at"`
+	UpdatedAt   time.Time               `json:"updated_at"`
+	Dynamic     *DynamicAgentProfileDTO `json:"dynamic,omitempty"`
+}
+
+// DynamicAgentProfileDTO is the versioned routing document attached to a
+// profile whose kind is "dynamic". Candidates stay opaque profile IDs on the
+// wire; the server resolves and validates their safe display data.
+type DynamicAgentProfileDTO struct {
+	Version    int64                      `json:"version"`
+	Candidates []DynamicAgentCandidateDTO `json:"candidates"`
+}
+
+// DynamicAgentPolicyDTO is the canonical, versioned policy document persisted
+// for one dynamic candidate. The two classes are deliberately explicit so a
+// missing class can never silently inherit another class's behavior.
+type DynamicAgentPolicyDTO struct {
+	Version      int64                         `json:"version"`
+	Transient    DynamicErrorPolicyDTO         `json:"transient"`
+	Hard         DynamicErrorPolicyDTO         `json:"hard"`
+	Unclassified *DynamicUnclassifiedPolicyDTO `json:"unclassified,omitempty"`
+}
+
+type DynamicUnclassifiedPolicyDTO struct {
+	Enabled                     bool  `json:"enabled"`
+	ConsecutiveFailureThreshold int64 `json:"consecutive_failure_threshold"`
+}
+
+type DynamicErrorPolicyDTO struct {
+	Retry        DynamicRetryPolicyDTO     `json:"retry"`
+	WaitForReset DynamicResetWaitPolicyDTO `json:"wait_for_reset"`
+	OnExhausted  string                    `json:"on_exhausted"`
+}
+
+type DynamicRetryPolicyDTO struct {
+	Enabled                bool  `json:"enabled"`
+	MaxRetries             int64 `json:"max_retries"`
+	InitialIntervalSeconds int64 `json:"initial_interval_seconds"`
+}
+
+type DynamicResetWaitPolicyDTO struct {
+	Enabled        bool  `json:"enabled"`
+	MaxWaitSeconds int64 `json:"max_wait_seconds"`
+}
+
+// DynamicAgentCandidateDTO is one ordered concrete execution profile and its
+// provider-error policy. Rules remains a read-compatible legacy input shape;
+// profile CRUD normalizes it into Policies before persistence and never emits
+// it in canonical responses.
+type DynamicAgentCandidateDTO struct {
+	Position           int                    `json:"position"`
+	ExecutionProfileID string                 `json:"execution_profile_id"`
+	Enabled            bool                   `json:"enabled"`
+	Policies           *DynamicAgentPolicyDTO `json:"policies,omitempty"`
+	Rules              map[string]string      `json:"rules,omitempty"`
+}
+
+// GetWorkspaceID lets struct-shaped profile payloads (e.g. the MCP event-bus
+// publisher wrapping *AgentProfileDTO under "profile") be routed by the
+// gateway's extractWorkspaceID without a JSON round-trip.
+func (p *AgentProfileDTO) GetWorkspaceID() string {
+	if p == nil {
+		return ""
+	}
+	return p.WorkspaceID
+}
+
+// CLIFlagDTO mirrors models.CLIFlag on the wire. Each entry is one user-facing
+// CLI argument on a profile; at launch time the `flag` string is shell-split
+// and only entries with `enabled:true` reach the agent subprocess argv.
+type CLIFlagDTO struct {
+	Description string `json:"description"`
+	Flag        string `json:"flag"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// ProfileEnvVarDTO mirrors models.ProfileEnvVar on the wire.
+type ProfileEnvVarDTO struct {
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`
+	SecretID string `json:"secret_id,omitempty"`
+}
+
+type TUIConfigDTO struct {
+	Command         string   `json:"command"`
+	DisplayName     string   `json:"display_name"`
+	Model           string   `json:"model,omitempty"`
+	Description     string   `json:"description,omitempty"`
+	CommandArgs     []string `json:"command_args,omitempty"`
+	WaitForTerminal bool     `json:"wait_for_terminal"`
+	// MCPStrategy is the selected MCP injection mechanism ("" = none).
+	MCPStrategy string `json:"mcp_strategy,omitempty"`
+	// Protocol is the runtime kandev drives the command with ("" = terminal
+	// passthrough, "acp" = ACP on stdin/stdout).
+	Protocol string `json:"protocol,omitempty"`
+	// DisableBracketedPaste selects paced unframed delivery for terminal TUIs
+	// that do not accept bracketed-paste delimiters.
+	DisableBracketedPaste bool `json:"disable_bracketed_paste,omitempty"`
+}
+
+type AgentDTO struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	WorkspaceID   *string           `json:"workspace_id,omitempty"`
+	SupportsMCP   bool              `json:"supports_mcp"`
+	MCPConfigPath string            `json:"mcp_config_path,omitempty"`
+	TUIConfig     *TUIConfigDTO     `json:"tui_config,omitempty"`
+	Profiles      []AgentProfileDTO `json:"profiles"`
+	// CapabilityStatus mirrors the host utility probe status so clients can
+	// flag agents that need login or reinstallation without fetching the
+	// full model config separately. "" for agents that aren't probed
+	// (mock, tui-only).
+	CapabilityStatus string `json:"capability_status,omitempty"`
+	CapabilityError  string `json:"capability_error,omitempty"`
+	// InferenceCapable identifies agents accepted by the sessionless host
+	// utility runner. Profile pickers use it to prevent invalid selections.
+	InferenceCapable bool      `json:"inference_capable"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// AgentMCPDiscoveryDTO exposes a credential-free host preview of one agent's
+// native MCP sources. Host paths and server connection definitions stay local.
+type AgentMCPDiscoveryDTO struct {
+	AgentID    string                       `json:"agent_id"`
+	ProviderID string                       `json:"provider_id"`
+	Status     string                       `json:"status"`
+	Reason     string                       `json:"reason,omitempty"`
+	Servers    []AgentMCPDiscoveryServerDTO `json:"servers"`
+}
+
+type AgentMCPDiscoveryServerDTO struct {
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	PluginName           string `json:"plugin_name,omitempty"`
+	SourceKind           string `json:"source_kind"`
+	CredentialsAvailable bool   `json:"credentials_available"`
+}
+
+type ListAgentsResponse struct {
+	Agents []AgentDTO `json:"agents"`
+	Total  int        `json:"total"`
+}
+
+type AgentDiscoveryDTO struct {
+	Name              string           `json:"name"`
+	SupportsMCP       bool             `json:"supports_mcp"`
+	MCPConfigPath     string           `json:"mcp_config_path,omitempty"`
+	InstallationPaths []string         `json:"installation_paths,omitempty"`
+	Available         bool             `json:"available"`
+	MatchedPath       string           `json:"matched_path,omitempty"`
+	LoginCommand      *LoginCommandDTO `json:"login_command,omitempty"`
+}
+
+// LoginCommandDTO describes an interactive login command surfaced to the UI.
+// The frontend uses it to render a "Login" button that opens a PTY terminal
+// running the named command.
+type LoginCommandDTO struct {
+	Variants    map[string][]string `json:"variants,omitempty"`
+	Cmd         []string            `json:"cmd"`
+	Description string              `json:"description,omitempty"`
+}
+
+type ListDiscoveryResponse struct {
+	Agents []AgentDiscoveryDTO `json:"agents"`
+	Total  int                 `json:"total"`
+}
+
+type AgentCapabilitiesDTO struct {
+	SupportsSessionResume bool `json:"supports_session_resume"`
+	SupportsShell         bool `json:"supports_shell"`
+	SupportsWorkspaceOnly bool `json:"supports_workspace_only"`
+}
+
+type ModelEntryDTO struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Provider      string `json:"provider"`
+	ContextWindow int    `json:"context_window"`
+	IsDefault     bool   `json:"is_default"`
+	Source        string `json:"source,omitempty"`
+	// Meta carries agent-specific extras from ACP's `_meta` field. For
+	// GitHub Copilot this includes `copilotUsage` (e.g. "1x", "0.33x",
+	// "0x" — the premium-request multiplier) and `copilotEnablement`.
+	Meta map[string]any `json:"meta,omitempty"`
+}
+
+type ModelConfigDTO struct {
+	DefaultModel          string            `json:"default_model"`
+	AvailableModels       []ModelEntryDTO   `json:"available_models"`
+	CurrentModelID        string            `json:"current_model_id,omitempty"`
+	AvailableModes        []ModeEntryDTO    `json:"available_modes,omitempty"`
+	CurrentModeID         string            `json:"current_mode_id,omitempty"`
+	AvailableCommands     []CommandEntryDTO `json:"available_commands,omitempty"`
+	ConfigOptions         []ConfigOptionDTO `json:"config_options,omitempty"`
+	SupportsDynamicModels bool              `json:"supports_dynamic_models"`
+	// Status reflects the host utility probe state for this agent type:
+	// "probing" | "ok" | "auth_required" | "not_installed" | "failed".
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type ConfigOptionDTO struct {
+	Type         string                  `json:"type"`
+	ID           string                  `json:"id"`
+	Name         string                  `json:"name"`
+	Description  string                  `json:"description,omitempty"`
+	CurrentValue string                  `json:"current_value"`
+	Category     string                  `json:"category,omitempty"`
+	Options      []ConfigOptionChoiceDTO `json:"options,omitempty"`
+}
+
+type ConfigOptionChoiceDTO struct {
+	Value       string `json:"value"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+type PermissionSettingDTO struct {
+	Supported    bool   `json:"supported"`
+	Default      bool   `json:"default"`
+	Label        string `json:"label"`
+	Description  string `json:"description"`
+	ApplyMethod  string `json:"apply_method,omitempty"`
+	CLIFlag      string `json:"cli_flag,omitempty"`
+	CLIFlagValue string `json:"cli_flag_value,omitempty"`
+}
+
+type PassthroughConfigDTO struct {
+	Supported        bool   `json:"supported"`
+	Label            string `json:"label"`
+	Description      string `json:"description"`
+	AutoInjectPrompt bool   `json:"auto_inject_prompt"`
+	SubmitSequence   string `json:"submit_sequence"`
+	// MCPInjection is a short human-readable phrase describing how kandev
+	// injects MCP servers into this agent's CLI in passthrough mode (e.g.
+	// "an MCP config file passed via the --mcp-config flag"). Empty when the
+	// agent declares no MCP strategy.
+	MCPInjection string `json:"mcp_injection,omitempty"`
+}
+
+type ToolStatusDTO struct {
+	Name          string `json:"name"`
+	DisplayName   string `json:"display_name"`
+	Available     bool   `json:"available"`
+	MatchedPath   string `json:"matched_path,omitempty"`
+	InstallScript string `json:"install_script,omitempty"`
+	Description   string `json:"description,omitempty"`
+	InfoURL       string `json:"info_url,omitempty"`
+}
+
+type AvailableAgentDTO struct {
+	Name               string                          `json:"name"`
+	DisplayName        string                          `json:"display_name"`
+	Description        string                          `json:"description,omitempty"`
+	InstallScript      string                          `json:"install_script,omitempty"`
+	SupportsMCP        bool                            `json:"supports_mcp"`
+	MCPConfigPath      string                          `json:"mcp_config_path,omitempty"`
+	InstallationPaths  []string                        `json:"installation_paths,omitempty"`
+	Available          bool                            `json:"available"`
+	MatchedPath        string                          `json:"matched_path,omitempty"`
+	Capabilities       AgentCapabilitiesDTO            `json:"capabilities"`
+	ModelConfig        ModelConfigDTO                  `json:"model_config"`
+	PermissionSettings map[string]PermissionSettingDTO `json:"permission_settings,omitempty"`
+	PassthroughConfig  *PassthroughConfigDTO           `json:"passthrough_config,omitempty"`
+	LoginCommand       *LoginCommandDTO                `json:"login_command,omitempty"`
+	RuntimeUpdate      *RuntimeUpdateDTO               `json:"runtime_update,omitempty"`
+	UpdatedAt          time.Time                       `json:"updated_at"`
+}
+
+// RuntimeUpdateDTO describes a Kandev-managed npm runtime. Package is
+// informational; update requests select only the built-in agent name.
+type RuntimeUpdateDTO struct {
+	ManagedFallback  bool   `json:"managed_fallback,omitempty"`
+	Supported        bool   `json:"supported"`
+	Package          string `json:"package"`
+	CurrentVersion   string `json:"current_version,omitempty"`
+	DefaultVersion   string `json:"default_version"`
+	ActiveVersion    string `json:"active_version,omitempty"`
+	EffectiveVersion string `json:"effective_version"`
+}
+
+// AgentUpdateCheckState describes the result of the cached npm latest-version
+// lookup. Unknown is intentionally distinct from up_to_date so the UI can
+// avoid suggesting that an unavailable registry check is current.
+type AgentUpdateCheckState string
+
+const (
+	AgentUpdateCheckStateUpdateAvailable AgentUpdateCheckState = "update_available"
+	AgentUpdateCheckStateUpToDate        AgentUpdateCheckState = "up_to_date"
+	AgentUpdateCheckStateUnknown         AgentUpdateCheckState = "unknown"
+)
+
+// AgentUpdateStatusDTO is the read-only update hint for one available managed
+// runtime. ActiveVersion is the optional persisted operator selection; the
+// default is never persisted and remains the fallback effective version.
+type AgentUpdateStatusDTO struct {
+	ManagedFallback     bool                          `json:"managed_fallback,omitempty"`
+	AutoUpdate          bool                          `json:"auto_update"`
+	LastOutcome         *managedruntime.UpdateOutcome `json:"last_outcome,omitempty"`
+	DisplayName         string                        `json:"display_name"`
+	RuntimeID           string                        `json:"runtime_id"`
+	Owner               string                        `json:"owner"`
+	Mechanism           string                        `json:"mechanism"`
+	Management          string                        `json:"management"`
+	Source              string                        `json:"source,omitempty"`
+	GuidanceURL         string                        `json:"guidance_url,omitempty"`
+	CurrentVersion      string                        `json:"current_version,omitempty"`
+	Available           bool                          `json:"available"`
+	Enabled             bool                          `json:"enabled"`
+	AutoUpdateSupported bool                          `json:"auto_update_supported"`
+
+	AgentName        string                `json:"agent_name"`
+	Package          string                `json:"package"`
+	DefaultVersion   string                `json:"default_version"`
+	ActiveVersion    string                `json:"active_version,omitempty"`
+	EffectiveVersion string                `json:"effective_version"`
+	LatestVersion    string                `json:"latest_version,omitempty"`
+	CheckedAt        *time.Time            `json:"checked_at,omitempty"`
+	CheckState       AgentUpdateCheckState `json:"check_state"`
+}
+
+type ListAgentUpdateStatusResponse struct {
+	Statuses []AgentUpdateStatusDTO `json:"statuses"`
+}
+
+type ListAvailableAgentsResponse struct {
+	Agents []AvailableAgentDTO `json:"agents"`
+	Tools  []ToolStatusDTO     `json:"tools,omitempty"`
+	Total  int                 `json:"total"`
+}
+
+// InstallJobStatus represents the state of an install job.
+type InstallJobStatus string
+
+const (
+	InstallJobStatusQueued    InstallJobStatus = "queued"
+	InstallJobStatusRunning   InstallJobStatus = "running"
+	InstallJobStatusSucceeded InstallJobStatus = "succeeded"
+	InstallJobStatusFailed    InstallJobStatus = "failed"
+)
+
+// InstallJobDTO is the snapshot of an install job returned via HTTP and
+// broadcast via WS.
+type InstallJobDTO struct {
+	JobID      string           `json:"job_id"`
+	Name       string           `json:"agent_name"`
+	Status     InstallJobStatus `json:"status"`
+	Output     string           `json:"output,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	ExitCode   *int             `json:"exit_code,omitempty"`
+	StartedAt  time.Time        `json:"started_at"`
+	FinishedAt *time.Time       `json:"finished_at,omitempty"`
+}
+
+// EnqueueInstallResponse is returned by POST /agent-install/:agentName.
+// The install runs asynchronously; clients subscribe to WS notifications
+// (agent.install.started/output/finished) or poll GET /agent-install/jobs.
+type EnqueueInstallResponse struct {
+	JobID string `json:"job_id"`
+}
+
+// ListInstallJobsResponse wraps the snapshot list for the jobs endpoint.
+type ListInstallJobsResponse struct {
+	Jobs []InstallJobDTO `json:"jobs"`
+}
+
+// AgentUpdateJobStatus represents one phase of a managed-runtime update.
+type AgentUpdateJobStatus string
+
+const (
+	AgentUpdateJobStatusQueued     AgentUpdateJobStatus = "queued"
+	AgentUpdateJobStatusResolving  AgentUpdateJobStatus = "resolving"
+	AgentUpdateJobStatusUpdating   AgentUpdateJobStatus = "updating"
+	AgentUpdateJobStatusRefreshing AgentUpdateJobStatus = "refreshing"
+	AgentUpdateJobStatusSucceeded  AgentUpdateJobStatus = "succeeded"
+	AgentUpdateJobStatusFailed     AgentUpdateJobStatus = "failed"
+)
+
+// AgentUpdateJobDTO is the retained HTTP and WebSocket update snapshot.
+type AgentUpdateJobDTO struct {
+	RuntimeID        string               `json:"runtime_id,omitempty"`
+	Automatic        bool                 `json:"automatic"`
+	PreviousVersion  string               `json:"previous_version,omitempty"`
+	JobID            string               `json:"job_id"`
+	AgentName        string               `json:"agent_name"`
+	Status           AgentUpdateJobStatus `json:"status"`
+	Operation        string               `json:"operation"`
+	CurrentVersion   string               `json:"current_version,omitempty"`
+	DefaultVersion   string               `json:"default_version"`
+	ActiveVersion    string               `json:"active_version,omitempty"`
+	EffectiveVersion string               `json:"effective_version"`
+	TargetVersion    string               `json:"target_version,omitempty"`
+	Output           string               `json:"output,omitempty"`
+	Error            string               `json:"error,omitempty"`
+	RefreshError     string               `json:"refresh_error,omitempty"`
+	StartedAt        time.Time            `json:"started_at"`
+	FinishedAt       *time.Time           `json:"finished_at,omitempty"`
+}
+
+// AgentUpdatePreviewDTO is a read-only representation of the next managed
+// runtime update. The command is derived from trusted built-in agent metadata.
+type AgentUpdatePreviewDTO struct {
+	ManagedFallback   bool                    `json:"managed_fallback,omitempty"`
+	AgentName         string                  `json:"agent_name"`
+	Package           string                  `json:"package"`
+	CurrentVersion    string                  `json:"current_version,omitempty"`
+	DefaultVersion    string                  `json:"default_version"`
+	ActiveVersion     string                  `json:"active_version,omitempty"`
+	EffectiveVersion  string                  `json:"effective_version"`
+	TargetVersion     string                  `json:"target_version"`
+	Operation         string                  `json:"operation"`
+	AvailableVersions []AgentUpdateVersionDTO `json:"available_versions"`
+	Command           []string                `json:"command"`
+	CommandString     string                  `json:"command_string"`
+}
+
+// AgentUpdateVersionDTO is one stable, selectable package version.
+type AgentUpdateVersionDTO struct {
+	Version string `json:"version"`
+	Latest  bool   `json:"latest"`
+}
+
+// AgentUpdateRequest is the only state-changing input accepted by the
+// managed-runtime update endpoint. Package identity and command arguments are
+// always resolved from trusted built-in agent metadata.
+type AgentUpdateRequest struct {
+	TargetVersion string `json:"target_version"`
+	UseDefault    bool   `json:"use_default"`
+}
+
+type ListAgentUpdateJobsResponse struct {
+	Jobs []AgentUpdateJobDTO `json:"jobs"`
+}
+
+type AgentProfileMcpConfigDTO struct {
+	ProfileID   string                         `json:"profile_id"`
+	WorkspaceID string                         `json:"-"`
+	Enabled     bool                           `json:"enabled"`
+	Servers     map[string]mcpconfig.ServerDef `json:"servers"`
+	Meta        map[string]any                 `json:"meta,omitempty"`
+}
+
+// CommandPreviewRequest is the request body for previewing the agent CLI command
+type CommandPreviewRequest struct {
+	Model              string          `json:"model"`
+	PermissionSettings map[string]bool `json:"permission_settings"`
+	CLIPassthrough     bool            `json:"cli_passthrough"`
+	CommandPrefix      string          `json:"command_prefix,omitempty"`
+}
+
+// Flag destinations reported by CommandPreviewResponse.
+const (
+	// FlagDestinationAgentCLI means the flags reach the agent CLI itself.
+	FlagDestinationAgentCLI = "agent_cli"
+	// FlagDestinationACPBridge means the flags are appended to the launched ACP
+	// bridge process, which forwards no unrecognized argument to the agent CLI.
+	FlagDestinationACPBridge = "acp_bridge"
+)
+
+// CommandPreviewResponse is the response for the command preview endpoint
+type CommandPreviewResponse struct {
+	Supported     bool     `json:"supported"`
+	Command       []string `json:"command"`
+	CommandString string   `json:"command_string"`
+	// FlagDestination names the process the profile's CLI flags are appended
+	// to. Over ACP that is the bridge, not the agent CLI it wraps, and the
+	// difference is the whole reason a flag can look enabled and change
+	// nothing. Values: "agent_cli" or "acp_bridge".
+	FlagDestination string `json:"flag_destination,omitempty"`
+}
+
+// DynamicModelsResponse is the response for the /agent-models/:agentName endpoint.
+// Data now comes from the host utility capability cache populated by ACP probes.
+type DynamicModelsResponse struct {
+	AgentName       string            `json:"agent_name"`
+	Status          string            `json:"status"` // "probing" | "ok" | "auth_required" | "not_installed" | "failed"
+	Models          []ModelEntryDTO   `json:"models"`
+	CurrentModelID  string            `json:"current_model_id,omitempty"`
+	Modes           []ModeEntryDTO    `json:"modes,omitempty"`
+	CurrentModeID   string            `json:"current_mode_id,omitempty"`
+	Commands        []CommandEntryDTO `json:"commands,omitempty"`
+	Error           *string           `json:"error"`
+	ContextRevision string            `json:"context_revision,omitempty"`
+}
+
+// ProfileLaunchSettingsRequest is a complete, request-only profile snapshot.
+// Pointer fields distinguish an explicit empty value from an omitted field.
+type ProfileLaunchSettingsRequest struct {
+	EnvVars       *[]ProfileEnvVarDTO `json:"env_vars"`
+	CLIFlags      *[]CLIFlagDTO       `json:"cli_flags"`
+	CommandPrefix *string             `json:"command_prefix"`
+}
+
+// ProfileCapabilityRequest asks the host utility to inspect a saved profile
+// or a complete unsaved launch-settings snapshot.
+type ProfileCapabilityRequest struct {
+	ProfileID          string                        `json:"profile_id,omitempty"`
+	LaunchSettings     *ProfileLaunchSettingsRequest `json:"launch_settings,omitempty"`
+	Refresh            bool                          `json:"refresh,omitempty"`
+	AuthorizationScope string                        `json:"-"`
+}
+
+// ResolveAgentModelConfigRequest selects the provider context to resolve.
+type ResolveAgentModelConfigRequest struct {
+	Model              string                        `json:"model"`
+	Mode               string                        `json:"mode,omitempty"`
+	ConfigOptions      map[string]string             `json:"config_options,omitempty"`
+	Refresh            bool                          `json:"refresh,omitempty"`
+	ProfileID          string                        `json:"profile_id,omitempty"`
+	LaunchSettings     *ProfileLaunchSettingsRequest `json:"launch_settings,omitempty"`
+	AuthorizationScope string                        `json:"-"`
+}
+
+// AgentModelConfigResponse is the complete provider option snapshot for one
+// selected model.
+type AgentModelConfigResponse struct {
+	AgentName       string            `json:"agent_name"`
+	Model           string            `json:"model"`
+	Status          string            `json:"status"`
+	ConfigOptions   []ConfigOptionDTO `json:"config_options"`
+	Error           *string           `json:"error"`
+	ContextRevision string            `json:"context_revision,omitempty"`
+}
+
+// ModeEntryDTO is a single ACP session mode advertised by an agent.
+type ModeEntryDTO struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+// CommandEntryDTO is a slash command advertised by the agent.
+type CommandEntryDTO struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}

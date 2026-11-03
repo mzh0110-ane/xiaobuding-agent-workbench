@@ -1,0 +1,439 @@
+package backendapp
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/kandev/kandev/internal/github"
+	officeconfig "github.com/kandev/kandev/internal/office/config"
+	"github.com/kandev/kandev/internal/office/configloader"
+	officedashboard "github.com/kandev/kandev/internal/office/dashboard"
+	officeengineadapters "github.com/kandev/kandev/internal/office/engine_adapters"
+	officemodels "github.com/kandev/kandev/internal/office/models"
+	officeonboarding "github.com/kandev/kandev/internal/office/onboarding"
+	officesqlite "github.com/kandev/kandev/internal/office/repository/sqlite"
+	officeroutines "github.com/kandev/kandev/internal/office/routines"
+	officeservice "github.com/kandev/kandev/internal/office/service"
+	officewakeup "github.com/kandev/kandev/internal/office/wakeup"
+	runsservice "github.com/kandev/kandev/internal/runs/service"
+	"github.com/kandev/kandev/internal/task/models"
+	tasksqlite "github.com/kandev/kandev/internal/task/repository/sqlite"
+	taskservice "github.com/kandev/kandev/internal/task/service"
+)
+
+type officeCommentWindowReader interface {
+	ListTaskCommentsWindow(ctx context.Context, taskID string, limit int) ([]*officemodels.TaskComment, int, error)
+}
+
+// officeCommentReaderAdapter keeps Office persistence models at the backend
+// composition boundary. The task service receives its own neutral records.
+type officeCommentReaderAdapter struct {
+	reader officeCommentWindowReader
+}
+
+func (a *officeCommentReaderAdapter) ListTaskCommentsWindow(
+	ctx context.Context, taskID string, limit int,
+) ([]taskservice.CommentRecord, int, error) {
+	rows, total, err := a.reader.ListTaskCommentsWindow(ctx, taskID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	records := make([]taskservice.CommentRecord, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		records = append(records, taskservice.CommentRecord{
+			ID:         row.ID,
+			TaskID:     row.TaskID,
+			AuthorType: row.AuthorType,
+			AuthorID:   row.AuthorID,
+			Source:     row.Source,
+			Body:       row.Body,
+			CreatedAt:  row.CreatedAt,
+		})
+	}
+	return records, total, nil
+}
+
+var _ taskservice.CommentReader = (*officeCommentReaderAdapter)(nil)
+
+// taskWorkspaceCreatorAdapter adapts the task service to the office
+// WorkspaceCreator interface for dual workspace creation.
+type taskWorkspaceCreatorAdapter struct {
+	taskSvc *taskservice.Service
+}
+
+func (a *taskWorkspaceCreatorAdapter) CreateWorkspace(ctx context.Context, name, description string) error {
+	_, err := a.taskSvc.CreateWorkspace(ctx, &taskservice.CreateWorkspaceRequest{
+		Name:        name,
+		Description: description,
+	})
+	return err
+}
+
+func (a *taskWorkspaceCreatorAdapter) FindWorkspaceIDByName(ctx context.Context, name string) (string, error) {
+	workspaces, err := a.taskSvc.ListWorkspaces(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, ws := range workspaces {
+		if ws.Name == name {
+			return ws.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func (a *taskWorkspaceCreatorAdapter) ListWorkspaceNames(ctx context.Context) ([]string, error) {
+	workspaces, err := a.taskSvc.ListWorkspaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(workspaces))
+	for i, ws := range workspaces {
+		names[i] = ws.Name
+	}
+	return names, nil
+}
+
+// taskPRListerAdapter adapts *github.Service to the office TaskPRLister
+// interface so the children-completed payload can carry per-child PR URLs.
+// Returns an empty map (no PRs) when the github service is nil.
+type taskPRListerAdapter struct {
+	gh *github.Service
+}
+
+func (a *taskPRListerAdapter) ListTaskPRsByTaskIDs(
+	ctx context.Context, taskIDs []string,
+) (map[string][]officeservice.TaskPRLink, error) {
+	out := make(map[string][]officeservice.TaskPRLink)
+	if a.gh == nil || len(taskIDs) == 0 {
+		return out, nil
+	}
+	prs, err := a.gh.ListTaskPRsByTaskIDs(ctx, taskIDs)
+	if err != nil {
+		return nil, err
+	}
+	for taskID, list := range prs {
+		links := make([]officeservice.TaskPRLink, 0, len(list))
+		for _, pr := range list {
+			if pr == nil {
+				continue
+			}
+			links = append(links, officeservice.TaskPRLink{
+				URL:    pr.PRURL,
+				Title:  pr.PRTitle,
+				Number: pr.PRNumber,
+				State:  pr.State,
+			})
+		}
+		if len(links) > 0 {
+			out[taskID] = links
+		}
+	}
+	return out, nil
+}
+
+// childTaskCreatorAdapter bridges *taskservice.Service to the
+// engine_adapters.ChildTaskCreator interface. The two structs use
+// identical fields but live in different packages — this adapter copies
+// the fields field-by-field to keep the dependency graph acyclic.
+type childTaskCreatorAdapter struct {
+	taskSvc *taskservice.Service
+}
+
+func (a *childTaskCreatorAdapter) CreateChildTask(
+	ctx context.Context, parent *models.Task, spec officeengineadapters.ChildTaskCreateSpec,
+) (string, error) {
+	return a.taskSvc.CreateChildTask(ctx, parent, taskservice.ChildTaskSpec{
+		Title:                 spec.Title,
+		Description:           spec.Description,
+		WorkflowID:            spec.WorkflowID,
+		StepID:                spec.StepID,
+		AgentProfileID:        spec.AgentProfileID,
+		OfficeCarrierMetadata: spec.OfficeCarrierMetadata,
+	})
+}
+
+// taskCreatorAdapter adapts the task service to the office TaskCreator interface.
+type taskCreatorAdapter struct {
+	taskSvc *taskservice.Service
+}
+
+func (a *taskCreatorAdapter) CreateOfficeTask(ctx context.Context, workspaceID, projectID, assigneeAgentID, title, description string) (string, error) {
+	return a.createOfficeTask(ctx, workspaceID, projectID, assigneeAgentID, title, description, models.TaskOriginOnboarding, nil)
+}
+
+func (a *taskCreatorAdapter) CreateOfficeTaskAsAgent(
+	ctx context.Context, workspaceID, projectID, assigneeAgentID, title, description string,
+	carrierMetadata map[string]interface{},
+) (string, error) {
+	return a.createOfficeTask(ctx, workspaceID, projectID, assigneeAgentID, title, description, models.TaskOriginAgentCreated, carrierMetadata)
+}
+
+// createOfficeTask persists carrierMetadata (already resolved server-side
+// from the causing run's record, or nil) through the trusted
+// OfficeCarrierMetadata field rather than the ordinary Metadata field, so
+// it survives create-time stripping the same way a request-body-forged
+// carrier does not (AC-OFFICE-RUN-CAUSATION-001.17).
+func (a *taskCreatorAdapter) createOfficeTask(
+	ctx context.Context, workspaceID, projectID, assigneeAgentID, title, description, origin string,
+	carrierMetadata map[string]interface{},
+) (string, error) {
+	result, err := a.taskSvc.CreateTask(ctx, &taskservice.CreateTaskRequest{ //nolint:exhaustruct
+		WorkspaceID:            workspaceID,
+		Title:                  title,
+		Description:            description,
+		ProjectID:              projectID,
+		AssigneeAgentProfileID: assigneeAgentID,
+		Origin:                 origin,
+		OfficeCarrierMetadata:  carrierMetadata,
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.Task.ID, nil
+}
+
+// CreateOfficeTaskInWorkflow creates an office task pinned to a specific
+// workflow id, bypassing the workspace's default office_workflow_id. Its
+// only production caller (as of WO-36) is the routines dispatcher, which
+// pins a materialized heavy-routine run to the dedicated Routine workflow.
+//
+// routineID is the firing routine's id, persisted as the task-boundary
+// causation carrier's routine attribution (AC-OFFICE-RUN-CAUSATION-001.14/.24):
+// a routine fire has no creating run, so the carrier's creating run
+// identifier, causation identifier, and depth are the AC.24 root values
+// (empty/empty/0), while the routine attribution, actor kind `system`,
+// and human-rooted `false` still apply, keeping the routine chargeable
+// for every run a later task-assigned wake queues off this task.
+func (a *taskCreatorAdapter) CreateOfficeTaskInWorkflow(
+	ctx context.Context, workspaceID, projectID, assigneeAgentID, workflowID, title, description, routineID string,
+) (string, error) {
+	metadata := map[string]interface{}{
+		// The Routine workflow's start step carries on_enter:
+		// auto_start_agent, but a materialized run lands directly on that
+		// step rather than transitioning into it, so nothing would
+		// otherwise evaluate on_enter for it. This opts the task into
+		// handleTaskCreated's create-time on_enter evaluation.
+		models.MetaKeyAutoStartOnCreate: true,
+	}
+	if assigneeAgentID != "" {
+		// The Routine workflow's start step pins no agent (routine.yml), so
+		// the kanban auto-start path's fallback read of
+		// task.Metadata[MetaKeyAgentProfileID] is what lets a materialized
+		// heavy-routine task actually launch with the routine's assignee.
+		metadata[models.MetaKeyAgentProfileID] = assigneeAgentID
+	}
+	// The full carrier set is written explicitly, including the
+	// empty/zero root values, so the read side's carrierPresent can tell
+	// this task apart from one that never carried a carrier at all — an
+	// omitted key reads as a defect (AC-OFFICE-RUN-CAUSATION-001.10
+	// "absent"), not as this deliberate root. Carried through the trusted
+	// OfficeCarrierMetadata field (AC-OFFICE-RUN-CAUSATION-001.17), not
+	// Metadata, so it survives create-time stripping.
+	carrierMetadata := map[string]interface{}{
+		models.MetaKeyOfficeCarrierCausationID:    "",
+		models.MetaKeyOfficeCarrierCausationDepth: 0,
+		models.MetaKeyOfficeCarrierCreatingRunID:  "",
+		models.MetaKeyOfficeCarrierHumanRooted:    false,
+		models.MetaKeyOfficeCarrierRoutineID:      routineID,
+		models.MetaKeyOfficeCarrierActorKind:      string(officemodels.ActorKindSystem),
+		models.MetaKeyOfficeCarrierActorID:        "",
+	}
+	result, err := a.taskSvc.CreateTask(ctx, &taskservice.CreateTaskRequest{ //nolint:exhaustruct
+		WorkspaceID:            workspaceID,
+		WorkflowID:             workflowID,
+		Title:                  title,
+		Description:            description,
+		ProjectID:              projectID,
+		AssigneeAgentProfileID: assigneeAgentID,
+		Metadata:               metadata,
+		OfficeCarrierMetadata:  carrierMetadata,
+		Origin:                 models.TaskOriginOnboarding,
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.Task.ID, nil
+}
+
+// CreateOfficeSubtask receives carrierMetadata already resolved server-side
+// from the causing run's record (or nil), and forwards it through the
+// trusted ChildTaskSpec.OfficeCarrierMetadata field so it survives
+// create-time stripping the same way a request-body-forged carrier does
+// not (AC-OFFICE-RUN-CAUSATION-001.17).
+func (a *taskCreatorAdapter) CreateOfficeSubtask(
+	ctx context.Context,
+	parentTaskID, assigneeAgentID, title, description string,
+	carrierMetadata map[string]interface{},
+) (string, error) {
+	parent, err := a.taskSvc.GetTask(ctx, parentTaskID)
+	if err != nil {
+		return "", err
+	}
+	return a.taskSvc.CreateChildTask(ctx, parent, taskservice.ChildTaskSpec{
+		Title:                 title,
+		Description:           description,
+		AgentProfileID:        assigneeAgentID,
+		OfficeCarrierMetadata: carrierMetadata,
+	})
+}
+
+// routineWakeupAdapter bridges the routines package's WakeupEnqueuer
+// interface to the concrete office sqlite repo + wakeup dispatcher.
+// Defined here (not in the routines package) so the routines package
+// stays free of office/repository/sqlite imports — keeping the
+// dependency direction routines → wakeup (via interface) and never the
+// reverse.
+type routineWakeupAdapter struct {
+	repo       *officesqlite.Repository
+	dispatcher *officewakeup.Dispatcher
+}
+
+func (a *routineWakeupAdapter) CreateWakeupRequest(
+	ctx context.Context, req *officeroutines.WakeupRequest,
+) error {
+	row := &officesqlite.WakeupRequest{
+		ID:             req.ID,
+		AgentProfileID: req.AgentProfileID,
+		Source:         req.Source,
+		Reason:         req.Reason,
+		Payload:        req.Payload,
+		RequestedAt:    req.RequestedAt,
+		CausationID:    req.CausationID,
+	}
+	if req.IdempotencyKey != "" {
+		row.IdempotencyKey = sql.NullString{String: req.IdempotencyKey, Valid: true}
+	}
+	if err := a.repo.CreateWakeupRequest(ctx, row); err != nil {
+		if errors.Is(err, officesqlite.ErrWakeupIdempotencyConflict) {
+			runsservice.ReportDurableDedup(runsservice.QueueSourceWakeup, req.Reason, req.IdempotencyKey, req.AgentProfileID)
+			// Wraps both sentinels so a caller can check either: routines
+			// callers key off ErrWakeupAlreadyRequested to treat this as
+			// success by another route, while errors.Is against the
+			// sqlite-layer ErrWakeupIdempotencyConflict still matches.
+			return fmt.Errorf("%w: %w", officeroutines.ErrWakeupAlreadyRequested, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (a *routineWakeupAdapter) Dispatch(ctx context.Context, requestID string) error {
+	return a.dispatcher.Dispatch(ctx, requestID)
+}
+
+func (a *routineWakeupAdapter) FailWakeupRequest(ctx context.Context, requestID, reason string) error {
+	return a.repo.MarkWakeupRequestFailed(ctx, requestID, reason)
+}
+
+// configSyncerAdapter bridges config.ConfigService to the onboarding.ConfigSyncer
+// interface by converting config.ImportResult to onboarding.ApplyResult.
+type configSyncerAdapter struct {
+	svc *officeconfig.ConfigService
+}
+
+func (a *configSyncerAdapter) ApplyIncoming(ctx context.Context, workspaceID string) (*officeonboarding.ApplyResult, error) {
+	result, err := a.svc.ApplyIncoming(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return &officeonboarding.ApplyResult{
+		CreatedCount: result.CreatedCount,
+		UpdatedCount: result.UpdatedCount,
+		Warnings:     result.Warnings,
+	}, nil
+}
+
+// workflowEnsurerAdapter wraps the task repo to satisfy onboarding.WorkflowEnsurer.
+type workflowEnsurerAdapter struct {
+	repo *tasksqlite.Repository
+}
+
+func (a *workflowEnsurerAdapter) EnsureOfficeWorkflow(ctx context.Context, workspaceID string) (string, error) {
+	return a.repo.EnsureOfficeWorkflow(ctx, workspaceID)
+}
+
+func (a *workflowEnsurerAdapter) EnsureOfficeDefaultWorkflow(ctx context.Context, workspaceID string) (string, error) {
+	return a.repo.EnsureOfficeDefaultWorkflow(ctx, workspaceID)
+}
+
+func (a *workflowEnsurerAdapter) EnsureRoutineWorkflow(ctx context.Context, workspaceID string) (string, error) {
+	return a.repo.EnsureRoutineWorkflow(ctx, workspaceID)
+}
+
+// workspaceSettingsProviderAdapter implements dashboard.SettingsProvider using
+// the filesystem-based config loader and writer.
+type workspaceSettingsProviderAdapter struct {
+	loader *configloader.ConfigLoader
+	writer *configloader.FileWriter
+}
+
+func (a *workspaceSettingsProviderAdapter) GetSettings(workspaceName string) (*officedashboard.WorkspaceSettings, error) {
+	ws, err := a.loader.GetWorkspace(workspaceName)
+	if err != nil {
+		// Workspace not found in config loader — return defaults.
+		return &officedashboard.WorkspaceSettings{
+			Name:                   workspaceName,
+			PermissionHandlingMode: "human",
+			RecoveryLookbackHours:  24,
+		}, nil
+	}
+	mode := string(ws.Settings.PermissionHandlingMode)
+	if mode == "" {
+		mode = "human"
+	}
+	lookback := ws.Settings.RecoveryLookbackHours
+	if lookback == 0 {
+		lookback = 24
+	}
+	return &officedashboard.WorkspaceSettings{
+		Name:                   ws.Settings.Name,
+		Description:            ws.Settings.Description,
+		PermissionHandlingMode: mode,
+		RecoveryLookbackHours:  lookback,
+	}, nil
+}
+
+func (a *workspaceSettingsProviderAdapter) UpdatePermissionHandlingMode(workspaceName, mode string) error {
+	ws, err := a.loader.GetWorkspace(workspaceName)
+	if err != nil {
+		// Workspace not in loader — write a minimal kandev.yml.
+		ws = &configloader.WorkspaceConfig{
+			Name: workspaceName,
+			Settings: configloader.WorkspaceSettings{
+				Name: workspaceName,
+			},
+		}
+	}
+	settings := ws.Settings
+	settings.PermissionHandlingMode = configloader.PermissionHandlingMode(mode)
+	data, err := configloader.MarshalSettings(settings)
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	return a.writer.WriteRawSettings(workspaceName, data)
+}
+
+func (a *workspaceSettingsProviderAdapter) UpdateRecoveryLookbackHours(workspaceName string, hours int) error {
+	ws, err := a.loader.GetWorkspace(workspaceName)
+	if err != nil {
+		ws = &configloader.WorkspaceConfig{
+			Name: workspaceName,
+			Settings: configloader.WorkspaceSettings{
+				Name: workspaceName,
+			},
+		}
+	}
+	settings := ws.Settings
+	settings.RecoveryLookbackHours = hours
+	data, err := configloader.MarshalSettings(settings)
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	return a.writer.WriteRawSettings(workspaceName, data)
+}

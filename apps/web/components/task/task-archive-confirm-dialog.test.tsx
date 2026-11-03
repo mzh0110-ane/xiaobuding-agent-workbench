@@ -1,0 +1,471 @@
+import { StrictMode, type ReactNode } from "react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { StateProvider, useAppStore } from "@/components/state-provider";
+import { defaultState } from "@/lib/state/default-state";
+import { expectCompactWarning } from "./task-confirm-dialog.test-helpers";
+
+const mockGetSubtaskCount = vi.fn();
+const ARCHIVE_CONFIRM_TEST_ID = "archive-confirm";
+const CLEANUP_EFFECTS_TEST_ID = "task-cleanup-effects";
+
+vi.mock("@/lib/api", () => ({
+  getSubtaskCount: (...args: unknown[]) => mockGetSubtaskCount(...args),
+}));
+
+import { TaskArchiveConfirmDialog } from "./task-archive-confirm-dialog";
+
+function renderDialog(ui: ReactNode, confirmTaskArchive = true) {
+  return render(
+    <StateProvider
+      initialState={{
+        userSettings: { ...defaultState.userSettings, confirmTaskArchive },
+      }}
+    >
+      {ui}
+    </StateProvider>,
+  );
+}
+
+type SeedTask = { id: string; foregroundActivity?: "generating" | "background" | null };
+
+// Seed the store's active kanban tasks so useTaskInFlight resolves the same
+// foreground_activity aggregate the board shows — the guard reads live store
+// state, not a prop.
+function renderWithTasks(ui: ReactNode, tasks: SeedTask[], confirmTaskArchive = true) {
+  return render(
+    <StateProvider
+      initialState={{
+        userSettings: { ...defaultState.userSettings, confirmTaskArchive },
+        kanban: {
+          workflowId: "wf-1",
+          steps: [],
+          tasks: tasks.map((t) => ({
+            id: t.id,
+            workflowId: "wf-1",
+            workflowStepId: "step-1",
+            title: t.id,
+            position: 0,
+            foregroundActivity: t.foregroundActivity ?? undefined,
+          })),
+        },
+      }}
+    >
+      {ui}
+    </StateProvider>,
+  );
+}
+
+const WARNING_TESTID = "still-working-warning";
+
+function DisableArchiveConfirmationButton() {
+  const settings = useAppStore((state) => state.userSettings);
+  const setUserSettings = useAppStore((state) => state.setUserSettings);
+
+  return (
+    <button
+      type="button"
+      onClick={() => setUserSettings({ ...settings, confirmTaskArchive: false })}
+    >
+      Disable archive confirmation
+    </button>
+  );
+}
+
+beforeEach(() => {
+  mockGetSubtaskCount.mockReset();
+  mockGetSubtaskCount.mockResolvedValue({ count: 0 });
+});
+
+afterEach(cleanup);
+
+describe("TaskArchiveConfirmDialog presentation", () => {
+  it("contains long confirmation content in a scrolling body with touch-safe actions", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="A task with a title that needs to wrap inside a phone confirmation surface"
+        taskId="task-1"
+        executorType="sprites"
+        isInFlight
+        confirmTestId={ARCHIVE_CONFIRM_TEST_ID}
+        onConfirm={() => {}}
+      />,
+    );
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.className).toContain("max-h-[calc(100dvh-2rem)]");
+    expect(dialog.className).toContain("grid-rows-[auto_minmax(0,1fr)_auto]");
+    expect(dialog.className).toContain("overflow-hidden");
+    expect(screen.getByTestId("task-confirmation-body").className).toContain("min-h-0");
+    expect(screen.getByTestId("task-confirmation-body").className).toContain("space-y-3");
+    expect(screen.getByTestId("task-confirmation-body").className).toContain("overflow-y-auto");
+    expect(screen.getByTestId(ARCHIVE_CONFIRM_TEST_ID).className).toContain("min-h-[44px]");
+    expect(screen.getByTestId(ARCHIVE_CONFIRM_TEST_ID).className).toContain("w-full");
+    expect(screen.getByTestId(ARCHIVE_CONFIRM_TEST_ID).getAttribute("data-variant")).toBe(
+      "default",
+    );
+  });
+
+  it("explains conditional worktree cleanup and retained branches", () => {
+    mockGetSubtaskCount.mockResolvedValue({ count: 0 });
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        confirmTestId={ARCHIVE_CONFIRM_TEST_ID}
+        onConfirm={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId(CLEANUP_EFFECTS_TEST_ID).textContent).toMatch(
+      /Git changes stays until it is clean/i,
+    );
+    expect(screen.getByTestId("task-cleanup-notes").textContent).toMatch(
+      /Unpublished local branches remain available/i,
+    );
+  });
+
+  it("uses grouped conditional cleanup copy for bulk worktree archives", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        isBulkOperation
+        count={2}
+        executorTypes={["worktree", "worktree"]}
+        confirmTestId={ARCHIVE_CONFIRM_TEST_ID}
+        onConfirm={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId(CLEANUP_EFFECTS_TEST_ID).textContent).toMatch(/2 Git worktree tasks/);
+    expect(screen.getByTestId(CLEANUP_EFFECTS_TEST_ID).textContent).toMatch(
+      /checkouts with Git changes stay until they are clean/i,
+    );
+  });
+});
+
+describe("TaskArchiveConfirmDialog preference", () => {
+  it("archives once without rendering a dialog when confirmation is disabled", async () => {
+    const onConfirm = vi.fn();
+    const onOpenChange = vi.fn();
+
+    renderDialog(
+      <StrictMode>
+        <TaskArchiveConfirmDialog
+          open
+          onOpenChange={onOpenChange}
+          taskTitle="My task"
+          taskId="task-1"
+          executorType="worktree"
+          onConfirm={onConfirm}
+        />
+      </StrictMode>,
+      false,
+    );
+
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith({ cascade: false }));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("does not auto-archive an already-open dialog after a settings sync", () => {
+    const onConfirm = vi.fn();
+
+    renderDialog(
+      <>
+        <DisableArchiveConfirmationButton />
+        <TaskArchiveConfirmDialog
+          open
+          onOpenChange={() => {}}
+          taskTitle="My task"
+          taskId="task-1"
+          executorType="worktree"
+          onConfirm={onConfirm}
+        />
+      </>,
+    );
+
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    fireEvent.click(screen.getByText("Disable archive confirmation", { selector: "button" }));
+
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+  });
+});
+
+describe("TaskArchiveConfirmDialog classification safety", () => {
+  it("disables archive while descendant classification is pending", () => {
+    const onConfirm = vi.fn();
+
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        subtaskClassification={{ status: "loading", total: 0 }}
+        confirmTestId={ARCHIVE_CONFIRM_TEST_ID}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    const confirm = screen.getByTestId(ARCHIVE_CONFIRM_TEST_ID);
+    expect(confirm.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(confirm);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it("keeps the safe fallback actionable when classification fails", () => {
+    const onConfirm = vi.fn();
+
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        subtaskClassification={{ status: "error", total: 0 }}
+        confirmTestId={ARCHIVE_CONFIRM_TEST_ID}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId(ARCHIVE_CONFIRM_TEST_ID));
+    expect(onConfirm).toHaveBeenCalledWith({ cascade: false });
+  });
+});
+
+describe("TaskArchiveConfirmDialog direct outcome", () => {
+  it("states the named archive outcome directly and separates cleanup effects", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId("task-confirmation-outcome").textContent).toMatch(
+      /Archive [“"]?My task[”"]?\./i,
+    );
+    expect(screen.getByTestId(CLEANUP_EFFECTS_TEST_ID).tagName).toBe("UL");
+    expect(screen.getByTestId(CLEANUP_EFFECTS_TEST_ID).querySelectorAll("li")).toHaveLength(2);
+    expect(screen.getByTestId("task-cleanup-notes").tagName).toBe("DIV");
+    expect(screen.queryByText(/Are you sure/i)).toBeNull();
+  });
+});
+
+describe("TaskArchiveConfirmDialog cleanup copy", () => {
+  it("renders local-executor reassurance about untouched repo", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="local"
+        onConfirm={() => {}}
+      />,
+    );
+    expect(screen.getByText(/directly in your repo/i)).toBeTruthy();
+  });
+
+  it("renders conditional worktree cleanup and branch retention copy", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Git changes stays until it is clean/i)).toBeTruthy();
+    expect(screen.getByText(/Unpublished local branches remain available/i)).toBeTruthy();
+  });
+
+  it("warns about sandbox destruction for sprites executor", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="sprites"
+        onConfirm={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Sprites cloud sandbox/i)).toBeTruthy();
+    expect(screen.getByText(/uncommitted work/i)).toBeTruthy();
+  });
+
+  it("describes Docker container removal for local_docker", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="local_docker"
+        onConfirm={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Docker container/i)).toBeTruthy();
+  });
+
+  it("renders grouped copy for bulk archive", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        isBulkOperation
+        count={3}
+        taskIds={["a", "b", "c"]}
+        executorTypes={["sprites", "worktree", "worktree"]}
+        onConfirm={() => {}}
+      />,
+    );
+    expect(screen.getByText(/For 2 Git worktree tasks/i)).toBeTruthy();
+    expect(screen.getByText(/Unpublished local branches remain available/i)).toBeTruthy();
+    expect(screen.getByText(/1 Sprites sandbox/i)).toBeTruthy();
+  });
+
+  it("no longer renders the old hardcoded worktree line for non-worktree executors", () => {
+    renderDialog(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="local"
+        onConfirm={() => {}}
+      />,
+    );
+    expect(
+      screen.queryByText(
+        /This will delete the task's worktree and stop any running agent sessions/,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("TaskArchiveConfirmDialog still-working guard", () => {
+  it("keeps the in-flight warning visually subordinate to confirmation copy", () => {
+    renderWithTasks(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+      [{ id: "task-1", foregroundActivity: "generating" }],
+    );
+
+    expectCompactWarning(screen.getByTestId(WARNING_TESTID));
+  });
+
+  it("warns when the task is generating", () => {
+    renderWithTasks(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+      [{ id: "task-1", foregroundActivity: "generating" }],
+    );
+    expect(screen.getByTestId(WARNING_TESTID)).toBeTruthy();
+    expect(screen.getByTestId(WARNING_TESTID).textContent).toMatch(/still working/i);
+  });
+
+  it("warns when spawned background work is still running", () => {
+    renderWithTasks(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+      [{ id: "task-1", foregroundActivity: "background" }],
+    );
+    expect(screen.getByTestId(WARNING_TESTID)).toBeTruthy();
+  });
+
+  it("omits the warning for an idle task", () => {
+    renderWithTasks(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        taskTitle="My task"
+        taskId="task-1"
+        executorType="worktree"
+        onConfirm={() => {}}
+      />,
+      [{ id: "task-1", foregroundActivity: null }],
+    );
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(screen.queryByTestId(WARNING_TESTID)).toBeNull();
+  });
+
+  it("warns for a bulk archive when any selected task is in-flight", () => {
+    renderWithTasks(
+      <TaskArchiveConfirmDialog
+        open
+        onOpenChange={() => {}}
+        isBulkOperation
+        count={2}
+        taskIds={["a", "b"]}
+        executorTypes={["worktree", "worktree"]}
+        onConfirm={() => {}}
+      />,
+      [
+        { id: "a", foregroundActivity: null },
+        { id: "b", foregroundActivity: "generating" },
+      ],
+    );
+    expect(screen.getByTestId(WARNING_TESTID)).toBeTruthy();
+  });
+
+  it("does not warn (or prompt) when archive confirmation is disabled, even mid-run", async () => {
+    // Documented residual gap (operator decision q1_opt2): honoring the
+    // confirmTaskArchive bypass means an in-flight task can be archived with no
+    // dialog and therefore no warning. Delete has no such bypass.
+    const onConfirm = vi.fn();
+    renderWithTasks(
+      <StrictMode>
+        <TaskArchiveConfirmDialog
+          open
+          onOpenChange={() => {}}
+          taskTitle="My task"
+          taskId="task-1"
+          executorType="worktree"
+          onConfirm={onConfirm}
+        />
+      </StrictMode>,
+      [{ id: "task-1", foregroundActivity: "generating" }],
+      false,
+    );
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith({ cascade: false }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByTestId(WARNING_TESTID)).toBeNull();
+  });
+});

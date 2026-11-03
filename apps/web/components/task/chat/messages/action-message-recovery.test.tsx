@@ -1,0 +1,489 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StateProvider, useAppStoreApi } from "@/components/state-provider";
+import type { StoreApi } from "zustand";
+import { ActionMessage } from "./action-message";
+import {
+  sessionId as toSessionId,
+  taskId as toTaskId,
+  type Message,
+  type TaskSession,
+  type TaskSessionState,
+} from "@/lib/types/http";
+import type { AppState } from "@/lib/state/store";
+import { WebSocketRequestError } from "@/lib/ws/client";
+
+import { i18n } from "@/lib/i18n";
+import ptTask from "@/src/locales/pt-pt/task.json";
+
+const requestMock = vi.fn().mockResolvedValue({});
+
+vi.mock("@/lib/ws/connection", () => ({
+  getWebSocketClient: () => ({ request: requestMock }),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  requestMock.mockReset().mockResolvedValue({});
+});
+
+const RECOVERY_MESSAGE = "Agent encountered an error";
+const RESUME_TEST_ID = "recovery-resume-button";
+const FRESH_TEST_ID = "recovery-fresh-button";
+const RESTORE_BUTTON_TEST_ID = "recovery-restore-workspace-button";
+const SESSION_RECOVERY_METHOD = "session.recover";
+const BRANCH_FAILURE_MESSAGE = "The saved branch is no longer available.";
+const RECOVERY_ERROR_TEST_ID = "session-recovery-error";
+const TEST_SESSION_ID = "sess-1";
+const TEST_TASK_ID = "task-1";
+const FAILED_AT = "2026-05-30T00:00:00Z";
+const BOOTED_AFTER_FAILURE = "2026-05-30T00:01:00Z";
+const BOOTED_BEFORE_FAILURE = "2026-05-29T23:59:00Z";
+
+function recoveryMessage(): Message {
+  return {
+    id: "msg-1",
+    session_id: toSessionId(TEST_SESSION_ID),
+    task_id: toTaskId(TEST_TASK_ID),
+    author_type: "agent",
+    content: RECOVERY_MESSAGE,
+    type: "status",
+    created_at: FAILED_AT,
+    metadata: {
+      variant: "error",
+      recovery_actions: true,
+      actions: [
+        {
+          type: "ws_request",
+          label: "Resume session",
+          test_id: RESUME_TEST_ID,
+          params: {
+            method: SESSION_RECOVERY_METHOD,
+            payload: { task_id: TEST_TASK_ID, session_id: TEST_SESSION_ID, action: "resume" },
+          },
+        },
+        {
+          type: "ws_request",
+          label: "Start fresh session",
+          test_id: FRESH_TEST_ID,
+          params: {
+            method: SESSION_RECOVERY_METHOD,
+            payload: { task_id: TEST_TASK_ID, session_id: TEST_SESSION_ID, action: "fresh_start" },
+          },
+        },
+      ],
+    },
+  } as Message;
+}
+
+function bootMessage(createdAt: string, metadata: Record<string, unknown> = {}): Message {
+  return {
+    id: `boot-${createdAt}`,
+    session_id: toSessionId(TEST_SESSION_ID),
+    task_id: toTaskId(TEST_TASK_ID),
+    author_type: "agent",
+    content: "",
+    type: "script_execution",
+    created_at: createdAt,
+    metadata: {
+      script_type: "agent_boot",
+      agent_name: "OpenCode",
+      is_resuming: true,
+      status: "exited",
+      ...metadata,
+    },
+  } as Message;
+}
+
+/**
+ * Renders the card against a seeded transcript and WITHOUT activating Resume.
+ * That is the reported situation: the click acknowledgment is in-memory, so a
+ * reload, a task switch, or an auto-resume-on-open all present the persisted
+ * card with no acknowledgment at all.
+ */
+function renderWithTranscript(
+  sessionState: TaskSessionState,
+  messages: Message[],
+  sessionMetadata?: Record<string, unknown>,
+  comment = recoveryMessage(),
+) {
+  const initialState: Partial<AppState> = {
+    taskSessions: {
+      items: {
+        [TEST_SESSION_ID]: { state: sessionState, metadata: sessionMetadata } as TaskSession,
+      },
+    },
+    turns: {
+      bySession: {},
+      activeBySession: {},
+      loadedBySession: {},
+      reconcileEpochBySession: {},
+      settledBoundaryBySession: {},
+    },
+    messages: { bySession: { [TEST_SESSION_ID]: messages }, metaBySession: {} },
+  };
+  return render(<ActionMessage comment={comment} />, {
+    wrapper: ({ children }) => (
+      <StateProvider initialState={initialState}>{children}</StateProvider>
+    ),
+  });
+}
+
+describe("ActionMessage — recovery history remains after the agent is back", () => {
+  it("retains the entry without controls when a resume re-established the agent", () => {
+    // A resumed agent settles at WAITING_FOR_INPUT, not RUNNING, so the session
+    // state alone never retires the card.
+    renderWithTranscript("WAITING_FOR_INPUT", [bootMessage(BOOTED_AFTER_FAILURE)]);
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+    expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+    expect(screen.queryByTestId(FRESH_TEST_ID)).toBeNull();
+  });
+
+  it("retains the entry without controls when a fresh start re-established the agent", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", [
+      bootMessage(BOOTED_AFTER_FAILURE, { is_resuming: false }),
+    ]);
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+    expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+    expect(screen.queryByTestId(FRESH_TEST_ID)).toBeNull();
+  });
+
+  it("keeps the card visible when the resume attempt failed", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", [
+      bootMessage(BOOTED_AFTER_FAILURE, { status: "failed" }),
+    ]);
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+    expect(screen.getByTestId(RESUME_TEST_ID)).toBeTruthy();
+  });
+
+  it("keeps the card visible while the resume is still running", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", [
+      bootMessage(BOOTED_AFTER_FAILURE, { status: "running" }),
+    ]);
+
+    expect(screen.getByTestId(RESUME_TEST_ID)).toBeTruthy();
+  });
+
+  it("keeps the card visible when the only successful boot predates the failure", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", [bootMessage(BOOTED_BEFORE_FAILURE)]);
+
+    expect(screen.getByTestId(RESUME_TEST_ID)).toBeTruthy();
+  });
+
+  it("keeps the card visible when the transcript holds no boot record at all", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", []);
+
+    expect(screen.getByTestId(RESUME_TEST_ID)).toBeTruthy();
+  });
+
+  it("uses the durable session resolution when the boot record is missing", () => {
+    renderWithTranscript("WAITING_FOR_INPUT", [], { recovery_resolved_at: BOOTED_AFTER_FAILURE });
+
+    expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+    expect(screen.queryByTestId(FRESH_TEST_ID)).toBeNull();
+  });
+
+  it("keeps a typed branch failure visible with explicit recovery choices", async () => {
+    requestMock.mockRejectedValueOnce(
+      new WebSocketRequestError(BRANCH_FAILURE_MESSAGE, "CONFLICT", {
+        kind: "branch_unrecoverable",
+        recovery_action: "resume_new_branch",
+        original_branch: "feature/lost",
+        base_branch: "main",
+      }),
+    );
+
+    renderWithTranscript("WAITING_FOR_INPUT", []);
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+
+    expect(await screen.findByTestId(RECOVERY_ERROR_TEST_ID)).toBeTruthy();
+    expect(screen.getByText(BRANCH_FAILURE_MESSAGE)).toBeTruthy();
+    expect(screen.getByTestId("recovery-new-branch-button")).toBeTruthy();
+
+    expect(screen.getByTestId(RESTORE_BUTTON_TEST_ID)).toBeTruthy();
+  });
+
+  it("retains both causes when manual resume and read-only restore fail", async () => {
+    requestMock
+      .mockRejectedValueOnce(
+        new WebSocketRequestError(BRANCH_FAILURE_MESSAGE, "CONFLICT", {
+          kind: "branch_unrecoverable",
+          recovery_action: "resume_new_branch",
+          original_branch: "feature/lost",
+          base_branch: "main",
+        }),
+      )
+      .mockRejectedValueOnce(new Error("Workspace restore failed."));
+
+    renderWithTranscript("WAITING_FOR_INPUT", []);
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    expect(await screen.findByTestId(RECOVERY_ERROR_TEST_ID)).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId(RESTORE_BUTTON_TEST_ID));
+
+    const recoveryError = await screen.findByTestId(RECOVERY_ERROR_TEST_ID);
+    expect(recoveryError.textContent).toContain(`Resume failed: ${BRANCH_FAILURE_MESSAGE}`);
+    expect(recoveryError.textContent).toContain(
+      "Workspace restore failed: Workspace restore failed.",
+    );
+    expect(screen.getByTestId("recovery-new-branch-button")).toBeTruthy();
+  });
+
+  it("does not offer branch continuation for an ordinary recovery failure", async () => {
+    requestMock.mockRejectedValueOnce(new Error("Provider is unavailable"));
+
+    renderWithTranscript("WAITING_FOR_INPUT", []);
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+
+    expect(await screen.findByText("Provider is unavailable")).toBeTruthy();
+    expect(screen.queryByTestId("recovery-new-branch-button")).toBeNull();
+
+    expect(screen.getByTestId(RESTORE_BUTTON_TEST_ID)).toBeTruthy();
+  });
+});
+
+describe("ActionMessage recovery retry", () => {
+  it("disables Retry while a repeated recovery request is pending", async () => {
+    let resolveRetry: (() => void) | undefined;
+    requestMock.mockRejectedValueOnce(new Error("Initial resume failed")).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+
+    renderWithTranscript("WAITING_FOR_INPUT", []);
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    expect(await screen.findByTestId(RECOVERY_ERROR_TEST_ID)).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    await waitFor(() =>
+      expect((screen.getByTestId(RESUME_TEST_ID) as HTMLButtonElement).disabled).toBe(true),
+    );
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    expect(requestMock).toHaveBeenCalledTimes(2);
+
+    resolveRetry?.();
+    await waitFor(() => expect(screen.queryByTestId(RECOVERY_ERROR_TEST_ID)).toBeNull());
+  });
+});
+
+/** Renders the card with a live store handle so a spec can land transcript rows and
+ *  session transitions after the user has already pressed Resume. */
+function renderWithLiveStore(messages: Message[]) {
+  let store: StoreApi<AppState> | null = null;
+  function CaptureStore() {
+    store = useAppStoreApi();
+    return null;
+  }
+  const initialState: Partial<AppState> = {
+    taskSessions: {
+      items: { [TEST_SESSION_ID]: { state: "WAITING_FOR_INPUT" } as TaskSession },
+    },
+    turns: {
+      bySession: {},
+      activeBySession: {},
+      loadedBySession: {},
+      reconcileEpochBySession: {},
+      settledBoundaryBySession: {},
+    },
+    messages: { bySession: { [TEST_SESSION_ID]: messages }, metaBySession: {} },
+  };
+  render(
+    <StateProvider initialState={initialState}>
+      <CaptureStore />
+      <ActionMessage comment={recoveryMessage()} />
+    </StateProvider>,
+  );
+  return {
+    setSessionState: (state: TaskSessionState) =>
+      act(() => {
+        store?.getState().setTaskSession({
+          id: toSessionId(TEST_SESSION_ID),
+          task_id: toTaskId(TEST_TASK_ID),
+          state,
+          started_at: "",
+          updated_at: "",
+        } as TaskSession);
+      }),
+    setMessages: (next: Message[]) =>
+      act(() => {
+        store?.getState().setMessages(toSessionId(TEST_SESSION_ID), next);
+      }),
+  };
+}
+
+describe("ActionMessage — a recovery that failed keeps its controls", () => {
+  it("brings the card back when the boot after an accepted resume reports failure", async () => {
+    const live = renderWithLiveStore([]);
+
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull());
+
+    // The launch was accepted, so the card hid; the agent then failed to come up.
+    live.setSessionState("STARTING");
+    live.setMessages([bootMessage(BOOTED_AFTER_FAILURE, { status: "failed" })]);
+    live.setSessionState("WAITING_FOR_INPUT");
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+
+    expect(screen.getByTestId(FRESH_TEST_ID)).toBeTruthy();
+  });
+
+  it("brings the card back when an accepted resume drives the session to FAILED", async () => {
+    const live = renderWithLiveStore([]);
+
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    await waitFor(() => expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull());
+
+    live.setSessionState("FAILED");
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+
+    expect(screen.getByTestId(FRESH_TEST_ID)).toBeTruthy();
+  });
+
+  it("keeps the card retired when the accepted resume actually boots", async () => {
+    const live = renderWithLiveStore([]);
+
+    fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+    await waitFor(() => expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull());
+
+    live.setSessionState("STARTING");
+    live.setMessages([bootMessage(BOOTED_AFTER_FAILURE)]);
+    live.setSessionState("WAITING_FOR_INPUT");
+
+    expect(screen.getByText(RECOVERY_MESSAGE)).toBeTruthy();
+    expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+  });
+});
+
+it("offers confirmed relocation after restore reports a managed-clone refusal", async () => {
+  requestMock.mockRejectedValueOnce(new Error("The first resume failed.")).mockRejectedValueOnce(
+    new WebSocketRequestError("Workspace relocation is required.", "CONFLICT", {
+      kind: "managed_clone_relocation_required",
+      error_stamp: "durable-relocation-stamp",
+      recovery_action: "relocate_and_resume",
+    }),
+  );
+  renderWithTranscript("FAILED", []);
+
+  fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+  fireEvent.click(await screen.findByTestId(RESTORE_BUTTON_TEST_ID));
+  await screen.findByTestId("session-recovery-error");
+  const relocate = await screen.findByTestId("managed-clone-relocate-button");
+  expect(screen.queryByTestId(RESUME_TEST_ID)).toBeNull();
+  expect(screen.queryByTestId(FRESH_TEST_ID)).toBeNull();
+  expect(screen.queryByTestId(RESTORE_BUTTON_TEST_ID)).toBeNull();
+
+  fireEvent.click(relocate);
+  expect(await screen.findByTestId("managed-clone-relocation-confirmation")).toBeTruthy();
+  expect(requestMock).toHaveBeenCalledTimes(2);
+
+  fireEvent.click(screen.getByTestId("managed-clone-relocation-confirm"));
+  await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(3));
+  expect(requestMock.mock.calls[2].slice(0, 2)).toEqual([
+    "session.recover",
+    {
+      task_id: TEST_TASK_ID,
+      session_id: TEST_SESSION_ID,
+      action: "relocate_and_resume",
+      error_stamp: "durable-relocation-stamp",
+    },
+  ]);
+});
+
+it("shows fresh start directly beside resume", () => {
+  renderWithTranscript("FAILED", []);
+  expect(screen.getByTestId(FRESH_TEST_ID)).toBeTruthy();
+});
+
+it("does not duplicate a supplied branch-recovery action after a branch refusal", async () => {
+  requestMock.mockRejectedValueOnce(
+    new WebSocketRequestError(BRANCH_FAILURE_MESSAGE, "CONFLICT", {
+      kind: "branch_unrecoverable",
+      recovery_action: "resume_new_branch",
+      original_branch: "feature/lost",
+      base_branch: "main",
+    }),
+  );
+  const row = recoveryMessage();
+  const metadata = row.metadata as { actions: Record<string, unknown>[] };
+  metadata.actions.push({
+    type: "ws_request",
+    label: "Continue on a new branch",
+    test_id: "supplied-branch",
+    params: { method: "session.recover", payload: { action: "resume_new_branch" } },
+  });
+  renderWithTranscript("FAILED", [row], undefined, row);
+  fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+  await screen.findByTestId(RECOVERY_ERROR_TEST_ID);
+  expect(screen.getAllByRole("button", { name: "Continue on a new branch" })).toHaveLength(1);
+});
+
+it("redacts a workspace failure after a transcript recovery guard", async () => {
+  requestMock
+    .mockRejectedValueOnce(
+      new WebSocketRequestError("busy", "CONFLICT", {
+        kind: "session_recovery_in_progress",
+        retryable: true,
+      }),
+    )
+    .mockRejectedValueOnce(new Error("Restore failed: token=transcript-secret-fixture"));
+  renderWithTranscript("FAILED", [recoveryMessage()]);
+  fireEvent.click(screen.getByTestId(RESUME_TEST_ID));
+  fireEvent.click(await screen.findByTestId(RESTORE_BUTTON_TEST_ID));
+  await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(screen.getByTestId(RESTORE_BUTTON_TEST_ID)).toHaveProperty("disabled", false),
+  );
+  expect(document.body.textContent).not.toContain("transcript-secret-fixture");
+});
+
+describe("recovery description localization", () => {
+  it.each([
+    ["sessionRecoveryResumeDescription", "Retomar mantém as mensagens e o contexto anteriores."],
+    [
+      "sessionRecoveryFreshDescription",
+      "Começar de novo utiliza o mesmo espaço de trabalho sem o contexto da conversa anterior.",
+    ],
+    [
+      "sessionRecoveryCorruptedDescription",
+      "É provável que retomar volte a falhar porque o estado guardado desta sessão está corrompido. Inicie uma nova sessão.",
+    ],
+  ])("localizes %s instead of displaying the backend fallback", async (key, expected) => {
+    i18n.addResourceBundle("pt-pt", "task", ptTask, true, true);
+    await i18n.changeLanguage("pt-pt");
+    try {
+      const message = recoveryMessage();
+      const actions = message.metadata!.actions as Record<string, unknown>[];
+      actions[0].tooltip_key = key;
+      actions[0].tooltip = "English fallback";
+      renderWithTranscript("WAITING_FOR_INPUT", [], undefined, message);
+      expect(screen.getByTestId(RESUME_TEST_ID).getAttribute("title")).toBe(expected);
+      expect(screen.getByText(expected)).toBeTruthy();
+      await act(() => i18n.changeLanguage("en"));
+      expect(screen.getByTestId(RESUME_TEST_ID).getAttribute("title")).toBe(i18n.t(`task:${key}`));
+    } finally {
+      cleanup();
+      await i18n.changeLanguage("en");
+    }
+  });
+});
+
+it.each([undefined, "futureDescription"])(
+  "keeps fallback copy for a missing or unknown key: %s",
+  (key) => {
+    const message = recoveryMessage();
+    const actions = message.metadata!.actions as Record<string, unknown>[];
+    actions[0].tooltip_key = key;
+    actions[0].tooltip = "Recovery fallback";
+    renderWithTranscript("WAITING_FOR_INPUT", [], undefined, message);
+    expect(screen.getByTestId(RESUME_TEST_ID).getAttribute("title")).toBe("Recovery fallback");
+  },
+);

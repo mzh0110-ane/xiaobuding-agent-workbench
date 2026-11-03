@@ -1,0 +1,295 @@
+"use client";
+
+import { memo } from "react";
+import {
+  IconCheck,
+  IconCode,
+  IconEdit,
+  IconEye,
+  IconFile,
+  IconSearch,
+  IconTerminal2,
+  IconX,
+} from "@tabler/icons-react";
+import { GridSpinner } from "@/components/grid-spinner";
+import { cn, transformPathsInText } from "@/lib/utils";
+import { prettifyToolTitle } from "@/lib/pretty-tool-title";
+import type { Message } from "@/lib/types/http";
+import type { ToolCallMetadata } from "@/components/task/chat/types";
+import { PermissionActionRow } from "./permission-action-row";
+import { ExpandableRow } from "./expandable-row";
+import { useExpandState } from "./use-expand-state";
+import {
+  parsePermission,
+  resolvePermissionAvailability,
+  type PermissionActionChoice,
+  type PermissionRequestMetadata,
+  usePermissionResponseHandlers,
+} from "./use-permission-handlers";
+import { t } from "@/lib/i18n";
+
+const TOOL_ICON_RULES: Array<{ keywords: string[]; Icon: typeof IconCode }> = [
+  { keywords: ["edit", "replace", "write", "save"], Icon: IconEdit },
+  { keywords: ["view", "read"], Icon: IconEye },
+  { keywords: ["search", "find", "retrieval"], Icon: IconSearch },
+  { keywords: ["terminal", "exec", "execute", "launch", "process"], Icon: IconTerminal2 },
+  { keywords: ["delete", "move", "file", "create"], Icon: IconFile },
+];
+
+function getToolIcon(toolName: string | undefined, className: string) {
+  const name = toolName?.toLowerCase() ?? "";
+  const match = TOOL_ICON_RULES.find(({ keywords }) =>
+    keywords.some((kw) => name === kw || name.includes(kw)),
+  );
+  const Icon = match?.Icon ?? IconCode;
+  return <Icon className={className} />;
+}
+
+type ToolCallMessageProps = {
+  comment: Message;
+  permissionMessage?: Message;
+  worktreePath?: string;
+};
+
+function getToolCallStatusIcon(status: string | undefined, permissionStatus: string | undefined) {
+  if (permissionStatus === "approved") return <IconCheck className="h-3.5 w-3.5 text-green-500" />;
+  if (permissionStatus === "rejected") return <IconX className="h-3.5 w-3.5 text-red-500" />;
+  if (status === "complete") return <IconCheck className="h-3.5 w-3.5 text-green-500" />;
+  if (status === "error") return <IconX className="h-3.5 w-3.5 text-red-500" />;
+  if (status === "running") return <GridSpinner className="text-muted-foreground" />;
+  return null;
+}
+
+function formatToolOutput(value: unknown): { content: string; isJson: boolean } {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return { content: JSON.stringify(parsed, null, 2), isJson: true };
+    } catch {
+      return { content: value, isJson: false };
+    }
+  }
+  return { content: JSON.stringify(value, null, 2), isJson: true };
+}
+
+type ToolCallExpandedContentProps = {
+  formattedOutput: { content: string; isJson: boolean } | null;
+  isHttpError: boolean | undefined;
+  isPermissionPending: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+  onAllowAlways?: () => void;
+  offeredChoices: PermissionActionChoice[];
+  onChooseOfferedChoice: (optionId: string) => void;
+  isResponding: boolean;
+};
+
+function ToolCallExpandedContent({
+  formattedOutput,
+  isHttpError,
+  isPermissionPending,
+  onApprove,
+  onReject,
+  onAllowAlways,
+  offeredChoices,
+  onChooseOfferedChoice,
+  isResponding,
+}: ToolCallExpandedContentProps) {
+  return (
+    <div className="pl-4 border-l-2 border-border/30 space-y-2">
+      {formattedOutput && (
+        <pre
+          className={cn(
+            "text-xs rounded p-2 overflow-x-auto whitespace-pre-wrap max-h-[200px] overflow-y-auto",
+            formattedOutput.isJson ? "bg-muted/30 font-mono text-[11px]" : "bg-muted/30",
+            isHttpError && "text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30",
+          )}
+        >
+          {formattedOutput.content}
+        </pre>
+      )}
+      {isPermissionPending && (
+        <PermissionActionRow
+          onApprove={onApprove}
+          onReject={onReject}
+          onAllowAlways={onAllowAlways}
+          offeredChoices={offeredChoices}
+          onChooseOfferedChoice={onChooseOfferedChoice}
+          isResponding={isResponding}
+        />
+      )}
+    </div>
+  );
+}
+
+function hasToolOutput(output: unknown): boolean {
+  if (!output) return false;
+  if (typeof output === "string") return output.length > 0;
+  return Object.keys(output as object).length > 0;
+}
+
+function parseToolCallOutput(metadata: ToolCallMetadata | undefined) {
+  const normalizedGeneric = metadata?.normalized?.generic;
+  const normalizedHttpRequest = metadata?.normalized?.http_request;
+  const output = normalizedHttpRequest?.response ?? normalizedGeneric?.output ?? metadata?.result;
+  const isHttpError = normalizedHttpRequest?.is_error;
+  return { output, isHttpError };
+}
+
+// Short, single-line tool output renders inline in the header (e.g. "Launching skill: e2e")
+// rather than behind an expand chevron.
+const INLINE_OUTPUT_MAX_LENGTH = 120;
+
+function getInlineOutput(output: unknown): string | null {
+  if (typeof output !== "string") return null;
+  const trimmed = output.trim();
+  // Reject both \n and \r — shell tool output can carry \r progress-bar overwrites
+  // that would render as multiple visual lines even without a \n.
+  if (!trimmed || /[\n\r]/.test(trimmed) || trimmed.length > INLINE_OUTPUT_MAX_LENGTH) return null;
+  return trimmed;
+}
+
+function parseToolCallMetadata(comment: Message, permissionMessage: Message | undefined) {
+  const metadata = comment.metadata as ToolCallMetadata | undefined;
+  const toolName = metadata?.tool_name ?? "";
+  const status = metadata?.status;
+  const { output, isHttpError } = parseToolCallOutput(metadata);
+  const { permissionMetadata, permissionStatus, isPermissionPending } =
+    parsePermission(permissionMessage);
+  const hasOutput = hasToolOutput(output);
+  const inlineOutput = getInlineOutput(output);
+  // When output is shown inline, there's nothing more to expand — skip the expand affordance
+  // unless a permission prompt still needs to be rendered.
+  return {
+    toolName,
+    status,
+    output,
+    isHttpError,
+    permissionMetadata,
+    permissionStatus,
+    isPermissionPending,
+    hasOutput,
+    inlineOutput,
+  };
+}
+
+export const ToolCallMessage = memo(function ToolCallMessage({
+  comment,
+  permissionMessage,
+  worktreePath,
+}: ToolCallMessageProps) {
+  const {
+    toolName,
+    status,
+    output,
+    isHttpError,
+    permissionMetadata,
+    permissionStatus,
+    isPermissionPending,
+    hasOutput,
+    inlineOutput,
+  } = parseToolCallMetadata(comment, permissionMessage);
+  const {
+    isResponding,
+    isUnavailable,
+    handleApprove,
+    handleAllowAlways,
+    hasAllowAlways,
+    handleReject,
+    offeredChoices,
+    handleOfferedChoice,
+  } = usePermissionResponseHandlers({
+    permissionMetadata,
+    permissionMessage,
+  });
+  const {
+    permissionStatus: effectivePermissionStatus,
+    isPermissionPending: effectivePermissionPending,
+  } = resolvePermissionAvailability(permissionStatus, isPermissionPending, isUnavailable);
+  const { hasExpandableContent, isSuccess, autoExpanded } = deriveToolCallPermissionPresentation({
+    status,
+    permissionStatus: effectivePermissionStatus,
+    isPermissionPending: effectivePermissionPending,
+    hasOutput,
+    inlineOutput,
+  });
+  const { isExpanded, handleToggle } = useExpandState(status, autoExpanded);
+
+  const metadata = comment.metadata as ToolCallMetadata | undefined;
+  const rawTitle = metadata?.title ?? comment.content ?? t("task:toolCall");
+  const title = transformPathsInText(prettifyToolTitle(rawTitle), worktreePath);
+
+  const formattedOutput = hasOutput && !inlineOutput ? formatToolOutput(output) : null;
+
+  return (
+    <ExpandableRow
+      icon={getToolIcon(
+        toolName,
+        cn(
+          "h-4 w-4",
+          effectivePermissionPending
+            ? "text-amber-600 dark:text-amber-400"
+            : "text-muted-foreground",
+        ),
+      )}
+      header={
+        <div className="flex items-center gap-2 text-xs">
+          <span
+            className={cn(
+              "inline-flex items-center gap-1.5",
+              effectivePermissionPending && "text-amber-600 dark:text-amber-400",
+            )}
+          >
+            <span className="font-mono text-xs text-muted-foreground">{title}</span>
+            {inlineOutput && (
+              <span
+                className={cn(
+                  "text-xs",
+                  isHttpError ? "text-red-600 dark:text-red-400" : "text-muted-foreground/80",
+                )}
+              >
+                {inlineOutput}
+              </span>
+            )}
+            {!isSuccess && getToolCallStatusIcon(status, effectivePermissionStatus)}
+          </span>
+        </div>
+      }
+      hasExpandableContent={!!hasExpandableContent}
+      isExpanded={isExpanded}
+      onToggle={handleToggle}
+    >
+      <ToolCallExpandedContent
+        formattedOutput={formattedOutput}
+        isHttpError={isHttpError}
+        isPermissionPending={effectivePermissionPending}
+        onApprove={handleApprove}
+        onReject={handleReject}
+        onAllowAlways={hasAllowAlways ? handleAllowAlways : undefined}
+        offeredChoices={offeredChoices}
+        onChooseOfferedChoice={handleOfferedChoice}
+        isResponding={isResponding}
+      />
+    </ExpandableRow>
+  );
+});
+
+function deriveToolCallPermissionPresentation({
+  status,
+  permissionStatus,
+  isPermissionPending,
+  hasOutput,
+  inlineOutput,
+}: {
+  status: string | undefined;
+  permissionStatus: PermissionRequestMetadata["status"];
+  isPermissionPending: boolean;
+  hasOutput: boolean;
+  inlineOutput: string | null;
+}) {
+  return {
+    hasExpandableContent: (hasOutput && !inlineOutput) || isPermissionPending,
+    isSuccess: status === "complete" && !permissionStatus,
+    autoExpanded: status === "running" || isPermissionPending,
+  };
+}

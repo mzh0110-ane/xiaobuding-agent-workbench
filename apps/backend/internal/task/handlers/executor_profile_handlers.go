@@ -1,0 +1,503 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/remoteauth"
+	"github.com/kandev/kandev/internal/agent/remoteconfig"
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/subproc"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/service"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+// AgentLister provides access to enabled agents for building remote auth specs.
+type AgentLister interface {
+	ListEnabled() []agents.Agent
+}
+
+type ExecutorProfileHandlers struct {
+	service   *service.Service
+	agentList AgentLister
+	logger    *logger.Logger
+}
+
+func NewExecutorProfileHandlers(svc *service.Service, agentList AgentLister, log *logger.Logger) *ExecutorProfileHandlers {
+	return &ExecutorProfileHandlers{service: svc, agentList: agentList, logger: log}
+}
+
+func (h *ExecutorProfileHandlers) profileDTO(ctx context.Context, profile *models.ExecutorProfile) dto.ExecutorProfileDTO {
+	executor, err := h.service.GetExecutor(ctx, profile.ExecutorID)
+	if err != nil {
+		return dto.FromExecutorProfile(profile)
+	}
+	return dto.FromExecutorProfileWithExecutor(profile, executor)
+}
+
+func RegisterExecutorProfileRoutes(router *gin.Engine, dispatcher *ws.Dispatcher, svc *service.Service, agentList AgentLister, log *logger.Logger) {
+	handlers := NewExecutorProfileHandlers(svc, agentList, log)
+	handlers.registerHTTP(router)
+	handlers.registerWS(dispatcher)
+}
+
+func (h *ExecutorProfileHandlers) registerHTTP(router *gin.Engine) {
+	api := router.Group("/api/v1")
+	api.GET("/executor-profiles", h.httpListAllProfiles)
+	api.GET("/executor-profiles/default-script", h.httpGetDefaultScript)
+	api.GET("/remote-credentials", h.httpListRemoteCredentials)
+	api.GET("/agent-config-bundles", h.httpListAgentConfigBundles)
+	api.GET("/git/identity", h.httpGetGitIdentity)
+	api.GET("/script-placeholders", h.httpListScriptPlaceholders)
+	api.GET("/executors/:id/profiles", h.httpListProfiles)
+	api.POST("/executors/:id/profiles", h.httpCreateProfile)
+	api.GET("/executors/:id/profiles/:profileId", h.httpGetProfile)
+	api.PATCH("/executors/:id/profiles/:profileId", h.httpUpdateProfile)
+	api.DELETE("/executors/:id/profiles/:profileId", h.httpDeleteProfile)
+	// Top-level DELETE: profile IDs are globally unique, so callers that
+	// only have the profile id (CLI, settings UI, test helpers) don't need
+	// to plumb the executor id through. The handler is identical otherwise.
+	api.DELETE("/executor-profiles/:profileId", h.httpDeleteProfile)
+}
+
+func (h *ExecutorProfileHandlers) registerWS(dispatcher *ws.Dispatcher) {
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileList, h.wsListProfiles)
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileListAll, h.wsListAllProfiles)
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileCreate, h.wsCreateProfile)
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileGet, h.wsGetProfile)
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileUpdate, h.wsUpdateProfile)
+	dispatcher.RegisterFunc(ws.ActionExecutorProfileDelete, h.wsDeleteProfile)
+}
+
+func (h *ExecutorProfileHandlers) httpListAllProfiles(c *gin.Context) {
+	ctx := c.Request.Context()
+	profiles, err := h.service.ListAllExecutorProfiles(ctx)
+	if err != nil {
+		h.logger.Error("failed to list all executor profiles", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list profiles"})
+		return
+	}
+	executors, err := h.service.ListExecutors(ctx)
+	if err != nil {
+		h.logger.Error("failed to list executors for profile enrichment", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list executors"})
+		return
+	}
+	executorMap := make(map[string]*models.Executor, len(executors))
+	for _, ex := range executors {
+		executorMap[ex.ID] = ex
+	}
+	resp := dto.ListExecutorProfilesResponse{
+		Profiles: make([]dto.ExecutorProfileDTO, 0, len(profiles)),
+		Total:    len(profiles),
+	}
+	for _, p := range profiles {
+		resp.Profiles = append(resp.Profiles, dto.FromExecutorProfileWithExecutor(p, executorMap[p.ExecutorID]))
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *ExecutorProfileHandlers) httpListScriptPlaceholders(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"placeholders": scriptPlaceholders})
+}
+
+func (h *ExecutorProfileHandlers) httpGetDefaultScript(c *gin.Context) {
+	executorType := c.Query("type")
+	if executorType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type query parameter is required"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"prepare_script": lifecycle.DefaultPrepareScript(executorType),
+		"cleanup_script": "",
+	})
+}
+
+func (h *ExecutorProfileHandlers) httpListRemoteCredentials(c *gin.Context) {
+	specs := h.buildRemoteAuthSpecs()
+	c.JSON(http.StatusOK, gin.H{
+		"auth_specs": specs,
+	})
+}
+
+func (h *ExecutorProfileHandlers) httpListAgentConfigBundles(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"bundles": h.buildAgentConfigBundles()})
+}
+
+func (h *ExecutorProfileHandlers) httpGetGitIdentity(c *gin.Context) {
+	name := firstNonEmptyGitConfig("user.name")
+	email := firstNonEmptyGitConfig("user.email")
+	detected := name != "" && email != ""
+	c.JSON(http.StatusOK, gin.H{
+		"user_name":  name,
+		"user_email": email,
+		"detected":   detected,
+	})
+}
+
+func firstNonEmptyGitConfig(key string) string {
+	if value := runGitConfig("config", "--get", key); value != "" {
+		return value
+	}
+	return runGitConfig("config", "--global", "--get", key)
+}
+
+func runGitConfig(args ...string) string {
+	ctx := context.Background()
+	cmd := subproc.NewGitCommand(ctx, args...)
+	out, err := subproc.RunGitOutputClass(ctx, subproc.GitInteractive, cmd)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (h *ExecutorProfileHandlers) buildRemoteAuthSpecs() []remoteauth.Spec {
+	if h.agentList == nil {
+		return remoteauth.BuildCatalog(nil).Specs
+	}
+	return remoteauth.BuildCatalog(h.agentList.ListEnabled()).Specs
+}
+
+func (h *ExecutorProfileHandlers) buildAgentConfigBundles() []remoteconfig.Bundle {
+	if h.agentList == nil {
+		return remoteconfig.BuildCatalog(nil).Bundles
+	}
+	return remoteconfig.BuildCatalog(h.agentList.ListEnabled()).Bundles
+}
+
+func (h *ExecutorProfileHandlers) httpListProfiles(c *gin.Context) {
+	executorID := c.Param("id")
+	profiles, err := h.service.ListExecutorProfiles(c.Request.Context(), executorID)
+	if err != nil {
+		h.logger.Error("failed to list executor profiles", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list profiles"})
+		return
+	}
+	executor, _ := h.service.GetExecutor(c.Request.Context(), executorID)
+	resp := dto.ListExecutorProfilesResponse{
+		Profiles: make([]dto.ExecutorProfileDTO, 0, len(profiles)),
+		Total:    len(profiles),
+	}
+	for _, p := range profiles {
+		resp.Profiles = append(resp.Profiles, dto.FromExecutorProfileWithExecutor(p, executor))
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+type httpCreateProfileRequest struct {
+	Name          string                 `json:"name"`
+	McpPolicy     string                 `json:"mcp_policy"`
+	Config        map[string]string      `json:"config,omitempty"`
+	PrepareScript string                 `json:"prepare_script"`
+	CleanupScript string                 `json:"cleanup_script"`
+	EnvVars       []models.ProfileEnvVar `json:"env_vars,omitempty"`
+}
+
+func (h *ExecutorProfileHandlers) httpCreateProfile(c *gin.Context) {
+	var body httpCreateProfileRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+	if body.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	profile, err := h.service.CreateExecutorProfile(c.Request.Context(), &service.CreateExecutorProfileRequest{
+		ExecutorID:    c.Param("id"),
+		Name:          body.Name,
+		McpPolicy:     body.McpPolicy,
+		Config:        body.Config,
+		PrepareScript: body.PrepareScript,
+		CleanupScript: body.CleanupScript,
+		EnvVars:       body.EnvVars,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrInvalidExecutorConfig) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrExecutorProviderUnavailable) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrExecutorProfileInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrExecutorProfileInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		h.logger.Error("failed to create executor profile", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "profile not created"})
+		return
+	}
+	c.JSON(http.StatusOK, h.profileDTO(c.Request.Context(), profile))
+}
+
+func (h *ExecutorProfileHandlers) httpGetProfile(c *gin.Context) {
+	profile, err := h.service.GetExecutorProfile(c.Request.Context(), c.Param("profileId"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "profile not found"})
+		return
+	}
+	c.JSON(http.StatusOK, h.profileDTO(c.Request.Context(), profile))
+}
+
+type httpUpdateProfileRequest struct {
+	Name          *string                `json:"name,omitempty"`
+	McpPolicy     *string                `json:"mcp_policy,omitempty"`
+	Config        map[string]string      `json:"config,omitempty"`
+	PrepareScript *string                `json:"prepare_script,omitempty"`
+	CleanupScript *string                `json:"cleanup_script,omitempty"`
+	EnvVars       []models.ProfileEnvVar `json:"env_vars,omitempty"`
+}
+
+func (h *ExecutorProfileHandlers) httpUpdateProfile(c *gin.Context) {
+	var body httpUpdateProfileRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+	profile, err := h.service.UpdateExecutorProfile(c.Request.Context(), c.Param("profileId"), &service.UpdateExecutorProfileRequest{
+		Name:          body.Name,
+		McpPolicy:     body.McpPolicy,
+		Config:        body.Config,
+		PrepareScript: body.PrepareScript,
+		CleanupScript: body.CleanupScript,
+		EnvVars:       body.EnvVars,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrInvalidExecutorConfig) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrExecutorProviderUnavailable) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		h.logger.Error("failed to update executor profile", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "profile not updated"})
+		return
+	}
+	c.JSON(http.StatusOK, h.profileDTO(c.Request.Context(), profile))
+}
+
+func (h *ExecutorProfileHandlers) httpDeleteProfile(c *gin.Context) {
+	if err := h.service.DeleteExecutorProfile(c.Request.Context(), c.Param("profileId")); err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrExecutorProfileInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		h.logger.Error("failed to delete executor profile", zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "profile not deleted"})
+		return
+	}
+	c.JSON(http.StatusOK, dto.SuccessResponse{Success: true})
+}
+
+// WebSocket handlers
+
+type wsListProfilesRequest struct {
+	ExecutorID string `json:"executor_id"`
+}
+
+func (h *ExecutorProfileHandlers) wsListProfiles(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsListProfilesRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ExecutorID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "executor_id is required", nil)
+	}
+	profiles, err := h.service.ListExecutorProfiles(ctx, req.ExecutorID)
+	if err != nil {
+		h.logger.Error("failed to list executor profiles", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list profiles", nil)
+	}
+	executor, _ := h.service.GetExecutor(ctx, req.ExecutorID)
+	resp := dto.ListExecutorProfilesResponse{
+		Profiles: make([]dto.ExecutorProfileDTO, 0, len(profiles)),
+		Total:    len(profiles),
+	}
+	for _, p := range profiles {
+		resp.Profiles = append(resp.Profiles, dto.FromExecutorProfileWithExecutor(p, executor))
+	}
+	return ws.NewResponse(msg.ID, msg.Action, resp)
+}
+
+func (h *ExecutorProfileHandlers) wsListAllProfiles(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	profiles, err := h.service.ListAllExecutorProfiles(ctx)
+	if err != nil {
+		h.logger.Error("failed to list all executor profiles", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list profiles", nil)
+	}
+	executors, err := h.service.ListExecutors(ctx)
+	if err != nil {
+		h.logger.Error("failed to list executors for profile enrichment", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list executors", nil)
+	}
+	executorMap := make(map[string]*models.Executor, len(executors))
+	for _, ex := range executors {
+		executorMap[ex.ID] = ex
+	}
+	resp := dto.ListExecutorProfilesResponse{
+		Profiles: make([]dto.ExecutorProfileDTO, 0, len(profiles)),
+		Total:    len(profiles),
+	}
+	for _, p := range profiles {
+		resp.Profiles = append(resp.Profiles, dto.FromExecutorProfileWithExecutor(p, executorMap[p.ExecutorID]))
+	}
+	return ws.NewResponse(msg.ID, msg.Action, resp)
+}
+
+type wsCreateProfileRequest struct {
+	ExecutorID    string                 `json:"executor_id"`
+	Name          string                 `json:"name"`
+	McpPolicy     string                 `json:"mcp_policy"`
+	Config        map[string]string      `json:"config,omitempty"`
+	PrepareScript string                 `json:"prepare_script"`
+	CleanupScript string                 `json:"cleanup_script"`
+	EnvVars       []models.ProfileEnvVar `json:"env_vars,omitempty"`
+}
+
+func (h *ExecutorProfileHandlers) wsCreateProfile(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsCreateProfileRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ExecutorID == "" || req.Name == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "executor_id and name are required", nil)
+	}
+	profile, err := h.service.CreateExecutorProfile(ctx, &service.CreateExecutorProfileRequest{
+		ExecutorID:    req.ExecutorID,
+		Name:          req.Name,
+		McpPolicy:     req.McpPolicy,
+		Config:        req.Config,
+		PrepareScript: req.PrepareScript,
+		CleanupScript: req.CleanupScript,
+		EnvVars:       req.EnvVars,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeForbidden, service.ErrKubernetesAdminRequired.Error(), nil)
+		}
+		if errors.Is(err, service.ErrInvalidExecutorConfig) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, service.ErrInvalidExecutorConfig.Error(), nil)
+		}
+		if errors.Is(err, service.ErrExecutorProfileInUse) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, err.Error(), nil)
+		}
+		if errors.Is(err, service.ErrExecutorProviderUnavailable) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeUnavailable, err.Error(), nil)
+		}
+		if errors.Is(err, service.ErrExecutorProviderUnavailable) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeUnavailable, err.Error(), nil)
+		}
+		h.logger.Error("failed to create executor profile", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to create profile", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, h.profileDTO(ctx, profile))
+}
+
+type wsGetProfileRequest struct {
+	ID string `json:"id"`
+}
+
+func (h *ExecutorProfileHandlers) wsGetProfile(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsGetProfileRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	profile, err := h.service.GetExecutorProfile(ctx, req.ID)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Profile not found", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, h.profileDTO(ctx, profile))
+}
+
+type wsUpdateProfileRequest struct {
+	ID            string                 `json:"id"`
+	Name          *string                `json:"name,omitempty"`
+	McpPolicy     *string                `json:"mcp_policy,omitempty"`
+	Config        map[string]string      `json:"config,omitempty"`
+	PrepareScript *string                `json:"prepare_script,omitempty"`
+	CleanupScript *string                `json:"cleanup_script,omitempty"`
+	EnvVars       []models.ProfileEnvVar `json:"env_vars,omitempty"`
+}
+
+func (h *ExecutorProfileHandlers) wsUpdateProfile(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsUpdateProfileRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	profile, err := h.service.UpdateExecutorProfile(ctx, req.ID, &service.UpdateExecutorProfileRequest{
+		Name:          req.Name,
+		McpPolicy:     req.McpPolicy,
+		Config:        req.Config,
+		PrepareScript: req.PrepareScript,
+		CleanupScript: req.CleanupScript,
+		EnvVars:       req.EnvVars,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeForbidden, service.ErrKubernetesAdminRequired.Error(), nil)
+		}
+		if errors.Is(err, service.ErrInvalidExecutorConfig) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, service.ErrInvalidExecutorConfig.Error(), nil)
+		}
+		h.logger.Error("failed to update executor profile", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update profile", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, h.profileDTO(ctx, profile))
+}
+
+func (h *ExecutorProfileHandlers) wsDeleteProfile(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsGetProfileRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	if err := h.service.DeleteExecutorProfile(ctx, req.ID); err != nil {
+		if errors.Is(err, service.ErrKubernetesAdminRequired) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeForbidden, service.ErrKubernetesAdminRequired.Error(), nil)
+		}
+		if errors.Is(err, service.ErrExecutorProfileInUse) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, err.Error(), nil)
+		}
+		h.logger.Error("failed to delete executor profile", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete profile", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.SuccessResponse{Success: true})
+}

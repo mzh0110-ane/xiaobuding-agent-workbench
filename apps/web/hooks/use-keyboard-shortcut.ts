@@ -1,0 +1,124 @@
+/**
+ * React hook for handling keyboard shortcuts
+ */
+
+import { useEffect, useCallback, useRef } from "react";
+import type { KeyboardShortcut } from "@/lib/keyboard/constants";
+import { matchesShortcut } from "@/lib/keyboard/utils";
+
+export type KeyboardShortcutOptions = {
+  /** Whether the shortcut is enabled (default: true) */
+  enabled?: boolean;
+  /** Whether to prevent default behavior (default: true) */
+  preventDefault?: boolean;
+  /** Whether to stop event propagation (default: false) */
+  stopPropagation?: boolean;
+  /** Whether to listen during capture phase (default: false) */
+  capture?: boolean;
+  /** Target element (default: window) */
+  target?: HTMLElement | Window | null;
+};
+
+/**
+ * Hook for handling global keyboard shortcuts
+ *
+ * @example
+ * ```tsx
+ * useKeyboardShortcut(SHORTCUTS.SUBMIT, handleSubmit);
+ * ```
+ */
+export function useKeyboardShortcut(
+  shortcut: KeyboardShortcut,
+  callback: (event: KeyboardEvent) => void,
+  options: KeyboardShortcutOptions = {},
+) {
+  const {
+    enabled = true,
+    preventDefault = true,
+    stopPropagation = false,
+    capture = false,
+    target = typeof window !== "undefined" ? window : null,
+  } = options;
+
+  // Use ref to avoid recreating the handler on every render
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback;
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent) => {
+      if (!enabled) return;
+      // Precedence: a capture-phase core dispatcher (`useAppShortcuts`) or a
+      // plugin keybinding (`usePluginShortcuts`) may have already handled and
+      // prevented this event before this bubble-phase, per-component listener
+      // runs. Bail out so the same combo fires exactly one action instead of
+      // both. See `useAppShortcuts`/`usePluginShortcuts` for the full
+      // core-vs-plugin precedence chain.
+      if (event.defaultPrevented) return;
+
+      if (matchesShortcut(event, shortcut)) {
+        if (preventDefault) {
+          event.preventDefault();
+        }
+        if (stopPropagation) {
+          event.stopPropagation();
+        }
+        callbackRef.current(event);
+      }
+    },
+    [enabled, preventDefault, stopPropagation, shortcut],
+  );
+
+  useEffect(() => {
+    if (!enabled || !target) return;
+
+    target.addEventListener("keydown", handleKeyDown as EventListener, { capture });
+
+    return () => {
+      target.removeEventListener("keydown", handleKeyDown as EventListener, { capture });
+    };
+  }, [enabled, target, handleKeyDown, capture]);
+}
+
+/**
+ * Hook for handling keyboard shortcuts on a specific element (e.g., textarea)
+ * Returns a handler to attach to onKeyDown
+ *
+ * @example
+ * ```tsx
+ * const handleKeyDown = useKeyboardShortcutHandler(SHORTCUTS.SUBMIT, handleSubmit);
+ *
+ * return <textarea onKeyDown={handleKeyDown} />;
+ * ```
+ */
+export function useKeyboardShortcutHandler(
+  shortcut: KeyboardShortcut,
+  callback: (event: React.KeyboardEvent) => void,
+  options: Omit<KeyboardShortcutOptions, "target"> = {},
+) {
+  const { enabled = true, preventDefault = true, stopPropagation = false } = options;
+
+  // Use ref to avoid recreating the handler on every render
+  const callbackRef = useRef(callback);
+
+  // Update ref in useEffect to avoid updating during render
+  useEffect(() => {
+    callbackRef.current = callback;
+  }, [callback]);
+
+  return useCallback(
+    (event: React.KeyboardEvent) => {
+      if (!enabled) return;
+
+      if (matchesShortcut(event, shortcut)) {
+        if (preventDefault) {
+          event.preventDefault();
+        }
+        if (stopPropagation) {
+          event.stopPropagation();
+        }
+        callbackRef.current(event);
+      }
+    },
+    [enabled, preventDefault, stopPropagation, shortcut],
+  );
+}

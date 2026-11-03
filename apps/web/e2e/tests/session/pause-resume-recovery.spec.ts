@@ -1,0 +1,204 @@
+import { type Page } from "@playwright/test";
+
+import { test, expect } from "../../fixtures/test-base";
+import type { SeedData } from "../../fixtures/test-base";
+import type { ApiClient } from "../../helpers/api-client";
+import { typeWhileBusy } from "../../helpers/type-while-busy";
+import { SessionPage } from "../../pages/session-page";
+
+// ---------------------------------------------------------------------------
+// Pause → resume recovery (#1597 pause→resume recovery)
+//
+// The operator's headline pain: pause a running agent turn and the session
+// wedges — the next message is dropped or the composer stays stuck "running",
+// and the only recovery is to restart the whole headless service. These tests
+// pin the corrected behavior end-to-end against the mock agent:
+//
+//   1. Pausing a running turn returns the SAME session to an input-ready state;
+//      a newly typed message resumes it with prior context intact — no wedged
+//      "still running" composer, no service restart.
+//   2. A message queued while the turn was running stays parked when the pause
+//      settles the session, then runs only after the operator explicitly asks.
+// ---------------------------------------------------------------------------
+
+/** Seed an ACP task, open its session, and wait for the initial turn to idle. */
+async function seedTaskAndWaitForIdle(
+  testPage: Page,
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+): Promise<SessionPage> {
+  // The Kanban template now opts into workflow completion for explicit
+  // cancellation. These tests exercise pause/resume queue semantics instead,
+  // so keep the source step in-place while the turn is paused.
+  await apiClient.updateWorkflowStep(seedData.startStepId, {
+    cancel_triggers_turn_complete: false,
+  });
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description: "/e2e:simple-message",
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: [seedData.repositoryId],
+    },
+  );
+
+  await testPage.goto(`/t/${task.id}`);
+  const session = new SessionPage(testPage);
+  await session.waitForLoad();
+  await session.waitForChatIdle({ timeout: 30_000 });
+  return session;
+}
+
+test.describe("Pause → resume recovery", () => {
+  // Cancel/resume timing can be sensitive under CI load.
+  test.describe.configure({ retries: 1 });
+
+  test("pausing a running turn lets a newly typed message resume the same session", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(90_000);
+
+    const session = await seedTaskAndWaitForIdle(
+      testPage,
+      apiClient,
+      seedData,
+      "Pause then resume",
+    );
+
+    // The initial turn produced one response — this is the context that must
+    // survive the pause and prove the same session (not a fresh one) resumed.
+    await expect(
+      session.chat.getByText("simple mock response", { exact: false }).nth(0),
+    ).toBeVisible({ timeout: 30_000 });
+    const sessionUrl = testPage.url();
+
+    // Start a long-running turn so we have time to pause it mid-flight.
+    await session.sendMessage("/slow 8s");
+    await expect(session.agentStatus()).toBeVisible({ timeout: 15_000 });
+    await expect(session.cancelAgentButton()).toBeVisible({ timeout: 15_000 });
+
+    // Pause: the operator stops the running turn.
+    await session.cancelAgentButton().click();
+
+    // The session must settle back to input-ready — NOT wedge on "still
+    // running". This is the regression that forced a service restart.
+    await expect(session.agentStatus()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.cancelAgentButton()).not.toBeVisible({ timeout: 15_000 });
+
+    // Still the same session — no navigation / service bounce.
+    expect(testPage.url()).toBe(sessionUrl);
+
+    // Sending a new message resumes the SAME session with its context intact.
+    await session.sendMessage("/e2e:simple-message");
+    await session.expectChatResponseVisible("simple mock response", 1, { timeout: 30_000 });
+
+    // Prior conversation is still present — context was preserved across the pause.
+    await expect(
+      session.chat.getByText("simple mock response", { exact: false }).nth(0),
+    ).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("Cancel parks queued work with Auto-run OFF and the switch resumes it", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(90_000);
+
+    const session = await seedTaskAndWaitForIdle(
+      testPage,
+      apiClient,
+      seedData,
+      "Pause parks queued message",
+    );
+
+    // Keep the agent busy, then queue a follow-up while it is running.
+    await session.sendMessage("/slow 8s");
+    await expect(session.agentStatus()).toBeVisible({ timeout: 15_000 });
+    await expect(session.cancelAgentButton()).toBeVisible({ timeout: 15_000 });
+
+    const editor = testPage.locator(".tiptap.ProseMirror").first();
+    await typeWhileBusy(testPage, editor, "/e2e:simple-message");
+    await testPage.getByTestId("submit-message-button").click();
+
+    // The queued message is parked while the turn runs.
+    await expect(testPage.getByTestId("queue-chip")).toBeVisible({ timeout: 10_000 });
+
+    // Pause the running turn. Cancel must stop here rather than interpreting the
+    // queued follow-up as an instruction to begin another turn immediately.
+    await session.cancelAgentButton().click();
+
+    // Session is idle, but queued message remains visible until explicit resume.
+    await expect(session.agentStatus()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(testPage.getByTestId("queue-chip")).toBeVisible({ timeout: 10_000 });
+
+    // Cancel projects the durable queue policy as OFF. Enabling Auto-run
+    // resumes queue processing and delivers the parked input.
+    await testPage.getByTestId("queue-chip").click();
+    const autoRun = testPage.getByTestId("queue-auto-run");
+    await expect(autoRun).toHaveAttribute("data-state", "unchecked");
+    await autoRun.click();
+    await expect(testPage.getByTestId("queue-chip")).not.toBeVisible({ timeout: 30_000 });
+    await session.expectChatResponseVisible("simple mock response", 1, { timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("a compact stalled notice cancels a running session without navigation", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const task = await apiClient.createTask(seedData.workspaceId, "Stalled notice recovery", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    const { session_id: sessionId } = await apiClient.seedTaskSession(task.id, {
+      state: "RUNNING",
+    });
+    await apiClient.seedSessionMessage(sessionId, {
+      type: "status",
+      content: "Still waiting on Start dev server.",
+      metadata: {
+        action_visibility: "running",
+        actions: [
+          {
+            type: "ws_request",
+            label: "Cancel turn",
+            test_id: "stall-cancel-turn-button",
+            params: { method: "agent.cancel", payload: { session_id: sessionId } },
+          },
+        ],
+      },
+    });
+
+    await testPage.goto(`/t/${task.id}`);
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+    const sessionUrl = testPage.url();
+    const notice = session.activeChat().getByTestId("running-action-notice");
+    const cancel = notice.getByTestId("stall-cancel-turn-button");
+
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText("Still waiting on Start dev server.");
+    await expect(notice.locator("svg")).toHaveCount(0);
+    const [noticeBox, cancelBox] = await Promise.all([notice.boundingBox(), cancel.boundingBox()]);
+    expect(noticeBox).not.toBeNull();
+    expect(cancelBox).not.toBeNull();
+    expect(noticeBox!.height).toBeLessThanOrEqual(48);
+    expect(cancelBox!.width).toBeLessThan(noticeBox!.width);
+
+    await cancel.click();
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(notice).not.toBeVisible();
+    expect(testPage.url()).toBe(sessionUrl);
+  });
+});

@@ -1,0 +1,380 @@
+import { describe, expect, it, vi } from "vitest";
+import type { StoreApi } from "zustand";
+import type { AppState } from "@/lib/state/store";
+import { registerTasksHandlers } from "./tasks";
+
+vi.mock("@/lib/recent-tasks", () => ({
+  removeRecentTask: vi.fn(),
+}));
+
+type Listener = (state: AppState) => void;
+
+// Self-contained harness (kept separate from tasks.test.ts, which already sits at
+// the file-length limit) covering the task-level MOST-ACTIVE-WINS activity
+// aggregate carried by task.updated — the live-propagation + safe-fallback path
+// the board card and task-list rows read.
+function makeStore(initial: Partial<AppState> = {}) {
+  let state = {
+    kanban: { workflowId: "wf1", steps: [], tasks: [] },
+    kanbanMulti: { snapshots: {}, isLoading: false },
+    tasks: {
+      activeTaskId: null,
+      activeSessionId: null,
+      pinnedSessionId: null,
+      lastSessionByTaskId: {},
+    },
+    taskSessionsByTask: { itemsByTaskId: {}, loadedByTaskId: {}, loadingByTaskId: {} },
+    environmentIdBySessionId: {},
+    setActiveSession: vi.fn(),
+    setActiveSessionAuto: vi.fn(),
+    removeTaskFromSidebarPrefs: vi.fn(),
+    setTaskDeletedNotification: vi.fn(),
+    ...initial,
+  } as unknown as AppState;
+
+  const listeners = new Set<Listener>();
+  return {
+    getState: () => state,
+    setState: (updater: AppState | ((s: AppState) => AppState)) => {
+      const next =
+        typeof updater === "function" ? (updater as (s: AppState) => AppState)(state) : updater;
+      state = { ...state, ...next };
+      for (const l of listeners) l(state);
+    },
+    subscribe: (l: Listener) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+    destroy: vi.fn(),
+    getInitialState: vi.fn(),
+  } as unknown as StoreApi<AppState> & { getState: () => AppState };
+}
+
+function makeTask(id: string): Record<string, unknown> {
+  return {
+    task_id: id,
+    workflow_id: "wf1",
+    workflow_step_id: "step1",
+    title: "Test",
+    description: "",
+    state: "IN_PROGRESS",
+    primary_session_id: null,
+    is_ephemeral: false,
+  };
+}
+
+function makeMessage(payload: Record<string, unknown>) {
+  return {
+    id: "msg-1",
+    type: "notification" as const,
+    action: "task.updated" as const,
+    payload,
+  } as Parameters<NonNullable<ReturnType<typeof registerTasksHandlers>["task.updated"]>>[0];
+}
+
+type StoreTaskSeed = { id: string } & Record<string, unknown>;
+
+// Shared by the activity-aggregate and interrupted-marker describes below;
+// kept at module scope so the two identical builders cannot drift apart.
+function storeWithTask(existing: StoreTaskSeed) {
+  const task = { workflowStepId: "step1", title: "T", position: 0, ...existing };
+  return makeStore({
+    kanban: {
+      workflowId: "wf1",
+      steps: [],
+      tasks: [task],
+    } as unknown as AppState["kanban"],
+    kanbanMulti: {
+      isLoading: false,
+      snapshots: {
+        wf1: { workflowId: "wf1", workflowName: "WF1", steps: [], tasks: [task] },
+      },
+    } as unknown as AppState["kanbanMulti"],
+  });
+}
+
+describe("task.updated task-level activity aggregate (live propagation + safe fallback)", () => {
+  function activityFor(store: ReturnType<typeof makeStore>, id: string) {
+    const kanban = store.getState().kanban.tasks.find((t) => t.id === id)?.foregroundActivity;
+    const multi = store
+      .getState()
+      .kanbanMulti.snapshots.wf1.tasks.find((t) => t.id === id)?.foregroundActivity;
+    return { kanban, multi };
+  }
+
+  it("applies a generating→background flip without any coarse state change", () => {
+    // A bare activity flip (coarse state stays IN_PROGRESS) must refresh the
+    // task-level surfaces so the board card and list read background-running
+    // promptly, not on the next coarse transition.
+    const store = storeWithTask({ id: "t1", foregroundActivity: "generating" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({ ...makeTask("t1"), state: "IN_PROGRESS", foreground_activity: "background" }),
+    );
+
+    const { kanban, multi } = activityFor(store, "t1");
+    expect(kanban).toBe("background");
+    expect(multi).toBe("background");
+    expect(store.getState().kanban.tasks.find((t) => t.id === "t1")?.state).toBe("IN_PROGRESS");
+  });
+
+  it("clears a stale background reading when the aggregate goes empty (explicit null wins)", () => {
+    // The done transition: the backend recomputes an empty aggregate and emits an
+    // explicit foreground_activity: null. That null must clear the prior
+    // background so the card can settle to its coarse (done) reading — never a
+    // spinner stuck on forever.
+    const store = storeWithTask({ id: "t1", foregroundActivity: "background" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), foreground_activity: null }));
+
+    const { kanban, multi } = activityFor(store, "t1");
+    expect(kanban ?? undefined).toBeUndefined();
+    expect(multi ?? undefined).toBeUndefined();
+  });
+
+  it("preserves the aggregate when a partial update omits foreground_activity", () => {
+    // Clobber guard: a lightweight task.updated that carries no activity field
+    // (e.g. a rename) must NOT wipe a live background-running reading, or the
+    // surface would falsely flip toward done between real activity events.
+    const store = storeWithTask({ id: "t1", foregroundActivity: "background" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), title: "Renamed" }));
+
+    const { kanban, multi } = activityFor(store, "t1");
+    expect(kanban).toBe("background");
+    expect(multi).toBe("background");
+  });
+
+  it("applies and clears the active subagent count, including count-only updates", () => {
+    const store = storeWithTask({
+      id: "t1",
+      foregroundActivity: "generating",
+      activeSubagentCount: 2,
+    });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), active_subagent_count: 0 }));
+
+    expect(store.getState().kanban.tasks.find((task) => task.id === "t1")).toMatchObject({
+      foregroundActivity: "generating",
+      activeSubagentCount: 0,
+    });
+    expect(
+      store.getState().kanbanMulti.snapshots.wf1.tasks.find((task) => task.id === "t1"),
+    ).toMatchObject({
+      foregroundActivity: "generating",
+      activeSubagentCount: 0,
+    });
+  });
+
+  it("preserves the active subagent count when a partial update omits it", () => {
+    const store = storeWithTask({ id: "t1", activeSubagentCount: 3 });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), title: "Renamed" }));
+
+    expect(
+      store.getState().kanban.tasks.find((task) => task.id === "t1")?.activeSubagentCount,
+    ).toBe(3);
+    expect(
+      store.getState().kanbanMulti.snapshots.wf1.tasks.find((task) => task.id === "t1")
+        ?.activeSubagentCount,
+    ).toBe(3);
+  });
+});
+
+// mergeTaskParkedFields' (parked_epoch, parked_revision) lexicographic discard
+// rule (spec D1): the backend always serializes these three fields on
+// task.updated (no omitempty — see task-06), so the only guard needed is
+// against an out-of-order WS delivery, not an omitted field.
+describe("task.updated task-level parked-on-background-work projection", () => {
+  function parkedFor(store: ReturnType<typeof makeStore>, id: string) {
+    const task = store.getState().kanban.tasks.find((t) => t.id === id);
+    return {
+      parkedOnBackgroundWork: task?.parkedOnBackgroundWork,
+      parkedRevision: task?.parkedRevision,
+      parkedEpoch: task?.parkedEpoch,
+    };
+  }
+
+  it("applies parked_on_background_work/parked_revision/parked_epoch", () => {
+    const store = storeWithTask({ id: "t1" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({
+        ...makeTask("t1"),
+        parked_on_background_work: true,
+        parked_revision: 1,
+        parked_epoch: 100,
+      }),
+    );
+
+    expect(parkedFor(store, "t1")).toEqual({
+      parkedOnBackgroundWork: true,
+      parkedRevision: 1,
+      parkedEpoch: 100,
+    });
+  });
+
+  it("rejects a stale snapshot with a lower revision in the same epoch", () => {
+    const store = storeWithTask({
+      id: "t1",
+      parkedOnBackgroundWork: true,
+      parkedRevision: 2,
+      parkedEpoch: 100,
+    });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({
+        ...makeTask("t1"),
+        parked_on_background_work: false,
+        parked_revision: 1,
+        parked_epoch: 100,
+      }),
+    );
+
+    expect(parkedFor(store, "t1")).toEqual({
+      parkedOnBackgroundWork: true,
+      parkedRevision: 2,
+      parkedEpoch: 100,
+    });
+  });
+
+  it("rejects a snapshot from an older process epoch even with a higher revision", () => {
+    const store = storeWithTask({
+      id: "t1",
+      parkedOnBackgroundWork: true,
+      parkedRevision: 1,
+      parkedEpoch: 200,
+    });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({
+        ...makeTask("t1"),
+        parked_on_background_work: false,
+        parked_revision: 99,
+        parked_epoch: 100,
+      }),
+    );
+
+    expect(parkedFor(store, "t1")).toEqual({
+      parkedOnBackgroundWork: true,
+      parkedRevision: 1,
+      parkedEpoch: 200,
+    });
+  });
+
+  it("accepts a newer epoch even with a lower revision", () => {
+    const store = storeWithTask({
+      id: "t1",
+      parkedOnBackgroundWork: true,
+      parkedRevision: 50,
+      parkedEpoch: 100,
+    });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({
+        ...makeTask("t1"),
+        parked_on_background_work: false,
+        parked_revision: 1,
+        parked_epoch: 200,
+      }),
+    );
+
+    expect(parkedFor(store, "t1")).toEqual({
+      parkedOnBackgroundWork: false,
+      parkedRevision: 1,
+      parkedEpoch: 200,
+    });
+  });
+});
+
+describe("task.updated interrupted marker (live propagation + safe fallback)", () => {
+  function interruptedFor(store: ReturnType<typeof makeStore>, id: string) {
+    const kanban = store.getState().kanban.tasks.find((t) => t.id === id)?.interrupted;
+    const multi = store
+      .getState()
+      .kanbanMulti.snapshots.wf1.tasks.find((t) => t.id === id)?.interrupted;
+    return { kanban, multi };
+  }
+
+  it("applies the marker from task.updated", () => {
+    const store = storeWithTask({ id: "t1" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(
+      makeMessage({ ...makeTask("t1"), state: "REVIEW", interrupted: true }),
+    );
+
+    expect(interruptedFor(store, "t1")).toEqual({ kanban: true, multi: true });
+  });
+
+  it("clears the marker on an explicit false", () => {
+    const store = storeWithTask({ id: "t1", interrupted: true });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), interrupted: false }));
+
+    expect(interruptedFor(store, "t1")).toEqual({ kanban: false, multi: false });
+  });
+
+  it("increments the marker generation for every explicit update", () => {
+    const store = storeWithTask({ id: "t1", interrupted: false, interruptedGeneration: 1 });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), interrupted: true }));
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), interrupted: false }));
+
+    expect(store.getState().kanban.tasks.find((task) => task.id === "t1")).toMatchObject({
+      interrupted: false,
+      interruptedGeneration: 3,
+    });
+    expect(
+      store.getState().kanbanMulti.snapshots.wf1.tasks.find((task) => task.id === "t1"),
+    ).toMatchObject({ interrupted: false, interruptedGeneration: 3 });
+  });
+
+  it("preserves the marker when a partial update omits interrupted", () => {
+    // Clobber guard: a lightweight task.updated (e.g. a rename) must not wipe
+    // the interruption reading between real marker events.
+    const store = storeWithTask({ id: "t1", interrupted: true });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), title: "Renamed" }));
+
+    expect(interruptedFor(store, "t1")).toEqual({ kanban: true, multi: true });
+  });
+});
+
+describe("task.updated autopilot marker", () => {
+  it("preserves the immutable marker when a partial update omits it", () => {
+    const store = storeWithTask({ id: "t1", autopilot: true });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), title: "Renamed" }));
+
+    expect(store.getState().kanban.tasks.find((task) => task.id === "t1")?.autopilot).toBe(true);
+    expect(
+      store.getState().kanbanMulti.snapshots.wf1.tasks.find((task) => task.id === "t1")?.autopilot,
+    ).toBe(true);
+  });
+
+  it("preserves the marker when a primary session is explicitly cleared", () => {
+    const store = storeWithTask({ id: "t1", autopilot: true, primarySessionId: "session-1" });
+    const handlers = registerTasksHandlers(store);
+
+    handlers["task.updated"]!(makeMessage({ ...makeTask("t1"), primary_session_id: null }));
+
+    expect(store.getState().kanban.tasks.find((task) => task.id === "t1")?.autopilot).toBe(true);
+    expect(
+      store.getState().kanbanMulti.snapshots.wf1.tasks.find((task) => task.id === "t1")?.autopilot,
+    ).toBe(true);
+  });
+});

@@ -1,0 +1,957 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	"github.com/kandev/kandev/internal/task/service"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+type RepositoryHandlers struct {
+	service *service.Service
+	logger  *logger.Logger
+}
+
+func NewRepositoryHandlers(svc *service.Service, log *logger.Logger) *RepositoryHandlers {
+	return &RepositoryHandlers{
+		service: svc,
+		logger:  log.WithFields(zap.String("component", "task-repository-handlers")),
+	}
+}
+
+func RegisterRepositoryRoutes(router *gin.Engine, dispatcher *ws.Dispatcher, svc *service.Service, log *logger.Logger) {
+	handlers := NewRepositoryHandlers(svc, log)
+	handlers.registerHTTP(router)
+	handlers.registerWS(dispatcher)
+}
+
+func (h *RepositoryHandlers) registerHTTP(router *gin.Engine) {
+	api := router.Group("/api/v1")
+	api.POST("/workspaces/:id/repository-checkout-capabilities", h.httpRepositoryCheckoutCapabilities)
+	api.GET("/workspaces/:id/repositories", h.httpListRepositories)
+	api.POST("/workspaces/:id/repositories", h.httpCreateRepository)
+	api.POST("/workspaces/:id/repositories/initialize-local", h.httpInitializeLocalRepository)
+	api.GET("/workspaces/:id/repositories/discover", h.httpDiscoverRepositories)
+	api.GET("/workspaces/:id/repositories/discovery", h.httpGetDiscoverySnapshot)
+	api.POST("/workspaces/:id/repositories/discovery/refresh", h.httpRefreshDiscovery)
+	api.GET("/repositories/discovery/roots", h.httpListDiscoveryRoots)
+	api.POST("/repositories/discovery/roots", h.httpAddDiscoveryRoot)
+	api.POST("/repositories/discovery/roots/confirm-home", h.httpConfirmHomeDiscovery)
+	api.POST("/repositories/discovery/roots/reconnect", h.httpReconnectDiscoveryRoot)
+	api.DELETE("/repositories/discovery/roots", h.httpRemoveDiscoveryRoot)
+	// Unified branch listing — accepts either ?repository_id= for an imported
+	// workspace repo, or ?path= for an on-machine folder discovered but not
+	// yet imported. Both paths bottom out in `listGitBranches`; the only
+	// difference is how the absolute path is resolved.
+	api.GET("/workspaces/:id/branches", h.httpListBranches)
+	// Local-status (branch + dirty files) backs the fresh-branch consent
+	// flow on the local executor. Path-only — fresh-branch is local-only.
+	api.GET("/workspaces/:id/repositories/local-status", h.httpLocalRepositoryStatus)
+	api.GET("/workspaces/:id/repositories/validate", h.httpValidateRepositoryPath)
+	api.GET("/fs/list-dir", h.httpListDirectory)
+	api.POST("/fs/create-dir", h.httpCreateDirectory)
+	api.GET("/repositories/:id", h.httpGetRepository)
+	api.GET("/repositories/:id/branches", h.httpListRepositoryBranches)
+	api.GET("/repositories/:id/active-session-count", h.httpGetRepositoryActiveSessionCount)
+	api.PATCH("/repositories/:id", h.httpUpdateRepository)
+	api.DELETE("/repositories/:id", h.httpDeleteRepository)
+	api.GET("/repositories/:id/scripts", h.httpListRepositoryScripts)
+	api.POST("/repositories/:id/scripts", h.httpCreateRepositoryScript)
+	api.GET("/scripts/:id", h.httpGetRepositoryScript)
+	api.PUT("/scripts/:id", h.httpUpdateRepositoryScript)
+	api.DELETE("/scripts/:id", h.httpDeleteRepositoryScript)
+}
+
+func (h *RepositoryHandlers) registerWS(dispatcher *ws.Dispatcher) {
+	dispatcher.RegisterFunc(ws.ActionRepositoryList, h.wsListRepositories)
+	dispatcher.RegisterFunc(ws.ActionRepositoryCreate, h.wsCreateRepository)
+	dispatcher.RegisterFunc(ws.ActionRepositoryGet, h.wsGetRepository)
+	dispatcher.RegisterFunc(ws.ActionRepositoryUpdate, h.wsUpdateRepository)
+	dispatcher.RegisterFunc(ws.ActionRepositoryDelete, h.wsDeleteRepository)
+	dispatcher.RegisterFunc(ws.ActionRepositoryScriptList, h.wsListRepositoryScripts)
+	dispatcher.RegisterFunc(ws.ActionRepositoryScriptCreate, h.wsCreateRepositoryScript)
+	dispatcher.RegisterFunc(ws.ActionRepositoryScriptGet, h.wsGetRepositoryScript)
+	dispatcher.RegisterFunc(ws.ActionRepositoryScriptUpdate, h.wsUpdateRepositoryScript)
+	dispatcher.RegisterFunc(ws.ActionRepositoryScriptDelete, h.wsDeleteRepositoryScript)
+}
+
+// HTTP handlers
+
+func (h *RepositoryHandlers) httpListRepositories(c *gin.Context) {
+	workspaceID := c.Param("id")
+	includeScripts := c.Query("include_scripts") == queryValueTrue
+
+	repositories, err := h.service.ListRepositories(c.Request.Context(), workspaceID)
+	if err != nil {
+		h.logger.Error("failed to list repositories", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list repositories"})
+		return
+	}
+
+	resp := dto.ListRepositoriesResponse{
+		Repositories: make([]dto.RepositoryDTO, 0, len(repositories)),
+		Total:        len(repositories),
+	}
+
+	var scriptsByRepo map[string][]*models.RepositoryScript
+	if includeScripts && len(repositories) > 0 {
+		repoIDs := make([]string, len(repositories))
+		for i, r := range repositories {
+			repoIDs[i] = r.ID
+		}
+		scriptsByRepo, _ = h.service.ListScriptsByRepositoryIDs(c.Request.Context(), repoIDs)
+	}
+
+	for _, repository := range repositories {
+		repoDTO := dto.FromRepository(repository)
+		if scripts, ok := scriptsByRepo[repository.ID]; ok {
+			repoDTO.Scripts = make([]dto.RepositoryScriptDTO, 0, len(scripts))
+			for _, script := range scripts {
+				repoDTO.Scripts = append(repoDTO.Scripts, dto.FromRepositoryScript(script))
+			}
+		}
+		resp.Repositories = append(resp.Repositories, repoDTO)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *RepositoryHandlers) httpDiscoverRepositories(c *gin.Context) {
+	workspaceID := c.Param("id")
+	root := c.Query("root")
+	result, err := h.service.DiscoverLocalRepositoriesForWorkspace(
+		c.Request.Context(), workspaceID, root,
+	)
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, discoveryResponse(result))
+}
+
+func (h *RepositoryHandlers) httpGetDiscoverySnapshot(c *gin.Context) {
+	result, err := h.service.GetLocalRepositoryDiscoveryForWorkspace(
+		c.Request.Context(), c.Param("id"), c.Query("root"),
+	)
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, discoveryResponse(result))
+}
+
+func (h *RepositoryHandlers) httpRefreshDiscovery(c *gin.Context) {
+	result, err := h.service.RefreshLocalRepositoryDiscoveryForWorkspaceWithTrigger(
+		c.Request.Context(),
+		c.Param("id"),
+		c.Query("root"),
+		service.NormalizeRepositoryDiscoveryTrigger(c.Query("trigger")),
+	)
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, discoveryResponse(result))
+}
+
+func discoveryResponse(result service.RepositoryDiscoveryResult) dto.RepositoryDiscoveryResponse {
+	rootStates := make([]dto.DesktopDiscoveryRootDTO, 0, len(result.RootStates))
+	for _, root := range result.RootStates {
+		rootStates = append(rootStates, dto.FromDesktopDiscoveryRoot(root))
+	}
+	repositories := make([]dto.LocalRepositoryDTO, 0, len(result.Repositories))
+	for _, repo := range result.Repositories {
+		repositories = append(repositories, dto.FromLocalRepository(repo))
+	}
+	return dto.RepositoryDiscoveryResponse{
+		Roots:                    result.Roots,
+		Repositories:             repositories,
+		Total:                    len(repositories),
+		DesktopRuntime:           result.DesktopRuntime,
+		RootStates:               rootStates,
+		ScanTime:                 result.ScanTime,
+		Refreshing:               result.Refreshing,
+		Cached:                   result.Cached,
+		HomeConfirmationRequired: result.HomeConfirmationRequired,
+		FailedRoots:              result.FailedRoots,
+	}
+}
+
+func (h *RepositoryHandlers) writeDiscoveryError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, repoerrors.ErrWorkspaceNotFound):
+		handleNotFound(c, h.logger, err, "workspace not found")
+	case errors.Is(err, service.ErrPathNotAllowed), errors.Is(err, service.ErrInvalidDiscoveryRoot):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, service.ErrDesktopDiscoveryUnavailable):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	case errors.Is(err, service.ErrHomeDiscoveryConfirmationStale):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	default:
+		h.logger.Error("failed to load repository discovery", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load repository discovery"})
+	}
+}
+
+type discoveryRootRequest struct {
+	Path    string `json:"path"`
+	NewPath string `json:"new_path"`
+}
+
+func (h *RepositoryHandlers) httpListDiscoveryRoots(c *gin.Context) {
+	roots, err := h.service.ListDesktopDiscoveryRoots(c.Request.Context())
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	response := make([]dto.DesktopDiscoveryRootDTO, 0, len(roots))
+	for _, root := range roots {
+		if root != nil {
+			response = append(response, dto.FromDesktopDiscoveryRoot(*root))
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"roots": response})
+}
+
+func (h *RepositoryHandlers) httpAddDiscoveryRoot(c *gin.Context) {
+	var body discoveryRootRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	root, err := h.service.AddDesktopDiscoveryRoot(c.Request.Context(), body.Path)
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	if root == nil {
+		h.logger.Error("desktop discovery root was not returned after add")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add discovery root"})
+		return
+	}
+	c.JSON(http.StatusCreated, dto.FromDesktopDiscoveryRoot(*root))
+}
+
+func (h *RepositoryHandlers) httpConfirmHomeDiscovery(c *gin.Context) {
+	root, err := h.service.ConfirmHomeDesktopDiscovery(c.Request.Context())
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	if root == nil {
+		h.logger.Error("desktop Home discovery root was not returned after confirmation")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to confirm Home discovery"})
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromDesktopDiscoveryRoot(*root))
+}
+
+func (h *RepositoryHandlers) httpReconnectDiscoveryRoot(c *gin.Context) {
+	var body discoveryRootRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	root, err := h.service.ReconnectDesktopDiscoveryRoot(c.Request.Context(), body.Path, body.NewPath)
+	if err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	if root == nil {
+		h.logger.Error("desktop discovery root was not returned after reconnect")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reconnect discovery root"})
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromDesktopDiscoveryRoot(*root))
+}
+
+func (h *RepositoryHandlers) httpRemoveDiscoveryRoot(c *gin.Context) {
+	if err := h.service.RemoveDesktopDiscoveryRoot(c.Request.Context(), c.Query("path")); err != nil {
+		h.writeDiscoveryError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// httpListDirectory lists the immediate subdirectories of ?path= (defaults
+// to $HOME). The picker deliberately allows browsing any directory the
+// kandev process has read access to — kandev runs locally on the user's
+// own machine, and the repo-less starting-folder flow legitimately wants
+// /tmp, /var/log/foo, etc. Hidden (dotfile) directories are excluded.
+func (h *RepositoryHandlers) httpListDirectory(c *gin.Context) {
+	path := c.Query("path")
+	result, err := h.service.ListDirectory(c.Request.Context(), path)
+	if err != nil {
+		// Log the raw OS error for debugging but return a generic message —
+		// otherwise we leak host paths and access patterns to the client (e.g.
+		// "open /home/user/private: permission denied").
+		h.logger.Warn("failed to list directory", zap.String("path", path), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to list directory"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"path":      result.Path,
+		"parent":    result.Parent,
+		"entries":   directoryEntriesResponse(result.Entries),
+		"choosable": result.Choosable,
+	})
+}
+
+func directoryEntriesResponse(entries []service.DirectoryEntry) []gin.H {
+	response := make([]gin.H, 0, len(entries))
+	for _, entry := range entries {
+		response = append(response, gin.H{"name": entry.Name, "path": entry.Path})
+	}
+	return response
+}
+
+type httpCreateDirectoryRequest struct {
+	ParentPath string `json:"parent_path"`
+	Name       string `json:"name"`
+}
+
+func (h *RepositoryHandlers) httpCreateDirectory(c *gin.Context) {
+	var body httpCreateDirectoryRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	result, err := h.service.CreateDirectory(c.Request.Context(), body.ParentPath, body.Name)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrDirectoryAlreadyExists):
+			c.JSON(http.StatusConflict, gin.H{"error": "folder already exists"})
+		case errors.Is(err, service.ErrInvalidDirectoryCreation),
+			errors.Is(err, service.ErrInvalidLocalRepositoryInitialization):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid folder location or name"})
+		default:
+			h.logger.Warn("failed to create directory", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create folder"})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"path":      result.Path,
+		"parent":    result.Parent,
+		"entries":   directoryEntriesResponse(result.Entries),
+		"choosable": result.Choosable,
+	})
+}
+
+func (h *RepositoryHandlers) httpValidateRepositoryPath(c *gin.Context) {
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+		return
+	}
+	result, err := h.service.ValidateLocalRepositoryPath(c.Request.Context(), path)
+	if err != nil {
+		h.logger.Error("failed to validate repository path", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate repository path"})
+		return
+	}
+	c.JSON(http.StatusOK, dto.RepositoryPathValidationResponse{
+		Path:          result.Path,
+		Exists:        result.Exists,
+		IsGitRepo:     result.IsGitRepo,
+		Allowed:       result.Allowed,
+		DefaultBranch: result.DefaultBranch,
+		Message:       result.Message,
+	})
+}
+
+// httpListBranches handles the unified branch endpoint:
+//
+//	GET /api/v1/workspaces/:id/branches?repository_id=X
+//	GET /api/v1/workspaces/:id/branches?path=/abs/path
+//
+// Exactly one of the two query params must be set. Both bottom out in the
+// same `listGitBranches` call; the difference is just where the absolute
+// path is resolved from (DB row vs request param).
+func (h *RepositoryHandlers) httpListBranches(c *gin.Context) {
+	repoID := c.Query("repository_id")
+	path := c.Query("path")
+	if repoID == "" && path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "repository_id or path is required"})
+		return
+	}
+	if repoID != "" && path != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "specify only one of repository_id or path"})
+		return
+	}
+	if repoID != "" {
+		repository, err := h.service.GetRepository(c.Request.Context(), repoID)
+		if err != nil || repository == nil || repository.WorkspaceID != c.Param("id") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "repository not found"})
+			return
+		}
+	}
+	result, err := h.service.ListBranchesWithCurrent(c.Request.Context(), repoID, path)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositoryPath) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		h.logger.Error("failed to list branches", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list branches"})
+		return
+	}
+	dtoBranches := make([]dto.BranchDTO, len(result.Branches))
+	for i, branch := range result.Branches {
+		dtoBranches[i] = dto.FromBranch(branch)
+	}
+	c.JSON(http.StatusOK, dto.RepositoryBranchesResponse{
+		Branches:      dtoBranches,
+		Total:         len(dtoBranches),
+		CurrentBranch: result.CurrentBranch,
+	})
+}
+
+func (h *RepositoryHandlers) httpLocalRepositoryStatus(c *gin.Context) {
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+		return
+	}
+	status, err := h.service.LocalRepositoryStatus(c.Request.Context(), path)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositoryPath) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		h.logger.Error("failed to read local repository status", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read local repository status"})
+		return
+	}
+	dirty := status.DirtyFiles
+	if dirty == nil {
+		dirty = []string{}
+	}
+	c.JSON(http.StatusOK, dto.LocalRepositoryStatusResponse{
+		CurrentBranch: status.CurrentBranch,
+		DirtyFiles:    dirty,
+	})
+}
+
+type httpCreateRepositoryRequest struct {
+	Name                   string                                 `json:"name"`
+	SourceType             string                                 `json:"source_type"`
+	LocalPath              string                                 `json:"local_path"`
+	Provider               string                                 `json:"provider"`
+	ProviderRepoID         string                                 `json:"provider_repo_id"`
+	ProviderHost           string                                 `json:"provider_host"`
+	ProviderScope          string                                 `json:"provider_scope"`
+	ProviderOwner          string                                 `json:"provider_owner"`
+	ProviderName           string                                 `json:"provider_name"`
+	DefaultBranch          string                                 `json:"default_branch"`
+	WorktreeBranchPrefix   string                                 `json:"worktree_branch_prefix"`
+	WorktreeBranchTemplate string                                 `json:"worktree_branch_template"`
+	PullBeforeWorktree     *bool                                  `json:"pull_before_worktree"`
+	SetupScript            string                                 `json:"setup_script"`
+	CleanupScript          string                                 `json:"cleanup_script"`
+	DevScript              string                                 `json:"dev_script"`
+	CopyFiles              string                                 `json:"copy_files"`
+	SecretBindings         []service.RepositorySecretBindingInput `json:"secret_bindings,omitempty"`
+}
+
+type httpInitializeLocalRepositoryRequest struct {
+	Name       string `json:"name"`
+	ParentPath string `json:"parent_path"`
+}
+
+// rejectReadOnlyWorkspaceHTTP returns 409 when the workspace is the dedicated
+// Improve Kandev workspace, whose repositories are read-only. Lookup errors
+// surface as not-found so callers keep their existing error handling.
+func (h *RepositoryHandlers) rejectReadOnlyWorkspaceHTTP(c *gin.Context, workspaceID string) bool {
+	if workspaceID == "" {
+		return false
+	}
+	workspace, err := h.service.GetWorkspace(c.Request.Context(), workspaceID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workspace not found")
+		return true
+	}
+	if workspace.IsImproveKandev() {
+		c.JSON(http.StatusConflict, gin.H{"error": workspaceReadOnlyMsg})
+		return true
+	}
+	return false
+}
+
+// rejectReadOnlyRepositoryHTTP loads the repository and returns 409 when it
+// lives in the read-only Improve Kandev workspace.
+func (h *RepositoryHandlers) rejectReadOnlyRepositoryHTTP(c *gin.Context, id string) bool {
+	repository, err := h.service.GetRepository(c.Request.Context(), id)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "repository not found")
+		return true
+	}
+	return h.rejectReadOnlyWorkspaceHTTP(c, repository.WorkspaceID)
+}
+
+// wsRejectReadOnlyWorkspace returns a conflict WS error when the workspace is
+// the dedicated Improve Kandev workspace, whose repositories are read-only.
+// Returns (nil, false) when the mutation is allowed.
+func (h *RepositoryHandlers) wsRejectReadOnlyWorkspace(ctx context.Context, msg *ws.Message, workspaceID string) (*ws.Message, bool) {
+	if workspaceID == "" {
+		return nil, false
+	}
+	workspace, err := h.service.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		errMsg, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Workspace not found", nil)
+		return errMsg, true
+	}
+	if workspace.IsImproveKandev() {
+		errMsg, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, workspaceReadOnlyMsg, nil)
+		return errMsg, true
+	}
+	return nil, false
+}
+
+// readOnlyRepositoryMessage returns the workspace read-only reason when the
+// repository lives in the dedicated Improve Kandev workspace. Lookup errors
+// surface as ("", false) so the caller's normal not-found path handles them.
+func (h *RepositoryHandlers) readOnlyRepositoryMessage(ctx context.Context, repositoryID string) (string, bool) {
+	repository, err := h.service.GetRepository(ctx, repositoryID)
+	if err != nil {
+		return "", false
+	}
+	if repository == nil || repository.WorkspaceID == "" {
+		return "", false
+	}
+	workspace, err := h.service.GetWorkspace(ctx, repository.WorkspaceID)
+	if err != nil {
+		return "", false
+	}
+	if workspace.IsImproveKandev() {
+		return workspaceReadOnlyMsg, true
+	}
+	return "", false
+}
+
+func (h *RepositoryHandlers) httpInitializeLocalRepository(c *gin.Context) {
+	var body httpInitializeLocalRepositoryRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	if h.rejectReadOnlyWorkspaceHTTP(c, c.Param("id")) {
+		return
+	}
+	initialized, err := h.service.InitializeLocalRepository(c.Request.Context(), &service.InitializeLocalRepositoryRequest{
+		WorkspaceID: c.Param("id"),
+		Name:        body.Name,
+		ParentPath:  body.ParentPath,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidLocalRepositoryInitialization):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrWorkspaceNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		case errors.Is(err, service.ErrLocalRepositoryTargetExists):
+			c.JSON(http.StatusConflict, gin.H{"error": "repository target already exists"})
+		default:
+			h.logger.Error("failed to initialize local repository", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize local repository"})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, dto.FromRepository(initialized))
+}
+
+func (h *RepositoryHandlers) httpCreateRepository(c *gin.Context) {
+	var body httpCreateRepositoryRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	if body.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if h.rejectReadOnlyWorkspaceHTTP(c, c.Param("id")) {
+		return
+	}
+	repository, err := h.service.CreateRepository(c.Request.Context(), &service.CreateRepositoryRequest{
+		WorkspaceID:            c.Param("id"),
+		Name:                   body.Name,
+		SourceType:             body.SourceType,
+		LocalPath:              body.LocalPath,
+		Provider:               body.Provider,
+		ProviderRepoID:         body.ProviderRepoID,
+		ProviderHost:           body.ProviderHost,
+		ProviderScope:          body.ProviderScope,
+		ProviderOwner:          body.ProviderOwner,
+		ProviderName:           body.ProviderName,
+		DefaultBranch:          body.DefaultBranch,
+		WorktreeBranchPrefix:   body.WorktreeBranchPrefix,
+		WorktreeBranchTemplate: body.WorktreeBranchTemplate,
+		PullBeforeWorktree:     body.PullBeforeWorktree,
+		SetupScript:            body.SetupScript,
+		CleanupScript:          body.CleanupScript,
+		DevScript:              body.DevScript,
+		CopyFiles:              body.CopyFiles,
+		SecretBindings:         body.SecretBindings,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositorySettings) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repository settings"})
+			return
+		}
+		h.logger.Error("failed to create repository", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create repository"})
+		return
+	}
+	c.JSON(http.StatusCreated, dto.FromRepository(repository))
+}
+
+func (h *RepositoryHandlers) httpGetRepository(c *gin.Context) {
+	repository, err := h.service.GetRepository(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		handleNotFound(c, h.logger, err, "repository not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromRepository(repository))
+}
+
+func (h *RepositoryHandlers) httpListRepositoryBranches(c *gin.Context) {
+	repoID := c.Param("id")
+	ctx := c.Request.Context()
+	if _, err := h.service.GetRepository(ctx, repoID); err != nil {
+		handleNotFound(c, h.logger, err, "repository not found")
+		return
+	}
+
+	var fetchedAt, fetchError string
+	if c.Query("refresh") == queryValueTrue {
+		fetchedAt, fetchError = h.refreshRepositoryBranches(ctx, repoID)
+	}
+
+	result, err := h.service.ListBranchesWithCurrent(ctx, repoID, "")
+	if err != nil {
+		h.logger.Error("failed to list repository branches", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list repository branches"})
+		return
+	}
+	dtoBranches := make([]dto.BranchDTO, len(result.Branches))
+	for i, branch := range result.Branches {
+		dtoBranches[i] = dto.FromBranch(branch)
+	}
+	c.JSON(http.StatusOK, dto.RepositoryBranchesResponse{
+		Branches:      dtoBranches,
+		Total:         len(dtoBranches),
+		CurrentBranch: result.CurrentBranch,
+		FetchedAt:     fetchedAt,
+		FetchError:    fetchError,
+	})
+}
+
+// refreshRepositoryBranches runs an identity-bound `git fetch` and returns
+// response metadata. Failures are best-effort so a transient network error
+// does not blank the branch dropdown.
+func (h *RepositoryHandlers) refreshRepositoryBranches(ctx context.Context, repoID string) (fetchedAt, fetchError string) {
+	res, err := h.service.RefreshRepositoryBranches(ctx, repoID)
+	if err != nil {
+		h.logger.Warn("branch refresh failed", zap.String("repo_id", repoID), zap.Error(err))
+		return "", err.Error()
+	}
+	if !res.FetchedAt.IsZero() {
+		fetchedAt = res.FetchedAt.UTC().Format(time.RFC3339)
+	}
+	if res.Err != nil {
+		fetchError = res.Err.Error()
+	}
+	return fetchedAt, fetchError
+}
+
+type httpUpdateRepositoryRequest struct {
+	Name                   *string                                 `json:"name"`
+	SourceType             *string                                 `json:"source_type"`
+	LocalPath              *string                                 `json:"local_path"`
+	Provider               *string                                 `json:"provider"`
+	ProviderRepoID         *string                                 `json:"provider_repo_id"`
+	ProviderHost           *string                                 `json:"provider_host"`
+	ProviderScope          *string                                 `json:"provider_scope"`
+	ProviderOwner          *string                                 `json:"provider_owner"`
+	ProviderName           *string                                 `json:"provider_name"`
+	DefaultBranch          *string                                 `json:"default_branch"`
+	WorktreeBranchPrefix   *string                                 `json:"worktree_branch_prefix"`
+	WorktreeBranchTemplate *string                                 `json:"worktree_branch_template"`
+	PullBeforeWorktree     *bool                                   `json:"pull_before_worktree"`
+	SetupScript            *string                                 `json:"setup_script"`
+	CleanupScript          *string                                 `json:"cleanup_script"`
+	DevScript              *string                                 `json:"dev_script"`
+	CopyFiles              *string                                 `json:"copy_files"`
+	SecretBindings         *[]service.RepositorySecretBindingInput `json:"secret_bindings,omitempty"`
+}
+
+func (h *RepositoryHandlers) httpUpdateRepository(c *gin.Context) {
+	var body httpUpdateRepositoryRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	if h.rejectReadOnlyRepositoryHTTP(c, c.Param("id")) {
+		return
+	}
+	repository, err := h.service.UpdateRepository(c.Request.Context(), c.Param("id"), &service.UpdateRepositoryRequest{
+		Name:                   body.Name,
+		SourceType:             body.SourceType,
+		LocalPath:              body.LocalPath,
+		Provider:               body.Provider,
+		ProviderRepoID:         body.ProviderRepoID,
+		ProviderHost:           body.ProviderHost,
+		ProviderScope:          body.ProviderScope,
+		ProviderOwner:          body.ProviderOwner,
+		ProviderName:           body.ProviderName,
+		DefaultBranch:          body.DefaultBranch,
+		WorktreeBranchPrefix:   body.WorktreeBranchPrefix,
+		WorktreeBranchTemplate: body.WorktreeBranchTemplate,
+		PullBeforeWorktree:     body.PullBeforeWorktree,
+		SetupScript:            body.SetupScript,
+		CleanupScript:          body.CleanupScript,
+		DevScript:              body.DevScript,
+		CopyFiles:              body.CopyFiles,
+		SecretBindings:         body.SecretBindings,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositorySettings) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repository settings"})
+			return
+		}
+		handleNotFound(c, h.logger, err, "repository not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromRepository(repository))
+}
+
+func (h *RepositoryHandlers) httpDeleteRepository(c *gin.Context) {
+	if h.rejectReadOnlyRepositoryHTTP(c, c.Param("id")) {
+		return
+	}
+	if err := h.service.DeleteRepository(c.Request.Context(), c.Param("id")); err != nil {
+		if errors.Is(err, service.ErrActiveTaskSessions) {
+			c.JSON(http.StatusConflict, gin.H{"error": "repository is used by an active agent session"})
+			return
+		}
+		handleNotFound(c, h.logger, err, "repository not found")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h *RepositoryHandlers) httpGetRepositoryActiveSessionCount(c *gin.Context) {
+	count, err := h.service.CountActiveSessionsByRepository(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		handleNotFound(c, h.logger, err, "repository not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.RepositoryActiveSessionCountResponse{ActiveSessionCount: count})
+}
+
+// WS handlers
+
+func reposToListResponse(repositories []*models.Repository) dto.ListRepositoriesResponse {
+	resp := dto.ListRepositoriesResponse{
+		Repositories: make([]dto.RepositoryDTO, 0, len(repositories)),
+		Total:        len(repositories),
+	}
+	for _, repository := range repositories {
+		resp.Repositories = append(resp.Repositories, dto.FromRepository(repository))
+	}
+	return resp
+}
+
+func (h *RepositoryHandlers) wsListRepositories(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		WorkspaceID string `json:"workspace_id"`
+	}
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	repositories, err := h.service.ListRepositories(ctx, req.WorkspaceID)
+	if err != nil {
+		h.logger.Error("failed to list repositories", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list repositories", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, reposToListResponse(repositories))
+}
+
+type wsCreateRepositoryRequest struct {
+	WorkspaceID            string                                 `json:"workspace_id"`
+	Name                   string                                 `json:"name"`
+	SourceType             string                                 `json:"source_type"`
+	LocalPath              string                                 `json:"local_path"`
+	Provider               string                                 `json:"provider"`
+	ProviderRepoID         string                                 `json:"provider_repo_id"`
+	ProviderHost           string                                 `json:"provider_host"`
+	ProviderScope          string                                 `json:"provider_scope"`
+	ProviderOwner          string                                 `json:"provider_owner"`
+	ProviderName           string                                 `json:"provider_name"`
+	DefaultBranch          string                                 `json:"default_branch"`
+	WorktreeBranchPrefix   string                                 `json:"worktree_branch_prefix"`
+	WorktreeBranchTemplate string                                 `json:"worktree_branch_template"`
+	SetupScript            string                                 `json:"setup_script"`
+	CleanupScript          string                                 `json:"cleanup_script"`
+	DevScript              string                                 `json:"dev_script"`
+	CopyFiles              string                                 `json:"copy_files"`
+	SecretBindings         []service.RepositorySecretBindingInput `json:"secret_bindings,omitempty"`
+}
+
+func (h *RepositoryHandlers) wsCreateRepository(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsCreateRepositoryRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.WorkspaceID == "" || req.Name == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workspace_id and name are required", nil)
+	}
+	if errMsg, blocked := h.wsRejectReadOnlyWorkspace(ctx, msg, req.WorkspaceID); blocked {
+		return errMsg, nil
+	}
+	repository, err := h.service.CreateRepository(ctx, &service.CreateRepositoryRequest{
+		WorkspaceID:            req.WorkspaceID,
+		Name:                   req.Name,
+		SourceType:             req.SourceType,
+		LocalPath:              req.LocalPath,
+		Provider:               req.Provider,
+		ProviderRepoID:         req.ProviderRepoID,
+		ProviderHost:           req.ProviderHost,
+		ProviderScope:          req.ProviderScope,
+		ProviderOwner:          req.ProviderOwner,
+		ProviderName:           req.ProviderName,
+		DefaultBranch:          req.DefaultBranch,
+		WorktreeBranchPrefix:   req.WorktreeBranchPrefix,
+		WorktreeBranchTemplate: req.WorktreeBranchTemplate,
+		SetupScript:            req.SetupScript,
+		CleanupScript:          req.CleanupScript,
+		DevScript:              req.DevScript,
+		CopyFiles:              req.CopyFiles,
+		SecretBindings:         req.SecretBindings,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositorySettings) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Invalid repository settings", nil)
+		}
+		h.logger.Error("failed to create repository", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to create repository", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromRepository(repository))
+}
+
+type wsGetRepositoryRequest struct {
+	ID string `json:"id"`
+}
+
+func (h *RepositoryHandlers) wsGetRepository(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsGetRepositoryRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	repository, err := h.service.GetRepository(ctx, req.ID)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Repository not found", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromRepository(repository))
+}
+
+type wsUpdateRepositoryRequest struct {
+	ID                     string                                  `json:"id"`
+	Name                   *string                                 `json:"name,omitempty"`
+	SourceType             *string                                 `json:"source_type,omitempty"`
+	LocalPath              *string                                 `json:"local_path,omitempty"`
+	Provider               *string                                 `json:"provider,omitempty"`
+	ProviderRepoID         *string                                 `json:"provider_repo_id,omitempty"`
+	ProviderHost           *string                                 `json:"provider_host,omitempty"`
+	ProviderScope          *string                                 `json:"provider_scope,omitempty"`
+	ProviderOwner          *string                                 `json:"provider_owner,omitempty"`
+	ProviderName           *string                                 `json:"provider_name,omitempty"`
+	DefaultBranch          *string                                 `json:"default_branch,omitempty"`
+	WorktreeBranchPrefix   *string                                 `json:"worktree_branch_prefix,omitempty"`
+	WorktreeBranchTemplate *string                                 `json:"worktree_branch_template,omitempty"`
+	SetupScript            *string                                 `json:"setup_script,omitempty"`
+	CleanupScript          *string                                 `json:"cleanup_script,omitempty"`
+	DevScript              *string                                 `json:"dev_script,omitempty"`
+	CopyFiles              *string                                 `json:"copy_files,omitempty"`
+	SecretBindings         *[]service.RepositorySecretBindingInput `json:"secret_bindings,omitempty"`
+}
+
+func (h *RepositoryHandlers) wsUpdateRepository(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsUpdateRepositoryRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	if reason, readOnly := h.readOnlyRepositoryMessage(ctx, req.ID); readOnly {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, reason, nil)
+	}
+	repository, err := h.service.UpdateRepository(ctx, req.ID, &service.UpdateRepositoryRequest{
+		Name:                   req.Name,
+		SourceType:             req.SourceType,
+		LocalPath:              req.LocalPath,
+		Provider:               req.Provider,
+		ProviderRepoID:         req.ProviderRepoID,
+		ProviderHost:           req.ProviderHost,
+		ProviderScope:          req.ProviderScope,
+		ProviderOwner:          req.ProviderOwner,
+		ProviderName:           req.ProviderName,
+		DefaultBranch:          req.DefaultBranch,
+		WorktreeBranchPrefix:   req.WorktreeBranchPrefix,
+		WorktreeBranchTemplate: req.WorktreeBranchTemplate,
+		SetupScript:            req.SetupScript,
+		CleanupScript:          req.CleanupScript,
+		DevScript:              req.DevScript,
+		CopyFiles:              req.CopyFiles,
+		SecretBindings:         req.SecretBindings,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidRepositorySettings) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Invalid repository settings", nil)
+		}
+		h.logger.Error("failed to update repository", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update repository", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromRepository(repository))
+}
+
+type wsDeleteRepositoryRequest struct {
+	ID string `json:"id"`
+}
+
+func (h *RepositoryHandlers) wsDeleteRepository(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsDeleteRepositoryRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	if reason, readOnly := h.readOnlyRepositoryMessage(ctx, req.ID); readOnly {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, reason, nil)
+	}
+	if err := h.service.DeleteRepository(ctx, req.ID); err != nil {
+		h.logger.Error("failed to delete repository", zap.Error(err))
+		if errors.Is(err, service.ErrActiveTaskSessions) {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "repository is used by an active agent session", nil)
+		}
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Repository not found", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, gin.H{"deleted": true})
+}

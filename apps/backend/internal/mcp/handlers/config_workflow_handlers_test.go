@@ -1,0 +1,690 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	eventtypes "github.com/kandev/kandev/internal/events"
+	eventbus "github.com/kandev/kandev/internal/events/bus"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	workflowctrl "github.com/kandev/kandev/internal/workflow/controller"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	workflowsvc "github.com/kandev/kandev/internal/workflow/service"
+
+	"github.com/kandev/kandev/internal/workflow/repository"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+// memWorkflowProvider is a minimal in-memory WorkflowProvider for import tests.
+// The canonical mock lives in the workflow/service test package, which can't be
+// imported here, so we keep a tiny local copy covering only the methods the
+// import path uses.
+type memWorkflowProvider struct {
+	workflows []*taskmodels.Workflow
+}
+
+func (m *memWorkflowProvider) ListWorkflows(_ context.Context, workspaceID string, _ bool) ([]*taskmodels.Workflow, error) {
+	var result []*taskmodels.Workflow
+	for _, wf := range m.workflows {
+		if wf.WorkspaceID == workspaceID {
+			result = append(result, wf)
+		}
+	}
+	return result, nil
+}
+
+func (m *memWorkflowProvider) GetWorkflow(_ context.Context, id string) (*taskmodels.Workflow, error) {
+	for _, wf := range m.workflows {
+		if wf.ID == id {
+			return wf, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+func (m *memWorkflowProvider) CreateWorkflow(_ context.Context, workspaceID, name, description string) (*taskmodels.Workflow, error) {
+	now := time.Now().UTC()
+	wf := &taskmodels.Workflow{
+		ID:          "wf-" + name,
+		WorkspaceID: workspaceID,
+		Name:        name,
+		Description: description,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	m.workflows = append(m.workflows, wf)
+	return wf, nil
+}
+
+func (m *memWorkflowProvider) UpdateWorkflow(_ context.Context, workflow *taskmodels.Workflow) error {
+	for i, wf := range m.workflows {
+		if wf.ID == workflow.ID {
+			m.workflows[i] = workflow
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
+// setupImportHandlers wires a Handlers value backed by an in-memory workflow
+// service so handleImportWorkflow can persist for real.
+func setupImportHandlers(t *testing.T) (*Handlers, *memWorkflowProvider, *repository.Repository) {
+	t.Helper()
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	// Pin the pool to a single connection: each new connection to an in-memory
+	// SQLite DB gets its own isolated database, so a second pooled connection
+	// would not see the schema created on the first, causing flaky failures.
+	rawDB.SetMaxOpenConns(1)
+	db := sqlx.NewDb(rawDB, "sqlite3")
+	t.Cleanup(func() { _ = db.Close() })
+
+	// workflows table is normally owned by the task repo; create it for the test.
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS workflows (
+		id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '',
+		workflow_template_id TEXT DEFAULT '', name TEXT NOT NULL,
+		description TEXT DEFAULT '', created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL
+	)`)
+	require.NoError(t, err)
+
+	repo, err := repository.NewWithDB(db, db, nil)
+	require.NoError(t, err)
+
+	svc := workflowsvc.NewService(repo, testLogger(t))
+	t.Cleanup(func() { _ = svc.Close() })
+	provider := &memWorkflowProvider{}
+	svc.SetWorkflowProvider(provider)
+
+	h := &Handlers{workflowSvc: svc, logger: testLogger(t).WithFields()}
+	return h, provider, repo
+}
+
+type publishedStepEvent struct {
+	subject string
+	step    map[string]interface{}
+}
+
+func collectWorkflowStepEvents(t *testing.T, eb *eventbus.MemoryEventBus, subjects ...string) *[]publishedStepEvent {
+	t.Helper()
+	var published []publishedStepEvent
+	for _, subject := range subjects {
+		subject := subject
+		_, err := eb.Subscribe(subject, func(_ context.Context, ev *eventbus.Event) error {
+			data, ok := ev.Data.(map[string]interface{})
+			require.True(t, ok)
+			step, ok := data["step"].(map[string]interface{})
+			require.True(t, ok)
+			published = append(published, publishedStepEvent{subject: subject, step: step})
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	return &published
+}
+
+func TestHandleCreateWorkflowStep_PublishesDemotedStartStep(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+	eb := eventbus.NewMemoryEventBus(testLogger(t))
+	h.eventBus = eb
+
+	published := collectWorkflowStepEvents(t, eb, eventtypes.WorkflowStepUpdated, eventtypes.WorkflowStepCreated)
+
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                        "old-start",
+		WorkflowID:                "wf-test",
+		Name:                      "Old Start",
+		Position:                  0,
+		IsStartStep:               true,
+		ShowInCommandPanel:        true,
+		AgentProfileID:            "agent-old",
+		StageType:                 wfmodels.StageTypeReview,
+		AutoAdvanceRequiresSignal: true,
+	}))
+	isStart := true
+	msg := makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"workflow_id":   "wf-test",
+		"name":          "New Start",
+		"position":      1,
+		"is_start_step": isStart,
+	})
+
+	resp, err := h.handleCreateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	require.Len(t, *published, 2)
+
+	assert.Equal(t, eventtypes.WorkflowStepUpdated, (*published)[0].subject)
+	assert.Equal(t, "old-start", (*published)[0].step["id"])
+	assert.False(t, (*published)[0].step["is_start_step"].(bool))
+	assert.Equal(t, "agent-old", (*published)[0].step["agent_profile_id"])
+	assert.Equal(t, string(wfmodels.StageTypeReview), (*published)[0].step["stage_type"])
+	assert.True(t, (*published)[0].step["auto_advance_requires_signal"].(bool))
+	assert.Equal(t, eventtypes.WorkflowStepCreated, (*published)[1].subject)
+	assert.True(t, (*published)[1].step["is_start_step"].(bool))
+}
+
+func TestHandleCreateWorkflowStep_PersistsAutoAdvanceRequiresSignal(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	msg := makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"workflow_id":                  "wf-test",
+		"name":                         "Signal gated",
+		"position":                     0,
+		"auto_advance_requires_signal": true,
+	})
+
+	resp, err := h.handleCreateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	steps, err := repo.ListStepsByWorkflow(ctx, "wf-test")
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.True(t, steps[0].AutoAdvanceRequiresSignal)
+}
+
+func TestHandleCreateWorkflowStep_PersistsCancelTriggersTurnComplete(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	msg := makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"workflow_id":                   "wf-test",
+		"name":                          "Cancel completion",
+		"position":                      0,
+		"cancel_triggers_turn_complete": true,
+	})
+	resp, err := h.handleCreateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	steps, err := repo.ListStepsByWorkflow(ctx, "wf-test")
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.True(t, steps[0].CancelTriggersTurnComplete)
+}
+
+func TestHandleCreateWorkflowStep_RejectsNullCompletionPolicy(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	resp, err := h.handleCreateWorkflowStep(ctx, makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"workflow_id":            "wf-test",
+		"name":                   "Null completion",
+		"complete_task_on_enter": nil,
+	}))
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+	steps, err := repo.ListStepsByWorkflow(ctx, "wf-test")
+	require.NoError(t, err)
+	require.Empty(t, steps)
+}
+
+func TestHandleUpdateWorkflowStep_PublishesDemotedStartStep(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+	eb := eventbus.NewMemoryEventBus(testLogger(t))
+	h.eventBus = eb
+
+	published := collectWorkflowStepEvents(t, eb, eventtypes.WorkflowStepUpdated)
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                        "old-start",
+		WorkflowID:                "wf-test",
+		Name:                      "Old Start",
+		Position:                  0,
+		IsStartStep:               true,
+		ShowInCommandPanel:        true,
+		AgentProfileID:            "agent-old",
+		StageType:                 wfmodels.StageTypeApproval,
+		AutoAdvanceRequiresSignal: true,
+	}))
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                 "new-start",
+		WorkflowID:         "wf-test",
+		Name:               "New Start",
+		Position:           1,
+		ShowInCommandPanel: true,
+	}))
+
+	isStart := true
+	msg := makeWSMessage(t, ws.ActionMCPUpdateWorkflowStep, map[string]interface{}{
+		"step_id":       "new-start",
+		"is_start_step": isStart,
+	})
+
+	resp, err := h.handleUpdateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	require.Len(t, *published, 2)
+
+	assert.Equal(t, "old-start", (*published)[0].step["id"])
+	assert.False(t, (*published)[0].step["is_start_step"].(bool))
+	assert.Equal(t, "agent-old", (*published)[0].step["agent_profile_id"])
+	assert.Equal(t, string(wfmodels.StageTypeApproval), (*published)[0].step["stage_type"])
+	assert.True(t, (*published)[0].step["auto_advance_requires_signal"].(bool))
+	assert.Equal(t, "new-start", (*published)[1].step["id"])
+	assert.True(t, (*published)[1].step["is_start_step"].(bool))
+}
+
+func TestHandleUpdateWorkflowStep_PersistsAutoAdvanceRequiresSignalFalse(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                        "signal-gated",
+		WorkflowID:                "wf-test",
+		Name:                      "Signal gated",
+		Position:                  0,
+		ShowInCommandPanel:        true,
+		AutoAdvanceRequiresSignal: true,
+	}))
+
+	msg := makeWSMessage(t, ws.ActionMCPUpdateWorkflowStep, map[string]interface{}{
+		"step_id":                      "signal-gated",
+		"auto_advance_requires_signal": false,
+	})
+
+	resp, err := h.handleUpdateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	step, err := repo.GetStep(ctx, "signal-gated")
+	require.NoError(t, err)
+	assert.False(t, step.AutoAdvanceRequiresSignal)
+}
+
+func TestHandleUpdateWorkflowStep_PersistsCancelTriggersTurnCompleteFalse(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                         "cancel-gated",
+		WorkflowID:                 "wf-test",
+		Name:                       "Cancel gated",
+		Position:                   0,
+		CancelTriggersTurnComplete: true,
+	}))
+	msg := makeWSMessage(t, ws.ActionMCPUpdateWorkflowStep, map[string]interface{}{
+		"step_id":                       "cancel-gated",
+		"cancel_triggers_turn_complete": false,
+	})
+	resp, err := h.handleUpdateWorkflowStep(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	step, err := repo.GetStep(ctx, "cancel-gated")
+	require.NoError(t, err)
+	assert.False(t, step.CancelTriggersTurnComplete)
+}
+
+func TestHandleUpdateWorkflowStep_RejectsNullCompletionPolicyWithoutMutation(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                  "completed-step",
+		WorkflowID:          "wf-test",
+		Name:                "Done",
+		Position:            0,
+		CompleteTaskOnEnter: true,
+	}))
+
+	resp, err := h.handleUpdateWorkflowStep(ctx, makeWSMessage(t, ws.ActionMCPUpdateWorkflowStep, map[string]interface{}{
+		"step_id":                "completed-step",
+		"complete_task_on_enter": nil,
+	}))
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+	step, err := repo.GetStep(ctx, "completed-step")
+	require.NoError(t, err)
+	require.True(t, step.CompleteTaskOnEnter)
+}
+
+func TestHandleListWorkflowSteps_IncludesAutoAdvanceRequiresSignal(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                 "legacy",
+		WorkflowID:         "wf-test",
+		Name:               "Legacy",
+		Position:           0,
+		ShowInCommandPanel: true,
+	}))
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                        "signal-gated",
+		WorkflowID:                "wf-test",
+		Name:                      "Signal gated",
+		Position:                  1,
+		ShowInCommandPanel:        true,
+		AutoAdvanceRequiresSignal: true,
+	}))
+
+	msg := makeWSMessage(t, ws.ActionMCPListWorkflowSteps, map[string]interface{}{
+		"workflow_id": "wf-test",
+	})
+
+	resp, err := h.handleListWorkflowSteps(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var body struct {
+		Steps []map[string]interface{} `json:"steps"`
+	}
+	require.NoError(t, json.Unmarshal(resp.Payload, &body))
+	require.Len(t, body.Steps, 2)
+
+	assert.Contains(t, body.Steps[0], "auto_advance_requires_signal")
+	assert.Equal(t, false, body.Steps[0]["auto_advance_requires_signal"])
+	assert.Contains(t, body.Steps[1], "auto_advance_requires_signal")
+	assert.Equal(t, true, body.Steps[1]["auto_advance_requires_signal"])
+}
+
+func TestHandleListWorkflowSteps_IncludesCancelTriggersTurnComplete(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:         "cancel-legacy",
+		WorkflowID: "wf-test",
+		Name:       "Legacy",
+		Position:   0,
+	}))
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:                         "cancel-enabled",
+		WorkflowID:                 "wf-test",
+		Name:                       "Enabled",
+		Position:                   1,
+		CancelTriggersTurnComplete: true,
+	}))
+
+	msg := makeWSMessage(t, ws.ActionMCPListWorkflowSteps, map[string]interface{}{"workflow_id": "wf-test"})
+	resp, err := h.handleListWorkflowSteps(ctx, msg)
+	require.NoError(t, err)
+	var body struct {
+		Steps []map[string]interface{} `json:"steps"`
+	}
+	require.NoError(t, json.Unmarshal(resp.Payload, &body))
+	require.Len(t, body.Steps, 2)
+	assert.Equal(t, false, body.Steps[0]["cancel_triggers_turn_complete"])
+	assert.Equal(t, true, body.Steps[1]["cancel_triggers_turn_complete"])
+}
+
+func TestHandleImportWorkflow_PersistsWorkflow(t *testing.T) {
+	h, provider, repo := setupImportHandlers(t)
+
+	doc := `version: 1
+type: kandev_workflow
+workflows:
+  - name: Sprint Board
+    description: A sprint workflow
+    steps:
+      - name: Todo
+        position: 0
+        color: "#3b82f6"
+        is_start_step: true
+      - name: Done
+        position: 1
+        color: "#22c55e"
+`
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+		"document":     doc,
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var result workflowsvc.ImportResult
+	require.NoError(t, json.Unmarshal(resp.Payload, &result))
+	assert.Equal(t, []string{"Sprint Board"}, result.Created)
+	assert.Empty(t, result.Skipped)
+
+	// The workflow row was created via the provider.
+	require.Len(t, provider.workflows, 1)
+	created := provider.workflows[0]
+	assert.Equal(t, "Sprint Board", created.Name)
+	assert.Equal(t, "ws-1", created.WorkspaceID)
+
+	// Its steps were persisted to the repository.
+	steps, err := repo.ListStepsByWorkflow(context.Background(), created.ID)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	assert.Equal(t, "Todo", steps[0].Name)
+	assert.True(t, steps[0].IsStartStep)
+	assert.Equal(t, "Done", steps[1].Name)
+}
+
+func TestHandleExportWorkflow_ReturnsPortableWorkflow(t *testing.T) {
+	h, provider, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	provider.workflows = append(provider.workflows, &taskmodels.Workflow{
+		ID: "wf-export", WorkspaceID: "ws-source", Name: "Portable Board",
+		Description: "A portable workflow", Prompt: "Keep the board moving",
+	})
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID: "step-todo", WorkflowID: "wf-export", Name: "Todo", Position: 0,
+		Color: "#3b82f6", IsStartStep: true, ShowInCommandPanel: true,
+	}))
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID: "step-done", WorkflowID: "wf-export", Name: "Done", Position: 1,
+		Color: "#22c55e",
+	}))
+
+	resp, err := h.handleExportWorkflow(ctx, makeWSMessage(t, ws.ActionMCPExportWorkflow, map[string]string{
+		"workflow_id": "wf-export",
+	}))
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var exported wfmodels.WorkflowExport
+	require.NoError(t, json.Unmarshal(resp.Payload, &exported))
+	assert.Equal(t, wfmodels.LegacyExportVersion, exported.Version)
+	assert.Equal(t, wfmodels.ExportType, exported.Type)
+	require.Len(t, exported.Workflows, 1)
+	assert.Equal(t, "Portable Board", exported.Workflows[0].Name)
+	assert.Equal(t, "A portable workflow", exported.Workflows[0].Description)
+	require.Len(t, exported.Workflows[0].Steps, 2)
+	assert.Equal(t, "Todo", exported.Workflows[0].Steps[0].Name)
+	assert.Equal(t, "Done", exported.Workflows[0].Steps[1].Name)
+	assert.NotContains(t, string(resp.Payload), "wf-export")
+	assert.NotContains(t, string(resp.Payload), "step-todo")
+}
+
+func TestHandleExportWorkflow_ResultCanBeImportedUnchanged(t *testing.T) {
+	h, provider, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	provider.workflows = append(provider.workflows, &taskmodels.Workflow{
+		ID: "wf-round-trip", WorkspaceID: "ws-source", Name: "Round Trip",
+	})
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID: "step-round-trip", WorkflowID: "wf-round-trip", Name: "Review", Position: 0,
+		Color: "purple", IsStartStep: true,
+	}))
+
+	exportResp, err := h.handleExportWorkflow(ctx, makeWSMessage(t, ws.ActionMCPExportWorkflow, map[string]string{
+		"workflow_id": "wf-round-trip",
+	}))
+	require.NoError(t, err)
+
+	importResp, err := h.handleImportWorkflow(ctx, makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]string{
+		"workspace_id": "ws-target",
+		"document":     string(exportResp.Payload),
+	}))
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, importResp.Type)
+
+	var result workflowsvc.ImportResult
+	require.NoError(t, json.Unmarshal(importResp.Payload, &result))
+	assert.Equal(t, []string{"Round Trip"}, result.Created)
+	assert.Empty(t, result.Skipped)
+	require.Len(t, provider.workflows, 2)
+	imported := provider.workflows[1]
+	assert.Equal(t, "ws-target", imported.WorkspaceID)
+	steps, err := repo.ListStepsByWorkflow(ctx, imported.ID)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "Review", steps[0].Name)
+}
+
+func TestHandleExportWorkflow_UnknownWorkflowReturnsGenericError(t *testing.T) {
+	h, _, _ := setupImportHandlers(t)
+
+	resp, err := h.handleExportWorkflow(context.Background(), makeWSMessage(t, ws.ActionMCPExportWorkflow, map[string]string{
+		"workflow_id": "missing-workflow",
+	}))
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeInternalError)
+	assert.NotContains(t, string(resp.Payload), "workflows")
+}
+
+func TestHandleExportWorkflow_MissingWorkflowID(t *testing.T) {
+	h := &Handlers{}
+
+	resp, err := h.handleExportWorkflow(context.Background(), makeWSMessage(t, ws.ActionMCPExportWorkflow, map[string]string{}))
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleImportWorkflow_SkipsDuplicateName(t *testing.T) {
+	h, provider, _ := setupImportHandlers(t)
+	provider.workflows = append(provider.workflows, &taskmodels.Workflow{
+		ID: "wf-existing", WorkspaceID: "ws-1", Name: "Sprint Board",
+	})
+
+	doc := "version: 1\ntype: kandev_workflow\nworkflows:\n  - name: Sprint Board\n    steps: []\n"
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+		"document":     doc,
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var result workflowsvc.ImportResult
+	require.NoError(t, json.Unmarshal(resp.Payload, &result))
+	assert.Empty(t, result.Created)
+	assert.Equal(t, []string{"Sprint Board"}, result.Skipped)
+}
+
+func TestHandleImportWorkflow_MissingWorkspaceID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"document": "version: 1",
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleImportWorkflow_MissingDocument(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleImportWorkflow_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPImportWorkflow,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleImportWorkflow_DocumentTooLarge(t *testing.T) {
+	h := &Handlers{}
+	big := make([]byte, (1<<20)+1)
+	for i := range big {
+		big[i] = 'a'
+	}
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+		"document":     string(big),
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleImportWorkflow_InvalidDocument(t *testing.T) {
+	h, _, _ := setupImportHandlers(t)
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+		"document":     "version: 1\ntype: kandev_workflow\nworkflows: [oops",
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleImportWorkflow_ValidationError(t *testing.T) {
+	h, _, _ := setupImportHandlers(t)
+	// Wrong export type fails WorkflowExport.Validate — a client-side error
+	// surfaced as a validation error so the agent can correct its document.
+	msg := makeWSMessage(t, ws.ActionMCPImportWorkflow, map[string]interface{}{
+		"workspace_id": "ws-1",
+		"document":     "version: 1\ntype: not_kandev\nworkflows:\n  - name: X\n    steps: []\n",
+	})
+
+	resp, err := h.handleImportWorkflow(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+// A step's pinned agent profile outranks an explicit agent_profile_id, matching
+// what the orchestrator launches. Reporting the caller's profile back would
+// confirm an agent that never runs.
+func TestResolveMCPAutoStartConfig_StepPinnedProfileOutranksExplicit(t *testing.T) {
+	h, _, repo := setupImportHandlers(t)
+	ctx := context.Background()
+	h.workflowCtrl = workflowctrl.NewController(h.workflowSvc)
+
+	require.NoError(t, repo.CreateStep(ctx, &wfmodels.WorkflowStep{
+		ID:             "step-pinned",
+		WorkflowID:     "wf-test",
+		Name:           "In Progress",
+		Position:       0,
+		IsStartStep:    true,
+		AgentProfileID: "step-pinned-profile",
+	}))
+
+	config, err := h.resolveMCPAutoStartConfigWithError(ctx, &taskmodels.Task{
+		WorkflowID:     "wf-test",
+		WorkflowStepID: "step-pinned",
+	}, "explicit-profile", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "step-pinned-profile", config.AgentProfileID)
+}

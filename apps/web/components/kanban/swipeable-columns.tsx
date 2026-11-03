@@ -1,0 +1,166 @@
+"use client";
+
+import { useEffect, useCallback, useRef, useMemo, useState } from "react";
+import useEmblaCarousel from "embla-carousel-react";
+import { KanbanColumn, WorkflowStep } from "../kanban-column";
+import { Task, type KanbanPresentation } from "../kanban-card";
+import { pickKanbanColumnComparator } from "@/lib/kanban/task-order";
+import { useAppStore } from "@/components/state-provider";
+import type { KanbanExternalLinkAvailability } from "../kanban-external-link-availability";
+import type { KeyboardReorderDraft } from "./virtualized-column-task-list";
+
+type SwipeableColumnsProps = {
+  steps: WorkflowStep[];
+  presentation: KanbanPresentation;
+  // Real workflow steps only (excludes the "Needs Reassignment" sentinel) —
+  // passed to KanbanColumn purely for move-menu targets.
+  moveTargetSteps: WorkflowStep[];
+  tasks: Task[];
+  activeIndex: number;
+  onIndexChange: (index: number) => void;
+  onPreviewTask: (task: Task) => void;
+  onOpenTask: (task: Task) => void;
+  onEditTask: (task: Task) => void;
+  onDeleteTask: (task: Task) => void;
+  onArchiveTask?: (task: Task) => void;
+  onMoveTask?: (task: Task, targetStepId: string) => void;
+  showMaximizeButton?: boolean;
+  deletingTaskId?: string | null;
+  archivingTaskId?: string | null;
+  selectedIds?: Set<string>;
+  onToggleSelect?: (taskId: string) => void;
+  onSelectRange?: (taskId: string, orderedIds: string[]) => void;
+  isMultiSelectMode?: boolean;
+  externalLinkAvailability: KanbanExternalLinkAvailability;
+  activeTaskId?: string | null;
+  keyboardDraft?: KeyboardReorderDraft | null;
+  onCardKeyDown?: (event: React.KeyboardEvent, task: Task) => void;
+};
+
+/** Two-way sync between Embla's carousel position and the external activeIndex. */
+function useEmblaIndexSync(
+  emblaApi: ReturnType<typeof useEmblaCarousel>[1],
+  activeIndex: number,
+  onIndexChange: (index: number) => void,
+) {
+  const userInteracting = useRef(false);
+
+  // Sync carousel position with external activeIndex (tab clicks)
+  useEffect(() => {
+    if (emblaApi && emblaApi.selectedScrollSnap() !== activeIndex) {
+      emblaApi.scrollTo(activeIndex, true);
+    }
+  }, [emblaApi, activeIndex]);
+
+  // Sync tab state when user swipes (only on user-initiated interactions)
+  useEffect(() => {
+    if (!emblaApi) return;
+    const onPointerDown = () => {
+      userInteracting.current = true;
+    };
+    const onSelect = () => {
+      if (!userInteracting.current) return;
+      userInteracting.current = false;
+      const selectedIndex = emblaApi.selectedScrollSnap();
+      if (selectedIndex !== activeIndex) onIndexChange(selectedIndex);
+    };
+    emblaApi.on("pointerDown", onPointerDown);
+    emblaApi.on("select", onSelect);
+    return () => {
+      emblaApi.off("pointerDown", onPointerDown);
+      emblaApi.off("select", onSelect);
+    };
+  }, [emblaApi, activeIndex, onIndexChange]);
+}
+
+export function SwipeableColumns({
+  steps,
+  presentation,
+  moveTargetSteps,
+  tasks,
+  activeIndex,
+  onIndexChange,
+  onPreviewTask,
+  onOpenTask,
+  onEditTask,
+  onDeleteTask,
+  onArchiveTask,
+  onMoveTask,
+  showMaximizeButton,
+  deletingTaskId,
+  archivingTaskId,
+  selectedIds,
+  onToggleSelect,
+  onSelectRange,
+  isMultiSelectMode,
+  externalLinkAvailability,
+  activeTaskId,
+  keyboardDraft,
+  onCardKeyDown,
+}: SwipeableColumnsProps) {
+  // Stable options to avoid Embla reinitializing on every activeIndex change
+  const [initialIndex] = useState(activeIndex);
+  const options = useMemo(
+    () => ({
+      align: "start" as const,
+      containScroll: "trimSnaps" as const,
+      watchDrag: true,
+      startIndex: initialIndex,
+    }),
+    [initialIndex],
+  );
+  const [emblaRef, emblaApi] = useEmblaCarousel(options);
+
+  const kanbanSort = useAppStore((state) => state.userSettings.kanbanSort);
+  const comparator = pickKanbanColumnComparator(kanbanSort);
+
+  const getTasksForStep = useCallback(
+    (stepId: string) => {
+      return tasks
+        .filter((task) => task.workflowStepId === stepId)
+        .map((task) => (task.position == null ? { ...task, position: 0 } : task))
+        .sort(comparator);
+    },
+    [tasks, comparator],
+  );
+
+  useEmblaIndexSync(emblaApi, activeIndex, onIndexChange);
+
+  return (
+    <div className="flex-1 min-h-0 overflow-hidden" ref={emblaRef}>
+      <div className="flex h-full min-h-0 touch-pan-y">
+        {steps.map((step) => (
+          <div
+            key={step.id}
+            className="flex h-full min-h-0 w-full min-w-0 flex-shrink-0 flex-col px-4 py-2"
+          >
+            <KanbanColumn
+              step={step}
+              tasks={getTasksForStep(step.id)}
+              presentation={presentation}
+              onPreviewTask={onPreviewTask}
+              onOpenTask={onOpenTask}
+              onEditTask={onEditTask}
+              onDeleteTask={onDeleteTask}
+              onArchiveTask={onArchiveTask}
+              onMoveTask={onMoveTask}
+              steps={moveTargetSteps}
+              showMaximizeButton={showMaximizeButton}
+              deletingTaskId={deletingTaskId}
+              archivingTaskId={archivingTaskId}
+              selectedIds={selectedIds}
+              onToggleSelect={onToggleSelect}
+              onSelectRange={onSelectRange}
+              isMultiSelectMode={isMultiSelectMode}
+              externalLinkAvailability={externalLinkAvailability}
+              activeTaskId={activeTaskId}
+              keyboardDraft={keyboardDraft}
+              onCardKeyDown={onCardKeyDown}
+              hideHeader
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

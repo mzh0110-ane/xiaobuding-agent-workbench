@@ -1,0 +1,258 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
+import { StateProvider } from "@/components/state-provider";
+import { TaskOptimisticContextProvider } from "@/hooks/use-optimistic-task-mutation";
+import { ApiError } from "@/lib/api/client";
+import { StatusPicker } from "./status-picker";
+import { formatPendingApproversMessage } from "@/lib/api/domains/office-status-gate";
+import type { Task } from "@/app/office/tasks/[id]/types";
+
+const updateTaskMock = vi.hoisted(() => vi.fn().mockResolvedValue({ ok: true }));
+const toastErrorMock = vi.hoisted(() => vi.fn());
+const applyPatchMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/api/domains/office-extended-api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api/domains/office-extended-api")>(
+    "@/lib/api/domains/office-extended-api",
+  );
+  return {
+    ...actual,
+    updateTask: updateTaskMock,
+  };
+});
+
+vi.mock("sonner", async () => {
+  const actual = await vi.importActual<typeof import("sonner")>("sonner");
+  return {
+    ...actual,
+    toast: { ...actual.toast, error: toastErrorMock },
+  };
+});
+
+import { updateTask } from "@/lib/api/domains/office-extended-api";
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  updateTaskMock.mockResolvedValue({ ok: true });
+});
+
+const TRIGGER_TEST_ID = "status-picker-trigger";
+const APPROVALS_PENDING_MESSAGE = "approvals pending";
+
+const task: Task = {
+  id: "t-1",
+  workspaceId: "ws-1",
+  identifier: "TASK-1",
+  title: "First task",
+  status: "todo",
+  priority: "medium",
+  labels: [],
+  blockedBy: [],
+  blocking: [],
+  children: [],
+  reviewers: [],
+  approvers: [],
+  decisions: [],
+  createdBy: "user",
+  createdAt: "2026-05-01T00:00:00Z",
+  updatedAt: "2026-05-01T00:00:00Z",
+};
+
+function Wrapper({ children }: { children: ReactNode }) {
+  const ctx = {
+    task,
+    applyPatch: applyPatchMock,
+    restore: vi.fn(),
+  };
+  return (
+    <StateProvider>
+      <TaskOptimisticContextProvider value={ctx}>{children}</TaskOptimisticContextProvider>
+    </StateProvider>
+  );
+}
+
+/**
+ * Unlike `Wrapper`, `ctx.task` here is backed by real React state, so the
+ * picker's displayed status reflects each `handleSelect` call's actual
+ * effect instead of a fixed prop. Needed to interleave two real picks
+ * through the component itself, the way a user clicking twice would.
+ */
+function LiveWrapper({ initialTask }: { initialTask: Task }) {
+  const [liveTask, setLiveTask] = useState(initialTask);
+  const ctx = {
+    task: liveTask,
+    applyPatch: (patch: Partial<Task>) => setLiveTask((t) => ({ ...t, ...patch })),
+    restore: (snapshot: Task) => setLiveTask(snapshot),
+  };
+  return (
+    <StateProvider>
+      <TaskOptimisticContextProvider value={ctx}>
+        <StatusPicker task={liveTask} />
+      </TaskOptimisticContextProvider>
+    </StateProvider>
+  );
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function selectStatus(testId: string) {
+  fireEvent.click(screen.getByTestId(TRIGGER_TEST_ID));
+  const option = await screen.findByTestId(testId);
+  await act(async () => {
+    fireEvent.click(option);
+  });
+}
+
+describe("StatusPicker", () => {
+  it("renders the current status label on the trigger", () => {
+    render(
+      <Wrapper>
+        <StatusPicker task={task} />
+      </Wrapper>,
+    );
+    const trigger = screen.getByTestId(TRIGGER_TEST_ID);
+    expect(trigger.getAttribute("aria-haspopup")).toBe("listbox");
+    expect(trigger.textContent).toContain("Todo");
+  });
+
+  it("calls updateTask with the new status when an option is selected", async () => {
+    render(
+      <Wrapper>
+        <StatusPicker task={task} />
+      </Wrapper>,
+    );
+    fireEvent.click(screen.getByTestId(TRIGGER_TEST_ID));
+    const option = await screen.findByTestId("status-picker-option-in_progress");
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    expect(updateTask).toHaveBeenCalledWith("t-1", { status: "in_progress" });
+  });
+
+  it("does not call the API when the same status is re-selected", async () => {
+    render(
+      <Wrapper>
+        <StatusPicker task={task} />
+      </Wrapper>,
+    );
+    fireEvent.click(screen.getByTestId(TRIGGER_TEST_ID));
+    const option = await screen.findByTestId("status-picker-option-todo");
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    expect(updateTask).not.toHaveBeenCalled();
+  });
+
+  it("toasts the formatted approvers message on a 409 gate response", async () => {
+    updateTaskMock.mockRejectedValueOnce(
+      new ApiError(APPROVALS_PENDING_MESSAGE, 409, {
+        error: APPROVALS_PENDING_MESSAGE,
+        pending_approvers: [
+          { agent_profile_id: "a1", name: "CEO" },
+          { agent_profile_id: "a2", name: "Eng Lead" },
+        ],
+        status: "in_review",
+      }),
+    );
+    render(
+      <Wrapper>
+        <StatusPicker task={task} />
+      </Wrapper>,
+    );
+    fireEvent.click(screen.getByTestId(TRIGGER_TEST_ID));
+    const option = await screen.findByTestId("status-picker-option-done");
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "Cannot mark done: awaiting approval from CEO, Eng Lead",
+    );
+  });
+});
+
+describe("StatusPicker approval gate redirect", () => {
+  it("settles on the redirected status instead of the pre-drag snapshot", async () => {
+    updateTaskMock.mockRejectedValueOnce(
+      new ApiError(APPROVALS_PENDING_MESSAGE, 409, {
+        error: APPROVALS_PENDING_MESSAGE,
+        pending_approvers: [{ agent_profile_id: "a1", name: "CEO" }],
+        status: "in_review",
+      }),
+    );
+    render(
+      <Wrapper>
+        <StatusPicker task={task} />
+      </Wrapper>,
+    );
+    fireEvent.click(screen.getByTestId(TRIGGER_TEST_ID));
+    const option = await screen.findByTestId("status-picker-option-done");
+    await act(async () => {
+      fireEvent.click(option);
+    });
+
+    // The hook settles on the server's redirected status directly, in place
+    // of its usual rollback, so the final patch is the redirect.
+    expect(applyPatchMock).toHaveBeenLastCalledWith({ status: "in_review" });
+  });
+
+  it("a delayed gate redirect does not clobber a newer, already-succeeded pick", async () => {
+    // Two real picks through the component itself: A ("done") hits the
+    // approver gate and stays pending; B ("blocked") is picked immediately
+    // after and succeeds first. A's gate redirect must not then overwrite
+    // B's newer, server-confirmed status.
+    const older = deferred<{ ok: true }>();
+    const newer = deferred<{ ok: true }>();
+    updateTaskMock.mockReturnValueOnce(older.promise);
+    updateTaskMock.mockReturnValueOnce(newer.promise);
+
+    render(<LiveWrapper initialTask={task} />);
+
+    await selectStatus("status-picker-option-done");
+    await selectStatus("status-picker-option-blocked");
+
+    await act(async () => {
+      newer.resolve({ ok: true });
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId(TRIGGER_TEST_ID).textContent).toContain("Blocked");
+
+    await act(async () => {
+      older.reject(
+        new ApiError(APPROVALS_PENDING_MESSAGE, 409, {
+          error: APPROVALS_PENDING_MESSAGE,
+          pending_approvers: [{ agent_profile_id: "a1", name: "CEO" }],
+          status: "in_review",
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId(TRIGGER_TEST_ID).textContent).toContain("Blocked");
+  });
+});
+
+describe("formatPendingApproversMessage", () => {
+  it("joins names with commas", () => {
+    expect(
+      formatPendingApproversMessage([
+        { agent_profile_id: "a", name: "CEO" },
+        { agent_profile_id: "b", name: "Eng Lead" },
+      ]),
+    ).toBe("Cannot mark done: awaiting approval from CEO, Eng Lead");
+  });
+
+  it("falls back to the agent id when name is missing", () => {
+    expect(formatPendingApproversMessage([{ agent_profile_id: "agent-x" }])).toBe(
+      "Cannot mark done: awaiting approval from agent-x",
+    );
+  });
+});

@@ -1,0 +1,339 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+
+	kandevdb "github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+// CreateTaskRepository creates a new task-repository link
+func (r *Repository) CreateTaskRepository(ctx context.Context, taskRepo *models.TaskRepository) error {
+	if taskRepo.ID == "" {
+		taskRepo.ID = uuid.New().String()
+	}
+	now := time.Now().UTC()
+	taskRepo.CreatedAt = now
+	taskRepo.UpdatedAt = now
+
+	metadataJSON, err := json.Marshal(taskRepo.Metadata)
+	if err != nil {
+		metadataJSON = []byte("{}")
+	}
+
+	_, err = r.db.ExecContext(ctx, r.db.Rebind(`
+		INSERT INTO task_repositories (
+			id, task_id, repository_id, base_branch, checkout_branch, branch_policy_id, branch_policy_name,
+			branch_policy_base_branch, branch_policy_branch_template, branch_policy_pull_request_target,
+			position, metadata, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`), taskRepo.ID, taskRepo.TaskID, taskRepo.RepositoryID, taskRepo.BaseBranch, taskRepo.CheckoutBranch,
+		taskRepo.BranchPolicyID, taskRepo.BranchPolicyName, taskRepo.BranchPolicyBaseBranch,
+		taskRepo.BranchPolicyBranchTemplate, taskRepo.BranchPolicyPullRequestTarget,
+		taskRepo.Position, string(metadataJSON), taskRepo.CreatedAt, taskRepo.UpdatedAt)
+	return err
+}
+
+// GetTaskRepository retrieves a task-repository link by ID
+func (r *Repository) GetTaskRepository(ctx context.Context, id string) (*models.TaskRepository, error) {
+	taskRepo := &models.TaskRepository{}
+	var metadataJSON string
+
+	err := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT id, task_id, repository_id, base_branch, checkout_branch, branch_policy_id, branch_policy_name,
+			branch_policy_base_branch, branch_policy_branch_template, branch_policy_pull_request_target,
+			position, metadata, created_at, updated_at
+		FROM task_repositories WHERE id = ?
+	`), id).Scan(
+		&taskRepo.ID,
+		&taskRepo.TaskID,
+		&taskRepo.RepositoryID,
+		&taskRepo.BaseBranch,
+		&taskRepo.CheckoutBranch,
+		&taskRepo.BranchPolicyID,
+		&taskRepo.BranchPolicyName,
+		&taskRepo.BranchPolicyBaseBranch,
+		&taskRepo.BranchPolicyBranchTemplate,
+		&taskRepo.BranchPolicyPullRequestTarget,
+		&taskRepo.Position,
+		&metadataJSON,
+		&taskRepo.CreatedAt,
+		&taskRepo.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("task repository not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if metadataJSON != "" && metadataJSON != "{}" {
+		if err := json.Unmarshal([]byte(metadataJSON), &taskRepo.Metadata); err != nil {
+			return nil, fmt.Errorf("failed to deserialize task repository metadata: %w", err)
+		}
+	}
+	return taskRepo, nil
+}
+
+// ListTaskRepositories returns all repository links for a task
+func (r *Repository) ListTaskRepositories(ctx context.Context, taskID string) ([]*models.TaskRepository, error) {
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT id, task_id, repository_id, base_branch, checkout_branch, branch_policy_id, branch_policy_name,
+			branch_policy_base_branch, branch_policy_branch_template, branch_policy_pull_request_target,
+			position, metadata, created_at, updated_at
+		FROM task_repositories
+		WHERE task_id = ?
+		ORDER BY position ASC, created_at ASC, id ASC
+	`), taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []*models.TaskRepository
+	for rows.Next() {
+		taskRepo := &models.TaskRepository{}
+		var metadataJSON string
+		if err := rows.Scan(
+			&taskRepo.ID,
+			&taskRepo.TaskID,
+			&taskRepo.RepositoryID,
+			&taskRepo.BaseBranch,
+			&taskRepo.CheckoutBranch,
+			&taskRepo.BranchPolicyID,
+			&taskRepo.BranchPolicyName,
+			&taskRepo.BranchPolicyBaseBranch,
+			&taskRepo.BranchPolicyBranchTemplate,
+			&taskRepo.BranchPolicyPullRequestTarget,
+			&taskRepo.Position,
+			&metadataJSON,
+			&taskRepo.CreatedAt,
+			&taskRepo.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if metadataJSON != "" && metadataJSON != "{}" {
+			if err := json.Unmarshal([]byte(metadataJSON), &taskRepo.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to deserialize task repository metadata: %w", err)
+			}
+		}
+		result = append(result, taskRepo)
+	}
+	return result, rows.Err()
+}
+
+// ListTaskRepositoryProviders returns the provider identities for a task's
+// live repository links in task order. Keeping the repository join in the
+// query avoids one repository lookup per task link during provider refresh.
+func (r *Repository) ListTaskRepositoryProviders(ctx context.Context, taskID string) ([]string, error) {
+	var providers []string
+	err := r.ro.SelectContext(ctx, &providers, r.ro.Rebind(`
+		SELECT r.provider
+		FROM task_repositories tr
+		INNER JOIN repositories r ON r.id = tr.repository_id
+		WHERE tr.task_id = ? AND r.deleted_at IS NULL
+		ORDER BY tr.position ASC, tr.created_at ASC
+	`), taskID)
+	return providers, err
+}
+
+// UpdateTaskRepository updates an existing task-repository link in place.
+//
+// Takes the shared task-row lock on both the link's current and target task
+// before writing: this is the only writer that can change a task's
+// repository count without
+// insert/delete, so a concurrent runner switch's repository-count read must
+// resolve fully before or fully after this update, on whichever task ID(s)
+// it touches. Locking both (sorted, to avoid a lock-order deadlock between
+// two concurrent re-parents) covers a re-parent moving the link away from
+// its current task as well as an in-place field update.
+func (r *Repository) UpdateTaskRepository(ctx context.Context, taskRepo *models.TaskRepository) error {
+	taskRepo.UpdatedAt = time.Now().UTC()
+
+	metadataJSON, err := json.Marshal(taskRepo.Metadata)
+	if err != nil {
+		metadataJSON = []byte("{}")
+	}
+
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	currentTaskID, err := r.currentTaskRepositoryTaskIDTx(ctx, tx, taskRepo.ID)
+	if err != nil {
+		return err
+	}
+	for _, taskID := range lockOrderedTaskIDs(currentTaskID, taskRepo.TaskID) {
+		if lockErr := kandevdb.LockTaskRowInTx(ctx, tx, r.db.DriverName(), taskID); lockErr != nil &&
+			!errors.Is(lockErr, kandevdb.ErrTaskRowNotFound) {
+			return lockErr
+		}
+	}
+
+	result, err := tx.ExecContext(ctx, r.db.Rebind(`
+		UPDATE task_repositories SET
+			task_id = ?, repository_id = ?, base_branch = ?, checkout_branch = ?, branch_policy_id = ?, branch_policy_name = ?,
+			branch_policy_base_branch = ?, branch_policy_branch_template = ?, branch_policy_pull_request_target = ?,
+			position = ?, metadata = ?, updated_at = ?
+		WHERE id = ?
+	`), taskRepo.TaskID, taskRepo.RepositoryID, taskRepo.BaseBranch, taskRepo.CheckoutBranch,
+		taskRepo.BranchPolicyID, taskRepo.BranchPolicyName, taskRepo.BranchPolicyBaseBranch,
+		taskRepo.BranchPolicyBranchTemplate, taskRepo.BranchPolicyPullRequestTarget,
+		taskRepo.Position, string(metadataJSON), taskRepo.UpdatedAt, taskRepo.ID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("task repository not found: %s", taskRepo.ID)
+	}
+	return tx.Commit()
+}
+
+// currentTaskRepositoryTaskIDTx returns the task_id a task_repositories row
+// currently holds, or "" if the row does not exist (UpdateTaskRepository's
+// own not-found check runs after the write and stays authoritative).
+func (r *Repository) currentTaskRepositoryTaskIDTx(ctx context.Context, tx *sqlx.Tx, id string) (string, error) {
+	var taskID string
+	err := tx.QueryRowContext(ctx, r.db.Rebind(`SELECT task_id FROM task_repositories WHERE id = ?`), id).Scan(&taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return taskID, err
+}
+
+// lockOrderedTaskIDs returns the distinct, non-empty task IDs among a and b
+// in a stable sorted order, so two concurrent re-parents always attempt
+// their locks in the same relative order and cannot deadlock each other.
+func lockOrderedTaskIDs(a, b string) []string {
+	seen := make(map[string]struct{}, 2)
+	ids := make([]string, 0, 2)
+	for _, id := range []string{a, b} {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// DeleteTaskRepository deletes a task-repository link by ID
+func (r *Repository) DeleteTaskRepository(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`DELETE FROM task_repositories WHERE id = ?`), id)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("task repository not found: %s", id)
+	}
+	return nil
+}
+
+// ListTaskRepositoriesByTaskIDs returns all repository links for the given task IDs,
+// grouped by task ID. This eliminates N+1 queries when loading repositories for multiple tasks.
+func (r *Repository) ListTaskRepositoriesByTaskIDs(ctx context.Context, taskIDs []string) (map[string][]*models.TaskRepository, error) {
+	return listTaskRepositoriesByTaskIDs(ctx, r.ro, taskIDs)
+}
+
+type taskRepositoryQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	Rebind(query string) string
+}
+
+func listTaskRepositoriesByTaskIDs(
+	ctx context.Context,
+	queryer taskRepositoryQueryer,
+	taskIDs []string,
+) (map[string][]*models.TaskRepository, error) {
+	result := make(map[string][]*models.TaskRepository, len(taskIDs))
+	if len(taskIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(taskIDs))
+	args := make([]interface{}, len(taskIDs))
+	for i, id := range taskIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, task_id, repository_id, base_branch, checkout_branch, branch_policy_id, branch_policy_name,
+			branch_policy_base_branch, branch_policy_branch_template, branch_policy_pull_request_target,
+			position, metadata, created_at, updated_at
+		FROM task_repositories
+		WHERE task_id IN (%s)
+		ORDER BY position ASC, created_at ASC, id ASC
+	`, strings.Join(placeholders, ","))
+
+	rows, err := queryer.QueryContext(ctx, queryer.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		taskRepo := &models.TaskRepository{}
+		var metadataJSON string
+		if err := rows.Scan(
+			&taskRepo.ID,
+			&taskRepo.TaskID,
+			&taskRepo.RepositoryID,
+			&taskRepo.BaseBranch,
+			&taskRepo.CheckoutBranch,
+			&taskRepo.BranchPolicyID,
+			&taskRepo.BranchPolicyName,
+			&taskRepo.BranchPolicyBaseBranch,
+			&taskRepo.BranchPolicyBranchTemplate,
+			&taskRepo.BranchPolicyPullRequestTarget,
+			&taskRepo.Position,
+			&metadataJSON,
+			&taskRepo.CreatedAt,
+			&taskRepo.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if metadataJSON != "" && metadataJSON != "{}" {
+			if err := json.Unmarshal([]byte(metadataJSON), &taskRepo.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to deserialize task repository metadata: %w", err)
+			}
+		}
+		result[taskRepo.TaskID] = append(result[taskRepo.TaskID], taskRepo)
+	}
+	return result, rows.Err()
+}
+
+// DeleteTaskRepositoriesByTask deletes all repository links for a task
+func (r *Repository) DeleteTaskRepositoriesByTask(ctx context.Context, taskID string) error {
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`DELETE FROM task_repositories WHERE task_id = ?`), taskID)
+	return err
+}
+
+// GetPrimaryTaskRepository returns the first (primary) repository for a task
+func (r *Repository) GetPrimaryTaskRepository(ctx context.Context, taskID string) (*models.TaskRepository, error) {
+	repos, err := r.ListTaskRepositories(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	return repos[0], nil
+}

@@ -1,0 +1,139 @@
+import { useCallback, useRef } from "react";
+import { archiveTask, deleteTask, moveTask, updateTask } from "@/lib/api";
+import type { DeleteTaskParams, WorkflowMoveEntryOptions } from "@/lib/api/domains/kanban-api";
+import { isTaskDeleteDirtyWorktreeError } from "@/lib/api/task-delete-errors";
+import { useAppStoreApi } from "@/components/state-provider";
+import { useToast } from "@/components/toast-provider";
+import { useTaskRemoval, useTaskRemovalSuccessNotifier } from "@/hooks/use-task-removal";
+import { useTranslation } from "react-i18next";
+
+type MovePayload = {
+  workflow_id: string;
+  workflow_step_id: string;
+  position?: number;
+  entry_options?: WorkflowMoveEntryOptions;
+};
+
+export type TaskActionOptions = {
+  cascade?: boolean;
+  discardWorktreeChanges?: boolean;
+  confirmationId?: string;
+};
+
+export function useTaskActions() {
+  const { toast, dismissToast } = useToast();
+  const { t } = useTranslation();
+  const archiveProgressRef = useRef({ count: 0, toastId: null as string | null });
+
+  const moveTaskById = useCallback(async (taskId: string, payload: MovePayload) => {
+    return moveTask(taskId, payload);
+  }, []);
+
+  const deleteTaskById = useCallback(
+    async (taskId: string, opts?: DeleteTaskParams) => {
+      try {
+        return await deleteTask(taskId, opts);
+      } catch (error) {
+        if (isTaskDeleteDirtyWorktreeError(error)) {
+          toast({
+            title: t("task:deleteDirtyWorktreeTitle"),
+            description: t("task:deleteDirtyWorktreeDescription"),
+            variant: "error",
+          });
+        }
+        throw error;
+      }
+    },
+    [t, toast],
+  );
+
+  const archiveTaskById = useCallback(
+    async (taskId: string, opts?: TaskActionOptions) => {
+      const progress = archiveProgressRef.current;
+      progress.count += 1;
+      if (progress.count === 1) {
+        progress.toastId = toast({
+          title: t("tasks:archivingInProgress"),
+          variant: "loading",
+        });
+      }
+
+      try {
+        return await archiveTask(taskId, opts);
+      } finally {
+        progress.count -= 1;
+        if (progress.count === 0 && progress.toastId) {
+          dismissToast(progress.toastId);
+          progress.toastId = null;
+        }
+      }
+    },
+    [dismissToast, t, toast],
+  );
+
+  const renameTaskById = useCallback(async (taskId: string, title: string) => {
+    return updateTask(taskId, { title });
+  }, []);
+
+  return { moveTaskById, deleteTaskById, archiveTaskById, renameTaskById };
+}
+
+/**
+ * Runs a one-shot task action (archive or delete) and switches to the next
+ * available task, restoring the previous active task if the action rejects
+ * after an optimistic switch. Shared shape behind `useArchiveAndSwitchTask`
+ * and `useDeleteAndSwitchTask`.
+ */
+function useSwitchAfterTaskAction(
+  action: "archive" | "delete",
+  runAction: (taskId: string, opts?: TaskActionOptions) => Promise<unknown>,
+  opts?: { useLayoutSwitch?: boolean; stayOnListing?: boolean },
+) {
+  const store = useAppStoreApi();
+  const notifySuccess = useTaskRemovalSuccessNotifier();
+  const { runTaskRemoval } = useTaskRemoval({
+    store,
+    useLayoutSwitch: opts?.useLayoutSwitch,
+    stayOnListing: opts?.stayOnListing,
+    notifySuccess,
+  });
+
+  return useCallback(
+    (taskId: string, actionOpts?: TaskActionOptions) =>
+      runTaskRemoval(
+        action,
+        {
+          taskId,
+          mutate: async () => {
+            await runAction(taskId, actionOpts);
+          },
+        },
+        { cascade: actionOpts?.cascade },
+      ).then(() => undefined),
+    [action, runAction, runTaskRemoval],
+  );
+}
+
+/**
+ * Archives a task and switches to the next available task.
+ * Shared between the PR merged banner and the sidebar archive action.
+ */
+export function useArchiveAndSwitchTask(opts?: {
+  useLayoutSwitch?: boolean;
+  stayOnListing?: boolean;
+}) {
+  const { archiveTaskById } = useTaskActions();
+  return useSwitchAfterTaskAction("archive", archiveTaskById, opts);
+}
+
+/**
+ * Deletes a task and switches to the next available task, mirroring
+ * `useArchiveAndSwitchTask`'s outcome for the task detail surface.
+ */
+export function useDeleteAndSwitchTask(opts?: {
+  useLayoutSwitch?: boolean;
+  stayOnListing?: boolean;
+}) {
+  const { deleteTaskById } = useTaskActions();
+  return useSwitchAfterTaskAction("delete", deleteTaskById, opts);
+}

@@ -1,0 +1,547 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/watchreset"
+)
+
+// Auth method constants.
+const (
+	AuthMethodNone = "none"
+	AuthMethodPAT  = "pat"
+)
+
+const defaultCIAutoFixPromptName = "ci-auto-fix"
+
+// defaultBranchMain and defaultBranchMaster are the conventional default branch
+// names sorted to the top of branch pickers.
+const (
+	defaultBranchMain   = "main"
+	defaultBranchMaster = "master"
+)
+
+// reviewEventApprove is the GitHub Reviews API event value for a positive
+// review. Extracted because it appears in the controller validator, the
+// service's self-approval guard, and tests.
+const reviewEventApprove = "APPROVE"
+
+// PRSyncFreshnessWindow is how long PR data is considered fresh.
+const PRSyncFreshnessWindow = 30 * time.Second
+
+// cleanupFetchFailureThreshold is the number of consecutive GetPRFeedback /
+// GetIssueState errors a single dedup row may accumulate before the cleanup
+// loop logs a Warn. The previous behavior swallowed the error at Debug level
+// so transient outages — auth-token expiry, rate-limit exhaustion — silently
+// blocked cleanup forever.
+const cleanupFetchFailureThreshold = 5
+
+// TaskDeleter deletes tasks by ID. Used for cleaning up merged PR tasks.
+// Implementations should return errors wrapping ErrTaskNotFound when the
+// task is already gone.
+type TaskDeleter interface {
+	DeleteTask(ctx context.Context, taskID string) error
+}
+
+// TaskDeleterWithReason is an optional extension of TaskDeleter that lets the
+// cleanup path attach a machine-readable deletion reason (e.g.
+// "pr_approved_by_user") to the published task.deleted event. When the wired
+// deleter does not implement this, cleanup falls back to plain DeleteTask.
+type TaskDeleterWithReason interface {
+	DeleteTaskWithReason(ctx context.Context, taskID, reason string) error
+}
+
+// isTaskNotFound reports whether an error from TaskDeleter signals the task
+// was already gone. Adapters wrap their underlying not-found error with
+// ErrTaskNotFound — see cmd/kandev/turn_adapters.go's taskDeleterAdapter.
+func isTaskNotFound(err error) bool {
+	return err != nil && errors.Is(err, ErrTaskNotFound)
+}
+
+// TaskSessionChecker checks whether the user genuinely engaged with a task
+// (authored at least one non-auto-start message). Used by cleanup logic to
+// preserve tasks the user touched while sweeping auto-started-only ones.
+type TaskSessionChecker interface {
+	HasUserAuthoredMessage(ctx context.Context, taskID string) (bool, error)
+}
+
+// SecretManager handles secret creation, update, and deletion.
+type SecretManager interface {
+	Create(ctx context.Context, name, value string) (id string, err error)
+	Update(ctx context.Context, id, value string) error
+	Delete(ctx context.Context, id string) error
+}
+
+// ConnectionSecretStore provides encrypted storage for internal GitHub
+// credentials, including deterministic workspace keys and deployment bundles.
+type ConnectionSecretStore interface {
+	Reveal(ctx context.Context, id string) (string, error)
+	Set(ctx context.Context, id, name, value string) error
+	Delete(ctx context.Context, id string) error
+	Exists(ctx context.Context, id string) (bool, error)
+	ListIDs(ctx context.Context) ([]string, error)
+}
+
+// PromptResolver resolves editable prompt content by name.
+type PromptResolver interface {
+	ResolvePromptContent(ctx context.Context, name, fallback string) string
+}
+
+// TaskRepositoryBaseBranchUpdater projects provider base changes into tasks.
+type TaskRepositoryBaseBranchUpdater interface {
+	UpdateTaskRepositoryBaseBranch(
+		ctx context.Context, taskID, repositoryID, headBranch, baseBranch string,
+	) error
+}
+
+// WorkspaceGroupOwnerResolver resolves the workspace-group owner task for a
+// task that may be a non-owner member sharing another task's worktree
+// (inherit_parent / shared_group). It mirrors
+// internal/orchestrator.resolveEffectivePushTaskID's lookup so that a
+// watch-sourced association write is redirected to the same task an
+// orchestrator-side watch would have redirected to — see
+// resolveEffectiveAssociationTaskID for the full rationale.
+type WorkspaceGroupOwnerResolver interface {
+	GetWorkspaceGroupOwnerTaskID(ctx context.Context, taskID string) (string, error)
+}
+
+// WorkspaceGroupOwnerSessionResolver resolves the owner for the exact group
+// bound to an observing session. It prevents a task with multiple active group
+// memberships from selecting an unrelated owner by task ID alone.
+type WorkspaceGroupOwnerSessionResolver interface {
+	GetWorkspaceGroupOwnerTaskIDForSession(ctx context.Context, taskID, sessionID string) (string, error)
+}
+
+// Service coordinates GitHub integration operations.
+type Service struct {
+	mu                          sync.Mutex
+	connectionMutationLocks     [64]sync.Mutex
+	client                      Client
+	authMethod                  string
+	secrets                     SecretProvider
+	secretManager               SecretManager
+	connectionSecrets           ConnectionSecretStore
+	personalConnections         *StorePersonalConnectionRepository
+	resolver                    *CredentialResolver
+	appRegistrationRuntimes     map[string]*githubAppRuntime
+	appRegistrationLifecycle    *AppRegistrationLifecycleService
+	credentialBroker            *CredentialBroker
+	store                       *Store
+	eventBus                    bus.EventBus
+	logger                      *logger.Logger
+	taskDeleter                 TaskDeleter
+	taskRepositoryUpdater       TaskRepositoryBaseBranchUpdater
+	comparisonTargetObserver    ComparisonTargetObserver
+	taskIssueStore              TaskIssueStore
+	workspaceGroupOwnerResolver WorkspaceGroupOwnerResolver
+	taskActivityProvider        TaskActivityProvider
+	clockMu                     sync.RWMutex
+	clock                       func() time.Time
+	// cascadeTaskDeleter is the cascade-delete entry point used by the
+	// watch reset flow. It is distinct from taskDeleter (which only deletes
+	// a single task by ID) because reset must walk the task tree and clean
+	// up subtasks, runs, and worktrees too. Wired post-construction via
+	// SetCascadeTaskDeleter to avoid an import cycle with the task service.
+	cascadeTaskDeleter    watchreset.TaskDeleter
+	taskSessionChecker    TaskSessionChecker
+	syncGroup             singleflight.Group
+	taskEventSubs         []bus.Subscription
+	searchCache           *ttlCache
+	prStatusCache         *ttlCache
+	prFeedbackCache       *ttlCache
+	workflowRunsCache     *ttlCache
+	workflowJobsCache     *ttlCache
+	mergeMethodsCache     *ttlCache
+	accessibleReposCache  *ttlCache
+	repoErrorCache        *ttlCache
+	forkParentCache       *ttlCache
+	protectionCache       *branchProtectionCache
+	rateTracker           *RateTracker
+	prDiscoveryHealth     *prDiscoveryHealthStore
+	prDiscoveryAttemptsMu sync.Mutex
+	prDiscoveryAttempts   map[string]*prDiscoveryAttemptResult
+	promptResolver        PromptResolver
+	tokenClientFactory    func(string) Client
+	ghAccountLister       func(context.Context) ([]GHAccount, error)
+	mockAuth              *MockAuthState
+	workspaceAuthorizer   func(context.Context, string) error
+	freshDefaultsMu       sync.Mutex
+	freshDefaultsDone     bool
+
+	// cleanupFailureMu guards cleanupFailureCounts; the cleanup loop is the
+	// only writer but the global sweep + per-watch sweep can run concurrently
+	// in different goroutines, and the map is shared between them.
+	cleanupFailureMu     sync.Mutex
+	cleanupFailureCounts map[string]int
+
+	// inflightWorkspaceRefreshes tracks workspaces whose stale-PR background
+	// refresh is currently running, so overlapping ListWorkspaceTaskPRs polls
+	// from the frontend coalesce instead of stacking goroutines (each of
+	// which fires its own batched GraphQL request). Keys are workspaceID;
+	// presence means "a refresh is in flight". sync.Map is the right shape
+	// here because keys are unbounded and short-lived and the hot path is a
+	// LoadOrStore guard, not iteration.
+	inflightWorkspaceRefreshes sync.Map
+
+	// passiveFallback* limits the legacy per-watch fallback used by passive
+	// workspace refreshes. The admission window is shared across workspaces so
+	// a batch outage cannot turn a single background tick into an unbounded CLI
+	// fan-out. Admissions are retained as timestamps to enforce a rolling
+	// minute instead of allowing a wall-clock boundary burst.
+	passiveFallbackMu            sync.Mutex
+	passiveFallbackAdmissions    []passiveFallbackAdmission
+	passiveFallbackTargetCursors map[string]int
+
+	// passiveWorkspaceRefreshAt suppresses repeated workspace reads that find
+	// no due watch. Stale-task refreshes bypass this admission and remain
+	// independent of the passive cooldown.
+	passiveWorkspaceRefreshMu sync.Mutex
+	passiveWorkspaceRefreshAt map[string]time.Time
+
+	// stopCtx / stopCancel / bgWG own the lifecycle of background goroutines
+	// the service spawns lazily (currently refreshStaleWorkspaceWatches).
+	// Stop() cancels stopCtx and waits for bgWG to drain, satisfying the
+	// "long-running goroutine has a single owner with explicit start/stop"
+	// convention in apps/backend/AGENTS.md. stopOnce makes Stop idempotent
+	// so the Provide cleanup func can be invoked from any number of
+	// shutdown paths.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+	bgWG       sync.WaitGroup
+	stopOnce   sync.Once
+}
+
+// SetWorkspaceAuthorizer installs the workspace access boundary used before
+// user-facing GitHub credential reads or mutations.
+func (s *Service) SetWorkspaceAuthorizer(authorizer func(context.Context, string) error) {
+	if s != nil {
+		s.workspaceAuthorizer = authorizer
+	}
+}
+
+func (s *Service) authorizeWorkspaceAccess(ctx context.Context, workspaceID string) error {
+	if s == nil || s.workspaceAuthorizer == nil {
+		return nil
+	}
+	return s.workspaceAuthorizer(ctx, workspaceID)
+}
+
+// NewService creates a new GitHub service.
+func NewService(client Client, authMethod string, secrets SecretProvider, store *Store, eventBus bus.EventBus, log *logger.Logger) *Service {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	service := &Service{
+		client:                       client,
+		authMethod:                   authMethod,
+		secrets:                      secrets,
+		store:                        store,
+		eventBus:                     eventBus,
+		logger:                       log,
+		searchCache:                  newTTLCache(),
+		prStatusCache:                newTTLCache(),
+		prFeedbackCache:              newPRFeedbackCache(),
+		workflowRunsCache:            newWorkflowAttentionCache(),
+		workflowJobsCache:            newWorkflowAttentionCache(),
+		mergeMethodsCache:            newMergeMethodsCache(),
+		accessibleReposCache:         newAccessibleReposCache(),
+		repoErrorCache:               newRepoErrorCache(),
+		forkParentCache:              newForkParentCache(),
+		protectionCache:              newBranchProtectionCache(),
+		rateTracker:                  NewRateTracker(eventBus, log),
+		prDiscoveryHealth:            newPRDiscoveryHealth(eventBus, log),
+		prDiscoveryAttempts:          make(map[string]*prDiscoveryAttemptResult),
+		tokenClientFactory:           func(token string) Client { return NewPATClient(token) },
+		ghAccountLister:              ListGHAccounts,
+		cleanupFailureCounts:         make(map[string]int),
+		passiveFallbackTargetCursors: make(map[string]int),
+		passiveWorkspaceRefreshAt:    make(map[string]time.Time),
+		appRegistrationRuntimes:      make(map[string]*githubAppRuntime),
+		stopCtx:                      stopCtx,
+		stopCancel:                   stopCancel,
+		clock:                        time.Now,
+	}
+	if store != nil {
+		service.resolver = NewCredentialResolver(store, secrets)
+		service.resolver.SetRateTracker(service.rateTracker)
+		service.resolver.SetLegacyFactory(func(ctx context.Context) (Client, string, error) {
+			return NewClient(ctx, secrets, log)
+		})
+		service.resolver.SetLegacyTransportFactory(func(ctx context.Context) (Client, string, string, error) {
+			return newLegacyGitTransportCredential(ctx, secrets, log)
+		})
+	}
+	return service
+}
+
+// ListGHAccounts returns the configured account source. Production uses the
+// host CLI; mock mode injects deterministic accounts and never shells out.
+func (s *Service) ListGHAccounts(ctx context.Context) ([]GHAccount, error) {
+	if s == nil || s.ghAccountLister == nil {
+		return nil, ErrGitHubNotConfigured
+	}
+	return s.ghAccountLister(ctx)
+}
+
+// Stop cancels in-flight background goroutines (currently the
+// per-workspace stale-PR refreshes spawned by refreshStaleWorkspaceWatches)
+// and waits for them to drain. Idempotent: safe to call from the Provide
+// cleanup func and any other shutdown path.
+func (s *Service) Stop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.stopCancel()
+		s.bgWG.Wait()
+		if s.prDiscoveryHealth != nil {
+			s.prDiscoveryHealth.clearAll()
+			s.invalidateAllPRDiscoveryAttempts("")
+		}
+	})
+}
+
+// RateTracker exposes the service's rate-limit tracker so factory callers
+// can wire it into individual clients.
+func (s *Service) RateTracker() *RateTracker {
+	return s.rateTracker
+}
+
+// SetPromptResolver wires the editable prompt service into GitHub automation.
+func (s *Service) SetPromptResolver(resolver PromptResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.promptResolver = resolver
+}
+
+func (s *Service) getPromptResolver() PromptResolver {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promptResolver
+}
+
+// newPATClient builds a PATClient pre-wired with the service's shared rate
+// tracker. Centralizing this guards against forgetting the wiring on auth
+// flips (e.g. ConfigureToken), which would otherwise leave PAT calls
+// invisible to the rate-limit UI, health checks, and poller throttling.
+func (s *Service) newPATClient(token string) *PATClient {
+	c := NewPATClient(token)
+	attachRateTracker(c, s.rateTracker, s.logger)
+	return c
+}
+
+// SetTaskDeleter sets the task deletion dependency for cleanup operations.
+func (s *Service) SetTaskDeleter(d TaskDeleter) { s.taskDeleter = d }
+
+// SetTaskRepositoryBaseBranchUpdater wires best-effort task base projection.
+func (s *Service) SetTaskRepositoryBaseBranchUpdater(updater TaskRepositoryBaseBranchUpdater) {
+	s.taskRepositoryUpdater = updater
+}
+
+// SetWorkspaceGroupOwnerResolver wires the workspace-group owner lookup used
+// by resolveEffectiveAssociationTaskID to redirect watch-sourced association
+// writes away from a non-owner shared-worktree member. Optional — when unset,
+// the redirect is a no-op and association writes keep their pre-existing
+// (potentially member-attributed) behavior.
+func (s *Service) SetWorkspaceGroupOwnerResolver(r WorkspaceGroupOwnerResolver) {
+	s.workspaceGroupOwnerResolver = r
+}
+
+// SetCascadeTaskDeleter wires the cascade-delete dependency used by the
+// watch reset flow (ResetIssueWatch / ResetReviewWatch). Optional — when
+// unset, reset returns an error so the missing wiring is surfaced instead
+// of silently no-op'ing.
+func (s *Service) SetCascadeTaskDeleter(d watchreset.TaskDeleter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cascadeTaskDeleter = d
+}
+
+// SetTaskSessionChecker sets the session checker for cleanup operations.
+func (s *Service) SetTaskSessionChecker(c TaskSessionChecker) { s.taskSessionChecker = c }
+
+// SetTaskActivityProvider wires the persisted task activity projection used
+// by passive adaptive searching-watch refreshes.
+func (s *Service) SetTaskActivityProvider(provider TaskActivityProvider) {
+	s.taskActivityProvider = provider
+}
+
+// SetClock installs the service clock used by passive refresh admission.
+// Production uses time.Now; tests can use a fixed clock.
+func (s *Service) SetClock(clock func() time.Time) {
+	s.clockMu.Lock()
+	defer s.clockMu.Unlock()
+	if clock == nil {
+		s.clock = time.Now
+		return
+	}
+	s.clock = clock
+}
+
+// SetSecretManager sets the secret manager for token configuration operations.
+func (s *Service) SetSecretManager(m SecretManager) { s.secretManager = m }
+
+// SetConnectionSecretStore wires deterministic workspace/user secret storage.
+func (s *Service) SetConnectionSecretStore(store ConnectionSecretStore) {
+	s.connectionSecrets = store
+	if s.store != nil && store != nil {
+		s.personalConnections = NewStorePersonalConnectionRepository(s.store, store)
+	}
+	if s.resolver != nil {
+		s.resolver.secrets = store
+		s.resolver.SetInstallationProvider(&runtimeInstallationCredentialProvider{service: s})
+		s.resolver.SetUserProvider(&runtimeUserCredentialProvider{service: s})
+	}
+}
+
+func (s *Service) InvalidateAppInstallationCredentials(registrationID string, installationID int64) {
+	runtime := s.currentAppRegistrationRuntime(registrationID)
+	if runtime != nil && runtime.installationTokens != nil {
+		runtime.installationTokens.Invalidate(installationID)
+	}
+}
+
+// Client returns the underlying GitHub client (may be nil if not authenticated).
+func (s *Service) Client() Client {
+	return s.client
+}
+
+// TestStore returns the store for test/mock use only.
+func (s *Service) TestStore() *Store {
+	return s.store
+}
+
+// ListTaskPRsByTaskIDs forwards to the underlying store. Exposed so other
+// packages (e.g. internal/office) can read PR associations without
+// importing internal/github/store.
+func (s *Service) ListTaskPRsByTaskIDs(ctx context.Context, taskIDs []string) (map[string][]*TaskPR, error) {
+	if s.store == nil {
+		return map[string][]*TaskPR{}, nil
+	}
+	return s.store.ListTaskPRsByTaskIDs(ctx, taskIDs)
+}
+
+// ListTaskPRAutomationOptionsByTaskIDs forwards bounded per-PR automation
+// hydration for task-summary projection without exposing the GitHub store.
+func (s *Service) ListTaskPRAutomationOptionsByTaskIDs(
+	ctx context.Context, taskIDs []string,
+) (map[string][]*TaskPRAutomationOptions, error) {
+	if s.store == nil {
+		return map[string][]*TaskPRAutomationOptions{}, nil
+	}
+	return s.store.ListTaskPRAutomationOptionsByTaskIDs(ctx, taskIDs)
+}
+
+// TestEventBus returns the event bus for test/mock use only.
+func (s *Service) TestEventBus() bus.EventBus {
+	return s.eventBus
+}
+
+// IsAuthenticated returns whether the service has a working GitHub client.
+// Returns false when using the NoopClient fallback (authMethod == "none").
+func (s *Service) IsAuthenticated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client != nil && s.authMethod != AuthMethodNone
+}
+
+// AuthMethod returns the authentication method ("gh_cli", "pat", or "none").
+func (s *Service) AuthMethod() string {
+	return s.authMethod
+}
+
+// isRepoCachedAsMissing reports whether the (owner, repo) tuple is in the
+// 10-min negative cache. Called from SyncWatchesBatched and per-watch
+// probes before acquiring the gh throttle, so the storm against
+// missing/unauthorized repos short-circuits without burning a slot.
+func (s *Service) isRepoCachedAsMissing(owner, repo string) bool {
+	if s == nil || s.repoErrorCache == nil {
+		return false
+	}
+	v, ok := s.repoErrorCache.get(repoErrorCacheKey(owner, repo))
+	if !ok {
+		return false
+	}
+	_, isErr := v.(cachedErr)
+	return isErr
+}
+
+// repoErrorGenSnapshot returns the current cache generation. Callers
+// snapshot this BEFORE issuing the fetch that may classify a repo as
+// missing, and pass the snapshot to markRepoAsMissing — that way an
+// evictRepoNegative / ClearRepoErrorCache that fires DURING the fetch
+// (bumping gen) causes the post-fetch write to be dropped, and the
+// negative cache reflects the user's latest intent rather than the
+// stale classifier result.
+func (s *Service) repoErrorGenSnapshot() uint64 {
+	if s == nil || s.repoErrorCache == nil {
+		return 0
+	}
+	return s.repoErrorCache.generation()
+}
+
+// markRepoAsMissing stores ErrRepoNotResolvable for (owner, repo) in the
+// negative cache. Called after a per-watch or batched probe deterministically
+// classifies the repo as missing/unauthorized (see isRepoNotResolvableErr).
+// `gen` must be a snapshot taken via repoErrorGenSnapshot BEFORE the fetch
+// — passing the current generation at write time would defeat the guard:
+// a concurrent del() / clear() that bumped gen between the fetch start and
+// the write would still be present at write time, so a write-time snapshot
+// would land in the new generation and the just-evicted entry would be
+// reinserted. The fetch-start snapshot turns the write into a no-op when
+// any eviction has fired since the fetch began.
+func (s *Service) markRepoAsMissing(owner, repo string, gen uint64) {
+	if s == nil || s.repoErrorCache == nil {
+		return
+	}
+	s.repoErrorCache.setIfCurrentGeneration(
+		repoErrorCacheKey(owner, repo), cachedErr{err: ErrRepoNotResolvable}, gen)
+}
+
+// evictRepoNegative drops any negative-cache entry for (owner, repo). Called
+// from the PR watch (re)create paths and AssociatePRByURL so a freshly
+// linked or re-linked repository is probed immediately on the next sync,
+// without waiting out the 10-min TTL.
+func (s *Service) evictRepoNegative(owner, repo string) {
+	if s == nil || s.repoErrorCache == nil {
+		return
+	}
+	s.repoErrorCache.del(repoErrorCacheKey(owner, repo))
+}
+
+// ClearRepoErrorCache drops every entry from the negative repo-resolution
+// cache. Called from ConfigureToken / ClearToken so a token swap or clear
+// invalidates classifications that were made under the prior identity —
+// without this, a repo that the old token couldn't see would stay
+// "permanent: true" for up to 10 minutes after the user fixes auth, and
+// the frontend retry loop would stop early on stale data. Nil-guards the
+// cache because tests construct Service literals without going through
+// NewService.
+func (s *Service) ClearRepoErrorCache() {
+	if s == nil || s.repoErrorCache == nil {
+		return
+	}
+	s.repoErrorCache.clear()
+}
+
+// ClearPRCaches drops the PR status and PR feedback caches. Called from
+// the token-swap path because review visibility differs across identities
+// (a PR readable to the old token may not be readable to the new one, and
+// vice versa); without this, the new identity could see stale review /
+// check / comment data for up to one TTL after the swap.
+func (s *Service) ClearPRCaches() {
+	if s == nil {
+		return
+	}
+	if s.prStatusCache != nil {
+		s.prStatusCache.clear()
+	}
+	if s.prFeedbackCache != nil {
+		s.prFeedbackCache.clear()
+	}
+}

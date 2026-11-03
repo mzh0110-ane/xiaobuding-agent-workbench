@@ -1,0 +1,327 @@
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+// TestCollectBaseBranches_MultiRepo verifies the per-repo map populated for
+// multi-repo launches: one entry per RepoLaunchSpec keyed by RepoName, plus
+// the legacy unkeyed entry when LaunchRequest carries the singular top-level
+// BaseBranch (for the synthesized single-repo path).
+func TestCollectBaseBranches_MultiRepo(t *testing.T) {
+	req := &LaunchRequest{
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "alpha", BaseBranch: "main"},
+			{RepoName: "beta", BaseBranch: "develop"},
+		},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"alpha": "main", "beta": "develop"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+func TestCollectBaseBranchesRemoteExecutorKeepsPrimaryAtRoot(t *testing.T) {
+	req := &LaunchRequest{
+		ExecutorType: string(models.ExecutorTypeRemoteDocker),
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "widget", BaseBranch: "main", CheckoutBranch: "feature/primary"},
+			{RepoName: "gadget", BaseBranch: "release/next", CheckoutBranch: "feature/next"},
+		},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"": "main", "gadget-feature-next": "release/next"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+func TestCollectBaseBranchesPluginRemoteUsesMaterializedRepositoryPaths(t *testing.T) {
+	req := &LaunchRequest{
+		ExecutorType: string(models.ExecutorTypePluginRemote),
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "widget", BaseBranch: "main", CheckoutBranch: "feature/primary"},
+			{RepoName: "gadget", BaseBranch: "release/next", CheckoutBranch: "feature/next"},
+		},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"widget-feature-primary": "main", "gadget-feature-next": "release/next"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+func TestCollectBaseBranches_MultiBranchKeysUseWorktreeSubpath(t *testing.T) {
+	req := &LaunchRequest{
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "kandev", BaseBranch: "main"},
+			{RepoName: "kandev", BranchSlug: "feature-x", BaseBranch: "feature/x"},
+		},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"kandev": "main", "kandev-feature-x": "feature/x"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+func TestBaseBranchMetadataKey_FallsBackToRawRepoNameWhenSanitizedEmpty(t *testing.T) {
+	spec := RepoLaunchSpec{RepoName: "/", BaseBranch: "main"}
+	if got := baseBranchMetadataKey(spec); got != "/" {
+		t.Fatalf("baseBranchMetadataKey = %q, want raw repo name", got)
+	}
+	req := &LaunchRequest{
+		Repositories: []RepoLaunchSpec{spec},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"/": "main"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+func TestCollectBaseBranches_SkipsMalformedEmptyRepoSpec(t *testing.T) {
+	req := &LaunchRequest{
+		BaseBranch: "legacy-main",
+		Repositories: []RepoLaunchSpec{
+			{BaseBranch: "malformed-main"},
+		},
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"": "legacy-main"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+// TestCollectBaseBranches_SingleRepoLegacyKey verifies the synthesized
+// single-repo path: when only top-level BaseBranch is set, it lands under the
+// empty key so the root WorkspaceTracker (repositoryName == "") finds it.
+func TestCollectBaseBranches_SingleRepoLegacyKey(t *testing.T) {
+	req := &LaunchRequest{
+		RepositoryID:   "repo-1",
+		RepositoryPath: "/tmp/repo",
+		RepoName:       "repo",
+		BaseBranch:     "main",
+	}
+	got := collectBaseBranches(req)
+	want := map[string]string{"repo": "main", "": "main"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("collectBaseBranches = %v, want %v", got, want)
+	}
+}
+
+// TestCollectBaseBranches_NoBaseBranchReturnsNil ensures we don't leak an
+// empty map into metadata for tasks without recorded base branches.
+func TestCollectBaseBranches_NoBaseBranchReturnsNil(t *testing.T) {
+	req := &LaunchRequest{
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "alpha"}, // no BaseBranch
+		},
+	}
+	if got := collectBaseBranches(req); got != nil {
+		t.Errorf("collectBaseBranches = %v, want nil", got)
+	}
+}
+
+// TestCollectBaseBranches_RepoLessReturnsNil covers quick-chat / repo-less
+// tasks. RepoSpecs returns nil, so the function must too — no metadata key
+// gets injected for them.
+func TestCollectBaseBranches_RepoLessReturnsNil(t *testing.T) {
+	req := &LaunchRequest{}
+	if got := collectBaseBranches(req); got != nil {
+		t.Errorf("collectBaseBranches = %v, want nil", got)
+	}
+}
+
+// TestGetMetadataStringMap_RoundTrips covers both shapes the metadata value
+// can take: the in-process map[string]string written by collectBaseBranches,
+// and the map[string]interface{} that results from a JSON round-trip (e.g.
+// when metadata is persisted and restored on a session resume).
+func TestGetMetadataStringMap_RoundTrips(t *testing.T) {
+	t.Run("concrete map[string]string", func(t *testing.T) {
+		md := map[string]interface{}{
+			"base_branches": map[string]string{"repo-a": "main"},
+		}
+		got := getMetadataStringMap(md, "base_branches")
+		if !reflect.DeepEqual(got, map[string]string{"repo-a": "main"}) {
+			t.Errorf("got %v", got)
+		}
+	})
+
+	t.Run("JSON-decoded map[string]interface{}", func(t *testing.T) {
+		md := map[string]interface{}{
+			"base_branches": map[string]interface{}{"repo-a": "main", "repo-b": "develop"},
+		}
+		got := getMetadataStringMap(md, "base_branches")
+		want := map[string]string{"repo-a": "main", "repo-b": "develop"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("missing key returns nil", func(t *testing.T) {
+		if got := getMetadataStringMap(nil, "missing"); got != nil {
+			t.Errorf("expected nil for nil metadata, got %v", got)
+		}
+		if got := getMetadataStringMap(map[string]interface{}{}, "missing"); got != nil {
+			t.Errorf("expected nil for missing key, got %v", got)
+		}
+	})
+
+	t.Run("non-string values are dropped", func(t *testing.T) {
+		md := map[string]interface{}{
+			"base_branches": map[string]interface{}{
+				"repo-a": "main",
+				"repo-b": 42, // intentionally wrong type
+			},
+		}
+		got := getMetadataStringMap(md, "base_branches")
+		want := map[string]string{"repo-a": "main"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestBuildLaunchMetadata_IncludesBaseBranches confirms the per-repo map is
+// attached to metadata under MetadataKeyBaseBranches so executor call sites
+// can forward it into CreateInstanceRequest.
+func TestBuildLaunchMetadata_IncludesBaseBranches(t *testing.T) {
+	req := &LaunchRequest{
+		Repositories: []RepoLaunchSpec{
+			{RepoName: "alpha", BaseBranch: "main"},
+			{RepoName: "beta", BaseBranch: "develop"},
+		},
+	}
+	md := buildLaunchMetadata(req, "", "", "")
+	raw, ok := md[MetadataKeyBaseBranches]
+	if !ok {
+		t.Fatalf("metadata missing key %q", MetadataKeyBaseBranches)
+	}
+	got, ok := raw.(map[string]string)
+	if !ok {
+		t.Fatalf("metadata value type = %T, want map[string]string", raw)
+	}
+	want := map[string]string{"alpha": "main", "beta": "develop"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// fakeBaseBranchSetter records the maps pushed to one agentctl endpoint.
+type fakeBaseBranchSetter struct {
+	calls []map[string]string
+	err   error
+}
+
+func (f *fakeBaseBranchSetter) SetBaseBranches(_ context.Context, branches map[string]string) error {
+	f.calls = append(f.calls, branches)
+	return f.err
+}
+
+// Regression: the per-repo base-branch map only ever reached agentctl through
+// LaunchRequest metadata (full launch) or an explicit user edit. Workspaces
+// created by startAgentOnExistingWorkspace or post-restart lazy recovery got
+// nothing, so WorkspaceTracker.BaseBranch() stayed empty, resolveBaseBranch
+// skipped the stored ref, and the branch diff stat was computed against an
+// integration candidate (origin/master) — producing whole-tree-scale numbers.
+// Pushing at the agentctl-ready chokepoint covers every creation path.
+func TestPushTaskBaseBranches(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	ctx := context.Background()
+
+	t.Run("pushes the hydrated map", func(t *testing.T) {
+		want := map[string]string{"alpha": "features/x", "": "features/x"}
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return want, nil
+		})
+
+		setter := &fakeBaseBranchSetter{}
+		m.pushTaskBaseBranches(ctx, "task-1", "exec-1", setter)
+
+		if len(setter.calls) != 1 {
+			t.Fatalf("expected 1 SetBaseBranches call, got %d", len(setter.calls))
+		}
+		if !reflect.DeepEqual(setter.calls[0], want) {
+			t.Errorf("pushed %v, want %v", setter.calls[0], want)
+		}
+	})
+
+	// SetBaseBranches *replaces* the map. The full-launch path already seeded
+	// it from LaunchRequest metadata, so pushing an empty hydration on top
+	// would wipe a correct map and reintroduce the bug on the one path that
+	// never had it.
+	t.Run("empty hydration does not clobber launch metadata", func(t *testing.T) {
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return nil, nil
+		})
+
+		setter := &fakeBaseBranchSetter{}
+		m.pushTaskBaseBranches(ctx, "task-1", "exec-1", setter)
+
+		if len(setter.calls) != 0 {
+			t.Fatalf("expected no push for an empty map, got %d calls", len(setter.calls))
+		}
+	})
+
+	t.Run("provider error is non-fatal", func(t *testing.T) {
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return nil, errors.New("db unavailable")
+		})
+
+		setter := &fakeBaseBranchSetter{}
+		m.pushTaskBaseBranches(ctx, "task-1", "exec-1", setter)
+
+		if len(setter.calls) != 0 {
+			t.Fatalf("expected no push after a provider error, got %d calls", len(setter.calls))
+		}
+	})
+
+	t.Run("setter error is non-fatal", func(t *testing.T) {
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return map[string]string{"alpha": "main"}, nil
+		})
+
+		setter := &fakeBaseBranchSetter{err: errors.New("agentctl down")}
+		m.pushTaskBaseBranches(ctx, "task-1", "exec-1", setter)
+
+		if len(setter.calls) != 1 {
+			t.Fatalf("expected the push to be attempted once, got %d", len(setter.calls))
+		}
+	})
+
+	t.Run("no provider or no task is a no-op", func(t *testing.T) {
+		setter := &fakeBaseBranchSetter{}
+		(&Manager{logger: log}).pushTaskBaseBranches(ctx, "task-1", "exec-1", setter)
+
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return map[string]string{"alpha": "main"}, nil
+		})
+		m.pushTaskBaseBranches(ctx, "", "exec-1", setter)
+
+		if len(setter.calls) != 0 {
+			t.Fatalf("expected no pushes, got %d", len(setter.calls))
+		}
+	})
+
+	t.Run("nil setter is a no-op", func(t *testing.T) {
+		m := &Manager{logger: log}
+		m.SetBaseBranchProvider(func(context.Context, string) (map[string]string, error) {
+			return map[string]string{"alpha": "main"}, nil
+		})
+		m.pushTaskBaseBranches(ctx, "task-1", "exec-1", nil)
+	})
+}

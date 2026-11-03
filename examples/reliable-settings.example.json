@@ -1,0 +1,17 @@
+{
+  "data_root": "C:\\xiaobuding\\data",
+  "codex_path": "C:\\path\\to\\codex.exe",
+  "codex_home": "C:\\Users\\YOUR_NAME\\.codex",
+  "model": "YOUR_AVAILABLE_MODEL",
+  "demo_project": "",
+  "connections": [
+    {
+      "id": "codex",
+      "name": "Codex（ChatGPT 登录）",
+      "kind": "codex",
+      "home": "C:\\Users\\YOUR_NAME\\.codex",
+      "provider": "openai",
+      "model": "YOUR_AVAILABLE_MODEL"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+import { expect, type Locator, type Page } from "@playwright/test";
+
+export class LayoutSettingsPage {
+  readonly root: Locator;
+  readonly editor: Locator;
+  readonly actions: Locator;
+
+  constructor(private readonly page: Page) {
+    this.root = page.getByTestId("layout-settings");
+    this.editor = page.getByTestId("layout-editor");
+    this.actions = page.getByTestId("layout-editor-context-actions");
+  }
+
+  async open(): Promise<void> {
+    await this.page.goto("/settings/preferences/layouts");
+    await expect(this.root).toBeVisible();
+  }
+
+  /** Reach Layouts the way a phone user does: from the /settings index page. */
+  async openFromSettingsIndex(): Promise<void> {
+    await this.page.goto("/settings");
+    const index = this.page.getByTestId("settings-index");
+    await expect(index).toBeVisible();
+    await index.getByRole("link", { name: /^Layouts\b/ }).click();
+    await expect(this.page).toHaveURL(/\/settings\/preferences\/layouts$/);
+    await expect(this.root).toBeVisible();
+  }
+
+  async duplicateDefault(name: string): Promise<void> {
+    await this.page.getByTestId("layout-profile-built-in-default").click();
+    await this.page.getByTestId("layout-profile-duplicate").click();
+    const nameInput = this.page.getByRole("textbox", { name: "Layout profile name" });
+    await expect(nameInput).toBeVisible();
+    await nameInput.fill(name);
+    await expect(this.actions).toBeVisible();
+  }
+
+  async selectPanel(name: string): Promise<void> {
+    await this.editor.locator(".dv-tab", { hasText: name }).click();
+    await expect(this.actions).toHaveAccessibleName(`Actions for ${name}`);
+  }
+
+  async addPanel(name: string, touch = false): Promise<void> {
+    const trigger = this.page.getByTestId("layout-editor-add-panel").getByRole("button", {
+      name: "Add panel",
+    });
+    if (touch) await trigger.tap();
+    else await trigger.click();
+    const item = this.page.getByRole("menuitem", { name, exact: true });
+    if (touch) await item.tap();
+    else await item.click();
+    await expect(this.editor.locator(".dv-tab", { hasText: name })).toBeVisible();
+  }
+
+  async removePanel(name: string): Promise<void> {
+    await this.selectPanel(name);
+    const button = this.actions.getByRole("button", { name: "Remove panel" });
+    await expect(button).toBeEnabled();
+    await button.click();
+    await expect(
+      this.page
+        .getByTestId("layout-profile-built-in-default")
+        .getByText("Customized", { exact: true }),
+    ).toBeVisible();
+  }
+
+  async renameSelected(name: string): Promise<void> {
+    const input = this.page.getByRole("textbox", { name: "Layout profile name" });
+    await expect(input).toBeVisible();
+    await input.fill(name);
+  }
+
+  async moveSelectedTabRight(): Promise<void> {
+    const button = this.actions.getByRole("button", { name: "Move tab right" });
+    await expect(button).toBeEnabled();
+    await button.click();
+  }
+
+  async save(): Promise<void> {
+    const response = this.page.waitForResponse(
+      (candidate) =>
+        candidate.url().includes("/api/v1/user/settings") &&
+        candidate.request().method() === "PATCH",
+    );
+    await this.page.getByRole("button", { name: "Save changes" }).click();
+    expect((await response).ok()).toBe(true);
+  }
+}

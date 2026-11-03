@@ -1,0 +1,182 @@
+// Package mentions provides provider-neutral, workspace-scoped work-item search.
+package mentions
+
+import (
+	"context"
+	"errors"
+
+	apiv1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+const (
+	DefaultLimit = 5
+	MaxLimit     = 10
+
+	mentionKindIssue         = "issue"
+	mentionLabelIssue        = "Issue"
+	mentionLabelWorkItem     = "Work item"
+	mentionIssuesPathSegment = "issues"
+)
+
+var (
+	ErrInvalidDescriptor            = errors.New("invalid mention provider descriptor")
+	ErrDuplicateSource              = errors.New("mention provider source already registered")
+	ErrDuplicateProvider            = errors.New("mention provider and kind already registered")
+	ErrMissingAuthorizer            = errors.New("mention provider reference authorizer is required")
+	ErrInvalidRequest               = errors.New("invalid mention search request")
+	ErrWorkspaceNotFound            = errors.New("mention search workspace not found")
+	ErrReferenceProviderUnavailable = errors.New("reference provider unavailable")
+	ErrReferenceUnauthorized        = errors.New("reference is not authorized")
+)
+
+type Status = apiv1.MentionStatus
+
+const (
+	FailureStageSearch              = "search"
+	FailureStageWorkspaceValidation = "workspace_validation"
+	FailureClassInternal            = "internal"
+	FailureClassWorkspaceLookup     = "workspace_lookup"
+)
+
+// SearchFailure carries safe classification metadata across the composition
+// boundary without requiring handlers to inspect an implementation error.
+type SearchFailure struct {
+	stage string
+	class string
+	cause error
+}
+
+func (e *SearchFailure) Error() string {
+	if e == nil || e.cause == nil {
+		return "mention search failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *SearchFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// NewSearchFailure attaches stable, non-sensitive diagnostic classification.
+func NewSearchFailure(stage, class string, cause error) error {
+	if stage == "" {
+		stage = FailureStageSearch
+	}
+	if class == "" {
+		class = FailureClassInternal
+	}
+	return &SearchFailure{stage: stage, class: class, cause: cause}
+}
+
+// SearchFailureMetadata returns safe fields for structured HTTP diagnostics.
+func SearchFailureMetadata(err error) (stage, class string) {
+	var failure *SearchFailure
+	if errors.As(err, &failure) && failure != nil {
+		return failure.stage, failure.class
+	}
+	return FailureStageSearch, FailureClassInternal
+}
+
+const (
+	StatusOK               = apiv1.MentionStatusOK
+	StatusNotConfigured    = apiv1.MentionStatusNotConfigured
+	StatusUnauthorized     = apiv1.MentionStatusUnauthorized
+	StatusRateLimited      = apiv1.MentionStatusRateLimited
+	StatusTimeout          = apiv1.MentionStatusTimeout
+	StatusUpstreamError    = apiv1.MentionStatusUpstreamError
+	StatusUnsupportedScope = apiv1.MentionStatusUnsupportedScope
+)
+
+// ProviderError classifies a provider failure without exposing its cause to clients.
+type ProviderError struct {
+	Status Status
+	cause  error
+}
+
+func (e *ProviderError) Error() string {
+	if e.cause != nil {
+		return e.cause.Error()
+	}
+	return string(e.Status)
+}
+
+func (e *ProviderError) Unwrap() error {
+	return e.cause
+}
+
+// NewProviderError wraps an optional diagnostic cause with a safe response status.
+func NewProviderError(status Status, causes ...error) error {
+	var cause error
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
+	return &ProviderError{Status: status, cause: cause}
+}
+
+// ProviderDescriptor is immutable registry-owned identity and presentation metadata.
+type ProviderDescriptor struct {
+	Source      string
+	Provider    string
+	Kind        string
+	DisplayName string
+	KindLabel   string
+	Order       int
+}
+
+// SearchRequest is the plain-text boundary shared by every provider.
+type SearchRequest struct {
+	WorkspaceID string
+	Query       string
+	Limit       int
+}
+
+// Candidate is untrusted provider-local data. Registry identity is intentionally absent.
+type Candidate struct {
+	ID    string
+	Key   string
+	Title string
+	URL   string
+	Scope string
+}
+
+// ReferencePurpose lets one provider apply cheaper search checks and stronger submission checks.
+type ReferencePurpose string
+
+const (
+	ReferencePurposeSearch     ReferencePurpose = "search"
+	ReferencePurposeSubmission ReferencePurpose = "submission"
+)
+
+// ReferenceAuthorizationRequest contains trusted conversation scope and one normalized reference.
+type ReferenceAuthorizationRequest struct {
+	WorkspaceID string
+	Purpose     ReferencePurpose
+	Reference   apiv1.EntityReference
+}
+
+// ReferenceAuthorizer verifies provider-owned scope and destination rules.
+type ReferenceAuthorizer interface {
+	AuthorizeReference(context.Context, ReferenceAuthorizationRequest) error
+}
+
+// MentionProvider searches one provider source and kind.
+type MentionProvider interface {
+	Descriptor() ProviderDescriptor
+	Search(context.Context, SearchRequest) ([]Candidate, error)
+}
+
+// SourceRegistrar materializes dynamic mention providers into one registry.
+// Implementations must register only descriptors they own.
+type SourceRegistrar interface {
+	RegisterMentionSources(*Registry) error
+}
+
+// SourceRefresher updates dynamic providers before a registry snapshot or
+// authorization lookup. Refresh failures must leave the previous registry
+// state intact so callers fail closed through the existing provider boundary.
+type SourceRefresher interface {
+	RefreshMentionSources()
+}

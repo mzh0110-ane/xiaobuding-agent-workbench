@@ -1,0 +1,1253 @@
+package handlers
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/entityrefs"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/orchestrator"
+	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
+	"github.com/kandev/kandev/internal/task/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"testing"
+	"time"
+)
+
+// mockEventBus is a no-op event bus for handler tests.
+type mockEventBus struct {
+	published int
+}
+
+func (m *mockEventBus) Publish(_ context.Context, _ string, _ *bus.Event) error {
+	m.published++
+	return nil
+}
+func (m *mockEventBus) Subscribe(_ string, _ bus.EventHandler) (bus.Subscription, error) {
+	return nil, nil
+}
+func (m *mockEventBus) QueueSubscribe(_, _ string, _ bus.EventHandler) (bus.Subscription, error) {
+	return nil, nil
+}
+func (m *mockEventBus) Request(_ context.Context, _ string, _ *bus.Event, _ time.Duration) (*bus.Event, error) {
+	return nil, nil
+}
+func (m *mockEventBus) Close()            {}
+func (m *mockEventBus) IsConnected() bool { return true }
+
+type allowQueueAccess struct{}
+
+func (allowQueueAccess) AuthorizeSessionAccess(context.Context, string) error { return nil }
+func (allowQueueAccess) AuthorizeTaskSessionAccess(context.Context, string, string) error {
+	return nil
+}
+
+type fakeQueueAccessAuthorizer struct {
+	sessionErr   error
+	pairErr      error
+	sessionCalls int
+	pairCalls    int
+}
+
+func (f *fakeQueueAccessAuthorizer) AuthorizeSessionAccess(context.Context, string) error {
+	f.sessionCalls++
+	return f.sessionErr
+}
+
+func (f *fakeQueueAccessAuthorizer) AuthorizeTaskSessionAccess(context.Context, string, string) error {
+	f.pairCalls++
+	return f.pairErr
+}
+
+type mockQueueDrainer struct {
+	calls             int
+	sessionID         string
+	drained           bool
+	err               error
+	autoRunCalls      int
+	autoRunEnabled    bool
+	autoRunResult     bool
+	autoRunDispatched bool
+	autoRunErr        error
+}
+
+type fakeReferenceSubmissionValidator struct {
+	calls     int
+	sessionID string
+	taskID    string
+	result    []v1.EntityReference
+	err       error
+}
+
+type recordingQueueAttachmentClaimer struct {
+	claims       []string
+	releases     []string
+	restores     []string
+	claimQueueID string
+	claimErr     error
+}
+
+func (f *recordingQueueAttachmentClaimer) ClaimQueuedMessageAttachments(_ context.Context, _, _, queueID string, attachments []v1.MessageAttachment) error {
+	f.claimQueueID = queueID
+	return f.ClaimMessageAttachments(context.Background(), "", "", attachments)
+}
+
+func (f *recordingQueueAttachmentClaimer) RestoreQueuedMessageAttachments(_ context.Context, _, _, _ string, attachments []v1.MessageAttachment) error {
+	for _, attachment := range attachments {
+		if attachment.AttachmentID != "" {
+			f.restores = append(f.restores, attachment.AttachmentID)
+		}
+	}
+	return nil
+}
+
+func (f *recordingQueueAttachmentClaimer) ClaimMessageAttachments(_ context.Context, _ string, _ string, attachments []v1.MessageAttachment) error {
+	for _, attachment := range attachments {
+		if attachment.AttachmentID != "" {
+			f.claims = append(f.claims, attachment.AttachmentID)
+		}
+	}
+	return f.claimErr
+}
+
+func (f *recordingQueueAttachmentClaimer) ReleaseMessageAttachments(_ context.Context, _ string, _ string, attachments []v1.MessageAttachment) error {
+	for _, attachment := range attachments {
+		if attachment.AttachmentID != "" {
+			f.releases = append(f.releases, attachment.AttachmentID)
+		}
+	}
+	return nil
+}
+
+func (f *fakeReferenceSubmissionValidator) ValidateForSubmission(
+	_ context.Context,
+	sessionID, taskID string,
+	_ []v1.EntityReference,
+) ([]v1.EntityReference, error) {
+	f.calls++
+	f.sessionID = sessionID
+	f.taskID = taskID
+	return f.result, f.err
+}
+
+func (m *mockQueueDrainer) DrainQueuedMessage(_ context.Context, sessionID string) (bool, error) {
+	m.calls++
+	m.sessionID = sessionID
+	return m.drained, m.err
+}
+func (m *mockQueueDrainer) DrainQueuedMessageIfAutoRun(_ context.Context, sessionID string) (bool, error) {
+	m.autoRunCalls++
+	m.sessionID = sessionID
+	return m.autoRunResult, m.autoRunErr
+}
+
+func (m *mockQueueDrainer) SetQueueAutoRun(_ context.Context, sessionID string, enabled bool) (bool, bool, error) {
+	m.autoRunCalls++
+	m.sessionID = sessionID
+	m.autoRunEnabled = enabled
+	return m.autoRunResult, m.autoRunDispatched, m.autoRunErr
+}
+
+func setupQueueHandlers(t *testing.T) (*QueueHandlers, *messagequeue.Service) {
+	return setupQueueHandlersWithDrainer(t, nil)
+}
+
+func setupQueueHandlersWithDrainer(t *testing.T, drainer QueueDrainer) (*QueueHandlers, *messagequeue.Service) {
+	t.Helper()
+	handlers, svc := setupQueueHandlersWithoutStart(t, drainer)
+	handlers.Start(context.Background())
+	return handlers, svc
+}
+
+func setupQueueHandlersWithoutStart(t *testing.T, drainer QueueDrainer) (*QueueHandlers, *messagequeue.Service) {
+	t.Helper()
+	log, err := logger.NewLogger(logger.LoggingConfig{
+		Level:      "error",
+		Format:     "console",
+		OutputPath: "stderr",
+	})
+	require.NoError(t, err)
+	svc := messagequeue.NewServiceMemory(log)
+	svc.SetAutoMergeEnabled(false)
+	handlers := NewQueueHandlers(svc, &mockEventBus{}, log, drainer, allowQueueAccess{}, nil)
+	t.Cleanup(handlers.Stop)
+	return handlers, svc
+}
+
+func setupQueueHandlersWithValidator(t *testing.T, validator entityrefs.SubmissionValidator) (*QueueHandlers, *messagequeue.Service) {
+	t.Helper()
+	log, err := logger.NewLogger(logger.LoggingConfig{
+		Level:      "error",
+		Format:     "console",
+		OutputPath: "stderr",
+	})
+	require.NoError(t, err)
+	svc := messagequeue.NewServiceMemory(log)
+	svc.SetAutoMergeEnabled(false)
+	handlers := NewQueueHandlers(svc, &mockEventBus{}, log, nil, allowQueueAccess{}, nil, validator)
+	handlers.Start(context.Background())
+	t.Cleanup(handlers.Stop)
+	return handlers, svc
+}
+
+func createTestMessage(t *testing.T, action string, payload interface{}) *ws.Message {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return &ws.Message{
+		ID:      "msg-1",
+		Type:    ws.MessageTypeRequest,
+		Action:  action,
+		Payload: data,
+	}
+}
+
+func parseError(t *testing.T, response *ws.Message) ws.ErrorPayload {
+	t.Helper()
+	var errorPayload ws.ErrorPayload
+	require.NoError(t, json.Unmarshal(response.Payload, &errorPayload))
+	return errorPayload
+}
+
+func TestQueueHandlersDenyUnauthorizedSessionActions(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		call   func(*QueueHandlers, context.Context, *ws.Message) (*ws.Message, error)
+		body   func(string) map[string]interface{}
+	}{
+		{name: "clear", action: ws.ActionMessageQueueCancel, call: (*QueueHandlers).wsCancelAll, body: func(string) map[string]interface{} { return map[string]interface{}{"session_id": "s"} }},
+		{name: "get", action: ws.ActionMessageQueueGet, call: (*QueueHandlers).wsGetQueueStatus, body: func(string) map[string]interface{} { return map[string]interface{}{"session_id": "s"} }},
+		{name: "update", action: ws.ActionMessageQueueUpdate, call: (*QueueHandlers).wsUpdateMessage, body: func(id string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "entry_id": id, "content": "changed"}
+		}},
+		{name: "drain", action: ws.ActionMessageQueueDrain, call: (*QueueHandlers).wsDrainQueue, body: func(string) map[string]interface{} { return map[string]interface{}{"session_id": "s"} }},
+		{name: "auto-run", action: ws.ActionMessageQueueAutoRunSet, call: (*QueueHandlers).wsSetAutoRun, body: func(string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "enabled": false}
+		}},
+		{name: "send now", action: ws.ActionMessageQueueSendNow, call: (*QueueHandlers).wsSendNow, body: func(string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "scope": orchestrator.QueueSendNowScopeEntry, "entry_id": "q"}
+		}},
+		{name: "remove", action: ws.ActionMessageQueueRemove, call: (*QueueHandlers).wsRemoveEntry, body: func(id string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "entry_id": id}
+		}},
+		{name: "merge", action: ws.ActionMessageQueueMerge, call: (*QueueHandlers).wsMergeIntoAbove, body: func(id string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "entry_id": id}
+		}},
+		{name: "reorder", action: ws.ActionMessageQueueReorder, call: (*QueueHandlers).wsReorder, body: func(id string) map[string]interface{} {
+			return map[string]interface{}{"session_id": "s", "ordered_ids": []string{id, "q-other"}}
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console", OutputPath: "stderr"})
+			require.NoError(t, err)
+			svc := messagequeue.NewServiceMemory(log)
+			svc.SetAutoMergeEnabled(false)
+			_, err = svc.QueueMessage(context.Background(), "s", "t", "first", "", messagequeue.QueuedByUser, false, nil)
+			require.NoError(t, err)
+			second, err := svc.QueueMessage(context.Background(), "s", "t", "second", "", messagequeue.QueuedByUser, false, nil)
+			require.NoError(t, err)
+			access := &fakeQueueAccessAuthorizer{sessionErr: errors.New("secret denial")}
+			events := &mockEventBus{}
+			drainer := &mockQueueDrainer{drained: true}
+			handlers := NewQueueHandlers(svc, events, log, drainer, access, nil)
+
+			response, err := tc.call(handlers, context.Background(), createTestMessage(t, tc.action, tc.body(second.ID)))
+			require.NoError(t, err)
+			assert.Equal(t, ws.MessageTypeError, response.Type)
+			assert.Equal(t, ws.ErrorCodeNotFound, parseError(t, response).Code)
+			assert.NotContains(t, string(response.Payload), "secret denial")
+			assert.Equal(t, 1, access.sessionCalls)
+			assert.Equal(t, 0, access.pairCalls)
+			assert.Equal(t, 0, events.published)
+			assert.Equal(t, 0, drainer.calls)
+			assert.Equal(t, 2, svc.GetStatus(context.Background(), "s").Count)
+		})
+	}
+}
+
+func TestQueueHandlersDenyUnauthorizedTaskSessionPairActions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+		call   func(*QueueHandlers, context.Context, *ws.Message) (*ws.Message, error)
+	}{
+		{name: "add", action: ws.ActionMessageQueueAdd, call: (*QueueHandlers).wsQueueMessage},
+		{name: "append", action: ws.ActionMessageQueueAppend, call: (*QueueHandlers).wsAppendToQueue},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console", OutputPath: "stderr"})
+			require.NoError(t, err)
+			svc := messagequeue.NewServiceMemory(log)
+			access := &fakeQueueAccessAuthorizer{pairErr: errors.New("secret denial")}
+			events := &mockEventBus{}
+			handlers := NewQueueHandlers(svc, events, log, nil, access, nil)
+
+			response, err := tc.call(handlers, context.Background(), createTestMessage(t, tc.action, map[string]interface{}{
+				"session_id": "s", "task_id": "other-task", "content": "secret",
+			}))
+			require.NoError(t, err)
+			assert.Equal(t, ws.MessageTypeError, response.Type)
+			assert.Equal(t, ws.ErrorCodeNotFound, parseError(t, response).Code)
+			assert.NotContains(t, string(response.Payload), "secret denial")
+			assert.Equal(t, 0, access.sessionCalls)
+			assert.Equal(t, 1, access.pairCalls)
+			assert.Equal(t, 0, events.published)
+			assert.Equal(t, 0, svc.GetStatus(context.Background(), "s").Count)
+		})
+	}
+}
+
+func TestWsQueueMessage(t *testing.T) {
+	t.Run("queues a message", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		msg := createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
+			"session_id": "session-1",
+			"task_id":    "task-1",
+			"content":    "test message",
+			"user_id":    "user-1",
+			"context_files": []map[string]interface{}{
+				{"path": "src/components", "name": "components", "is_directory": true},
+			},
+		})
+
+		response, err := handlers.wsQueueMessage(ctx, msg)
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		entries := svc.GetStatus(ctx, "session-1").Entries
+		require.Len(t, entries, 1)
+		files, ok := entries[0].Metadata[messagequeue.MetadataContextFiles].([]v1.ContextFileMeta)
+		require.True(t, ok)
+		require.Len(t, files, 1)
+		assert.Equal(t, "src/components", files[0].Path)
+		assert.Equal(t, "components", files[0].Name)
+		require.NotNil(t, files[0].IsDirectory)
+		assert.True(t, *files[0].IsDirectory)
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsQueueMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{"task_id": "t", "content": "x"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+
+	t.Run("rejects missing task_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsQueueMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{"session_id": "s", "content": "x"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "task_id is required")
+	})
+
+	t.Run("rejects missing content and attachments", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsQueueMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{"session_id": "s", "task_id": "t"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "content or attachments are required")
+	})
+
+	t.Run("returns queue_full when over cap", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		// Saturate the queue.
+		for i := 0; i < messagequeue.DefaultMaxPerSession; i++ {
+			_, err := svc.QueueMessage(ctx, "s", "t", "x", "", "u", false, nil)
+			require.NoError(t, err)
+		}
+
+		response, err := handlers.wsQueueMessage(ctx, createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
+			"session_id": "s",
+			"task_id":    "t",
+			"content":    "overflow",
+			"user_id":    "u",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		errPayload := parseError(t, response)
+		assert.Equal(t, "queue_full", errPayload.Code)
+		assert.EqualValues(t, messagequeue.DefaultMaxPerSession, errPayload.Details["queue_size"])
+		assert.EqualValues(t, messagequeue.DefaultMaxPerSession, errPayload.Details["max"])
+	})
+
+	t.Run("rejects entity references without an authorization validator", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		response, err := handlers.wsQueueMessage(ctx, createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
+			"session_id": "s",
+			"task_id":    "t",
+			"content":    "reference it",
+			"entity_references": []map[string]interface{}{
+				{
+					"version":  1,
+					"ref":      "mention:v1:kandev:task:workspace-1:task-2",
+					"provider": "kandev",
+					"kind":     "task",
+					"id":       "task-2",
+					"key":      "TASK-2",
+					"title":    "Referenced task",
+					"url":      "/t/task-2",
+					"scope":    "workspace-1",
+				},
+			},
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeValidation, parseError(t, response).Code)
+		assert.Zero(t, svc.GetStatus(ctx, "s").Count, "validation must happen before queue mutation")
+	})
+
+	t.Run("persists references returned by authorization validator", func(t *testing.T) {
+		normalized := v1.EntityReference{
+			Version:  v1.EntityReferenceVersion,
+			Ref:      "mention:v1:kandev:task:workspace-1:task-2",
+			Provider: "kandev",
+			Kind:     "task",
+			ID:       "task-2",
+			Key:      "TASK-2",
+			Title:    "Referenced task",
+			URL:      "/t/task-2",
+			Scope:    "workspace-1",
+		}
+		validator := &fakeReferenceSubmissionValidator{result: []v1.EntityReference{normalized}}
+		handlers, svc := setupQueueHandlersWithValidator(t, validator)
+		ctx := context.Background()
+
+		response, err := handlers.wsQueueMessage(ctx, createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
+			"session_id":        "s",
+			"task_id":           "t",
+			"content":           "reference it",
+			"entity_references": []v1.EntityReference{normalized},
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, validator.calls)
+		assert.Equal(t, "s", validator.sessionID)
+		assert.Equal(t, "t", validator.taskID)
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, []v1.EntityReference{normalized}, entries[0].Metadata["entity_references"])
+	})
+
+	t.Run("rejects passthrough reference scope before queue mutation", func(t *testing.T) {
+		reference := v1.EntityReference{
+			Version: v1.EntityReferenceVersion,
+			Ref:     "mention:v1:kandev:task:workspace-1:task-2", Provider: "kandev", Kind: "task",
+			ID: "task-2", Title: "Referenced task", URL: "/t/task-2", Scope: "workspace-1",
+		}
+		validator := &fakeReferenceSubmissionValidator{err: entityrefs.ErrUnauthorizedReference}
+		handlers, svc := setupQueueHandlersWithValidator(t, validator)
+		ctx := context.Background()
+		response, err := handlers.wsQueueMessage(ctx, createTestMessage(t, ws.ActionMessageQueueAdd, map[string]interface{}{
+			"session_id":        "passthrough-session",
+			"task_id":           "t",
+			"content":           "reference it",
+			"entity_references": []v1.EntityReference{reference},
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, 1, validator.calls)
+		assert.Zero(t, svc.GetStatus(ctx, "passthrough-session").Count)
+	})
+}
+
+func TestFirstInvalidDeliveryMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		attachments []messagequeue.MessageAttachment
+		want        int
+	}{
+		{name: "empty list", attachments: nil, want: -1},
+		{
+			name: "valid modes",
+			attachments: []messagequeue.MessageAttachment{
+				{DeliveryMode: ""},
+				{DeliveryMode: "prompt"},
+				{DeliveryMode: "path"},
+			},
+			want: -1,
+		},
+		{
+			name: "first invalid mode",
+			attachments: []messagequeue.MessageAttachment{
+				{DeliveryMode: "prompt"},
+				{DeliveryMode: "inline"},
+				{DeliveryMode: "path"},
+			},
+			want: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := firstInvalidDeliveryMode(tt.attachments)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestFirstInvalidAttachmentCountsInlineDataInAggregate(t *testing.T) {
+	inline := base64.StdEncoding.EncodeToString([]byte("inline"))
+	attachments := []messagequeue.MessageAttachment{
+		{Type: "resource", AttachmentID: "descriptor", Name: "large.bin", MimeType: "application/octet-stream", SizeBytes: models.MaxMessageAttachmentBytes},
+		{Type: "resource", Data: inline, Name: "inline.txt", MimeType: "text/plain"},
+	}
+	assert.Equal(t, 1, firstInvalidAttachment(attachments))
+}
+
+func TestWsCancelAll(t *testing.T) {
+	t.Run("clears the queue", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		for i := 0; i < 3; i++ {
+			_, err := svc.QueueMessage(ctx, "s", "t", "x", "", "u", false, nil)
+			require.NoError(t, err)
+		}
+
+		response, err := handlers.wsCancelAll(ctx,
+			createTestMessage(t, ws.ActionMessageQueueCancel, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		var payload map[string]interface{}
+		require.NoError(t, json.Unmarshal(response.Payload, &payload))
+		assert.EqualValues(t, 3, payload["removed"])
+
+		assert.Equal(t, 0, svc.GetStatus(ctx, "s").Count)
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsCancelAll(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueCancel, map[string]interface{}{}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+}
+
+func TestWsDrainQueue(t *testing.T) {
+	t.Run("drains next queued message", func(t *testing.T) {
+		drainer := &mockQueueDrainer{drained: true}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, drainer.calls)
+		assert.Equal(t, "s", drainer.sessionID)
+
+		var payload map[string]interface{}
+		require.NoError(t, json.Unmarshal(response.Payload, &payload))
+		assert.Equal(t, true, payload["drained"])
+	})
+
+	t.Run("reports no queued message", func(t *testing.T) {
+		drainer := &mockQueueDrainer{drained: false}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, drainer.calls)
+
+		var payload map[string]interface{}
+		require.NoError(t, json.Unmarshal(response.Payload, &payload))
+		assert.Equal(t, false, payload["drained"])
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlersWithDrainer(t, &mockQueueDrainer{})
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+
+	t.Run("rejects unavailable drainer", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeInternalError, parseError(t, response).Code)
+	})
+
+	t.Run("reports busy session", func(t *testing.T) {
+		handlers, _ := setupQueueHandlersWithDrainer(t, &mockQueueDrainer{err: orchestrator.ErrAgentPromptInProgress})
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, queueErrorCodeSessionBusy, parseError(t, response).Code)
+	})
+
+	t.Run("reports not promptable session", func(t *testing.T) {
+		handlers, _ := setupQueueHandlersWithDrainer(t, &mockQueueDrainer{err: orchestrator.ErrSessionNotPromptable})
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, queueErrorCodeNotPromptable, parseError(t, response).Code)
+		assert.Equal(t, "Session is not ready for input", parseError(t, response).Message)
+	})
+
+	t.Run("reports internal drain errors", func(t *testing.T) {
+		handlers, _ := setupQueueHandlersWithDrainer(t, &mockQueueDrainer{err: errors.New("boom")})
+		response, err := handlers.wsDrainQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueDrain, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeInternalError, parseError(t, response).Code)
+	})
+}
+
+func TestQueueHandlers_AutoRunSetContract(t *testing.T) {
+	const action = "message.queue.auto_run.set"
+
+	t.Run("registers action and returns authoritative result", func(t *testing.T) {
+		drainer := &mockQueueDrainer{autoRunResult: false, autoRunDispatched: false}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+		dispatcher := ws.NewDispatcher()
+		handlers.RegisterHandlers(dispatcher)
+		require.True(t, dispatcher.HasHandler(action))
+
+		response, err := dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "s",
+			"enabled":    false,
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, drainer.autoRunCalls)
+		assert.Equal(t, "s", drainer.sessionID)
+		assert.False(t, drainer.autoRunEnabled)
+		var payload map[string]interface{}
+		require.NoError(t, json.Unmarshal(response.Payload, &payload))
+		assert.Equal(t, false, payload["auto_run"])
+		assert.Equal(t, false, payload["dispatched"])
+	})
+
+	t.Run("requires explicit boolean", func(t *testing.T) {
+		drainer := &mockQueueDrainer{}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+		dispatcher := ws.NewDispatcher()
+		handlers.RegisterHandlers(dispatcher)
+
+		response, err := dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "s",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeValidation, parseError(t, response).Code)
+		assert.Equal(t, 0, drainer.autoRunCalls)
+
+		response, err = dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "s",
+			"enabled":    "yes",
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeBadRequest, parseError(t, response).Code)
+		assert.Equal(t, 0, drainer.autoRunCalls)
+	})
+
+	t.Run("authorizes before mutation", func(t *testing.T) {
+		drainer := &mockQueueDrainer{}
+		authorizer := &fakeQueueAccessAuthorizer{sessionErr: errors.New("denied")}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+		handlers.accessAuthorizer = authorizer
+		dispatcher := ws.NewDispatcher()
+		handlers.RegisterHandlers(dispatcher)
+
+		response, err := dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "hidden",
+			"enabled":    true,
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, queueAccessDenied, parseError(t, response).Message)
+		assert.Equal(t, 1, authorizer.sessionCalls)
+		assert.Equal(t, 0, drainer.autoRunCalls)
+	})
+
+	t.Run("reports unavailable controller", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		dispatcher := ws.NewDispatcher()
+		handlers.RegisterHandlers(dispatcher)
+		response, err := dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "s",
+			"enabled":    true,
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeInternalError, parseError(t, response).Code)
+	})
+
+	t.Run("reports controller failure", func(t *testing.T) {
+		drainer := &mockQueueDrainer{autoRunErr: errors.New("storage unavailable")}
+		handlers, _ := setupQueueHandlersWithDrainer(t, drainer)
+		dispatcher := ws.NewDispatcher()
+		handlers.RegisterHandlers(dispatcher)
+		response, err := dispatcher.Dispatch(context.Background(), createTestMessage(t, action, map[string]interface{}{
+			"session_id": "s",
+			"enabled":    true,
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, ws.ErrorCodeInternalError, parseError(t, response).Code)
+	})
+}
+
+func TestWsGetQueueStatus(t *testing.T) {
+	t.Run("returns ordered list", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		for _, body := range []string{"a", "b", "c"} {
+			_, err := svc.QueueMessage(ctx, "s", "t", body, "", "u", false, nil)
+			require.NoError(t, err)
+		}
+
+		response, err := handlers.wsGetQueueStatus(ctx,
+			createTestMessage(t, ws.ActionMessageQueueGet, map[string]interface{}{"session_id": "s"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		var status messagequeue.QueueStatus
+		require.NoError(t, json.Unmarshal(response.Payload, &status))
+		assert.Equal(t, 3, status.Count)
+		assert.Equal(t, "a", status.Entries[0].Content)
+		assert.Equal(t, "c", status.Entries[2].Content)
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsGetQueueStatus(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueGet, map[string]interface{}{}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+}
+
+func TestWsUpdateMessage(t *testing.T) {
+	t.Run("claims replacement attachments and releases superseded claims", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		claimer := &recordingQueueAttachmentClaimer{}
+		handlers.SetAttachmentClaimer(claimer)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "s", "task-1", "original", "", "u", false, []messagequeue.MessageAttachment{{
+			Type: "resource", AttachmentID: "old-attachment", Name: "old.txt", MimeType: "text/plain",
+		}})
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s", "entry_id": queued.ID, "content": "edited", "user_id": "u",
+				"attachments": []messagequeue.MessageAttachment{{
+					Type: "resource", AttachmentID: "new-attachment", Name: "new.txt", MimeType: "text/plain",
+				}},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, []string{"new-attachment"}, claimer.claims)
+		assert.Equal(t, []string{"old-attachment"}, claimer.releases)
+	})
+	t.Run("preserves an attachment still referenced by another queue entry", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		claimer := &recordingQueueAttachmentClaimer{}
+		handlers.SetAttachmentClaimer(claimer)
+		ctx := context.Background()
+		attachment := messagequeue.MessageAttachment{
+			Type: "resource", AttachmentID: "shared-attachment", Name: "shared.txt", MimeType: "text/plain",
+		}
+		first, err := svc.QueueMessage(ctx, "s", "task-1", "first", "", "u", false, []messagequeue.MessageAttachment{attachment})
+		require.NoError(t, err)
+		_, err = svc.QueueMessage(ctx, "s", "task-1", "second", "", "u", false, []messagequeue.MessageAttachment{attachment})
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s", "entry_id": first.ID, "content": "edited", "user_id": "u",
+				"attachments": []messagequeue.MessageAttachment{},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Empty(t, claimer.releases)
+	})
+
+	t.Run("releases only newly claimed attachments when replacement fails", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		claimer := &recordingQueueAttachmentClaimer{}
+		handlers.SetAttachmentClaimer(claimer)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "s", "task-1", "original", "", "u", false, []messagequeue.MessageAttachment{{
+			Type: "resource", AttachmentID: "old-attachment", Name: "old.txt", MimeType: "text/plain",
+		}})
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s", "entry_id": queued.ID, "content": "edited", "user_id": "other",
+				"attachments": []messagequeue.MessageAttachment{
+					{Type: "resource", AttachmentID: "old-attachment", Name: "old.txt", MimeType: "text/plain"},
+					{Type: "resource", AttachmentID: "new-attachment", Name: "new.txt", MimeType: "text/plain"},
+				},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, []string{"new-attachment"}, claimer.claims)
+		assert.Equal(t, []string{"new-attachment"}, claimer.releases)
+	})
+
+	t.Run("releases attachments when claim reports an error", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		claimer := &recordingQueueAttachmentClaimer{claimErr: errors.New("claim failed")}
+		handlers.SetAttachmentClaimer(claimer)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "s", "task-1", "original", "", "u", false, nil)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s", "entry_id": queued.ID, "content": "edited", "user_id": "u",
+				"attachments": []messagequeue.MessageAttachment{{
+					Type: "resource", AttachmentID: "new-attachment", Name: "new.txt", MimeType: "text/plain",
+				}},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, []string{"new-attachment"}, claimer.claims)
+		assert.Equal(t, []string{"new-attachment"}, claimer.releases)
+	})
+
+	t.Run("updates an entry", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		queued, err := svc.QueueMessage(ctx, "s", "t", "original", "", "u", false, nil)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "edited",
+				"user_id":    "u",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, "edited", svc.GetStatus(ctx, "s").Entries[0].Content)
+	})
+
+	t.Run("omitted references preserve existing metadata", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		references := []interface{}{"existing"}
+		queued, err := svc.QueueMessageWithMetadata(
+			ctx, "s", "t", "original", "", "u", false, nil,
+			map[string]interface{}{
+				"entity_references": references,
+				"origin":            "inter-task",
+			},
+		)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "edited",
+				"user_id":    "u",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, "inter-task", entries[0].Metadata["origin"])
+		assert.Equal(t, references, entries[0].Metadata["entity_references"])
+	})
+
+	t.Run("explicit empty references clear existing metadata", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		queued, err := svc.QueueMessageWithMetadata(
+			ctx, "s", "t", "original", "", "u", false, nil,
+			map[string]interface{}{
+				"entity_references": []interface{}{"existing"},
+				"origin":            "inter-task",
+			},
+		)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id":        "s",
+				"entry_id":          queued.ID,
+				"content":           "edited",
+				"user_id":           "u",
+				"entity_references": []v1.EntityReference{},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, "inter-task", entries[0].Metadata["origin"])
+		_, exists := entries[0].Metadata["entity_references"]
+		assert.False(t, exists, "explicit empty references must clear existing metadata")
+	})
+
+	t.Run("rejects references before editing when validator is unavailable", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "s", "t", "original", "", "u", false, nil)
+		require.NoError(t, err)
+		reference := v1.EntityReference{
+			Version: v1.EntityReferenceVersion,
+			Ref:     "mention:v1:kandev:task:workspace-1:task-2", Provider: "kandev", Kind: "task",
+			ID: "task-2", Title: "Referenced task", URL: "/t/task-2", Scope: "workspace-1",
+		}
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id":        "s",
+				"entry_id":          queued.ID,
+				"content":           "edited",
+				"user_id":           "u",
+				"entity_references": []v1.EntityReference{reference},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, "original", svc.GetStatus(ctx, "s").Entries[0].Content)
+	})
+
+	t.Run("rejects passthrough reference scope before editing", func(t *testing.T) {
+		validator := &fakeReferenceSubmissionValidator{err: entityrefs.ErrUnauthorizedReference}
+		handlers, svc := setupQueueHandlersWithValidator(t, validator)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "passthrough-session", "t", "original", "", "u", false, nil)
+		require.NoError(t, err)
+		reference := v1.EntityReference{
+			Version: v1.EntityReferenceVersion,
+			Ref:     "mention:v1:kandev:task:workspace-1:task-2", Provider: "kandev", Kind: "task",
+			ID: "task-2", Title: "Referenced task", URL: "/t/task-2", Scope: "workspace-1",
+		}
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id":        "passthrough-session",
+				"entry_id":          queued.ID,
+				"content":           "edited",
+				"user_id":           "u",
+				"entity_references": []v1.EntityReference{reference},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, 1, validator.calls)
+		assert.Equal(t, "original", svc.GetStatus(ctx, "passthrough-session").Entries[0].Content)
+	})
+
+	t.Run("authorizes and replaces references", func(t *testing.T) {
+		normalized := v1.EntityReference{
+			Version: v1.EntityReferenceVersion,
+			Ref:     "mention:v1:kandev:task:workspace-1:task-2", Provider: "kandev", Kind: "task",
+			ID: "task-2", Key: "TASK-2", Title: "Referenced task", URL: "/t/task-2", Scope: "workspace-1",
+		}
+		validator := &fakeReferenceSubmissionValidator{result: []v1.EntityReference{normalized}}
+		handlers, svc := setupQueueHandlersWithValidator(t, validator)
+		ctx := context.Background()
+		queued, err := svc.QueueMessage(ctx, "s", "t", "original", "", "u", false, nil)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id":        "s",
+				"entry_id":          queued.ID,
+				"content":           "edited",
+				"user_id":           "u",
+				"entity_references": []v1.EntityReference{normalized},
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, validator.calls)
+		assert.Equal(t, "s", validator.sessionID)
+		assert.Empty(t, validator.taskID, "queue edit resolves task from trusted session")
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, []v1.EntityReference{normalized}, entries[0].Metadata["entity_references"])
+	})
+
+	t.Run("returns entry_not_found when drained", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		queued, _ := svc.QueueMessage(ctx, "s", "t", "x", "", "u", false, nil)
+		_, _ = svc.TakeQueued(ctx, "s")
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "edit",
+				"user_id":    "u",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, "entry_not_found", parseError(t, response).Code)
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsUpdateMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{"entry_id": "e", "content": "x"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+
+	t.Run("rejects missing entry_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsUpdateMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{"session_id": "s", "content": "x"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "entry_id is required")
+	})
+
+	t.Run("rejects when content and attachments missing", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsUpdateMessage(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{"session_id": "s", "entry_id": "e"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "content or attachments are required")
+	})
+
+	t.Run("rejects user_id impersonating the agent identity", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		queued, _ := svc.QueueMessageWithMetadata(ctx, "s", "t", "agent prompt", "", messagequeue.QueuedByAgent, false, nil, nil)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "hijack",
+				"user_id":    messagequeue.QueuedByAgent,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "may not impersonate the agent identity")
+
+		// And confirm the agent entry was not overwritten.
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, "agent prompt", entries[0].Content)
+	})
+
+	t.Run("rejects user_id impersonating the workflow identity", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		queued, err := svc.QueueMessageWithMetadata(
+			ctx, "s", "t", "lifecycle prompt", "", messagequeue.QueuedByWorkflow, false, nil,
+			map[string]interface{}{"origin": "github_pr_automation"},
+		)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "hostile replacement",
+				"user_id":    messagequeue.QueuedByWorkflow,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, "lifecycle prompt", entries[0].Content)
+	})
+
+	t.Run("rejects user_id impersonating the move-task identity", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+		queued, err := svc.QueueMessageWithMetadata(
+			ctx, "s", "t", "handoff", "", messagequeue.QueuedByMoveTask, false, nil,
+			map[string]interface{}{messagequeue.MetadataDeferredMoveID: "move-1"},
+		)
+		require.NoError(t, err)
+
+		response, err := handlers.wsUpdateMessage(ctx,
+			createTestMessage(t, ws.ActionMessageQueueUpdate, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+				"content":    "forged handoff",
+				"user_id":    messagequeue.QueuedByMoveTask,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+
+		entries := svc.GetStatus(ctx, "s").Entries
+		require.Len(t, entries, 1)
+		assert.Equal(t, "handoff", entries[0].Content)
+	})
+}
+
+func TestWsRemoveEntry(t *testing.T) {
+	t.Run("removes a single entry", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		a, _ := svc.QueueMessage(ctx, "s", "t", "a", "", "u", false, nil)
+		_, _ = svc.QueueMessage(ctx, "s", "t", "b", "", "u", false, nil)
+
+		response, err := handlers.wsRemoveEntry(ctx,
+			createTestMessage(t, ws.ActionMessageQueueRemove, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   a.ID,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		status := svc.GetStatus(ctx, "s")
+		assert.Equal(t, 1, status.Count)
+		assert.Equal(t, "b", status.Entries[0].Content)
+	})
+
+	t.Run("returns entry_not_found when missing", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsRemoveEntry(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueRemove, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   "ghost",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Equal(t, "entry_not_found", parseError(t, response).Code)
+	})
+
+	t.Run("removes agent-authored entries", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		queued, err := svc.QueueMessageWithMetadata(ctx, "s", "t", "agent prompt", "", messagequeue.QueuedByAgent, false, nil, nil)
+		require.NoError(t, err)
+
+		response, err := handlers.wsRemoveEntry(ctx,
+			createTestMessage(t, ws.ActionMessageQueueRemove, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		status := svc.GetStatus(ctx, "s")
+		assert.Equal(t, 0, status.Count)
+	})
+
+	t.Run("removes workflow-authored entries", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		queued, err := svc.QueueMessageWithMetadata(
+			ctx, "s", "t", "lifecycle prompt", "", messagequeue.QueuedByWorkflow, false, nil,
+			map[string]interface{}{"origin": "github_pr_automation"},
+		)
+		require.NoError(t, err)
+
+		response, err := handlers.wsRemoveEntry(ctx,
+			createTestMessage(t, ws.ActionMessageQueueRemove, map[string]interface{}{
+				"session_id": "s",
+				"entry_id":   queued.ID,
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+
+		status := svc.GetStatus(ctx, "s")
+		assert.Equal(t, 0, status.Count)
+	})
+
+	t.Run("rejects missing session_id", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsRemoveEntry(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueRemove, map[string]interface{}{"entry_id": "e"}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "session_id is required")
+	})
+}
+
+func TestWsAppendToQueue(t *testing.T) {
+	t.Run("appends to tail when same sender", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		_, err := svc.QueueMessage(ctx, "s", "t", "first", "", "user-1", false, nil)
+		require.NoError(t, err)
+
+		response, err := handlers.wsAppendToQueue(ctx,
+			createTestMessage(t, ws.ActionMessageQueueAppend, map[string]interface{}{
+				"session_id": "s",
+				"task_id":    "t",
+				"content":    "second",
+				"user_id":    "user-1",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, svc.GetStatus(ctx, "s").Count)
+		assert.Contains(t, svc.GetStatus(ctx, "s").Entries[0].Content, "first\n\n---\n\nsecond")
+	})
+
+	t.Run("inserts when queue empty", func(t *testing.T) {
+		handlers, svc := setupQueueHandlers(t)
+		ctx := context.Background()
+
+		response, err := handlers.wsAppendToQueue(ctx,
+			createTestMessage(t, ws.ActionMessageQueueAppend, map[string]interface{}{
+				"session_id": "s",
+				"task_id":    "t",
+				"content":    "fresh",
+				"user_id":    "u",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeResponse, response.Type)
+		assert.Equal(t, 1, svc.GetStatus(ctx, "s").Count)
+	})
+
+	t.Run("rejects missing fields", func(t *testing.T) {
+		handlers, _ := setupQueueHandlers(t)
+		response, err := handlers.wsAppendToQueue(context.Background(),
+			createTestMessage(t, ws.ActionMessageQueueAppend, map[string]interface{}{
+				"session_id": "s",
+				"task_id":    "t",
+				"content":    "",
+			}))
+		require.NoError(t, err)
+		assert.Equal(t, ws.MessageTypeError, response.Type)
+		assert.Contains(t, parseError(t, response).Message, "content is required")
+	})
+}

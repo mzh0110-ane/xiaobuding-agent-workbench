@@ -1,0 +1,647 @@
+package streams
+
+import (
+	"encoding/json"
+	"reflect"
+)
+
+// ToolKind categorizes the normalized tool operation
+type ToolKind string
+
+const (
+	ToolKindReadFile     ToolKind = "read_file"
+	ToolKindModifyFile   ToolKind = "modify_file"
+	ToolKindShellExec    ToolKind = "shell_exec"
+	ToolKindCodeSearch   ToolKind = "code_search"
+	ToolKindHttpRequest  ToolKind = "http_request"
+	ToolKindGeneric      ToolKind = "generic"
+	ToolKindCreateTask   ToolKind = "create_task"
+	ToolKindSubagentTask ToolKind = "subagent_task"
+	ToolKindShowPlan     ToolKind = "show_plan"
+	ToolKindManageTodos  ToolKind = "manage_todos"
+	ToolKindMisc         ToolKind = "misc"
+)
+
+// ToMessageType maps the ToolKind to a frontend message type.
+// This allows the frontend to use specialized renderers for different tool categories.
+func (k ToolKind) ToMessageType() string {
+	switch k {
+	case ToolKindReadFile:
+		return "tool_read"
+	case ToolKindCodeSearch:
+		return "tool_search"
+	case ToolKindModifyFile:
+		return "tool_edit"
+	case ToolKindShellExec:
+		return "tool_execute"
+	case ToolKindManageTodos:
+		return "todo"
+	default:
+		return "tool_call"
+	}
+}
+
+// NormalizedPayload is the normalized tool data (discriminated union).
+// Exactly one of the kind-specific fields will be set based on Kind.
+// Fields are unexported to enforce use of factory functions (NewReadFile, NewShellExec, etc.)
+type NormalizedPayload struct {
+	kind         ToolKind
+	readFile     *ReadFilePayload
+	modifyFile   *ModifyFilePayload
+	shellExec    *ShellExecPayload
+	codeSearch   *CodeSearchPayload
+	httpRequest  *HttpRequestPayload
+	generic      *GenericPayload
+	createTask   *CreateTaskPayload
+	subagentTask *SubagentTaskPayload
+	showPlan     *ShowPlanPayload
+	manageTodos  *ManageTodosPayload
+	misc         *MiscPayload
+	// backgroundWork is adapter-issued provenance. Tool kind and payload shape
+	// are presentation contracts and cannot relax prompt admission by
+	// themselves.
+	backgroundWork *BackgroundWorkPayload
+	// monitor is adapter-only provenance, deliberately a sibling of generic
+	// rather than a key inside GenericPayload.Output. Output is assigned the
+	// agent's raw tool result verbatim (see NormalizeToolResult), so anything
+	// carried inside it is agent-shaped data and cannot attest to its own origin.
+	// This slot is written solely by the ACP adapter's Monitor recognizer, which
+	// gates on ACP `_meta.claudeCode.toolName` — set by the claude-agent-acp
+	// wrapper, not by model tool output. IsActiveMonitor classifies on this.
+	monitor *MonitorPayload
+	// mcpTool is trusted adapter provenance for a recognized MCP execution.
+	// It stays internal because persistence should contain the canonical tool
+	// name, input, and result rather than transport-specific metadata.
+	mcpTool bool
+}
+
+// --- Getters for NormalizedPayload ---
+
+func (p *NormalizedPayload) Kind() ToolKind                     { return p.kind }
+func (p *NormalizedPayload) ReadFile() *ReadFilePayload         { return p.readFile }
+func (p *NormalizedPayload) ModifyFile() *ModifyFilePayload     { return p.modifyFile }
+func (p *NormalizedPayload) ShellExec() *ShellExecPayload       { return p.shellExec }
+func (p *NormalizedPayload) CodeSearch() *CodeSearchPayload     { return p.codeSearch }
+func (p *NormalizedPayload) HttpRequest() *HttpRequestPayload   { return p.httpRequest }
+func (p *NormalizedPayload) Generic() *GenericPayload           { return p.generic }
+func (p *NormalizedPayload) CreateTask() *CreateTaskPayload     { return p.createTask }
+func (p *NormalizedPayload) SubagentTask() *SubagentTaskPayload { return p.subagentTask }
+func (p *NormalizedPayload) ShowPlan() *ShowPlanPayload         { return p.showPlan }
+func (p *NormalizedPayload) ManageTodos() *ManageTodosPayload   { return p.manageTodos }
+func (p *NormalizedPayload) Misc() *MiscPayload                 { return p.misc }
+func (p *NormalizedPayload) IsMCPTool() bool                    { return p != nil && p.mcpTool }
+
+// Snapshot returns a detached copy of the normalized payload. A snapshot owns
+// every pointer, slice, and JSON-compatible value reachable from the payload so
+// it can safely cross an asynchronous event boundary.
+func (p *NormalizedPayload) Snapshot() *NormalizedPayload {
+	if p == nil {
+		return nil
+	}
+	return &NormalizedPayload{
+		kind:           p.kind,
+		readFile:       cloneReadFilePayload(p.readFile),
+		modifyFile:     cloneModifyFilePayload(p.modifyFile),
+		shellExec:      cloneShellExecPayload(p.shellExec),
+		codeSearch:     cloneCodeSearchPayload(p.codeSearch),
+		httpRequest:    cloneHttpRequestPayload(p.httpRequest),
+		generic:        cloneGenericPayload(p.generic),
+		createTask:     cloneCreateTaskPayload(p.createTask),
+		subagentTask:   cloneSubagentTaskPayload(p.subagentTask),
+		showPlan:       cloneShowPlanPayload(p.showPlan),
+		manageTodos:    cloneManageTodosPayload(p.manageTodos),
+		misc:           cloneMiscPayload(p.misc),
+		backgroundWork: cloneBackgroundWorkPayload(p.backgroundWork),
+		monitor:        cloneMonitorPayload(p.monitor),
+		mcpTool:        p.mcpTool,
+	}
+}
+
+func cloneReadFilePayload(src *ReadFilePayload) *ReadFilePayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if src.Output != nil {
+		output := *src.Output
+		clone.Output = &output
+	}
+	return &clone
+}
+
+func cloneModifyFilePayload(src *ModifyFilePayload) *ModifyFilePayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.Mutations = append([]FileMutation(nil), src.Mutations...)
+	return &clone
+}
+
+func cloneShellExecPayload(src *ShellExecPayload) *ShellExecPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if src.Output != nil {
+		output := *src.Output
+		clone.Output = &output
+	}
+	return &clone
+}
+
+func cloneCodeSearchPayload(src *CodeSearchPayload) *CodeSearchPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if src.Output != nil {
+		output := *src.Output
+		output.Files = append([]string(nil), src.Output.Files...)
+		clone.Output = &output
+	}
+	return &clone
+}
+
+func cloneHttpRequestPayload(src *HttpRequestPayload) *HttpRequestPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func cloneGenericPayload(src *GenericPayload) *GenericPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.Input = cloneJSONValue(src.Input)
+	clone.Output = cloneJSONValue(src.Output)
+	return &clone
+}
+
+func cloneCreateTaskPayload(src *CreateTaskPayload) *CreateTaskPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func cloneSubagentTaskPayload(src *SubagentTaskPayload) *SubagentTaskPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if src.ToolUseCount != nil {
+		count := *src.ToolUseCount
+		clone.ToolUseCount = &count
+	}
+	return &clone
+}
+
+func cloneShowPlanPayload(src *ShowPlanPayload) *ShowPlanPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.Steps = append([]string(nil), src.Steps...)
+	return &clone
+}
+
+func cloneManageTodosPayload(src *ManageTodosPayload) *ManageTodosPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.Items = append([]TodoItem(nil), src.Items...)
+	return &clone
+}
+
+func cloneMiscPayload(src *MiscPayload) *MiscPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.Details = cloneJSONValue(src.Details)
+	return &clone
+}
+
+func cloneBackgroundWorkPayload(src *BackgroundWorkPayload) *BackgroundWorkPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func cloneMonitorPayload(src *MonitorPayload) *MonitorPayload {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func cloneJSONValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	return cloneJSONReflectValue(reflect.ValueOf(value)).Interface()
+}
+
+func cloneJSONReflectValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		clone := cloneJSONReflectValue(value.Elem())
+		result := reflect.New(value.Type()).Elem()
+		result.Set(clone)
+		return result
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			result.SetMapIndex(iter.Key(), cloneJSONReflectValue(iter.Value()))
+		}
+		return result
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := 0; index < value.Len(); index++ {
+			result.Index(index).Set(cloneJSONReflectValue(value.Index(index)))
+		}
+		return result
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		result := reflect.New(value.Type().Elem())
+		result.Elem().Set(cloneJSONReflectValue(value.Elem()))
+		return result
+	default:
+		return value
+	}
+}
+
+// MarshalJSON implements custom JSON marshaling for NormalizedPayload.
+func (p *NormalizedPayload) MarshalJSON() ([]byte, error) {
+	type jsonPayload struct {
+		Kind         ToolKind               `json:"kind"`
+		ReadFile     *ReadFilePayload       `json:"read_file,omitempty"`
+		ModifyFile   *ModifyFilePayload     `json:"modify_file,omitempty"`
+		ShellExec    *ShellExecPayload      `json:"shell_exec,omitempty"`
+		CodeSearch   *CodeSearchPayload     `json:"code_search,omitempty"`
+		HttpRequest  *HttpRequestPayload    `json:"http_request,omitempty"`
+		Generic      *GenericPayload        `json:"generic,omitempty"`
+		CreateTask   *CreateTaskPayload     `json:"create_task,omitempty"`
+		SubagentTask *SubagentTaskPayload   `json:"subagent_task,omitempty"`
+		ShowPlan     *ShowPlanPayload       `json:"show_plan,omitempty"`
+		ManageTodos  *ManageTodosPayload    `json:"manage_todos,omitempty"`
+		Misc         *MiscPayload           `json:"misc,omitempty"`
+		Background   *BackgroundWorkPayload `json:"background_work,omitempty"`
+		Monitor      *MonitorPayload        `json:"monitor,omitempty"`
+	}
+	return json.Marshal(jsonPayload{
+		Kind:         p.kind,
+		ReadFile:     p.readFile,
+		ModifyFile:   p.modifyFile,
+		ShellExec:    p.shellExec,
+		CodeSearch:   p.codeSearch,
+		HttpRequest:  p.httpRequest,
+		Generic:      p.generic,
+		CreateTask:   p.createTask,
+		SubagentTask: p.subagentTask,
+		ShowPlan:     p.showPlan,
+		ManageTodos:  p.manageTodos,
+		Misc:         p.misc,
+		Background:   p.backgroundWork,
+		Monitor:      p.monitor,
+	})
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for NormalizedPayload.
+// This is required because the struct has unexported fields.
+func (p *NormalizedPayload) UnmarshalJSON(data []byte) error {
+	type jsonPayload struct {
+		Kind         ToolKind               `json:"kind"`
+		ReadFile     *ReadFilePayload       `json:"read_file,omitempty"`
+		ModifyFile   *ModifyFilePayload     `json:"modify_file,omitempty"`
+		ShellExec    *ShellExecPayload      `json:"shell_exec,omitempty"`
+		CodeSearch   *CodeSearchPayload     `json:"code_search,omitempty"`
+		HttpRequest  *HttpRequestPayload    `json:"http_request,omitempty"`
+		Generic      *GenericPayload        `json:"generic,omitempty"`
+		CreateTask   *CreateTaskPayload     `json:"create_task,omitempty"`
+		SubagentTask *SubagentTaskPayload   `json:"subagent_task,omitempty"`
+		ShowPlan     *ShowPlanPayload       `json:"show_plan,omitempty"`
+		ManageTodos  *ManageTodosPayload    `json:"manage_todos,omitempty"`
+		Misc         *MiscPayload           `json:"misc,omitempty"`
+		Background   *BackgroundWorkPayload `json:"background_work,omitempty"`
+		Monitor      *MonitorPayload        `json:"monitor,omitempty"`
+	}
+	var jp jsonPayload
+	if err := json.Unmarshal(data, &jp); err != nil {
+		return err
+	}
+	p.kind = jp.Kind
+	p.monitor = jp.Monitor
+	p.readFile = jp.ReadFile
+	p.modifyFile = jp.ModifyFile
+	p.shellExec = jp.ShellExec
+	p.codeSearch = jp.CodeSearch
+	p.httpRequest = jp.HttpRequest
+	p.generic = jp.Generic
+	p.createTask = jp.CreateTask
+	p.subagentTask = jp.SubagentTask
+	p.showPlan = jp.ShowPlan
+	p.manageTodos = jp.ManageTodos
+	p.misc = jp.Misc
+	p.backgroundWork = jp.Background
+	return nil
+}
+
+// --- Kind-specific payloads ---
+
+// ReadFileOutput contains the result of a file read operation.
+type ReadFileOutput struct {
+	Content   string `json:"content,omitempty"`
+	LineCount int    `json:"line_count,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Language  string `json:"language,omitempty"`
+}
+
+// ReadFilePayload contains normalized data for file read operations.
+type ReadFilePayload struct {
+	FilePath string          `json:"file_path"`
+	Offset   int             `json:"offset,omitempty"`
+	Limit    int             `json:"limit,omitempty"`
+	Output   *ReadFileOutput `json:"output,omitempty"`
+}
+
+// ModifyFilePayload contains normalized data for file modification operations.
+type ModifyFilePayload struct {
+	FilePath  string         `json:"file_path"`
+	Mutations []FileMutation `json:"mutations"`
+}
+
+// MutationType describes the type of file mutation.
+type MutationType string
+
+const (
+	MutationCreate  MutationType = "create"
+	MutationReplace MutationType = "replace"
+	MutationPatch   MutationType = "patch"
+	MutationDelete  MutationType = "delete"
+	MutationRename  MutationType = "rename"
+)
+
+// FileMutation represents a single change to a file.
+type FileMutation struct {
+	Type       MutationType `json:"type"`
+	Content    string       `json:"content,omitempty"`     // for create/replace
+	OldContent string       `json:"old_content,omitempty"` // for patch
+	NewContent string       `json:"new_content,omitempty"` // for patch
+	Diff       string       `json:"diff,omitempty"`        // unified diff
+	NewPath    string       `json:"new_path,omitempty"`    // for rename
+	StartLine  int          `json:"start_line,omitempty"`
+	EndLine    int          `json:"end_line,omitempty"`
+}
+
+// ShellExecPayload contains normalized data for shell command execution.
+type ShellExecPayload struct {
+	Command     string           `json:"command"`
+	WorkDir     string           `json:"work_dir,omitempty"`
+	Description string           `json:"description,omitempty"`
+	Timeout     int              `json:"timeout,omitempty"`
+	Background  bool             `json:"background,omitempty"`
+	Output      *ShellExecOutput `json:"output,omitempty"`
+}
+
+// ShellExecOutput contains the result of a shell command execution.
+type ShellExecOutput struct {
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	Stdout    string `json:"stdout,omitempty"`
+	Stderr    string `json:"stderr,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	// Internal stream state keeps the serialized combined flag accurate across replacements.
+	StdoutTruncated bool `json:"-"`
+	StderrTruncated bool `json:"-"`
+	// RawTerminalOutput mirrors Stdout's own bounded cumulative-append
+	// bookkeeping but is never echo-stripped. Cumulative terminal_output
+	// frames must be prefix-compared against the provider's own raw view of
+	// what it has sent so far, not against Stdout, which may already have
+	// had a leading command echo stripped for display.
+	RawTerminalOutput string `json:"-"`
+}
+
+// CodeSearchOutput contains the result of a code search operation.
+type CodeSearchOutput struct {
+	Files     []string `json:"files,omitempty"`
+	FileCount int      `json:"file_count,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
+
+// CodeSearchPayload contains normalized data for code search operations.
+type CodeSearchPayload struct {
+	Query   string            `json:"query,omitempty"`
+	Pattern string            `json:"pattern,omitempty"`
+	Path    string            `json:"path,omitempty"`
+	Glob    string            `json:"glob,omitempty"`
+	Output  *CodeSearchOutput `json:"output,omitempty"`
+}
+
+// HttpRequestPayload contains normalized data for HTTP request operations.
+type HttpRequestPayload struct {
+	URL      string `json:"url"`
+	Method   string `json:"method,omitempty"`
+	Response string `json:"response,omitempty"`
+	IsError  bool   `json:"is_error,omitempty"`
+}
+
+// GenericPayload is the fallback for unrecognized tools.
+type GenericPayload struct {
+	Name   string `json:"name"`
+	Input  any    `json:"input,omitempty"`
+	Output any    `json:"output,omitempty"`
+}
+
+// CreateTaskPayload contains normalized data for task creation operations.
+type CreateTaskPayload struct {
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+}
+
+// SubagentTaskPayload contains normalized data for subagent task invocations.
+type SubagentTaskPayload struct {
+	Description  string `json:"description"`
+	Prompt       string `json:"prompt"`
+	SubagentType string `json:"subagent_type"`
+
+	// Result fields (populated from tool_use_result on completion)
+	Status         string `json:"status,omitempty"`
+	AgentID        string `json:"agent_id,omitempty"`
+	Model          string `json:"model,omitempty"`
+	ChildSessionID string `json:"child_session_id,omitempty"`
+	// ProviderThreadID is an agent-native child conversation identity. It is
+	// kept separate from Kandev session IDs because Codex threads are not tasks.
+	ProviderThreadID string `json:"provider_thread_id,omitempty"`
+	DurationMs       int64  `json:"duration_ms,omitempty"`
+	TotalTokens      int64  `json:"total_tokens,omitempty"`
+	// ToolUseCount is a pointer so a genuine zero ("0 tools" for a completed
+	// subagent) serializes, while agents that don't report it (OpenCode,
+	// Cursor) stay omitted rather than surfacing a misleading "0 tools" chip.
+	ToolUseCount *int `json:"tool_use_count,omitempty"`
+
+	// ResultText is the final summary returned by the subagent. Auggie reads it
+	// from `rawOutput.output`; Claude reads text blocks from
+	// `_meta.claudeCode.toolResponse.content`. OpenCode and Cursor currently
+	// leave it empty because their progress is visible as nested child messages.
+	ResultText string `json:"result_text,omitempty"`
+
+	// Async/backgrounded subagent fields. Claude Code's Task tool with
+	// `run_in_background: true` returns `_meta.claudeCode.toolResponse.status:
+	// "async_launched"` and includes `isAsync`, `outputFile`,
+	// `canReadOutputFile`. The dispatch IS terminal for the Task tool — the
+	// subagent runs in the SDK's background and writes its result to OutputFile.
+	IsAsync           bool   `json:"is_async,omitempty"`
+	OutputFile        string `json:"output_file,omitempty"`
+	CanReadOutputFile bool   `json:"can_read_output_file,omitempty"`
+
+	// isAuggie marks payloads recognized via Auggie's "sub-agent-<type>:"
+	// title prefix. Internal to the adapter; not serialized. Gates the
+	// Auggie-specific result extractor (which keys off a generic
+	// `rawOutput.output` string) so it never fires for unrelated agents that
+	// happen to emit a similarly-shaped completion frame.
+	isAuggie bool
+}
+
+// IsAuggie reports whether the subagent was recognized via Auggie's title
+// prefix. Used by the normalizer to gate Auggie-only result extraction.
+func (p *SubagentTaskPayload) IsAuggie() bool { return p.isAuggie }
+
+// SetIsAuggie marks the payload as an Auggie subagent. Called by the
+// normalizer at recognition time; never set by JSON unmarshal.
+func (p *SubagentTaskPayload) SetIsAuggie(v bool) { p.isAuggie = v }
+
+// ShowPlanPayload contains normalized data for plan display operations.
+type ShowPlanPayload struct {
+	Summary string   `json:"summary"`
+	Steps   []string `json:"steps,omitempty"`
+}
+
+// ManageTodosPayload contains normalized data for todo management operations.
+type ManageTodosPayload struct {
+	Operation string     `json:"operation"` // "add", "update", "remove", "list"
+	Items     []TodoItem `json:"items,omitempty"`
+}
+
+// TodoItem represents a single todo item.
+// Claude Code's TodoWrite uses "content" for the description and includes "activeForm".
+type TodoItem struct {
+	ID          string `json:"id,omitempty"`
+	Description string `json:"description"`
+	Status      string `json:"status,omitempty"`
+	ActiveForm  string `json:"active_form,omitempty"`
+}
+
+// MiscPayload is for miscellaneous operations that don't fit other categories.
+type MiscPayload struct {
+	Label   string `json:"label"`
+	Details any    `json:"details,omitempty"`
+}
+
+// --- Factory functions for NormalizedPayload ---
+// These are the ONLY way to create NormalizedPayload instances.
+
+// NewReadFile creates a NormalizedPayload for file read operations.
+func NewReadFile(filePath string, offset, limit int) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindReadFile,
+		readFile: &ReadFilePayload{
+			FilePath: filePath,
+			Offset:   offset,
+			Limit:    limit,
+		},
+	}
+}
+
+// NewModifyFile creates a NormalizedPayload for file modification operations.
+func NewModifyFile(filePath string, mutations []FileMutation) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindModifyFile,
+		modifyFile: &ModifyFilePayload{
+			FilePath:  filePath,
+			Mutations: mutations,
+		},
+	}
+}
+
+// NewShellExec creates a NormalizedPayload for shell command execution.
+func NewShellExec(command, workDir, description string, timeout int, background bool) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindShellExec,
+		shellExec: &ShellExecPayload{
+			Command:     command,
+			WorkDir:     workDir,
+			Description: description,
+			Timeout:     timeout,
+			Background:  background,
+		},
+	}
+}
+
+// NewCodeSearch creates a NormalizedPayload for code search operations.
+func NewCodeSearch(query, pattern, path, glob string) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindCodeSearch,
+		codeSearch: &CodeSearchPayload{
+			Query:   query,
+			Pattern: pattern,
+			Path:    path,
+			Glob:    glob,
+		},
+	}
+}
+
+// NewGeneric creates a NormalizedPayload for unrecognized tools.
+func NewGeneric(name string, input any) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindGeneric,
+		generic: &GenericPayload{
+			Name:  name,
+			Input: input,
+		},
+	}
+}
+
+// NewMCPTool creates a generic payload with trusted MCP transport provenance.
+func NewMCPTool(name string, input any) *NormalizedPayload {
+	payload := NewGeneric(name, input)
+	payload.mcpTool = true
+	return payload
+}
+
+// NewSubagentTask creates a NormalizedPayload for subagent (Task) tool calls.
+// Result fields (status, agent id, metrics, …) are filled later from the
+// completion tool_call_update via the ACP normalizer's EnrichSubagentResult.
+func NewSubagentTask(description, prompt, subagentType string) *NormalizedPayload {
+	return &NormalizedPayload{
+		kind: ToolKindSubagentTask,
+		subagentTask: &SubagentTaskPayload{
+			Description:  description,
+			Prompt:       prompt,
+			SubagentType: subagentType,
+		},
+	}
+}

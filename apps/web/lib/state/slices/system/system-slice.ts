@@ -1,0 +1,93 @@
+import type { StateCreator } from "zustand";
+import type { SystemSlice, SystemSliceState } from "./types";
+
+export const defaultSystemState: SystemSliceState = {
+  system: {
+    diskUsage: null,
+    database: null,
+    retention: null,
+    backups: { items: [], loaded: false },
+    updates: null,
+    jobs: {},
+    metrics: null,
+    storage: {
+      policy: null,
+      overview: null,
+      analysisRevision: 0,
+      disk: null,
+      diskIdentity: null,
+      runs: [],
+      quarantine: [],
+    },
+  },
+};
+
+type ImmerSet = Parameters<
+  StateCreator<SystemSlice, [["zustand/immer", never]], [], SystemSlice>
+>[0];
+
+export const createSystemSlice: StateCreator<
+  SystemSlice,
+  [["zustand/immer", never]],
+  [],
+  SystemSlice
+> = (set: ImmerSet, _get, _api) => ({
+  ...defaultSystemState,
+  setSystemDiskUsage: (usage) =>
+    set((draft) => {
+      draft.system.diskUsage = usage;
+    }),
+  setSystemDatabase: (stats) =>
+    set((draft) => {
+      draft.system.database = stats;
+    }),
+  setSystemRetention: (status) =>
+    set((draft) => {
+      draft.system.retention = status;
+    }),
+  setSystemBackups: (items) =>
+    set((draft) => {
+      draft.system.backups = { items, loaded: true };
+    }),
+  setSystemUpdates: (updates) =>
+    set((draft) => {
+      draft.system.updates = updates;
+    }),
+  upsertSystemJob: (job) =>
+    set((draft) => {
+      draft.system.jobs[job.id] = job;
+    }),
+  clearSystemJob: (jobId) =>
+    set((draft) => {
+      delete draft.system.jobs[jobId];
+    }),
+  setSystemMetricsSnapshot: (snapshot) =>
+    set((draft) => {
+      draft.system.metrics = snapshot;
+    }),
+  setSystemStoragePolicy: (policy) =>
+    set((draft) => {
+      draft.system.storage.policy = policy;
+    }),
+  setSystemStorageOverview: (overview) =>
+    set((draft) => {
+      draft.system.storage.overview = overview;
+    }),
+  bumpSystemStorageAnalysisRevision: () =>
+    set((draft) => {
+      draft.system.storage.analysisRevision += 1;
+    }),
+  setSystemStorageDisk: (disk, identity) =>
+    set((draft) => {
+      draft.system.storage.disk = disk;
+      draft.system.storage.diskIdentity = identity;
+    }),
+  setSystemStorageRuns: (runs) =>
+    set((draft) => {
+      draft.system.storage.runs = runs;
+    }),
+  setSystemStorageQuarantine: (entries) =>
+    set((draft) => {
+      draft.system.storage.quarantine = entries;
+    }),
+});

@@ -1,0 +1,529 @@
+import type { ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import { renderToStaticMarkup } from "react-dom/server";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const openFile = vi.hoisted(() => vi.fn());
+const appState = vi.hoisted(() => ({
+  value: {
+    tasks: { activeSessionId: "session-1" },
+    taskSessions: {
+      items: {
+        "session-1": {
+          worktree_path: "/root/.kandev/tasks/example/kandev",
+        },
+      } as Record<string, { worktree_path: string; workspace_path?: string }>,
+    },
+  },
+}));
+
+vi.mock("@/components/shared/mermaid-block", () => ({
+  MermaidBlock: ({ code, taskId }: { code: string; taskId?: string | null }) => (
+    <div data-kind="mermaid" data-task-id={taskId ?? undefined}>
+      {code}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/task/chat/messages/code-block", () => ({
+  CodeBlock: ({ children, className }: { children: ReactNode; className?: string }) => (
+    <pre data-kind="block" className={className}>
+      <code>{children}</code>
+    </pre>
+  ),
+}));
+
+vi.mock("@/components/task/chat/messages/inline-code", () => ({
+  InlineCode: ({ children }: { children: ReactNode }) => <code data-kind="inline">{children}</code>,
+}));
+
+vi.mock("@/hooks/use-panel-actions", () => ({
+  usePanelActions: () => ({ openFile }),
+}));
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (state: typeof appState.value) => unknown) => selector(appState.value),
+}));
+
+import {
+  MarkdownFileLinkContext,
+  MarkdownTaskContext,
+  markdownComponents,
+  normalizeMarkdown,
+  rehypePlugins,
+  remarkPlugins,
+  type MarkdownFileLinkContextValue,
+} from "./markdown-components";
+import { MemoizedMarkdown } from "./memoized-markdown";
+
+describe("cached transcript Markdown ownership", () => {
+  afterEach(resetMarkdownComponentTestState);
+
+  it("resolves cached file links through the returning task's current context", () => {
+    const content = "[Open delivery route](src/delivery-route.ts)";
+    const firstOpen = vi.fn();
+    const secondOpen = vi.fn();
+    const first = render(
+      <MemoizedMarkdown content={content} worktreePath="/workspace/first" onOpenFile={firstOpen} />,
+    );
+    fireEvent.click(first.getByText("Open delivery route"));
+    expect(firstOpen).toHaveBeenCalledWith("src/delivery-route.ts");
+    first.unmount();
+
+    const second = render(
+      <MemoizedMarkdown
+        content={content}
+        worktreePath="/workspace/second"
+        onOpenFile={secondOpen}
+      />,
+    );
+    fireEvent.click(second.getByText("Open delivery route"));
+    expect(secondOpen).toHaveBeenCalledWith("src/delivery-route.ts");
+    expect(firstOpen).toHaveBeenCalledOnce();
+  });
+
+  it("binds cached diagram elements to the current task", () => {
+    const content = "```mermaid\ngraph LR\nShipment-->Delivered\n```";
+    const first = render(<MemoizedMarkdown content={content} taskId="task-a" />);
+    expect(first.container.querySelector("[data-task-id]")?.getAttribute("data-task-id")).toBe(
+      "task-a",
+    );
+    first.unmount();
+    const second = render(<MemoizedMarkdown content={content} taskId="task-b" />);
+    expect(second.container.querySelector("[data-task-id]")?.getAttribute("data-task-id")).toBe(
+      "task-b",
+    );
+  });
+});
+
+function renderMarkdown(source: string): string {
+  return renderToStaticMarkup(
+    <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+      {source}
+    </ReactMarkdown>,
+  );
+}
+
+function renderMathMarkdown(source: string): string {
+  return renderToStaticMarkup(
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins}>
+      {source}
+    </ReactMarkdown>,
+  );
+}
+
+function renderTaskMarkdown(source: string, taskId: string): string {
+  return renderToStaticMarkup(
+    <MarkdownTaskContext.Provider value={taskId}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+        {source}
+      </ReactMarkdown>
+    </MarkdownTaskContext.Provider>,
+  );
+}
+
+function Markdown({ children }: { children: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+      {children}
+    </ReactMarkdown>
+  );
+}
+
+function resetMarkdownComponentTestState() {
+  cleanup();
+  openFile.mockClear();
+  appState.value.tasks.activeSessionId = "session-1";
+  appState.value.taskSessions.items = {
+    "session-1": {
+      worktree_path: "/root/.kandev/tasks/example/kandev",
+    },
+  };
+}
+
+const KATEX_CLASS = 'class="katex"';
+const KATEX_DISPLAY_CLASS = 'class="katex-display"';
+
+describe("markdown math", () => {
+  afterEach(resetMarkdownComponentTestState);
+
+  // @covers AC-UI-MARKDOWN-MATH-001.1
+  it("renders inline math through the shared remark plugin list", () => {
+    const html = renderMathMarkdown("Energy: $E = mc^2$");
+
+    expect(html).toContain(KATEX_CLASS);
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-001.2
+  it("renders a single-line double-dollar expression as display math", () => {
+    const html = renderMathMarkdown("$$\\frac{a}{b}$$");
+
+    expect(html).toContain(KATEX_DISPLAY_CLASS);
+    expect(html).toContain('class="frac-line"');
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-002.1, AC-UI-MARKDOWN-MATH-002.2
+  it("keeps currency text literal when a dollar pair contains edge whitespace", () => {
+    const html = renderMathMarkdown("Cost: $100 and $200");
+
+    expect(html).toContain("Cost: $100 and $200");
+    expect(html).not.toContain(KATEX_CLASS);
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-001.2
+  it("renders multiline display math", () => {
+    const html = renderMathMarkdown("$$\n\\frac{a}{b}\n$$");
+
+    expect(html).toContain(KATEX_DISPLAY_CLASS);
+    expect(html).toContain('class="frac-line"');
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-002.1, AC-UI-MARKDOWN-MATH-002.2
+  it("keeps escaped and edge-whitespace dollar pairs literal", () => {
+    const html = renderMathMarkdown(String.raw`\$100 and \$200
+
+$ 100$ and $100 $`);
+
+    expect(html).toContain("$100 and $200");
+    expect(html).toContain("$ 100$ and $100 $");
+    expect(html).not.toContain(KATEX_CLASS);
+  });
+
+  it("keeps source delimiters literal when both math edges contain whitespace", () => {
+    const html = renderMathMarkdown("Literal: $ E = mc^2 $");
+
+    expect(html).toContain("$ E = mc^2 $");
+    expect(html).not.toContain(KATEX_CLASS);
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-002.2
+  it("leaves dollar signs in inline and fenced code literal", () => {
+    const html = renderMathMarkdown("`$E = mc^2$`\n\n```text\n$E = mc^2$\n```");
+
+    expect(html).toContain("$E = mc^2$");
+    expect(html).not.toContain(KATEX_CLASS);
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-001.6
+  it("keeps surrounding prose when TeX is invalid", () => {
+    const html = renderMathMarkdown(String.raw`Before $\notARealCommand$ after`);
+
+    expect(html).toContain("Before");
+    expect(html).toContain("after");
+    expect(html).toContain("notARealCommand");
+  });
+
+  // @covers AC-UI-MARKDOWN-MATH-001.3
+  it("renders math in the memoized chat Markdown renderer", () => {
+    const { container } = render(<MemoizedMarkdown content="Energy: $E = mc^2$" />);
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+});
+
+describe("markdownComponents", () => {
+  afterEach(resetMarkdownComponentTestState);
+
+  it("keeps mermaid keywords in inline code as inline code", () => {
+    const html = renderMarkdown("Metadata comes from `kanban`, `kanbanMulti`, repositories.");
+
+    expect(html).toContain('data-kind="inline"');
+    expect(html).toContain("kanban");
+    expect(html).not.toContain('data-kind="mermaid"');
+  });
+
+  it("renders fenced mermaid code as a mermaid block", () => {
+    const html = renderMarkdown("```mermaid\ngraph LR\nA-->B\n```");
+
+    expect(html).toContain('data-kind="mermaid"');
+    expect(html).toContain("graph LR");
+  });
+
+  it("passes the owning task to a fenced Mermaid block", () => {
+    const html = renderTaskMarkdown("```mermaid\ngraph LR\nA-->B\n```", "task-a");
+
+    expect(html).toContain('data-task-id="task-a"');
+  });
+
+  it("renders non-mermaid fenced code as a code block", () => {
+    const html = renderMarkdown("```ts\nconst source = 'kanban';\n```");
+
+    expect(html).toContain('data-kind="block"');
+    expect(html).toContain("language-ts");
+    expect(html).toContain("const source");
+    expect(html).not.toContain('data-kind="mermaid"');
+  });
+
+  it("opens absolute worktree file links in the editor", () => {
+    render(
+      <Markdown>
+        {"[spec.md](/root/.kandev/tasks/example/kandev/docs/specs/native/spec.md)"}
+      </Markdown>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "spec.md" }));
+
+    expect(openFile).toHaveBeenCalledWith("docs/specs/native/spec.md");
+  });
+
+  it("opens absolute worktree file links with line suffixes in the editor", () => {
+    render(
+      <Markdown>
+        {
+          "[workflow](/root/.kandev/tasks/example/kandev/.github/workflows/opencode-code-review.yml:1)"
+        }
+      </Markdown>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "workflow" }));
+
+    expect(openFile).toHaveBeenCalledWith(".github/workflows/opencode-code-review.yml");
+  });
+
+  it("opens relative file links in the editor", () => {
+    render(<Markdown>{"[plan.md](docs/specs/native/plan.md)"}</Markdown>);
+
+    const link = screen.getByRole("link", { name: "plan.md" });
+    expect(link.getAttribute("target")).toBe("_self");
+
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("docs/specs/native/plan.md");
+  });
+
+  it("opens repo-root file links in the editor", () => {
+    render(<Markdown>{"[migration](/docs/nextjs-spa-migration.md)"}</Markdown>);
+
+    const link = screen.getByRole("link", { name: "migration" });
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("docs/nextjs-spa-migration.md");
+  });
+
+  it("opens repo-root file links with line and column suffixes in the editor", () => {
+    render(<Markdown>{"[migration](/docs/nextjs-spa-migration.md:12:3)"}</Markdown>);
+
+    fireEvent.click(screen.getByRole("link", { name: "migration" }));
+
+    expect(openFile).toHaveBeenCalledWith("docs/nextjs-spa-migration.md");
+  });
+
+  it("opens repo-root file links when no worktree path is available", () => {
+    appState.value.taskSessions.items = {};
+
+    render(<Markdown>{"[migration](/docs/nextjs-spa-migration.md)"}</Markdown>);
+
+    fireEvent.click(screen.getByRole("link", { name: "migration" }));
+
+    expect(openFile).toHaveBeenCalledWith("docs/nextjs-spa-migration.md");
+  });
+
+  it("does not open host-absolute file links outside the worktree", () => {
+    render(<Markdown>{"[secret](/root/other-project/secret.md)"}</Markdown>);
+
+    fireEvent.click(screen.getByRole("link", { name: "secret" }));
+
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("does not treat sibling workspace paths as repo-root file links", () => {
+    appState.value.taskSessions.items["session-1"].worktree_path = "/workspace/current-project";
+
+    render(<Markdown>{"[schema](/workspace/sibling-project/schema.prisma)"}</Markdown>);
+
+    fireEvent.click(screen.getByRole("link", { name: "schema" }));
+
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("does not open Windows drive-letter absolute file links", () => {
+    render(<Markdown>{"[hosts](/C:/Windows/System32/drivers/etc/hosts)"}</Markdown>);
+
+    const link = screen.getByRole("link", { name: "hosts" });
+    fireEvent.click(link);
+
+    expect(openFile).not.toHaveBeenCalled();
+    expect(link.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("does not treat bare domains as relative file links", () => {
+    render(<Markdown>{"[service](api.service.com)"}</Markdown>);
+
+    const link = screen.getByRole("link", { name: "service" });
+    link.addEventListener("click", (event) => event.preventDefault());
+    fireEvent.click(link);
+
+    expect(openFile).not.toHaveBeenCalled();
+    expect(link.getAttribute("target")).toBe("_blank");
+  });
+});
+
+describe("markdownComponents registered source links", () => {
+  afterEach(resetMarkdownComponentTestState);
+
+  it("opens registered repository paths through the active task worktree", () => {
+    const fileLinkContext: MarkdownFileLinkContextValue = {
+      worktreePath: "/root/.kandev/tasks/example",
+      onOpenFile: openFile,
+      fileRootAliases: [
+        {
+          repositoryId: "repo-1",
+          sourceRoot: "/home/jcfs/kandev-plugins/project",
+          workspaceRelativeRoot: "kandev",
+        },
+      ],
+    };
+
+    render(
+      <MarkdownFileLinkContext.Provider value={fileLinkContext}>
+        <Markdown>{"[bundle](/home/jcfs/kandev-plugins/project/ui/bundle.js:61)"}</Markdown>
+      </MarkdownFileLinkContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "bundle" }));
+
+    expect(openFile).toHaveBeenCalledWith("kandev/ui/bundle.js");
+  });
+
+  it("keeps an unmatched host path inert", () => {
+    render(<Markdown>{"[secret](/home/other-project/secret.md)"}</Markdown>);
+
+    const link = screen.getByRole("link", { name: "secret" });
+    expect(fireEvent.click(link)).toBe(false);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(link.getAttribute("aria-disabled")).toBe("true");
+  });
+});
+
+describe("markdownComponents workspace roots", () => {
+  afterEach(resetMarkdownComponentTestState);
+
+  it("opens multi-repository absolute links relative to the task workspace root", () => {
+    appState.value.taskSessions.items["session-1"].workspace_path = "/root/.kandev/tasks/example";
+    render(
+      <Markdown>
+        {
+          "[primary](/root/.kandev/tasks/example/kandev/docs/specs/native/spec.md) [sibling](/root/.kandev/tasks/example/plugin/ui/bundle.js)"
+        }
+      </Markdown>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "primary" }));
+    fireEvent.click(screen.getByRole("link", { name: "sibling" }));
+
+    expect(openFile).toHaveBeenNthCalledWith(1, "kandev/docs/specs/native/spec.md");
+    expect(openFile).toHaveBeenNthCalledWith(2, "plugin/ui/bundle.js");
+  });
+});
+
+describe("markdownComponents omp read selectors", () => {
+  afterEach(() => {
+    cleanup();
+    openFile.mockClear();
+    appState.value.tasks.activeSessionId = "session-1";
+    appState.value.taskSessions.items = {
+      "session-1": { worktree_path: "/root/.kandev/tasks/example/kandev" },
+    };
+  });
+
+  it("opens file links with omp range selectors in the editor", () => {
+    render(<Markdown>{"[readme](docs/README.md:16-20)"}</Markdown>);
+    fireEvent.click(screen.getByRole("link", { name: "readme" }));
+    expect(openFile).toHaveBeenCalledWith("docs/README.md");
+  });
+
+  it("opens file links with omp multi-range and mode selectors in the editor", () => {
+    render(<Markdown>{"[readme](docs/README.md:5-16,960-973:raw)"}</Markdown>);
+    fireEvent.click(screen.getByRole("link", { name: "readme" }));
+    expect(openFile).toHaveBeenCalledWith("docs/README.md");
+  });
+});
+
+describe("normalizeMarkdown", () => {
+  it("splits a glued 4-backtick close", () => {
+    const input = "````go\nfunc f() {\n  ...\n}````\nprose continues here";
+    const expected = "````go\nfunc f() {\n  ...\n}\n````\nprose continues here";
+    expect(normalizeMarkdown(input)).toBe(expected);
+  });
+
+  it("splits a glued 3-backtick close", () => {
+    const input = "```go\nfunc f() {}```\nprose";
+    const expected = "```go\nfunc f() {}\n```\nprose";
+    expect(normalizeMarkdown(input)).toBe(expected);
+  });
+
+  it("leaves a valid fence (close on its own line) unchanged", () => {
+    const input = "```go\nfunc f() {}\n```\nprose";
+    expect(normalizeMarkdown(input)).toBe(input);
+  });
+
+  it("leaves inline-code prose outside any fence unchanged", () => {
+    const input = "Use `code` inline in a paragraph.";
+    expect(normalizeMarkdown(input)).toBe(input);
+  });
+
+  it("does not split when trailing run is shorter than opener", () => {
+    // Opens with 4, line ends with 3 — those 3 backticks would not close, so
+    // we must not split. The parser will keep gobbling, but at least we don't
+    // invent a false close.
+    const input = "````go\nfunc f() {}```\nstill code";
+    expect(normalizeMarkdown(input)).toBe(input);
+  });
+
+  it("splits only the malformed fence when multiple fences appear", () => {
+    const input = ["```go", "func f() {}```", "prose", "", "```ts", "const x = 1;", "```"].join(
+      "\n",
+    );
+    const expected = [
+      "```go",
+      "func f() {}",
+      "```",
+      "prose",
+      "",
+      "```ts",
+      "const x = 1;",
+      "```",
+    ].join("\n");
+    expect(normalizeMarkdown(input)).toBe(expected);
+  });
+
+  it("handles up to 3 leading spaces on the opener", () => {
+    const input = "   ```go\nfunc f() {}```\nprose";
+    const expected = "   ```go\nfunc f() {}\n```\nprose";
+    expect(normalizeMarkdown(input)).toBe(expected);
+  });
+
+  it("returns pure prose unchanged", () => {
+    const input = "Just some paragraph text with no fences.\nSecond line.";
+    expect(normalizeMarkdown(input)).toBe(input);
+  });
+
+  it("returns empty and single-line input unchanged", () => {
+    expect(normalizeMarkdown("")).toBe("");
+    expect(normalizeMarkdown("single line")).toBe("single line");
+  });
+
+  it("preserves a trailing newline if present", () => {
+    const input = "```go\nx```\nprose\n";
+    const expected = "```go\nx\n```\nprose\n";
+    expect(normalizeMarkdown(input)).toBe(expected);
+  });
+
+  it("renders malformed fence + prose as two code blocks plus a paragraph", () => {
+    const malformed = "```go\nfunc f() {}```\nprose continues here\n```ts\nconst x = 1;\n```";
+    const htmlRaw = renderMarkdown(malformed);
+    const htmlFixed = renderMarkdown(normalizeMarkdown(malformed));
+
+    // Without normalization the parser swallows the prose into one code node.
+    const rawBlockCount = (htmlRaw.match(/data-kind="block"/g) ?? []).length;
+    const fixedBlockCount = (htmlFixed.match(/data-kind="block"/g) ?? []).length;
+    expect(fixedBlockCount).toBeGreaterThan(rawBlockCount);
+    expect(fixedBlockCount).toBe(2);
+
+    // Prose paragraph is visible as its own node, not inside a code block.
+    expect(htmlFixed).toContain("prose continues here");
+    expect(htmlFixed).toContain("language-go");
+    expect(htmlFixed).toContain("language-ts");
+  });
+});

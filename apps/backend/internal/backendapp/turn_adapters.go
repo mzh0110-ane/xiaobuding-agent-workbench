@@ -1,0 +1,396 @@
+package backendapp
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"go.uber.org/zap"
+
+	settingsstore "github.com/kandev/kandev/internal/agent/settings/store"
+	"github.com/kandev/kandev/internal/automation"
+	"github.com/kandev/kandev/internal/azuredevops"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/github"
+	"github.com/kandev/kandev/internal/task/models"
+	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	taskservice "github.com/kandev/kandev/internal/task/service"
+	workflowservice "github.com/kandev/kandev/internal/workflow/service"
+)
+
+// turnServiceAdapter adapts the task service to the orchestrator.TurnService interface.
+type turnServiceAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *turnServiceAdapter) StartTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return a.svc.StartTurn(ctx, sessionID)
+}
+
+func (a *turnServiceAdapter) ReserveTurn(
+	ctx context.Context,
+	sessionID string,
+	recovery *models.PromptDispatchRecovery,
+) (*models.Turn, error) {
+	return a.svc.ReserveTurn(ctx, sessionID, recovery)
+}
+
+func (a *turnServiceAdapter) PublishReservedTurn(ctx context.Context, turn *models.Turn) error {
+	return a.svc.PublishReservedTurn(ctx, turn)
+}
+
+func (a *turnServiceAdapter) MarkReservedTurnDispatchAttempted(ctx context.Context, turn *models.Turn) error {
+	return a.svc.MarkReservedTurnDispatchAttempted(ctx, turn)
+}
+
+func (a *turnServiceAdapter) RollbackReservedTurn(
+	ctx context.Context,
+	sessionID, turnID string,
+) (bool, error) {
+	return a.svc.RollbackReservedTurn(ctx, sessionID, turnID)
+}
+
+func (a *turnServiceAdapter) ReconcileUnpublishedPromptTurns(ctx context.Context) (int, error) {
+	return a.svc.ReconcileUnpublishedPromptTurns(ctx)
+}
+
+func (a *turnServiceAdapter) CompleteTurn(ctx context.Context, turnID string) error {
+	return a.svc.CompleteTurn(ctx, turnID)
+}
+
+func (a *turnServiceAdapter) GetTurn(ctx context.Context, turnID string) (*models.Turn, error) {
+	return a.svc.GetTurn(ctx, turnID)
+}
+
+func (a *turnServiceAdapter) GetActiveTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return a.svc.GetActiveTurn(ctx, sessionID)
+}
+
+func (a *turnServiceAdapter) UpdateTurn(ctx context.Context, turn *models.Turn) error {
+	return a.svc.UpdateTurn(ctx, turn)
+}
+
+func (a *turnServiceAdapter) PatchTurnMetadata(
+	ctx context.Context,
+	sessionID, turnID string,
+	updates map[string]interface{},
+) error {
+	return a.svc.PatchTurnMetadata(ctx, sessionID, turnID, updates)
+}
+
+func (a *turnServiceAdapter) AbandonOpenTurns(ctx context.Context, sessionID string) error {
+	return a.svc.AbandonOpenTurns(ctx, sessionID)
+}
+
+func newTurnServiceAdapter(svc *taskservice.Service) *turnServiceAdapter {
+	return &turnServiceAdapter{svc: svc}
+}
+
+// taskSessionCheckerAdapter adapts the task repository for github.TaskSessionChecker.
+type taskSessionCheckerAdapter struct {
+	repo interface {
+		ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error)
+		ListMessages(ctx context.Context, sessionID string) ([]*models.Message, error)
+	}
+}
+
+// HasUserAuthoredMessage reports whether the user has authored any message
+// on this task that wasn't created by an automated trigger (workflow
+// auto-start, PR/issue watch, Jira/Linear integration). Auto-start messages
+// are tagged with metadata.auto_start = true; the check ignores them so a
+// task whose only "user" message is the agent's auto-injected prompt counts
+// as untouched and is eligible for cleanup when its PR/issue merges.
+func (a *taskSessionCheckerAdapter) HasUserAuthoredMessage(ctx context.Context, taskID string) (bool, error) {
+	sessions, err := a.repo.ListTaskSessions(ctx, taskID)
+	if err != nil {
+		return false, wrapGitHubTaskSessionCheckerError(err)
+	}
+	for _, sess := range sessions {
+		messages, err := a.repo.ListMessages(ctx, sess.ID)
+		if err != nil {
+			return false, wrapGitHubTaskSessionCheckerError(err)
+		}
+		for _, m := range messages {
+			if m.AuthorType != models.MessageAuthorUser {
+				continue
+			}
+			// New code paths tag both auto_start and workflow_auto_start.
+			// Legacy rows (pre-cleanup-policy upgrade) carry only the
+			// workflow_auto_start tag from the old recordAutoStartMessage
+			// implementation — recognize it too so the install-wide
+			// cleanup button actually drains piled-up tasks after upgrade.
+			if metaFlag(m.Metadata, "auto_start") || metaFlag(m.Metadata, "workflow_auto_start") {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func wrapGitHubTaskSessionCheckerError(err error) error {
+	if errors.Is(err, taskrepo.ErrTaskNotFound) {
+		return fmt.Errorf("%w: %w", github.ErrTaskNotFound, err)
+	}
+	return err
+}
+
+// metaFlag returns true when meta[key] is a bool with value true. Returns
+// false for missing keys, nil maps, non-bool values, and false values.
+func metaFlag(meta map[string]interface{}, key string) bool {
+	v, ok := meta[key].(bool)
+	return ok && v
+}
+
+// taskDeleterAdapter satisfies github.TaskDeleter and translates the task
+// repository's ErrTaskNotFound sentinel to github.ErrTaskNotFound so the
+// github cleanup paths can classify the "already gone" case via errors.Is
+// without importing the task repository's package.
+type taskDeleterAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *taskDeleterAdapter) DeleteTask(ctx context.Context, taskID string) error {
+	return a.translateDeleteErr(a.svc.DeleteTaskWithLifecycle(ctx, taskID))
+}
+
+// DeleteTaskWithReason satisfies github.TaskDeleterWithReason so cleanup
+// attribution survives the lifecycle coordinator when one is configured.
+func (a *taskDeleterAdapter) DeleteTaskWithReason(ctx context.Context, taskID, reason string) error {
+	return a.translateDeleteErr(a.svc.DeleteTaskWithLifecycleAndReason(ctx, taskID, reason))
+}
+
+// translateDeleteErr maps the task repository's ErrTaskNotFound sentinel to
+// github.ErrTaskNotFound so cleanup can classify the "already gone" case.
+func (a *taskDeleterAdapter) translateDeleteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, taskrepo.ErrTaskNotFound) {
+		return fmt.Errorf("%w: %w", github.ErrTaskNotFound, err)
+	}
+	return err
+}
+
+// automationTaskDeleterAdapter satisfies automation.TaskDeleter and
+// translates the task repository's ErrTaskNotFound sentinel to
+// automation.ErrTaskNotFound so the automation run-cleanup paths can
+// classify the "already gone" case via errors.Is without importing the task
+// repository's package.
+// automationWorkflowLocatorAdapter lets the automation service verify that a
+// workflow belongs to the workspace an automation is saved into, without the
+// automation package importing the task service.
+type automationWorkflowLocatorAdapter struct {
+	svc       *taskservice.Service
+	workflows *workflowservice.Service
+}
+
+func (a *automationWorkflowLocatorAdapter) WorkflowWorkspaceID(ctx context.Context, workflowID string) (string, error) {
+	wf, err := a.svc.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return "", err
+	}
+	if wf == nil {
+		return "", nil
+	}
+	return wf.WorkspaceID, nil
+}
+
+// WorkflowStepBelongs satisfies automation.WorkflowStepLocator. Workflow
+// ownership and step ownership are checked together so a crafted automation
+// request cannot pair a valid workflow with a step from another workflow.
+func (a *automationWorkflowLocatorAdapter) WorkflowStepBelongs(ctx context.Context, workspaceID, workflowID, stepID string) (bool, error) {
+	wf, err := a.svc.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return false, err
+	}
+	if wf == nil || wf.WorkspaceID != workspaceID {
+		return false, nil
+	}
+	if a.workflows == nil {
+		return false, fmt.Errorf("workflow step lookup is unavailable")
+	}
+	step, err := a.workflows.GetStep(ctx, stepID)
+	if err != nil {
+		return false, err
+	}
+	return step != nil && step.WorkflowID == workflowID, nil
+}
+
+// automationAgentProfileLookupAdapter satisfies automation.AgentProfileLookup
+// over the agent settings store, so the automation service can refuse a
+// binding to a profile that isn't there without importing the settings
+// controller that already imports it.
+//
+// GetAgentProfile filters soft-deleted rows and reports a miss as
+// sql.ErrNoRows, which is the only shape translated to (false, nil). Every
+// other error is returned verbatim so a driver failure is never mistaken for a
+// deleted profile — the service surfaces it instead of rejecting the binding.
+type automationAgentProfileLookupAdapter struct {
+	store settingsstore.Repository
+}
+
+func (a *automationAgentProfileLookupAdapter) AgentProfileExists(ctx context.Context, profileID string) (bool, error) {
+	profile, err := a.store.GetAgentProfile(ctx, profileID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return profile != nil, nil
+}
+
+type automationTaskDeleterAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *automationTaskDeleterAdapter) DeleteTask(ctx context.Context, taskID string) error {
+	err := a.svc.DeleteTaskWithLifecycle(ctx, taskID)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, taskrepo.ErrTaskNotFound) {
+		return fmt.Errorf("%w: %w", automation.ErrTaskNotFound, err)
+	}
+	return err
+}
+
+type taskOriginGetter interface {
+	GetTask(ctx context.Context, id string) (*models.Task, error)
+}
+
+// automationTaskOriginLookupAdapter satisfies automation.TaskOriginLookup.
+// It resolves a task's workspace and whether it was created by an automation
+// run so the github_pr_merged subscriber can skip automation-spawned tasks
+// (loop-guard) and scope workspace matching without importing the task service
+// into the automation package.
+type automationTaskOriginLookupAdapter struct {
+	svc taskOriginGetter
+	log *logger.Logger
+}
+
+func (a *automationTaskOriginLookupAdapter) TaskWorkspaceAndAutomationOrigin(ctx context.Context, taskID string) (string, bool, bool) {
+	task, err := a.svc.GetTask(ctx, taskID)
+	if err != nil {
+		a.log.Warn("task origin lookup failed", zap.String("task_id", taskID), zap.Error(err))
+		return "", false, false
+	}
+	if task == nil {
+		a.log.Debug("task not found for origin lookup", zap.String("task_id", taskID))
+		return "", false, false
+	}
+	return task.WorkspaceID, task.Origin == models.TaskOriginAutomationRun, true
+}
+
+// automationExportWorkspaceLookupAdapter satisfies automation.ExportWorkspaceLookup
+// over the task service's GetWorkspace, which already returns
+// repoerrors.ErrWorkspaceNotFound (wrapped) both for a missing row and for a
+// workspace the caller's scoped identity cannot see - exactly the
+// errors.Is-classifiable shape AC-44 step 2 needs, with no translation
+// required.
+type automationExportWorkspaceLookupAdapter struct {
+	svc *taskservice.Service
+}
+
+func (a *automationExportWorkspaceLookupAdapter) WorkspaceExists(ctx context.Context, workspaceID string) error {
+	_, err := a.svc.GetWorkspace(ctx, workspaceID)
+	return err
+}
+
+// repositoryLookupAdapter satisfies the linear/jira/sentry RepositoryLookup
+// interface over the task service. It is the validation seam for a watcher's
+// optional repository binding. The task service's GetRepository filters
+// soft-deleted rows and errors on a miss, so a missing or deleted repository
+// maps to ok=false and watcher create/update rejects the binding.
+type repositoryLookupAdapter struct {
+	svc *taskservice.Service
+}
+
+type gitLabWatchDependencyValidator struct {
+	tasks     *taskservice.Service
+	workflows *workflowservice.Service
+	agents    settingsstore.Repository
+}
+
+func (v *gitLabWatchDependencyValidator) WorkflowStepBelongs(ctx context.Context, workspaceID, workflowID, stepID string) (bool, error) {
+	workflow, err := v.tasks.GetWorkflow(ctx, workflowID)
+	if err != nil || workflow == nil || workflow.WorkspaceID != workspaceID {
+		return false, nil
+	}
+	step, err := v.workflows.GetStep(ctx, stepID)
+	if err != nil || step == nil {
+		return false, nil
+	}
+	return step.WorkflowID == workflowID, nil
+}
+
+func (v *gitLabWatchDependencyValidator) AgentProfileBelongs(ctx context.Context, workspaceID string, profileID string) (bool, error) {
+	profile, err := v.agents.GetAgentProfile(ctx, profileID)
+	if err != nil || profile == nil {
+		return false, nil
+	}
+	return profile.WorkspaceID == "" || profile.WorkspaceID == workspaceID, nil
+}
+
+func (v *gitLabWatchDependencyValidator) ExecutorProfileBelongs(ctx context.Context, _ string, profileID string) (bool, error) {
+	profile, err := v.tasks.GetExecutorProfile(ctx, profileID)
+	return err == nil && profile != nil, nil
+}
+
+func (a *repositoryLookupAdapter) GetRepository(ctx context.Context, id string) (string, string, bool) {
+	repo, err := a.svc.GetRepository(ctx, id)
+	if err != nil || repo == nil {
+		return "", "", false
+	}
+	return repo.WorkspaceID, repo.DefaultBranch, true
+}
+
+// LookupTaskRepository resolves provider metadata only when repositoryID is
+// linked to taskID. Azure association validation fails closed on a nil result.
+func (a *repositoryLookupAdapter) LookupTaskRepository(
+	ctx context.Context,
+	taskID, repositoryID string,
+) (*azuredevops.RepositoryBinding, error) {
+	task, err := a.svc.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	linked := false
+	for _, taskRepository := range task.Repositories {
+		if taskRepository != nil && taskRepository.RepositoryID == repositoryID {
+			linked = true
+			break
+		}
+	}
+	if !linked {
+		return nil, nil
+	}
+	repository, err := a.svc.GetRepository(ctx, repositoryID)
+	if err != nil {
+		return nil, err
+	}
+	return &azuredevops.RepositoryBinding{
+		WorkspaceID: repository.WorkspaceID, Provider: repository.Provider,
+		ProviderOwner: repository.ProviderOwner, ProviderRepoID: repository.ProviderRepoID,
+	}, nil
+}
+
+// RepositoryExists satisfies orchestrator.RepositoryChecker. It uses the
+// workspace listing (which excludes soft-deleted repos) so a definitive
+// "absent" is distinguishable from a transient error: a non-nil err lets the
+// dispatch pre-flight fail open, while (false, nil) means the bound repository
+// was removed and the watcher should self-heal.
+func (a *repositoryLookupAdapter) RepositoryExists(ctx context.Context, workspaceID, repositoryID string) (bool, error) {
+	repos, err := a.svc.ListRepositories(ctx, workspaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, repo := range repos {
+		if repo.ID == repositoryID {
+			return true, nil
+		}
+	}
+	return false, nil
+}

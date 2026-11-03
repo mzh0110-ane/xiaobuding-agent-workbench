@@ -1,0 +1,296 @@
+"use client";
+
+import { memo, useCallback } from "react";
+import {
+  IconSettings,
+  IconX,
+  IconLayoutColumns,
+  IconLayoutRows,
+  IconTextWrap,
+  IconRoute,
+} from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@kandev/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { Checkbox } from "@kandev/ui/checkbox";
+import type { ReviewComment } from "@/lib/state/slices/comments";
+import { useAppStore } from "@/components/state-provider";
+import { useTaskReview } from "@/hooks/domains/review/use-task-review";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import { updateUserSettings } from "@/lib/api";
+import { VcsSplitButton } from "@/components/vcs-split-button";
+import { isRunActive } from "@/lib/review/findings";
+import { FixCommentsButton } from "./review-fix-comments-button";
+import { ReviewRunButton } from "./review-run-button";
+import { ReviewFindingsButton } from "./review-findings-button";
+import { ReviewPRSelector } from "./review-pr-selector";
+import type { TaskPR } from "@/lib/types/github";
+import { useTranslation } from "react-i18next";
+
+type ReviewTopBarProps = {
+  sessionId: string;
+  reviewedCount: number;
+  totalCount: number;
+  commentCount: number;
+  baseBranch?: string;
+  splitView: boolean;
+  onToggleSplitView: (split: boolean) => void;
+  wordWrap: boolean;
+  onToggleWordWrap: (wrap: boolean) => void;
+  onSendComments: (comments: ReviewComment[]) => void;
+  onClose: () => void;
+  /** Selects a file in the review diff — used to jump to a finding's file. */
+  onSelectFile: (fileKey: string) => void;
+  onRequestWalkthrough?: () => void;
+  requestWalkthroughDisabled?: boolean;
+  getPendingComments: () => ReviewComment[];
+  markCommentsSent: (ids: string[]) => void;
+  prs: TaskPR[];
+  selectedPR: TaskPR | null;
+  onSelectPR?: (pr: TaskPR) => void;
+  prDiffLoading: boolean;
+};
+
+function sendAutoMarkSetting(checked: boolean) {
+  const payload = { review_auto_mark_on_scroll: checked };
+  const client = getWebSocketClient();
+  if (client) {
+    client.request("user.settings.update", payload).catch(() => {
+      updateUserSettings(payload, { cache: "no-store" }).catch(() => {});
+    });
+  } else {
+    updateUserSettings(payload, { cache: "no-store" }).catch(() => {});
+  }
+}
+
+type ReviewSettingsMenuProps = {
+  reviewAutoMarkOnScroll: boolean;
+  onToggleAutoMark: (checked: boolean) => void;
+};
+
+function ReviewSettingsMenu({ reviewAutoMarkOnScroll, onToggleAutoMark }: ReviewSettingsMenuProps) {
+  const { t } = useTranslation();
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="sm" variant="ghost" className="px-2 cursor-pointer">
+          <IconSettings className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-64">
+        <DropdownMenuItem
+          className="cursor-pointer gap-2"
+          onSelect={(e) => {
+            e.preventDefault();
+            onToggleAutoMark(!reviewAutoMarkOnScroll);
+          }}
+        >
+          <Checkbox checked={reviewAutoMarkOnScroll} className="pointer-events-none" />
+          <span className="text-sm flex-1">{t("review:autoMarkReviewedOnScroll")}</span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+type ReviewProgressProps = { reviewedCount: number; totalCount: number };
+
+function ReviewProgress({ reviewedCount, totalCount }: ReviewProgressProps) {
+  const { t } = useTranslation();
+  const progressPercent = totalCount > 0 ? (reviewedCount / totalCount) * 100 : 0;
+  return (
+    <div className="flex items-center gap-2 flex-1 min-w-0 overflow-hidden">
+      <div className="flex-1 h-2 rounded-full bg-muted overflow-hidden max-w-[200px]">
+        <div
+          className="h-full bg-primary rounded-full transition-all duration-300"
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
+      <span className="text-xs text-muted-foreground truncate">
+        {t("review:filesReviewed", { reviewedCount, totalCount })}
+      </span>
+    </div>
+  );
+}
+
+function ReviewDisplayControls({
+  wordWrap,
+  splitView,
+  onToggleWordWrap,
+  onToggleSplitView,
+}: Pick<ReviewTopBarProps, "wordWrap" | "splitView" | "onToggleWordWrap" | "onToggleSplitView">) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={`px-2 cursor-pointer ${wordWrap ? "bg-muted" : ""}`}
+            onClick={() => onToggleWordWrap(!wordWrap)}
+          >
+            <IconTextWrap className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("review:toggleWordWrap")}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="px-2 cursor-pointer"
+            onClick={() => onToggleSplitView(!splitView)}
+          >
+            {splitView ? (
+              <IconLayoutRows className="h-4 w-4" />
+            ) : (
+              <IconLayoutColumns className="h-4 w-4" />
+            )}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {splitView ? t("review:switchToUnifiedView") : t("review:switchToSplitView")}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  );
+}
+
+function ReviewWalkthroughButton({
+  onRequestWalkthrough,
+  disabled,
+}: {
+  onRequestWalkthrough: (() => void) | undefined;
+  disabled?: boolean;
+}) {
+  const { t } = useTranslation();
+  if (!onRequestWalkthrough) return null;
+  const tooltip = disabled
+    ? t("review:loadingChangedFiles")
+    : t("review:walkMeThroughTheseChanges");
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className="inline-flex"
+          tabIndex={disabled ? 0 : undefined}
+          aria-label={disabled ? tooltip : undefined}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            className="px-2 cursor-pointer"
+            aria-label={t("review:walkMeThroughTheseReviewChanges")}
+            data-testid="review-request-walkthrough"
+            disabled={disabled}
+            onClick={onRequestWalkthrough}
+          >
+            <IconRoute className="h-4 w-4" />
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export const ReviewTopBar = memo(function ReviewTopBar({
+  sessionId,
+  reviewedCount,
+  totalCount,
+  commentCount,
+  baseBranch,
+  splitView,
+  onToggleSplitView,
+  wordWrap,
+  onToggleWordWrap,
+  onSendComments,
+  onClose,
+  onSelectFile,
+  onRequestWalkthrough,
+  requestWalkthroughDisabled,
+  getPendingComments,
+  markCommentsSent,
+  prs,
+  selectedPR,
+  onSelectPR,
+  prDiffLoading,
+}: ReviewTopBarProps) {
+  const { t } = useTranslation();
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const { activeRun, findings } = useTaskReview(activeTaskId);
+  const reviewRunning = isRunActive(activeRun);
+  const reviewAutoMarkOnScroll = useAppStore((state) => state.userSettings.reviewAutoMarkOnScroll);
+  const setUserSettings = useAppStore((state) => state.setUserSettings);
+  const userSettings = useAppStore((state) => state.userSettings);
+
+  const handleFixComments = useCallback(() => {
+    const comments = getPendingComments();
+    if (comments.length === 0) return;
+    onSendComments(comments);
+    markCommentsSent(comments.map((c) => c.id));
+  }, [getPendingComments, onSendComments, markCommentsSent]);
+
+  const handleToggleAutoMark = useCallback(
+    (checked: boolean) => {
+      setUserSettings({ ...userSettings, reviewAutoMarkOnScroll: checked });
+      sendAutoMarkSetting(checked);
+    },
+    [userSettings, setUserSettings],
+  );
+
+  return (
+    <div className="flex min-h-[48px] flex-wrap items-center gap-2 border-b border-border bg-card/50 px-2 py-2 sm:gap-3 sm:px-4">
+      <ReviewSettingsMenu
+        reviewAutoMarkOnScroll={reviewAutoMarkOnScroll}
+        onToggleAutoMark={handleToggleAutoMark}
+      />
+      {onSelectPR && (
+        <ReviewPRSelector
+          prs={prs}
+          selectedPR={selectedPR}
+          loading={prDiffLoading}
+          onSelectPR={onSelectPR}
+          className="order-first w-full sm:order-none sm:w-auto"
+        />
+      )}
+      <ReviewProgress reviewedCount={reviewedCount} totalCount={totalCount} />
+      <ReviewDisplayControls
+        wordWrap={wordWrap}
+        splitView={splitView}
+        onToggleWordWrap={onToggleWordWrap}
+        onToggleSplitView={onToggleSplitView}
+      />
+      {commentCount > 0 && (
+        <FixCommentsButton
+          commentCount={commentCount}
+          getPendingComments={getPendingComments}
+          onFixComments={handleFixComments}
+        />
+      )}
+      <ReviewRunButton taskId={activeTaskId} sessionId={sessionId} activeRun={activeRun} />
+      {!reviewRunning && <ReviewFindingsButton findings={findings} onSelectFile={onSelectFile} />}
+      <ReviewWalkthroughButton
+        onRequestWalkthrough={onRequestWalkthrough}
+        disabled={requestWalkthroughDisabled}
+      />
+      <VcsSplitButton sessionId={sessionId} baseBranch={baseBranch} />
+      <Button
+        size="sm"
+        variant="ghost"
+        className="px-2 cursor-pointer"
+        onClick={onClose}
+        aria-label={t("review:closeReview")}
+      >
+        <IconX className="h-4 w-4" />
+      </Button>
+    </div>
+  );
+});

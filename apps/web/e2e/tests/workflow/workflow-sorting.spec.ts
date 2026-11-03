@@ -1,0 +1,133 @@
+import { test, expect } from "../../fixtures/test-base";
+import { WorkflowSettingsPage } from "../../pages/workflow-settings-page";
+
+test.describe("Workflow sorting", () => {
+  test("API reorder persists workflow order", async ({ apiClient, seedData }) => {
+    const { workspaceId } = seedData;
+    await apiClient.e2eReset(workspaceId, [seedData.workflowId]);
+
+    // Create every workflow asserted by this API-only test. The seeded
+    // workflow belongs to the worker fixture and can be removed by an earlier
+    // API-only reset because `testPage` (which normally resets state) is lazy.
+    const wfA = await apiClient.createWorkflow(workspaceId, "Workflow A", "simple");
+    const wfB = await apiClient.createWorkflow(workspaceId, "Workflow B", "simple");
+    const wfC = await apiClient.createWorkflow(workspaceId, "Workflow C", "simple");
+    const expectedIds = [wfA.id, wfB.id, wfC.id];
+    const workflowIds = new Set(expectedIds);
+
+    // Verify initial order: sorted by sort_order ASC (0, 1, 2)
+    const before = await apiClient.listWorkflows(workspaceId);
+    const idsBefore = before.workflows
+      .map((workflow) => workflow.id)
+      .filter((id) => workflowIds.has(id));
+    expect(idsBefore).toEqual(expectedIds);
+
+    // Reorder: C, A, B
+    await apiClient.reorderWorkflows(workspaceId, [wfC.id, wfA.id, wfB.id]);
+
+    // Verify new order persists
+    const after = await apiClient.listWorkflows(workspaceId);
+    const idsAfter = after.workflows
+      .map((workflow) => workflow.id)
+      .filter((id) => workflowIds.has(id));
+    expect(idsAfter).toEqual([wfC.id, wfA.id, wfB.id]);
+  });
+
+  test("settings page displays workflows in sort order", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const { workspaceId } = seedData;
+
+    // Create a second workflow
+    const wfExtra = await apiClient.createWorkflow(workspaceId, "Extra Workflow", "simple");
+
+    // Reorder: Extra first, then E2E
+    await apiClient.reorderWorkflows(workspaceId, [wfExtra.id, seedData.workflowId]);
+
+    // Navigate to settings page
+    const page = new WorkflowSettingsPage(testPage);
+    await page.goto(workspaceId);
+
+    // Verify order matches API reorder
+    const order = await page.getWorkflowOrder();
+    expect(order.filter((name) => name === "Extra Workflow" || name === "E2E Workflow")).toEqual([
+      "Extra Workflow",
+      "E2E Workflow",
+    ]);
+  });
+
+  test("settings page places workflow drag handles inside cards without a list gutter", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const { workspaceId } = seedData;
+
+    // Create a second workflow so drag handles appear
+    await apiClient.createWorkflow(workspaceId, "Second Workflow", "simple");
+
+    const page = new WorkflowSettingsPage(testPage);
+    await page.goto(workspaceId);
+
+    const card = await page.findWorkflowCard("E2E Workflow");
+    const handle = page.dragHandle(seedData.workflowId);
+    const list = testPage.getByTestId("workflow-order-list");
+    const handles = testPage.locator('[data-testid^="workflow-drag-handle-"]');
+    await expect(handle).toBeVisible();
+    await expect(handle).toHaveAccessibleName("Reorder E2E Workflow");
+    expect(await handles.count()).toBeGreaterThanOrEqual(2);
+
+    const [cardBox, handleBox, listBox] = await Promise.all([
+      card.boundingBox(),
+      handle.boundingBox(),
+      list.boundingBox(),
+    ]);
+    expect(cardBox).not.toBeNull();
+    expect(handleBox).not.toBeNull();
+    expect(listBox).not.toBeNull();
+    expect(handleBox!.x).toBeGreaterThanOrEqual(cardBox!.x);
+    expect(handleBox!.x + handleBox!.width).toBeLessThanOrEqual(cardBox!.x + cardBox!.width);
+    expect(handleBox!.x).toBeGreaterThan(cardBox!.x + cardBox!.width / 2);
+    expect(Math.abs(cardBox!.x - listBox!.x)).toBeLessThanOrEqual(1);
+  });
+
+  test("kanban board respects workflow sort order", async ({ testPage, apiClient, seedData }) => {
+    const { workspaceId, workflowId } = seedData;
+
+    // Create a second workflow with a task so both show on kanban
+    const wfSecond = await apiClient.createWorkflow(workspaceId, "Second Board", "simple");
+    const secondSteps = await apiClient.listWorkflowSteps(wfSecond.id);
+    const secondStartStep = secondSteps.steps.find((s) => s.is_start_step) ?? secondSteps.steps[0];
+
+    // Create tasks in both workflows so they appear
+    await apiClient.createTask(workspaceId, "Task in E2E", {
+      workflow_id: workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(workspaceId, "Task in Second", {
+      workflow_id: wfSecond.id,
+      workflow_step_id: secondStartStep.id,
+    });
+
+    // Reorder: Second Board first
+    await apiClient.reorderWorkflows(workspaceId, [wfSecond.id, workflowId]);
+
+    // Clear workflow filter so kanban shows all workflows with swimlane headers
+    await apiClient.saveUserSettings({
+      workspace_id: workspaceId,
+      workflow_filter_id: "",
+    });
+
+    // Navigate to kanban
+    await testPage.goto("/");
+    await expect(testPage.getByTestId("swimlane-container")).toBeVisible({ timeout: 10000 });
+
+    // Verify swimlane headers appear in the reordered sequence
+    const headers = testPage.getByTestId("swimlane-header");
+    await expect(headers.first()).toBeVisible();
+    const firstHeader = await headers.first().textContent();
+    expect(firstHeader).toContain("Second Board");
+  });
+});

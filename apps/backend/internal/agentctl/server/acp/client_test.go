@@ -1,0 +1,286 @@
+package acp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"github.com/coder/acp-go-sdk"
+	"github.com/kandev/kandev/internal/agentctl/types"
+)
+
+func TestResolvePath(t *testing.T) {
+	client := NewClient(WithWorkspaceRoot("/workspace/project"))
+
+	tests := []struct {
+		name      string
+		input     string
+		expected  string
+		expectErr bool
+	}{
+		{
+			name:     "absolute path within workspace",
+			input:    "/workspace/project/src/main.go",
+			expected: "/workspace/project/src/main.go",
+		},
+		{
+			name:     "relative path resolves within workspace",
+			input:    "src/main.go",
+			expected: filepath.Join("/workspace/project", "src/main.go"),
+		},
+		{
+			name:     "workspace root itself is allowed",
+			input:    "/workspace/project",
+			expected: "/workspace/project",
+		},
+		{
+			name:     "dot path resolves to workspace root",
+			input:    ".",
+			expected: "/workspace/project",
+		},
+		{
+			name:      "path traversal with relative path is rejected",
+			input:     "../../etc/passwd",
+			expectErr: true,
+		},
+		{
+			name:      "path traversal with dot-dot in middle is rejected",
+			input:     "src/../../etc/passwd",
+			expectErr: true,
+		},
+		{
+			name:      "absolute path outside workspace is rejected",
+			input:     "/etc/passwd",
+			expectErr: true,
+		},
+		{
+			name:      "absolute path with parent traversal is rejected",
+			input:     "/workspace/project/../../../etc/passwd",
+			expectErr: true,
+		},
+		{
+			name:     "nested relative path within workspace",
+			input:    "src/pkg/handler.go",
+			expected: filepath.Join("/workspace/project", "src/pkg/handler.go"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := client.resolvePath(tt.input)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("resolvePath(%q) expected error, got path %q", tt.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("resolvePath(%q) unexpected error: %v", tt.input, err)
+				return
+			}
+			if got != tt.expected {
+				t.Errorf("resolvePath(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestForwardPermissionRequestTitleDerivation(t *testing.T) {
+	str := func(s string) *string { return &s }
+	kind := func(k acp.ToolKind) *acp.ToolKind { return &k }
+	allowOpt := acp.PermissionOption{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce}
+
+	tests := []struct {
+		name           string
+		toolCall       acp.ToolCallUpdate
+		wantTitle      string
+		wantActionType string
+		wantDescInDtl  bool
+		wantRawInput   map[string]any
+	}{
+		{
+			name: "title present, kind other -> human title wins",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-1",
+				Title:      str("Run bash command 'ls -la'"),
+				Kind:       kind(acp.ToolKindOther),
+			},
+			wantTitle:      "Run bash command 'ls -la'",
+			wantActionType: "other",
+			wantDescInDtl:  true,
+		},
+		{
+			name: "title present, kind execute -> human title still wins",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-2",
+				Title:      str("Run bash command 'rm -rf'"),
+				Kind:       kind(acp.ToolKindExecute),
+			},
+			wantTitle:      "Run bash command 'rm -rf'",
+			wantActionType: "execute",
+			wantDescInDtl:  true,
+		},
+		{
+			name: "only kind -> kind is the title, no description forwarded",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-3",
+				Kind:       kind(acp.ToolKindEdit),
+			},
+			wantTitle:      "edit",
+			wantActionType: "edit",
+			wantDescInDtl:  false,
+		},
+		{
+			name: "only title, no kind",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-4",
+				Title:      str("Reading configuration file"),
+			},
+			wantTitle:      "Reading configuration file",
+			wantActionType: "",
+			wantDescInDtl:  true,
+		},
+		{
+			name: "neither title nor kind -> both empty",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-5",
+			},
+			wantTitle:      "",
+			wantActionType: "",
+			wantDescInDtl:  false,
+		},
+		{
+			name: "whitespace-only title falls back to kind",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-ws",
+				Title:      str("   "),
+				Kind:       kind(acp.ToolKindExecute),
+			},
+			wantTitle:      "execute",
+			wantActionType: "execute",
+			wantDescInDtl:  false,
+		},
+		{
+			name: "raw_input forwarded into ActionDetails",
+			toolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc-6",
+				Title:      str("Run bash"),
+				Kind:       kind(acp.ToolKindExecute),
+				RawInput:   map[string]any{"command": "ls -la", "cwd": "/tmp"},
+			},
+			wantTitle:      "Run bash",
+			wantActionType: "execute",
+			wantDescInDtl:  true,
+			wantRawInput:   map[string]any{"command": "ls -la", "cwd": "/tmp"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewClient()
+			var captured *types.PermissionRequest
+			handler := func(_ context.Context, req *types.PermissionRequest) (*types.PermissionResponse, error) {
+				captured = req
+				return &types.PermissionResponse{OptionID: "allow"}, nil
+			}
+			req := acp.RequestPermissionRequest{
+				SessionId: "sess",
+				ToolCall:  tt.toolCall,
+				Options:   []acp.PermissionOption{allowOpt},
+			}
+			if _, err := c.forwardPermissionRequest(context.Background(), handler, req); err != nil {
+				t.Fatalf("forwardPermissionRequest returned error: %v", err)
+			}
+			if captured == nil {
+				t.Fatal("handler not invoked")
+			}
+			if captured.Title != tt.wantTitle {
+				t.Errorf("Title = %q, want %q", captured.Title, tt.wantTitle)
+			}
+			if captured.ActionType != tt.wantActionType {
+				t.Errorf("ActionType = %q, want %q", captured.ActionType, tt.wantActionType)
+			}
+			_, hasDesc := captured.ActionDetails["description"]
+			if hasDesc != tt.wantDescInDtl {
+				t.Errorf("ActionDetails.description present = %v, want %v (details=%v)", hasDesc, tt.wantDescInDtl, captured.ActionDetails)
+			}
+			if tt.wantRawInput != nil {
+				gotRaw, ok := captured.ActionDetails["raw_input"].(map[string]any)
+				if !ok {
+					t.Fatalf("ActionDetails.raw_input missing or wrong type: %#v", captured.ActionDetails["raw_input"])
+				}
+				if !reflect.DeepEqual(gotRaw, tt.wantRawInput) {
+					t.Errorf("ActionDetails.raw_input = %v, want %v", gotRaw, tt.wantRawInput)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleExtensionMethod(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		params     json.RawMessage
+		wantErr    bool
+		wantCalled bool
+	}{
+		{
+			name:       "cursor task succeeds and forwards params",
+			method:     cursorTaskMethod,
+			params:     json.RawMessage(`{"toolCallId":"tool-1","prompt":"summarize"}`),
+			wantCalled: true,
+		},
+		{
+			name:    "unknown method returns method not found",
+			method:  "foo/bar",
+			params:  json.RawMessage(`{"x":1}`),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var called bool
+			var gotParams json.RawMessage
+			client := NewClient(WithCursorTaskHandler(func(params json.RawMessage) {
+				called = true
+				gotParams = append(json.RawMessage(nil), params...)
+			}))
+
+			resp, err := client.HandleExtensionMethod(context.Background(), tt.method, tt.params)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				var reqErr *acp.RequestError
+				if !errors.As(err, &reqErr) {
+					t.Fatalf("error type = %T, want *acp.RequestError", err)
+				}
+				if reqErr.Code != -32601 {
+					t.Fatalf("error code = %d, want -32601", reqErr.Code)
+				}
+				if called {
+					t.Fatal("handler was called for unknown method")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("HandleExtensionMethod returned error: %v", err)
+			}
+			if !reflect.DeepEqual(resp, struct{}{}) {
+				t.Fatalf("response = %#v, want empty success object", resp)
+			}
+			if called != tt.wantCalled {
+				t.Fatalf("handler called = %v, want %v", called, tt.wantCalled)
+			}
+			if !reflect.DeepEqual(gotParams, tt.params) {
+				t.Fatalf("params = %s, want %s", gotParams, tt.params)
+			}
+		})
+	}
+}

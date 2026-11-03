@@ -1,0 +1,74 @@
+"use client";
+
+import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { useAppStore } from "@/components/state-provider";
+import type { AppState } from "@/lib/state/store";
+import type { FilterDimension } from "@/lib/state/slices/ui/sidebar-view-types";
+import { getExecutorLabel } from "@/lib/executor-icons";
+import { repositorySlug } from "@/lib/repository-slug";
+
+type Option = { value: string; label: string; color?: string; group?: string };
+type Snapshots = AppState["kanbanMulti"]["snapshots"];
+type ReposByWorkspace = AppState["repositories"]["itemsByWorkspaceId"];
+
+function workflowOptions(snapshots: Snapshots): Option[] {
+  return Object.entries(snapshots).map(([id, snap]) => ({
+    value: id,
+    label: snap.workflowName || id,
+  }));
+}
+
+export function workflowStepOptions(snapshots: Snapshots): Option[] {
+  const out: Option[] = [];
+  const seen = new Set<string>();
+  const workflows = Object.values(snapshots).sort((a, b) =>
+    (a.workflowName || a.workflowId).localeCompare(b.workflowName || b.workflowId),
+  );
+  for (const snap of workflows) {
+    const group = snap.workflowName || snap.workflowId;
+    const steps = [...snap.steps].sort((a, b) => a.position - b.position);
+    for (const step of steps) {
+      if (seen.has(step.id)) continue;
+      seen.add(step.id);
+      out.push({ value: step.id, label: step.title, color: step.color, group });
+    }
+  }
+  return out;
+}
+
+function executorTypeOptions(snapshots: Snapshots): Option[] {
+  const seen = new Set<string>();
+  for (const snap of Object.values(snapshots)) {
+    for (const task of snap.tasks) {
+      if (task.primaryExecutorType) seen.add(task.primaryExecutorType);
+    }
+  }
+  return [...seen].sort().map((v) => ({ value: v, label: getExecutorLabel(v) }));
+}
+
+export function repositoryOptions(repositoriesByWorkspace: ReposByWorkspace): Option[] {
+  const repos = Object.values(repositoriesByWorkspace).flat();
+  return repos.map((r) => {
+    const slug = repositorySlug(r);
+    return { value: slug, label: slug };
+  });
+}
+
+export function useFilterValueOptions(dimension: FilterDimension): Option[] {
+  const snapshots = useAppStore((s) => s.kanbanMulti.snapshots);
+  const repositoriesByWorkspace = useAppStore((s) => s.repositories.itemsByWorkspaceId);
+  // `executorTypeOptions` resolves its labels through `getExecutorLabel`, which
+  // now reads the catalog. Subscribing here — and keeping the language in the
+  // memo's deps — is what makes those labels follow a runtime locale switch;
+  // without it the memo only recomputes when store data changes.
+  const { i18n } = useTranslation();
+
+  return useMemo(() => {
+    if (dimension === "workflow") return workflowOptions(snapshots);
+    if (dimension === "workflowStep") return workflowStepOptions(snapshots);
+    if (dimension === "executorType") return executorTypeOptions(snapshots);
+    if (dimension === "repository") return repositoryOptions(repositoriesByWorkspace);
+    return [];
+  }, [dimension, snapshots, repositoriesByWorkspace, i18n.language]);
+}

@@ -1,0 +1,177 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+
+const mockListRepositories = vi.fn();
+const mockSetRepositories = vi.fn();
+const mockSetRepositoriesLoading = vi.fn();
+
+type Repos = { id: string; name: string }[];
+type MockState = {
+  repositories: {
+    itemsByWorkspaceId: Record<string, Repos>;
+    loadingByWorkspaceId: Record<string, boolean>;
+    loadedByWorkspaceId: Record<string, boolean>;
+  };
+  setRepositories: typeof mockSetRepositories;
+  setRepositoriesLoading: typeof mockSetRepositoriesLoading;
+};
+
+let mockState: MockState;
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (s: MockState) => unknown) => selector(mockState),
+}));
+
+vi.mock("@/lib/api", () => ({
+  listRepositories: (...args: unknown[]) => mockListRepositories(...args),
+}));
+
+import { useRepositories } from "./use-repositories";
+
+function setup(loaded: boolean) {
+  vi.clearAllMocks();
+  mockState = {
+    repositories: {
+      itemsByWorkspaceId: {},
+      loadingByWorkspaceId: {},
+      loadedByWorkspaceId: { "ws-1": loaded },
+    },
+    setRepositories: mockSetRepositories,
+    setRepositoriesLoading: mockSetRepositoriesLoading,
+  };
+}
+
+describe("useRepositories", () => {
+  beforeEach(() => {
+    mockListRepositories.mockResolvedValue({ repositories: [{ id: "r1", name: "Repo One" }] });
+  });
+
+  it("force-refreshes a fresh list even when the workspace is already loaded", async () => {
+    setup(/* loaded */ true);
+    renderHook(() => useRepositories("ws-1", true, true));
+    await waitFor(() => expect(mockSetRepositories).toHaveBeenCalled());
+    expect(mockListRepositories).toHaveBeenCalledWith("ws-1", undefined, { cache: "no-store" });
+    expect(mockSetRepositories).toHaveBeenCalledWith("ws-1", [{ id: "r1", name: "Repo One" }]);
+  });
+
+  it("does not fetch on the lazy path when already loaded", async () => {
+    setup(/* loaded */ true);
+    renderHook(() => useRepositories("ws-1", true, false));
+    await Promise.resolve();
+    expect(mockListRepositories).not.toHaveBeenCalled();
+  });
+
+  it("fetches on the lazy path when not yet loaded", async () => {
+    setup(/* loaded */ false);
+    renderHook(() => useRepositories("ws-1", true, false));
+    await waitFor(() => expect(mockSetRepositories).toHaveBeenCalled());
+    expect(mockListRepositories).toHaveBeenCalledWith("ws-1", undefined, { cache: "no-store" });
+  });
+
+  it("retries a transient initial fetch failure", async () => {
+    setup(/* loaded */ false);
+    mockListRepositories
+      .mockRejectedValueOnce(new Error("temporary failure"))
+      .mockResolvedValueOnce({ repositories: [{ id: "r2", name: "Retry Repo" }] });
+
+    renderHook(() => useRepositories("ws-1", true, false));
+
+    await waitFor(() =>
+      expect(mockSetRepositories).toHaveBeenCalledWith("ws-1", [{ id: "r2", name: "Retry Repo" }]),
+    );
+    expect(mockListRepositories).toHaveBeenCalledTimes(2);
+  });
+
+  it("does nothing when disabled or workspace is null", async () => {
+    setup(/* loaded */ false);
+    renderHook(() => useRepositories(null, true, true));
+    renderHook(() => useRepositories("ws-1", false, true));
+    await Promise.resolve();
+    expect(mockListRepositories).not.toHaveBeenCalled();
+  });
+
+  it("refreshes an already-loaded workspace when requested", async () => {
+    setup(/* loaded */ true);
+    const { result } = renderHook(() => useRepositories("ws-1"));
+
+    await result.current.refresh();
+
+    expect(mockListRepositories).toHaveBeenCalledWith("ws-1", undefined, { cache: "no-store" });
+    expect(mockSetRepositories).toHaveBeenCalledWith("ws-1", [{ id: "r1", name: "Repo One" }]);
+  });
+
+  it("keeps a cached workspace loading until its refresh completes", async () => {
+    setup(true);
+    let complete!: (response: { repositories: Repos }) => void;
+    mockListRepositories.mockReturnValue(
+      new Promise((resolve) => {
+        complete = resolve;
+      }),
+    );
+    const { result, rerender } = renderHook(() => useRepositories("ws-1"));
+    const pending = result.current.refresh();
+    mockState.repositories.loadingByWorkspaceId["ws-1"] = true;
+    rerender();
+    expect(mockSetRepositoriesLoading).not.toHaveBeenCalledWith("ws-1", false);
+    complete({ repositories: [{ id: "r2", name: "Refreshed" }] });
+    await pending;
+    expect(mockSetRepositoriesLoading).toHaveBeenLastCalledWith("ws-1", false);
+  });
+
+  it("keeps cached repositories when a manual refresh fails", async () => {
+    setup(/* loaded */ true);
+    mockListRepositories.mockRejectedValue(new Error("Network unavailable"));
+    const { result } = renderHook(() => useRepositories("ws-1"));
+
+    await expect(result.current.refresh()).resolves.toBeUndefined();
+
+    expect(mockSetRepositories).not.toHaveBeenCalled();
+    expect(mockSetRepositoriesLoading).toHaveBeenNthCalledWith(1, "ws-1", true);
+    expect(mockSetRepositoriesLoading).toHaveBeenLastCalledWith("ws-1", false);
+  });
+});
+
+describe("useRepositories request ownership", () => {
+  beforeEach(() => {
+    mockListRepositories.mockResolvedValue({ repositories: [{ id: "r1", name: "Repo One" }] });
+  });
+
+  it("clears loading when a force refresh is cancelled", async () => {
+    setup(/* loaded */ true);
+    let complete!: (response: { repositories: Repos }) => void;
+    mockListRepositories.mockReturnValue(
+      new Promise((resolve) => {
+        complete = resolve;
+      }),
+    );
+
+    const { unmount } = renderHook(() => useRepositories("ws-1", true, true));
+    await waitFor(() => expect(mockSetRepositoriesLoading).toHaveBeenCalledWith("ws-1", true));
+    unmount();
+
+    expect(mockSetRepositoriesLoading).toHaveBeenLastCalledWith("ws-1", false);
+    complete({ repositories: [{ id: "stale", name: "Stale" }] });
+    await Promise.resolve();
+    expect(mockSetRepositories).not.toHaveBeenCalled();
+  });
+
+  it("keeps loading while another workspace request is active", async () => {
+    setup(/* loaded */ true);
+    let completeFirst!: (response: { repositories: Repos }) => void;
+    let completeSecond!: (response: { repositories: Repos }) => void;
+    mockListRepositories
+      .mockReturnValueOnce(new Promise((resolve) => (completeFirst = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (completeSecond = resolve)));
+
+    const first = renderHook(() => useRepositories("ws-1", true, true));
+    const second = renderHook(() => useRepositories("ws-1", true, true));
+    await waitFor(() => expect(mockListRepositories).toHaveBeenCalledTimes(2));
+    first.unmount();
+    expect(mockSetRepositoriesLoading).toHaveBeenLastCalledWith("ws-1", true);
+
+    completeSecond({ repositories: [{ id: "fresh", name: "Fresh" }] });
+    await waitFor(() => expect(mockSetRepositoriesLoading).toHaveBeenLastCalledWith("ws-1", false));
+    completeFirst({ repositories: [{ id: "stale", name: "Stale" }] });
+    second.unmount();
+  });
+});

@@ -1,0 +1,148 @@
+package models
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/entityrefs"
+	apiv1 "github.com/kandev/kandev/pkg/api/v1"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMessageToAPIProjectsTypedShellOutputWithoutMutation(t *testing.T) {
+	exitCode := 7
+	normalized := streams.NewShellExec("go test ./...", "/workspace", "", 0, false)
+	normalized.ShellExec().Output = &streams.ShellExecOutput{
+		ExitCode:  &exitCode,
+		Stdout:    "pass ✓\n",
+		Stderr:    "warning\n",
+		Truncated: true,
+	}
+	message := &Message{Metadata: map[string]any{
+		"status":     "completed",
+		"normalized": normalized,
+	}}
+
+	projected := jsonMetadata(t, message.ToAPI().Metadata)
+	output := projected["normalized"].(map[string]any)["shell_exec"].(map[string]any)["output"].(map[string]any)
+
+	require.NotContains(t, output, "stdout")
+	require.NotContains(t, output, "stderr")
+	require.Equal(t, true, output["has_output"])
+	require.Equal(t, float64(len("pass ✓\n")), output["stdout_bytes"])
+	require.Equal(t, float64(len("warning\n")), output["stderr_bytes"])
+	require.Equal(t, float64(exitCode), output["exit_code"])
+	require.Equal(t, true, output["truncated"])
+	projectedAgain := jsonMetadata(t, ProjectMessageMetadata(projected))
+	outputAgain := projectedAgain["normalized"].(map[string]any)["shell_exec"].(map[string]any)["output"].(map[string]any)
+	require.Equal(t, true, outputAgain["has_output"])
+	require.Equal(t, float64(len("pass ✓\n")), outputAgain["stdout_bytes"])
+	require.Equal(t, "pass ✓\n", normalized.ShellExec().Output.Stdout)
+	require.Equal(t, "warning\n", normalized.ShellExec().Output.Stderr)
+}
+
+func TestProjectMessageMetadataNormalizesEntityReferencesWithoutMutation(t *testing.T) {
+	valid := apiv1.EntityReference{
+		Version:  apiv1.EntityReferenceVersion,
+		Ref:      entityrefs.CanonicalRef("linear", "issue", "acme", "issue-1"),
+		Provider: "linear", Kind: "issue", ID: "issue-1", Key: "ENG-1",
+		Title: "Fix auth", URL: "https://linear.app/acme/issue/ENG-1", Scope: "acme",
+	}
+	originalRefs := []any{
+		map[string]any{
+			"version": float64(valid.Version), "ref": valid.Ref, "provider": valid.Provider,
+			"kind": valid.Kind, "id": valid.ID, "key": valid.Key, "title": valid.Title,
+			"url": valid.URL, "scope": valid.Scope,
+		},
+		map[string]any{"version": float64(1), "ref": "bad"},
+	}
+	metadata := map[string]any{"status": "sent", "entity_references": originalRefs}
+
+	projected := ProjectMessageMetadata(metadata)
+	references, ok := projected["entity_references"].([]apiv1.EntityReference)
+	require.True(t, ok)
+	require.Equal(t, []apiv1.EntityReference{valid}, references)
+	require.Equal(t, originalRefs, metadata["entity_references"])
+	projected["status"] = "changed"
+	require.Equal(t, "sent", metadata["status"])
+}
+
+func TestMessageToAPIProjectsPersistedShellOutputWithoutMutation(t *testing.T) {
+	output := map[string]any{
+		"stdout":    "persisted stdout",
+		"stderr":    "",
+		"truncated": false,
+	}
+	message := &Message{Metadata: map[string]any{
+		"status": "running",
+		"normalized": map[string]any{
+			"kind": "shell_exec",
+			"shell_exec": map[string]any{
+				"command": "make test",
+				"output":  output,
+			},
+		},
+	}}
+
+	projected := jsonMetadata(t, message.ToAPI().Metadata)
+	projectedOutput := projected["normalized"].(map[string]any)["shell_exec"].(map[string]any)["output"].(map[string]any)
+
+	require.NotContains(t, projectedOutput, "stdout")
+	require.NotContains(t, projectedOutput, "stderr")
+	require.Equal(t, true, projectedOutput["has_output"])
+	require.Equal(t, float64(len("persisted stdout")), projectedOutput["stdout_bytes"])
+	require.Equal(t, float64(0), projectedOutput["stderr_bytes"])
+	require.Equal(t, false, projectedOutput["truncated"])
+	require.Equal(t, "persisted stdout", output["stdout"])
+	originalShell := message.Metadata["normalized"].(map[string]any)["shell_exec"].(map[string]any)
+	require.Equal(t, output, originalShell["output"])
+}
+
+func TestProjectMessageMetadataMatchesTypedAndPersistedShellOutput(t *testing.T) {
+	exitCode := 3
+	typed := streams.NewShellExec("printf ✓", "/workspace", "print", 30, true)
+	typed.ShellExec().Output = &streams.ShellExecOutput{ExitCode: &exitCode, Stdout: "✓", Truncated: true}
+	persisted := map[string]any{
+		"kind": "shell_exec",
+		"shell_exec": map[string]any{
+			"command": "printf ✓", "work_dir": "/workspace", "description": "print",
+			"timeout": float64(30), "background": true,
+			"output": map[string]any{"exit_code": float64(3), "stdout": "✓", "truncated": true},
+		},
+	}
+
+	typedJSON, err := json.Marshal(ProjectMessageMetadata(map[string]any{"normalized": typed})["normalized"])
+	require.NoError(t, err)
+	persistedJSON, err := json.Marshal(ProjectMessageMetadata(map[string]any{"normalized": persisted})["normalized"])
+	require.NoError(t, err)
+	require.JSONEq(t, string(typedJSON), string(persistedJSON))
+}
+
+func jsonMetadata(t *testing.T, metadata map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	return decoded
+}
+
+func TestShellExitCodeJSONNumber(t *testing.T) {
+	for _, tc := range []struct {
+		raw   string
+		want  int
+		valid bool
+	}{
+		{"0", 0, true}, {"1", 1, true}, {"-1", -1, true},
+		{"1.5", 0, false}, {"9223372036854775808", 0, false}, {"not-a-number", 0, false},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			value, ok := intFromAny(json.Number(tc.raw))
+			require.Equal(t, tc.valid, ok)
+			if ok {
+				require.Equal(t, tc.want, value)
+			}
+		})
+	}
+}

@@ -1,0 +1,976 @@
+package process
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/kandev/kandev/internal/common/unidiff"
+)
+
+const (
+	fileStatusAdded   = "added"
+	fileStatusRenamed = "renamed"
+)
+
+// GitLogResult represents the result of a git log operation.
+type GitLogResult struct {
+	Success bool             `json:"success"`
+	Commits []*GitCommitInfo `json:"commits"`
+	Error   string           `json:"error,omitempty"`
+	// ErrorCode is a bounded machine-readable failure reason. It is populated
+	// for explicit comparison-target failures; raw git/provider errors stay in
+	// server logs only.
+	ErrorCode string `json:"error_code,omitempty"`
+	// PerRepoErrors lists per-repo failures during a multi-repo log fan-out.
+	// Empty/nil for single-repo responses or when every repo succeeded. The
+	// merged response keeps Success=true as long as at least one repo
+	// succeeded; callers inspect this slice to surface partial failures.
+	PerRepoErrors []GitLogRepoError `json:"per_repo_errors,omitempty"`
+}
+
+// GitLogRepoError describes a single per-repo failure from a multi-repo log
+// fan-out. It is omitted from the response entirely for single-repo responses.
+type GitLogRepoError struct {
+	RepositoryName string `json:"repository_name"`
+	Error          string `json:"error"`
+	ErrorCode      string `json:"error_code,omitempty"`
+}
+
+// GitCommitInfo represents a single commit in the log.
+// Field names match GitCommitData and SessionCommit for frontend consistency.
+type GitCommitInfo struct {
+	CommitSHA     string `json:"commit_sha"`
+	ParentSHA     string `json:"parent_sha"`
+	CommitMessage string `json:"commit_message"`
+	AuthorName    string `json:"author_name"`
+	AuthorEmail   string `json:"author_email"`
+	CommittedAt   string `json:"committed_at"`
+	FilesChanged  int    `json:"files_changed"`
+	Insertions    int    `json:"insertions"`
+	Deletions     int    `json:"deletions"`
+	// Pushed is true when the commit is reachable from the branch's upstream
+	// tracking ref (i.e. present on the remote). Sourced from git itself —
+	// not from any PR API — so it stays correct when no PR exists yet, after
+	// rebases, and across multi-repo workspaces.
+	Pushed bool `json:"pushed"`
+	// RepositoryName tags commits returned from a multi-repo log fan-out.
+	// Empty for single-repo workspaces. Set by the API layer after the call.
+	RepositoryName string `json:"repository_name,omitempty"`
+}
+
+// CumulativeDiffResult represents the cumulative diff from base commit to HEAD.
+type CumulativeDiffResult struct {
+	Success      bool                   `json:"success"`
+	BaseCommit   string                 `json:"base_commit"`
+	HeadCommit   string                 `json:"head_commit"`
+	TotalCommits int                    `json:"total_commits"`
+	Files        map[string]interface{} `json:"files"`
+	// TruncatedFilesCount is how many files were dropped from Files entirely
+	// because the cumulative range exceeded maxCumulativeDiffFiles. Zero
+	// (omitted) when the full file set fit. The frontend surfaces this as a
+	// "N more files hidden" banner — a mid-rebase cumulative diff can otherwise
+	// enumerate tens of thousands of files, one rendered row each.
+	//
+	// This counts only fully-dropped files. Files kept in the map but whose
+	// diff was emptied by the byte budget (diff_skip_reason "budget_exceeded")
+	// are NOT counted here — they remain listed and carry their own per-file
+	// skip reason that the diff viewer renders, so they are visible-but-capped
+	// rather than hidden.
+	TruncatedFilesCount int    `json:"truncated_files_count,omitempty"`
+	Error               string `json:"error,omitempty"`
+	ErrorCode           string `json:"error_code,omitempty"`
+}
+
+// maxCumulativeDiffFiles bounds how many file entries GetCumulativeDiff returns.
+// This is a safety valve for the rebase pathology (base→working-tree across a
+// large range), not a UX limit — normal PRs stay well under it. Capping the
+// count bounds the number of rendered file rows on the frontend regardless of
+// the per-file/total byte budgets.
+const maxCumulativeDiffFiles = 500
+
+// Field and record separators for git log parsing.
+// Using non-printable ASCII separators to avoid collision with commit message content.
+const (
+	fieldSep  = "\x1f" // Unit Separator (ASCII 31)
+	recordSep = "\x1e" // Record Separator (ASCII 30)
+)
+
+// GetLog returns commits from baseCommit (exclusive) to HEAD (inclusive).
+// If baseCommit is empty, returns recent commits (limited by limit parameter).
+// Stats (files changed, insertions, deletions) are fetched in-band via --shortstat
+// to avoid an N+1 git-show call per commit.
+func (g *GitOperator) GetLog(ctx context.Context, baseCommit string, limit int) (*GitLogResult, error) {
+	result := &GitLogResult{
+		Commits: make([]*GitCommitInfo, 0),
+	}
+
+	// Build the git log command with non-printable separators and --shortstat.
+	// The record separator (%x1e) is placed BEFORE the fields so that --shortstat
+	// output (appended after the format) stays within the same record:
+	//   \x1e<fields>\n <stat summary>\n\x1e<fields>\n <stat summary>\n...
+	// Splitting on recordSep groups each commit's fields + stats together.
+	args := []string{"log", "--format=%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%s%x1f%aI", "--shortstat"}
+
+	switch {
+	case baseCommit != "":
+		// --first-parent only on the divergence-range path: when the branch
+		// has merged main back in, plain `git log <base>..HEAD` walks both
+		// parents of the merge and surfaces commits brought in via main as
+		// if they were the branch's own work. Following only the first parent
+		// keeps the branch's line plus its merge commits and excludes the
+		// merged-in side. We deliberately don't apply this to the open-ended
+		// "recent N commits" path so future history-view callers (activity
+		// widgets, etc.) keep getting the full graph.
+		args = append(args, "--first-parent", baseCommit+"..HEAD")
+	case limit > 0:
+		args = append(args, fmt.Sprintf("-n%d", limit))
+	default:
+		// Default to last 50 commits if no base and no limit
+		args = append(args, "-n50")
+	}
+
+	output, err := g.runGitCommand(ctx, args...)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to get git log: %s", err.Error())
+		return result, nil
+	}
+
+	output = strings.TrimSpace(output)
+	if output == "" {
+		result.Success = true
+		return result, nil
+	}
+
+	// Split by record separator. The first element is empty (separator is at the start).
+	records := strings.Split(output, recordSep)
+	for _, record := range records {
+		record = strings.TrimSpace(record)
+		if record == "" {
+			continue
+		}
+
+		// The record may contain a trailing shortstat line after the commit fields.
+		// Split on newline: first line has the fields, remaining lines may have the stat summary.
+		lines := strings.SplitN(record, "\n", 2)
+		fieldLine := strings.TrimSpace(lines[0])
+
+		parts := strings.Split(fieldLine, fieldSep)
+		if len(parts) < 6 {
+			continue
+		}
+
+		sha := parts[0]
+		parentSHA := parts[1]
+		if idx := strings.Index(parentSHA, " "); idx > 0 {
+			parentSHA = parentSHA[:idx]
+		}
+
+		// Parse inline shortstat if present
+		var filesChanged, insertions, deletions int
+		if len(lines) > 1 {
+			statLine := strings.TrimSpace(lines[1])
+			if statLine != "" {
+				filesChanged, insertions, deletions = parseStatSummary(statLine)
+			}
+		}
+
+		result.Commits = append(result.Commits, &GitCommitInfo{
+			CommitSHA:     sha,
+			ParentSHA:     parentSHA,
+			AuthorName:    parts[2],
+			AuthorEmail:   parts[3],
+			CommitMessage: parts[4],
+			CommittedAt:   parts[5],
+			FilesChanged:  filesChanged,
+			Insertions:    insertions,
+			Deletions:     deletions,
+		})
+	}
+
+	g.markPushedCommits(ctx, result.Commits, baseCommit)
+
+	result.Success = true
+	return result, nil
+}
+
+// markPushedCommits sets Pushed on each commit by looking up which commits in
+// HEAD's history are NOT reachable from the upstream tracking ref. A commit is
+// pushed iff it is not in that "ahead" set. When the branch has no upstream
+// (never been pushed) or the lookup fails, all commits stay Pushed=false — the
+// safer default than falsely claiming a commit is on the remote.
+func (g *GitOperator) markPushedCommits(ctx context.Context, commits []*GitCommitInfo, baseCommit string) {
+	if len(commits) == 0 {
+		return
+	}
+	upstream := g.getUpstreamRef(ctx)
+	if upstream == "" {
+		return
+	}
+	// Resolve to a SHA so we can pass it to rev-list as `^<sha>`. The caret
+	// prefix means the arg doesn't match LooksLikeCommitSHA; it falls through
+	// to the non-branch catch-all in runGitCommand, which passes it unchanged.
+	// Safe: upstreamSHA is local rev-parse output, not user input.
+	upstreamSHA, err := g.runGitCommand(ctx, "rev-parse", upstream)
+	if err != nil {
+		return
+	}
+	upstreamSHA = strings.TrimSpace(upstreamSHA)
+	if upstreamSHA == "" {
+		return
+	}
+	// Match the returned log's positive traversal so the capped ahead set
+	// covers every local row. Exclusions retain full ancestry, including
+	// commits reachable through an upstream merge's side parents.
+	// The returned tip pins the walk even if HEAD advances after the log read.
+	args := []string{"rev-list", fmt.Sprintf("-n%d", len(commits))}
+	tip := commits[0].CommitSHA
+	if baseCommit != "" {
+		args = append(args, "--first-parent", baseCommit+".."+tip)
+	} else {
+		args = append(args, tip)
+	}
+	args = append(args, "^"+upstreamSHA)
+	output, err := g.runGitCommand(ctx, args...)
+	if err != nil {
+		return
+	}
+	unpushed := make(map[string]struct{})
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		sha := strings.TrimSpace(line)
+		if sha != "" {
+			unpushed[sha] = struct{}{}
+		}
+	}
+	for _, c := range commits {
+		if _, isUnpushed := unpushed[c.CommitSHA]; !isUnpushed {
+			c.Pushed = true
+		}
+	}
+}
+
+// GetCumulativeDiff returns the cumulative diff from baseCommit to the working tree
+// (including uncommitted/unstaged changes).
+func (g *GitOperator) GetCumulativeDiff(ctx context.Context, baseCommit string) (*CumulativeDiffResult, error) {
+	result := &CumulativeDiffResult{
+		Files: make(map[string]interface{}),
+	}
+
+	if baseCommit == "" {
+		result.Error = "base_commit is required"
+		return result, nil
+	}
+
+	result.BaseCommit = baseCommit
+
+	// Get current HEAD
+	headOutput, err := g.runGitCommand(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to get HEAD: %s", err.Error())
+		return result, nil
+	}
+	result.HeadCommit = strings.TrimSpace(headOutput)
+
+	// Count commits between base and HEAD
+	countOutput, err := g.runGitCommand(ctx, "rev-list", "--count", baseCommit+"..HEAD")
+	if err == nil {
+		_, _ = fmt.Sscanf(strings.TrimSpace(countOutput), "%d", &result.TotalCommits)
+	}
+
+	// Get the cumulative diff (base → working tree, includes uncommitted changes).
+	// Deliberately no --numstat here: parseCommitDiffWithOptions falls back to
+	// unidiff.CountLines, which was checked against git's own numstat over 600
+	// commits of this repo's history with zero disagreements on line counts.
+	// (Binary files were excluded from that comparison — numstat reports them as
+	// `-` with nothing to compare — but both routes report 0/0 for them anyway,
+	// since a binary block carries no hunk.) Adding the flag would change a
+	// production git invocation for a difference no test can observe.
+	diffOutput, err := g.runGitCommand(
+		ctx,
+		"diff",
+		"--no-color",
+		"--no-ext-diff",
+		"--src-prefix=a/",
+		"--dst-prefix=b/",
+		baseCommit,
+	)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to get diff: %s", err.Error())
+		return result, nil
+	}
+
+	// Parse the diff output into files, capping per-file (256 KB) and total
+	// (2 MB) diff bytes. Unlike ShowCommit (single, bounded commit) a
+	// multi-commit cumulative range can produce tens of MB of patch text.
+	result.Files = g.parseCommitDiffWithOptions(diffOutput, parseCommitDiffOptions{
+		perFileMaxBytes: maxDiffOutputSize,
+		totalMaxBytes:   maxTotalDiffBytes,
+	})
+
+	// Cap the number of file entries too — the byte budget bounds payload size
+	// but not the row count, and the frontend renders one component per file.
+	result.Files, result.TruncatedFilesCount = capCumulativeDiffFiles(result.Files, maxCumulativeDiffFiles)
+
+	result.Success = true
+	return result, nil
+}
+
+// capCumulativeDiffFiles keeps at most maxFiles entries (deterministically, by
+// sorted path) and returns the kept map plus the number dropped.
+func capCumulativeDiffFiles(files map[string]interface{}, maxFiles int) (map[string]interface{}, int) {
+	if maxFiles <= 0 || len(files) <= maxFiles {
+		return files, 0
+	}
+
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	capped := make(map[string]interface{}, maxFiles)
+	for _, path := range paths[:maxFiles] {
+		capped[path] = files[path]
+	}
+	return capped, len(files) - maxFiles
+}
+
+// CommitDiffResult represents the result of getting a commit's diff.
+type CommitDiffResult struct {
+	Success      bool                   `json:"success"`
+	CommitSHA    string                 `json:"commit_sha"`
+	Message      string                 `json:"message"`
+	Author       string                 `json:"author"`
+	Date         string                 `json:"date"`
+	Files        map[string]interface{} `json:"files"` // FileInfo objects with diff content
+	FilesChanged int                    `json:"files_changed"`
+	Insertions   int                    `json:"insertions"`
+	Deletions    int                    `json:"deletions"`
+	Error        string                 `json:"error,omitempty"`
+}
+
+// isHexChar reports whether r is a valid hexadecimal digit (0-9, a-f, A-F).
+func isHexChar(r rune) bool {
+	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+}
+
+// validateCommitSHA validates a commit SHA.
+// Returns an error message if invalid, empty string if valid.
+func validateCommitSHA(sha string) string {
+	if sha == "" {
+		return "commit SHA is required"
+	}
+
+	// Must be between 4 and 40 hex characters
+	if len(sha) < 4 || len(sha) > 40 {
+		return "commit SHA must be between 4 and 40 characters"
+	}
+
+	for _, r := range sha {
+		if !isHexChar(r) {
+			return "commit SHA contains invalid characters"
+		}
+	}
+	return ""
+}
+
+// sumFileDiffStats sums additions and deletions from a file diff map.
+func sumFileDiffStats(files map[string]interface{}) (insertions, deletions int) {
+	for _, f := range files {
+		fi, ok := f.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if additions, ok := fi["additions"].(int); ok {
+			insertions += additions
+		}
+		if dels, ok := fi["deletions"].(int); ok {
+			deletions += dels
+		}
+	}
+	return insertions, deletions
+}
+
+// ShowCommit gets the diff for a specific commit using git show.
+func (g *GitOperator) ShowCommit(ctx context.Context, commitSHA string) (*CommitDiffResult, error) {
+	result := &CommitDiffResult{
+		CommitSHA: commitSHA,
+	}
+
+	// Validate commit SHA (basic validation - alphanumeric only)
+	if errMsg := validateCommitSHA(commitSHA); errMsg != "" {
+		result.Error = errMsg
+		return result, nil
+	}
+
+	// Get commit metadata
+	formatOutput, err := g.runGitCommand(ctx, "show", "--no-patch", "--format=%H%n%s%n%an <%ae>%n%aI", commitSHA)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to get commit info: %s", err.Error())
+		return result, nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(formatOutput), "\n")
+	if len(lines) >= 4 {
+		result.CommitSHA = lines[0]
+		result.Message = lines[1]
+		result.Author = lines[2]
+		result.Date = lines[3]
+	}
+
+	// Get the diff with stats
+	// Merge commits must be compared with their first parent so the patch
+	// matches the branch history shown by the commit list and GitHub.
+	diffOutput, err := g.runGitCommand(
+		ctx,
+		"show",
+		"--first-parent",
+		"--no-color",
+		"--format=",
+		"--stat",
+		"--numstat",
+		"-p",
+		"--src-prefix=a/",
+		"--dst-prefix=b/",
+		commitSHA,
+	)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to get commit diff: %s", err.Error())
+		return result, nil
+	}
+
+	// Parse the diff output into files
+	result.Files = g.parseCommitDiff(diffOutput)
+	result.FilesChanged = len(result.Files)
+	result.Insertions, result.Deletions = sumFileDiffStats(result.Files)
+
+	result.Success = true
+	return result, nil
+}
+
+// parseCommitDiffOptions controls per-file and cumulative budget enforcement
+// while parsing a `git diff`/`git show` output into the file info map. The zero
+// value applies no caps, which preserves the ShowCommit contract (single-commit
+// detail views expect full diffs). The cumulative-diff path passes non-zero
+// budgets because a multi-commit range can produce tens of MB of patch text
+// that, JSON-encoded and shipped over the WS, grinds the browser.
+type parseCommitDiffOptions struct {
+	perFileMaxBytes int
+	totalMaxBytes   int
+}
+
+// parseCommitDiff parses git show output into file info map. No budget caps —
+// callers that need them use parseCommitDiffWithOptions.
+func (g *GitOperator) parseCommitDiff(output string) map[string]interface{} {
+	return g.parseCommitDiffWithOptions(output, parseCommitDiffOptions{})
+}
+
+// parseCommitDiffWithOptions parses git diff/show output into a file info map,
+// applying the budgets in opts. Diffs are truncated (per-file) or dropped
+// (once the cumulative budget is exceeded); additions/deletions counts are
+// always computed from the full per-file content because they're cheap and
+// the frontend relies on them.
+func (g *GitOperator) parseCommitDiffWithOptions(output string, opts parseCommitDiffOptions) map[string]interface{} {
+	files := make(map[string]interface{})
+
+	// Split into per-file sections. The split is line-aware: only a line that
+	// STARTS with `diff --git ` begins a new section, because git only emits
+	// that token at the start of a section header. Splitting the raw byte
+	// stream would truncate a real section when a patch body or filename
+	// contains the literal sequence (e.g. an added line
+	// `+diff --git a/example b/example`) and fabricate a bogus section.
+	prefix, sections := splitDiffSections(output)
+	if len(sections) == 0 {
+		return files
+	}
+
+	// When the caller's git command included --numstat, git printed authoritative
+	// per-file counts ahead of the first "diff --git" — exactly the text the split
+	// discards. Recover them; files without a row fall back to counting
+	// their own patch body.
+	numstat := numstatByPath(prefix)
+
+	totalDiffBytes := 0
+	for _, diffContent := range sections {
+		// Extract the file path. git's per-file `+++ b/<path>` line is the
+		// authoritative source: it carries exactly one path, so spaces and
+		// literal ` b/` sequences inside a filename can't be confused with
+		// the old/new separator, and git C-quotes paths containing tabs,
+		// non-ASCII bytes, quotes, or backslashes (core.quotePath, default
+		// on) — a header-only split would drop those entirely.
+		filePath, ok := diffSectionPath(diffContent)
+		if !ok {
+			continue
+		}
+
+		status := diffSectionStatus(diffContent)
+
+		// Count additions and deletions (always from the full content).
+		additions, deletions := fileLineCounts(numstat, filePath, diffContent)
+
+		diffOut, skipReason := applyDiffBudget(diffContent, totalDiffBytes, opts)
+		totalDiffBytes += len(diffOut)
+
+		fileEntry := map[string]interface{}{
+			"path":      filePath,
+			"status":    status,
+			"staged":    false,
+			"additions": additions,
+			"deletions": deletions,
+			"diff":      diffOut,
+		}
+		if skipReason != "" {
+			fileEntry["diff_skip_reason"] = skipReason
+		}
+		files[filePath] = fileEntry
+	}
+
+	return files
+}
+
+// diffSectionStatus reads only raw extended headers, between the section's
+// path header and its file headers or payload. Content prefixes are significant.
+func diffSectionStatus(diffContent string) string {
+	_, metadata, _ := strings.Cut(diffContent, "\n")
+	for line := range strings.SplitSeq(metadata, "\n") {
+		if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") ||
+			strings.HasPrefix(line, "@@") || strings.HasPrefix(line, "Binary files ") || line == "GIT binary patch" {
+			break
+		}
+		if mode, ok := strings.CutPrefix(line, "new file mode "); ok && validDiffFileMode(mode) {
+			return fileStatusAdded
+		}
+		if mode, ok := strings.CutPrefix(line, "deleted file mode "); ok && validDiffFileMode(mode) {
+			return fileStatusDeleted
+		}
+		if path, ok := strings.CutPrefix(line, "rename from "); ok && path != "" {
+			return fileStatusRenamed
+		}
+	}
+	return fileStatusModified
+}
+
+func validDiffFileMode(mode string) bool {
+	if len(mode) != 6 {
+		return false
+	}
+	for _, digit := range mode {
+		if digit < '0' || digit > '7' {
+			return false
+		}
+	}
+	return true
+}
+
+// diffSectionPath extracts the new-side path of one `diff --git` section.
+// The `+++ b/<path>` file line is the authoritative source: git writes it
+// once per section, exactly one path per line, so spaces and literal ` b/`
+// sequences inside filenames can't confuse the old/new split, and git
+// C-quotes paths containing special bytes (tabs, non-ASCII, quotes,
+// backslashes) the same way it quotes the header. Sections that carry no
+// file lines fall back to other unambiguous per-section lines before the
+// `diff --git` header:
+//   - deleted files: `--- a/<path>` (the `+++` side is `/dev/null`);
+//   - pure renames without hunks: `rename to <path>`;
+//   - binary sections: `Binary files a/<old> and b/<new> differ`;
+//   - mode-only changes: the quoted/unquoted header itself.
+//
+// A single trailing tab on a file line is git's marker for paths that end in
+// whitespace; it is stripped but any real trailing whitespace is kept.
+func diffSectionPath(diffContent string) (string, bool) {
+	lines := strings.Split(diffContent, "\n")
+
+	// First pass prefers the `+++ b/<path>` line: in a rename section the
+	// `--- a/<old>` line precedes it, and the new-side path is what the
+	// changes panel shows. `+++ /dev/null` (deleted files) yields nothing,
+	// so the second pass falls back to the `--- a/<path>` old-side line.
+	for _, line := range lines {
+		if path, ok := diffFileLinePath("+++", line); ok {
+			return path, true
+		}
+	}
+	for _, line := range lines {
+		if path, ok := diffFileLinePath("---", line); ok {
+			return path, true
+		}
+	}
+	// Pure renames (similarity 100%, no hunks) emit rename from/to lines with
+	// no ---/+++ file lines; `rename to <path>` is one path per line.
+	for _, line := range lines {
+		if path, ok := diffWholeLinePath("rename to ", line); ok {
+			return path, true
+		}
+	}
+	// Binary sections emit `Binary files a/<old> and b/<new> differ` with no
+	// ---/+++ lines; parse the new-side path off that line.
+	for _, line := range lines {
+		if path, ok := diffBinaryFilesNewPath(line); ok {
+			return path, true
+		}
+	}
+	// Mode-only changes (old mode/new mode) have no path-bearing line at all;
+	// parse the header, handling git's C-quoted form.
+	return diffHeaderNewPath(lines[0])
+}
+
+// splitDiffSections splits git diff/show output into the pre-header prefix
+// (numstat rows when --numstat was used) and one section per file, each
+// section starting with its `diff --git ` header line. The split only breaks
+// at lines that begin with the token — git's actual section-boundary
+// grammar — so the token appearing inside a patch body or filename cannot
+// truncate a real section or create a bogus one.
+func splitDiffSections(output string) (prefix string, sections []string) {
+	first := firstDiffHeaderIndex(output)
+	prefix = output[:first]
+	rest := output[first:]
+	for rest != "" {
+		// rest starts at a `diff --git ` header line; the next section
+		// begins at the next line that starts with the token.
+		next := strings.Index(rest, "\ndiff --git ")
+		if next == -1 {
+			sections = append(sections, rest)
+			break
+		}
+		sections = append(sections, rest[:next+1])
+		rest = rest[next+1:]
+	}
+	return prefix, sections
+}
+
+// firstDiffHeaderIndex returns the byte offset of the first line that starts
+// with `diff --git `, or len(s) when there is none.
+func firstDiffHeaderIndex(s string) int {
+	for i := 0; i < len(s); {
+		lineEnd := i
+		for lineEnd < len(s) && s[lineEnd] != '\n' {
+			lineEnd++
+		}
+		if strings.HasPrefix(s[i:lineEnd], "diff --git ") {
+			return i
+		}
+		if lineEnd >= len(s) {
+			return len(s)
+		}
+		i = lineEnd + 1
+	}
+	return len(s)
+}
+
+// diffHeaderNewPath parses the new-side path out of a `diff --git` header,
+// supporting git's C-quoted form. The unquoted form (`a/<old> b/<new>`) can
+// only be split at the first ` b/` — a path that itself contains ` b/`
+// renders unquoted and is inherently ambiguous in git's text output; the
+// per-line sources above disambiguate every section that carries them.
+func diffHeaderNewPath(header string) (string, bool) {
+	rest, ok := strings.CutPrefix(header, "diff --git ")
+	if !ok {
+		return "", false
+	}
+	if strings.HasPrefix(rest, `"`) {
+		// Quoted: `"a/<old>" "b/<new>"`. Both tokens are C-quoted, so scan
+		// the first token's closing quote escape-aware: a `\"` inside the
+		// path must not be read as the end of the token. The second token
+		// starts right after the closing quote and the separating space.
+		oldEnd := quotedTokenEnd(rest)
+		if oldEnd < 0 || oldEnd >= len(rest) || rest[oldEnd] != ' ' {
+			return "", false
+		}
+		after := rest[oldEnd+1:]
+		if !strings.HasPrefix(after, `"`) {
+			return "", false
+		}
+		newEnd := quotedTokenEnd(after)
+		if newEnd < 0 {
+			return "", false
+		}
+		newPath := unquoteGitPath(after[:newEnd])
+		return strings.TrimPrefix(newPath, "b/"), true
+	}
+	// Unquoted: `a/<old> b/<new>`. A path that itself contains ` b/` renders
+	// unquoted and the first occurrence splits inside the old path. Mode-only
+	// changes (the main consumer of this fallback) always carry identical
+	// old/new paths, so scan candidates and prefer the separator whose two
+	// sides unquote to equal paths — the same rule the binary parser uses.
+	// Fall back to the first candidate when none match (a hypothetical
+	// rename-without-rename-lines would land here).
+	firstSep := -1
+	search := rest
+	base := 0
+	for {
+		sep := strings.Index(search, " b/")
+		if sep < 0 {
+			break
+		}
+		// `abs` points at the space; the `b/` prefix of the new side starts
+		// one byte later, so the right side (prefix included) is rest[abs+1:].
+		abs := base + sep
+		if firstSep == -1 {
+			firstSep = abs
+		}
+		left, leftOK := headerSidePath(rest[:abs], "a/")
+		right, rightOK := headerSidePath(rest[abs+1:], "b/")
+		if leftOK && rightOK && left == right {
+			return right, true
+		}
+		base = abs + 3
+		search = rest[base:]
+	}
+	if firstSep == -1 {
+		return "", false
+	}
+	return unquoteGitPath(rest[firstSep+3:]), true
+}
+
+// headerSidePath strips a fixed a/ or b/ prefix (optionally inside git's
+// C-quotes) off one side of a diff header or Binary files line, returning the
+// unquoted path.
+func headerSidePath(side, prefix string) (string, bool) {
+	if strings.HasPrefix(side, `"`) {
+		unquoted, err := strconv.Unquote(side)
+		if err != nil {
+			return "", false
+		}
+		side = unquoted
+	}
+	if !strings.HasPrefix(side, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(side, prefix), true
+}
+
+// diffWholeLinePath reads a path off a line whose entire remainder is the
+// path (`rename to <path>`, `rename from <path>`), C-unquoting when git
+// quoted it. One path per line, so spaces inside the path are unambiguous.
+func diffWholeLinePath(prefix, line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, prefix)
+	if !ok {
+		return "", false
+	}
+	if rest == "" {
+		return "", false
+	}
+	return unquoteGitPath(rest), true
+}
+
+// quotedTokenEnd returns the index just past the closing quote of the first
+// C-quoted token in s (which must start with `"`), or -1 when unterminated.
+// Escapes are honored: a `\"` inside the path is content, not a terminator.
+func quotedTokenEnd(s string) int {
+	if !strings.HasPrefix(s, `"`) {
+		return -1
+	}
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // skip the escaped byte
+		case '"':
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// diffBinaryFilesNewPath parses the new-side path off a
+// `Binary files a/<old> and b/<new> differ` line (git's shape for binary
+// sections, which carry no ---/+++ file lines). Both sides may be C-quoted:
+// `Binary files "a/<old>" and "b/<new>" differ`.
+//
+// For a binary content change git emits the SAME path on both sides, so the
+// separator whose two sides unquote to equal paths is authoritative — this
+// resolves paths that themselves contain ` and b/` (a valid filename; the
+// first-candidate scan would split inside the old path). When no candidate
+// matches (binary rename with differing paths), the first ` and ` whose
+// right side starts the `b/` token wins.
+func diffBinaryFilesNewPath(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, "Binary files ")
+	if !ok {
+		return "", false
+	}
+	rest = strings.TrimSuffix(rest, " differ")
+	if rest == "" {
+		return "", false
+	}
+
+	firstSep := -1
+	search := rest
+	base := 0
+	for {
+		sep := strings.Index(search, " and ")
+		if sep < 0 {
+			break
+		}
+		abs := base + sep
+		right := search[sep+5:]
+		rightBare := strings.TrimPrefix(right, `"`)
+		if strings.HasPrefix(rightBare, "b/") {
+			if firstSep == -1 {
+				firstSep = abs
+			}
+			// Equal-paths check: the left side is everything before this
+			// candidate separator; both sides may be quoted.
+			leftPath, leftOK := binarySidePath(rest[:abs])
+			rightPath, rightOK := binarySidePath(right)
+			if leftOK && rightOK && leftPath == rightPath {
+				return rightPath, true
+			}
+		}
+		base = abs + 5
+		search = rest[base:]
+	}
+	if firstSep == -1 {
+		return "", false
+	}
+	newSide, ok := binarySidePath(rest[firstSep+5:])
+	if !ok {
+		return "", false
+	}
+	return newSide, true
+}
+
+// binarySidePath strips the `a/` or `b/` prefix (optionally inside git's
+// C-quotes) off one side of a `Binary files` line, returning the unquoted
+// path.
+func binarySidePath(side string) (string, bool) {
+	if strings.HasPrefix(side, `"`) {
+		unquoted, err := strconv.Unquote(side)
+		if err != nil {
+			return "", false
+		}
+		side = unquoted
+	}
+	if !strings.HasPrefix(side, "a/") && !strings.HasPrefix(side, "b/") {
+		return "", false
+	}
+	return side[2:], true
+}
+
+// diffFileLinePath reads the path off one `+++ <path>` or `--- <path>` file
+// line (per git's per-section file headers), returning ok=false for
+// `/dev/null` sides and non-file lines. Quoted paths (git C-quoting) carry
+// the `a/`/`b/` prefix inside the quotes; the trailing-tab whitespace marker
+// sits outside them, so it is stripped before unquoting.
+func diffFileLinePath(prefix, line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, prefix+" ")
+	if !ok {
+		return "", false
+	}
+	if strings.HasPrefix(rest, "/dev/null") {
+		return "", false
+	}
+	path := unquoteGitPath(strings.TrimSuffix(rest, "\t"))
+	if prefix == "+++" {
+		return strings.TrimPrefix(path, "b/"), true
+	}
+	return strings.TrimPrefix(path, "a/"), true
+}
+
+// numstatByPath indexes the `<adds>\t<dels>\t<path>` rows git writes for
+// --numstat by their new-side path (parseNumstatEntry already expands git's
+// `dir/{old => new}` rename notation, so the key matches the path
+// parseCommitDiffWithOptions reads out of the `diff --git` header). Rows that
+// are not numstat — the `--stat` table, which is tab-free — are skipped, and a
+// binary file's `-\t-\t<path>` row yields a zero pair, which is the correct
+// answer since binary changes have no lines.
+func numstatByPath(block string) map[string]numstatEntry {
+	rows := make(map[string]numstatEntry)
+	for _, line := range strings.Split(block, "\n") {
+		entry, ok := parseNumstatEntry(line)
+		if !ok {
+			continue
+		}
+		rows[entry.path] = entry
+	}
+	return rows
+}
+
+// fileLineCounts returns the add/delete counts for one file section: git's own
+// --numstat row when the caller's command supplied one, otherwise a count of the
+// patch body. Counting is positional (in-hunk), never textual — a removed
+// `-- seed data` line arrives as `--- seed data` and a prefix test drops it.
+func fileLineCounts(numstat map[string]numstatEntry, filePath, diffContent string) (additions, deletions int) {
+	if entry, ok := numstat[filePath]; ok {
+		return entry.additions, entry.deletions
+	}
+	return unidiff.CountLines(diffContent)
+}
+
+// applyDiffBudget enforces the per-file and cumulative byte budgets in opts and
+// returns the (possibly truncated/empty) diff content plus a skip reason. A zero
+// budget means "no cap" for that dimension. The cumulative budget is strict: the
+// running total never exceeds totalMaxBytes — a file that would cross the
+// boundary is clamped to the remaining budget rather than emitted in full.
+func applyDiffBudget(diffContent string, totalSoFar int, opts parseCommitDiffOptions) (diff, skipReason string) {
+	limit := len(diffContent)
+	truncated := false
+
+	if opts.totalMaxBytes > 0 {
+		remaining := opts.totalMaxBytes - totalSoFar
+		if remaining <= 0 {
+			return "", diffSkipReasonBudgetExceeded
+		}
+		if remaining < limit {
+			limit = remaining
+			truncated = true
+		}
+	}
+
+	if opts.perFileMaxBytes > 0 && opts.perFileMaxBytes < limit {
+		limit = opts.perFileMaxBytes
+		truncated = true
+	}
+
+	if truncated {
+		return diffContent[:limit], diffSkipReasonTruncated
+	}
+	return diffContent, ""
+}
+
+// GetMergeBase returns the merge-base commit SHA between two refs (e.g., HEAD and origin/main).
+// This is used to determine the common ancestor for filtering commits.
+func (g *GitOperator) GetMergeBase(ctx context.Context, ref1, ref2 string) (string, error) {
+	output, err := g.runGitCommand(ctx, "merge-base", ref1, ref2)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute merge-base: %w", err)
+	}
+	return strings.TrimSpace(output), nil
+}
+
+// IsAncestor reports whether `ancestor` is an ancestor of `descendant`
+// (git merge-base --is-ancestor). Exit 0 => true, exit 1 => false, any other
+// exit status => error. git treats a commit as an ancestor of itself, so an
+// equal SHA returns true; callers wanting a STRICT ancestor check compare the
+// SHAs themselves first. Empty ancestor or descendant returns (false, nil)
+// without invoking git.
+func (g *GitOperator) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	if ancestor == "" || descendant == "" {
+		return false, nil
+	}
+	_, err := g.runGitCommand(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	// runGitCommand wraps the underlying *exec.ExitError with fmt.Errorf("%w: ..."),
+	// so errors.As recovers the exit code. Exit 1 is git's "not an ancestor"
+	// signal; anything else is a genuine failure (bad repo, unknown SHA).
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// GetRevParse resolves a ref name to its commit SHA. Returns the empty
+// string when the ref doesn't exist; used as a no-common-ancestor fallback
+// for the commits panel so a base branch with unrelated history still
+// produces a stable anchor for `git log <tip>..HEAD`.
+func (g *GitOperator) GetRevParse(ctx context.Context, ref string) (string, error) {
+	output, err := g.runGitCommand(ctx, "rev-parse", ref)
+	if err != nil {
+		return "", fmt.Errorf("failed to rev-parse %q: %w", ref, err)
+	}
+	return strings.TrimSpace(output), nil
+}

@@ -1,0 +1,795 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+const GitPushPreflightHistoryUpdateRequired = "history_update_required"
+
+const (
+	gitPushPreflightTimeout = 2 * time.Minute
+	gitStatusDetailsReady   = "ready"
+)
+
+// GitOperationResult represents the result of a git operation.
+// This matches the server-side process.GitOperationResult.
+type GitOperationResult struct {
+	Success         bool     `json:"success"`
+	Operation       string   `json:"operation"`
+	Output          string   `json:"output"`
+	Error           string   `json:"error,omitempty"`
+	ErrorCode       string   `json:"error_code,omitempty"`
+	PreflightReason string   `json:"preflight_reason,omitempty"`
+	ConflictFiles   []string `json:"conflict_files,omitempty"`
+	RecoveryBranch  string   `json:"recovery_branch,omitempty"`
+	// Destination a push or preflight validated. A push populates these only
+	// when the request carried an explicit push target.
+	PushedRemote string `json:"pushed_remote,omitempty"`
+	PushedBranch string `json:"pushed_branch,omitempty"`
+	// Branches accompanying a mismatch refusal. CurrentBranch is empty for a
+	// detached HEAD.
+	ExpectedBranch string `json:"expected_branch,omitempty"`
+	CurrentBranch  string `json:"current_branch,omitempty"`
+	// BaselinePublished marks a mismatch refusal after empty-remote first
+	// publication already published the baseline in this request.
+	BaselinePublished bool `json:"baseline_published,omitempty"`
+}
+
+// PushOptions carries the optional inputs of a push or push-preflight call.
+// The zero value reproduces the behavior of a request that names neither.
+type PushOptions struct {
+	Force          bool
+	SetUpstream    bool
+	Remote         string
+	ExpectedBranch string
+}
+
+// ContributionHistoryExplanationResult mirrors the bounded, read-only Git
+// observation returned by the agentctl server.
+type ContributionHistoryExplanationResult struct {
+	Repo                 string `json:"repo,omitempty"`
+	Branch               string `json:"branch"`
+	ExpectedLocalHead    string `json:"expected_local_head"`
+	ExpectedRemoteHead   string `json:"expected_remote_head"`
+	Kind                 string `json:"kind"`
+	Reason               string `json:"reason"`
+	OntoHead             string `json:"onto_head,omitempty"`
+	TaskCommitCount      *int   `json:"task_commit_count,omitempty"`
+	PublishedCommitCount *int   `json:"published_commit_count,omitempty"`
+	NewBaseCommitCount   *int   `json:"new_base_commit_count,omitempty"`
+}
+
+// PRCreateResult represents the result of a PR creation operation.
+// This matches the server-side process.PRCreateResult.
+type PRCreateResult struct {
+	Success      bool   `json:"success"`
+	BranchPushed bool   `json:"branch_pushed,omitempty"`
+	PRURL        string `json:"pr_url,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Output       string `json:"output,omitempty"`
+	Error        string `json:"error,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+}
+
+// GitPull performs a git pull operation on the worktree.
+// If rebase is true, uses git pull --rebase.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitPull(ctx context.Context, rebase bool, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Rebase bool   `json:"rebase"`
+		Repo   string `json:"repo,omitempty"`
+	}{
+		Rebase: rebase,
+		Repo:   repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/pull", payload)
+}
+
+// GitPush performs a git push operation on the worktree.
+// If opts.Force is true, uses --force-with-lease.
+// If opts.SetUpstream is true, uses --set-upstream.
+// opts.Remote and opts.ExpectedBranch are optional and passed through.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitPush(ctx context.Context, repo string, opts PushOptions) (*GitOperationResult, error) {
+	payload := struct {
+		Force          bool   `json:"force"`
+		SetUpstream    bool   `json:"set_upstream"`
+		Repo           string `json:"repo,omitempty"`
+		Remote         string `json:"remote,omitempty"`
+		ExpectedBranch string `json:"expected_branch,omitempty"`
+	}{
+		Force:          opts.Force,
+		SetUpstream:    opts.SetUpstream,
+		Repo:           repo,
+		Remote:         opts.Remote,
+		ExpectedBranch: opts.ExpectedBranch,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/push", payload)
+}
+
+// GitPushPreflight validates the push destination without mutating the remote.
+// repo is the multi-repo workspace subpath; opts carries the optional explicit
+// push target and expected branch.
+func (c *Client) GitPushPreflight(ctx context.Context, repo string, opts PushOptions) (*GitOperationResult, error) {
+	payload := struct {
+		Repo           string `json:"repo,omitempty"`
+		Remote         string `json:"remote,omitempty"`
+		ExpectedBranch string `json:"expected_branch,omitempty"`
+	}{
+		Repo:           repo,
+		Remote:         opts.Remote,
+		ExpectedBranch: opts.ExpectedBranch,
+	}
+	return c.gitOperationWithClient(ctx, "/api/v1/git/push-preflight", payload, c.gitPushPreflightClient())
+}
+
+func (c *Client) gitPushPreflightClient() *http.Client {
+	client := *c.httpClient
+	client.Timeout = gitPushPreflightTimeout
+	return &client
+}
+
+// GitReplaceRemoteContribution replaces the bound contribution branch when
+// its provider head still matches expectedRemoteHead.
+func (c *Client) GitReplaceRemoteContribution(ctx context.Context, expectedRemoteHead, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		ExpectedRemoteHead string `json:"expected_remote_head"`
+		Repo               string `json:"repo,omitempty"`
+	}{
+		ExpectedRemoteHead: expectedRemoteHead,
+		Repo:               repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/contribution/replace", payload)
+}
+
+// GitUseRemoteContribution adopts the bound contribution head after creating
+// a local recovery branch at the current task HEAD.
+func (c *Client) GitUseRemoteContribution(ctx context.Context, expectedRemoteHead, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		ExpectedRemoteHead string `json:"expected_remote_head"`
+		Repo               string `json:"repo,omitempty"`
+	}{
+		ExpectedRemoteHead: expectedRemoteHead,
+		Repo:               repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/contribution/use", payload)
+}
+
+// GitContributionHistoryExplanation observes the selected branch and heads
+// without fetching, rewriting, or publishing any Git refs.
+func (c *Client) GitContributionHistoryExplanation(
+	ctx context.Context, branch, expectedLocalHead, expectedRemoteHead, repo string,
+) (*ContributionHistoryExplanationResult, error) {
+	payload := struct {
+		Branch             string `json:"branch"`
+		ExpectedLocalHead  string `json:"expected_local_head"`
+		ExpectedRemoteHead string `json:"expected_remote_head"`
+		Repo               string `json:"repo,omitempty"`
+	}{
+		Branch:             branch,
+		ExpectedLocalHead:  expectedLocalHead,
+		ExpectedRemoteHead: expectedRemoteHead,
+		Repo:               repo,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/v1/git/contribution/history-explanation", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	responseBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	var result ContributionHistoryExplanationResult
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(responseBody), err)
+	}
+	if resp.StatusCode >= 400 {
+		return &result, fmt.Errorf("git contribution history explanation failed with status %d", resp.StatusCode)
+	}
+	return &result, nil
+}
+
+// GitRebase rebases the worktree branch onto the specified base branch.
+// It first fetches origin/<baseBranch>, then rebases onto it.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitRebase(ctx context.Context, baseBranch, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		BaseBranch string `json:"base_branch"`
+		Repo       string `json:"repo,omitempty"`
+	}{
+		BaseBranch: baseBranch,
+		Repo:       repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/rebase", payload)
+}
+
+// GitMerge merges the specified base branch into the worktree branch.
+// It first fetches origin/<baseBranch>, then merges it.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitMerge(ctx context.Context, baseBranch, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		BaseBranch string `json:"base_branch"`
+		Repo       string `json:"repo,omitempty"`
+	}{
+		BaseBranch: baseBranch,
+		Repo:       repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/merge", payload)
+}
+
+// GitAbort aborts an in-progress merge or rebase operation.
+// The operation parameter must be "merge" or "rebase".
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitAbort(ctx context.Context, operation, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Operation string `json:"operation"`
+		Repo      string `json:"repo,omitempty"`
+	}{
+		Operation: operation,
+		Repo:      repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/abort", payload)
+}
+
+// GitCommit creates a commit with the specified message.
+// If stageAll is true, all changes are staged before committing.
+// If amend is true, it amends the previous commit instead of creating a new one.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitCommit(ctx context.Context, message string, stageAll bool, amend bool, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Message  string `json:"message"`
+		StageAll bool   `json:"stage_all"`
+		Amend    bool   `json:"amend"`
+		Repo     string `json:"repo,omitempty"`
+	}{
+		Message:  message,
+		StageAll: stageAll,
+		Amend:    amend,
+		Repo:     repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/commit", payload)
+}
+
+// GitRenameBranch renames the current branch to a new name.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitRenameBranch(ctx context.Context, newName, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		NewName string `json:"new_name"`
+		Repo    string `json:"repo,omitempty"`
+	}{
+		NewName: newName,
+		Repo:    repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/rename-branch", payload)
+}
+
+// GitStage stages files for commit.
+// If paths is empty, stages all changes (git add -A).
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitStage(ctx context.Context, paths []string, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Paths []string `json:"paths"`
+		Repo  string   `json:"repo,omitempty"`
+	}{
+		Paths: paths,
+		Repo:  repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/stage", payload)
+}
+
+// GitUnstage unstages files from the index.
+// If paths is empty, unstages all changes (git reset HEAD).
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitUnstage(ctx context.Context, paths []string, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Paths []string `json:"paths"`
+		Repo  string   `json:"repo,omitempty"`
+	}{
+		Paths: paths,
+		Repo:  repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/unstage", payload)
+}
+
+// GitDiscard discards changes to files, reverting them to HEAD.
+// Paths must not be empty - at least one file must be specified.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitDiscard(ctx context.Context, paths []string, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		Paths []string `json:"paths"`
+		Repo  string   `json:"repo,omitempty"`
+	}{
+		Paths: paths,
+		Repo:  repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/discard", payload)
+}
+
+// GitRevertCommit undoes the latest commit using git reset --soft, keeping changes staged.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitRevertCommit(ctx context.Context, commitSHA, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		CommitSHA string `json:"commit_sha"`
+		Repo      string `json:"repo,omitempty"`
+	}{
+		CommitSHA: commitSHA,
+		Repo:      repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/revert-commit", payload)
+}
+
+// GitReset resets HEAD to the specified commit.
+// Mode can be "soft" (keep changes staged), "mixed" (keep changes unstaged), or "hard" (discard all changes).
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitReset(ctx context.Context, commitSHA, mode, repo string) (*GitOperationResult, error) {
+	payload := struct {
+		CommitSHA string `json:"commit_sha"`
+		Mode      string `json:"mode"`
+		Repo      string `json:"repo,omitempty"`
+	}{
+		CommitSHA: commitSHA,
+		Mode:      mode,
+		Repo:      repo,
+	}
+	return c.gitOperation(ctx, "/api/v1/git/reset", payload)
+}
+
+// GitCreatePR creates a pull request using the gh CLI.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitCreatePR(ctx context.Context, title, body, baseBranch string, draft bool, repo string) (*PRCreateResult, error) {
+	payload := struct {
+		Title      string `json:"title"`
+		Body       string `json:"body"`
+		BaseBranch string `json:"base_branch"`
+		Draft      bool   `json:"draft"`
+		Repo       string `json:"repo,omitempty"`
+	}{
+		Title:      title,
+		Body:       body,
+		BaseBranch: baseBranch,
+		Draft:      draft,
+		Repo:       repo,
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/git/create-pr", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var result PRCreateResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	// For 409 Conflict (operation in progress), return the result with error set
+	// For other HTTP errors, return as error
+	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict {
+		return &result, fmt.Errorf("create PR failed with status %d: %s", resp.StatusCode, result.Error)
+	}
+
+	return &result, nil
+}
+
+// gitOperation is a helper that performs a git operation via HTTP POST.
+func (c *Client) gitOperation(ctx context.Context, path string, payload interface{}) (*GitOperationResult, error) {
+	return c.gitOperationWithClient(ctx, path, payload, c.httpClient)
+}
+
+func (c *Client) gitOperationWithClient(
+	ctx context.Context,
+	path string,
+	payload interface{},
+	httpClient *http.Client,
+) (*GitOperationResult, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var result GitOperationResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	// For 409 Conflict (operation in progress), return the result with error set
+	// For other HTTP errors, return as error
+	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusConflict {
+		return &result, fmt.Errorf("git operation failed with status %d: %s", resp.StatusCode, result.Error)
+	}
+
+	return &result, nil
+}
+
+// CommitDiffResult represents the result of getting a commit's diff.
+type CommitDiffResult struct {
+	Success      bool                   `json:"success"`
+	CommitSHA    string                 `json:"commit_sha"`
+	Message      string                 `json:"message"`
+	Author       string                 `json:"author"`
+	Date         string                 `json:"date"`
+	Files        map[string]interface{} `json:"files"`
+	FilesChanged int                    `json:"files_changed"`
+	Insertions   int                    `json:"insertions"`
+	Deletions    int                    `json:"deletions"`
+	Error        string                 `json:"error,omitempty"`
+}
+
+// GitShowCommit gets the diff for a specific commit.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+// Multi-repo tasks must pass the owning repo because a SHA from one repo's
+// commit graph isn't resolvable in any other repo.
+func (c *Client) GitShowCommit(ctx context.Context, commitSHA, repo string) (*CommitDiffResult, error) {
+	reqURL := c.baseURL + "/api/v1/git/commit/" + commitSHA
+	if repo != "" {
+		reqURL += "?repo=" + url.QueryEscape(repo)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var result CommitDiffResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return &result, fmt.Errorf("git show commit failed with status %d: %s", resp.StatusCode, result.Error)
+	}
+
+	return &result, nil
+}
+
+// GitLogResult represents the result of a git log operation.
+type GitLogResult struct {
+	Success   bool             `json:"success"`
+	Commits   []*GitCommitInfo `json:"commits"`
+	Error     string           `json:"error,omitempty"`
+	ErrorCode string           `json:"error_code,omitempty"`
+	// PerRepoErrors lists per-repo failures during a multi-repo log fan-out.
+	// Empty/nil for single-repo responses or when every repo succeeded. Mirrors
+	// the server's process.GitLogResult.PerRepoErrors field.
+	PerRepoErrors []GitLogRepoError `json:"per_repo_errors,omitempty"`
+}
+
+// GitLogRepoError describes a single per-repo failure from a multi-repo log
+// fan-out. Mirrors the server's process.GitLogRepoError type so callers using
+// the agentctl client can deserialize and surface partial failures.
+type GitLogRepoError struct {
+	RepositoryName string `json:"repository_name"`
+	Error          string `json:"error"`
+	ErrorCode      string `json:"error_code,omitempty"`
+}
+
+// GitCommitInfo represents a single commit in the log.
+// Field names match GitCommitData and SessionCommit for frontend consistency.
+type GitCommitInfo struct {
+	CommitSHA     string `json:"commit_sha"`
+	ParentSHA     string `json:"parent_sha"`
+	CommitMessage string `json:"commit_message"`
+	AuthorName    string `json:"author_name"`
+	AuthorEmail   string `json:"author_email"`
+	CommittedAt   string `json:"committed_at"`
+	FilesChanged  int    `json:"files_changed"`
+	Insertions    int    `json:"insertions"`
+	Deletions     int    `json:"deletions"`
+	// Pushed mirrors process.GitCommitInfo.Pushed — true when the commit is
+	// reachable from the branch's upstream tracking ref. Sourced from git, so
+	// it stays correct without an open PR and across multi-repo workspaces.
+	Pushed bool `json:"pushed"`
+	// RepositoryName tags commits when fetched from a multi-repo subpath. Empty
+	// for single-repo workspaces. Stamped client-side after the per-repo call
+	// so callers can fan out across repos and merge.
+	RepositoryName string `json:"repository_name,omitempty"`
+}
+
+// GitLog gets the commit log from baseCommit to HEAD.
+// If baseCommit is empty, returns recent commits (limited by limit).
+// If targetBranch is provided, computes merge-base dynamically for accurate filtering.
+// repo is the multi-repo subpath (e.g. "kandev"); empty for single-repo workspaces.
+func (c *Client) GitLog(ctx context.Context, baseCommit string, limit int, targetBranch, repo string) (*GitLogResult, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/git/log?since=%s&limit=%d",
+		c.baseURL, url.QueryEscape(baseCommit), limit)
+	if targetBranch != "" {
+		reqURL += "&target_branch=" + url.QueryEscape(targetBranch)
+	}
+	if repo != "" {
+		reqURL += "&repo=" + url.QueryEscape(repo)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var result GitLogResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return &result, fmt.Errorf("git log failed with status %d: %s", resp.StatusCode, result.Error)
+	}
+
+	return &result, nil
+}
+
+// CumulativeDiffResult represents the cumulative diff from base commit to HEAD.
+type CumulativeDiffResult struct {
+	Success      bool                   `json:"success"`
+	BaseCommit   string                 `json:"base_commit"`
+	HeadCommit   string                 `json:"head_commit"`
+	TotalCommits int                    `json:"total_commits"`
+	Files        map[string]interface{} `json:"files"`
+	// TruncatedFilesCount is how many files agentctl dropped because the
+	// cumulative range exceeded its per-request file cap (large rebase).
+	// Surfaced to the UI as a "N more files hidden" banner.
+	TruncatedFilesCount int    `json:"truncated_files_count,omitempty"`
+	Error               string `json:"error,omitempty"`
+	ErrorCode           string `json:"error_code,omitempty"`
+}
+
+// GetCumulativeDiff gets the cumulative diff from baseCommit to HEAD.
+// When targetBranch is non-empty the server recomputes the base via merge-base
+// against origin/<targetBranch>, falling back to baseCommit when that fails.
+func (c *Client) GetCumulativeDiff(ctx context.Context, baseCommit, targetBranch string) (*CumulativeDiffResult, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/git/cumulative-diff?base=%s", c.baseURL, url.QueryEscape(baseCommit))
+	if targetBranch != "" {
+		reqURL += "&target_branch=" + url.QueryEscape(targetBranch)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var result CumulativeDiffResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return &result, fmt.Errorf("cumulative diff failed with status %d: %s", resp.StatusCode, result.Error)
+	}
+
+	return &result, nil
+}
+
+// GitStatusResult represents the result of a git status query.
+type GitStatusResult struct {
+	Success             bool                   `json:"success"`
+	StatusState         string                 `json:"status_state,omitempty"`
+	FilesComplete       bool                   `json:"files_complete"`
+	DetailState         string                 `json:"detail_state,omitempty"`
+	ErrorCode           string                 `json:"error_code,omitempty"`
+	TrackerID           string                 `json:"tracker_id,omitempty"`
+	TrackerEpoch        uint64                 `json:"tracker_epoch,omitempty"`
+	SnapshotRevision    uint64                 `json:"snapshot_revision,omitempty"`
+	RepositoryName      string                 `json:"repository_name,omitempty"`
+	IsSubmodule         bool                   `json:"is_submodule,omitempty"`
+	Branch              string                 `json:"branch"`
+	RemoteBranch        string                 `json:"remote_branch"`
+	HeadCommit          string                 `json:"head_commit"`
+	BaseCommit          string                 `json:"base_commit"` // Merge-base with origin branch
+	ComparisonTarget    string                 `json:"comparison_target,omitempty"`
+	ComparisonStatus    string                 `json:"comparison_status,omitempty"`
+	ComparisonErrorCode string                 `json:"comparison_error_code,omitempty"`
+	Ahead               int                    `json:"ahead"`
+	Behind              int                    `json:"behind"`
+	RemoteAhead         int                    `json:"remote_ahead"`
+	RemoteBehind        int                    `json:"remote_behind"`
+	RemoteHeadCommit    string                 `json:"remote_head_commit,omitempty"`
+	Modified            []string               `json:"modified"`
+	Added               []string               `json:"added"`
+	Deleted             []string               `json:"deleted"`
+	Untracked           []string               `json:"untracked"`
+	Renamed             []string               `json:"renamed"`
+	Files               map[string]interface{} `json:"files"`
+	Timestamp           string                 `json:"timestamp"`
+	BranchAdditions     int                    `json:"branch_additions,omitempty"`
+	BranchDeletions     int                    `json:"branch_deletions,omitempty"`
+	Error               string                 `json:"error,omitempty"`
+}
+
+// fetchJSONResult performs a GET against `path` and decodes the response into
+// `out`. Returns the HTTP status code so callers can decide whether to wrap
+// any structured-error body into the typed result. Centralises the boilerplate
+// shared between the status endpoints (which is what triggers `dupl`).
+func (c *Client) fetchJSONResult(ctx context.Context, path string, out any) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return resp.StatusCode, fmt.Errorf("failed to parse response (status %d, body: %s): %w",
+			resp.StatusCode, truncateBody(respBody), err)
+	}
+	return resp.StatusCode, nil
+}
+
+// GetGitStatus gets the current (cached) git status from the workspace.
+func (c *Client) GetGitStatus(ctx context.Context) (*GitStatusResult, error) {
+	var result GitStatusResult
+	status, err := c.fetchJSONResult(ctx, "/api/v1/git/status", &result)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return &result, fmt.Errorf("git status failed with status %d: %s", status, result.Error)
+	}
+	return &result, nil
+}
+
+// GetGitStatusFresh starts or joins a fresh basic status observation and
+// publishes the accepted result to the workspace tracker's cache.
+func (c *Client) GetGitStatusFresh(ctx context.Context) (*GitStatusResult, error) {
+	var result GitStatusResult
+	status, err := c.fetchJSONResult(ctx, "/api/v1/git/status?fresh=true", &result)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return &result, fmt.Errorf("git status fresh failed with status %d: %s", status, result.Error)
+	}
+	return &result, nil
+}
+
+// GetGitStatusWithDetails returns a fresh snapshot after file diffs and
+// secondary Git statistics settle under the caller's deadline.
+func (c *Client) GetGitStatusWithDetails(ctx context.Context) (*GitStatusResult, error) {
+	var result GitStatusResult
+	status, err := c.fetchJSONResult(ctx, "/api/v1/git/status?fresh=true&details=wait", &result)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return &result, fmt.Errorf("git status details failed with status %d: %s", status, result.Error)
+	}
+	if !result.Success || (result.DetailState != "" && result.DetailState != gitStatusDetailsReady) {
+		return &result, fmt.Errorf("git status details unavailable: %s", result.ErrorCode)
+	}
+	return &result, nil
+}
+
+// PerRepoGitStatus pairs a repository_name with its status. Mirrors the
+// server-side shape so the gateway can fan a single subscribe out into one
+// notification per repo (multi-repo workspaces) without re-running git
+// commands once per call.
+type PerRepoGitStatus struct {
+	RepositoryName string          `json:"repository_name"`
+	Status         GitStatusResult `json:"status"`
+}
+
+// MultiRepoGitStatusResult is the response shape for /api/v1/git/status/multi.
+type MultiRepoGitStatusResult struct {
+	Success bool               `json:"success"`
+	Repos   []PerRepoGitStatus `json:"repos"`
+	Error   string             `json:"error,omitempty"`
+}
+
+// GetGitStatusMultiFresh returns one status entry per repo (multi-repo) or a
+// single untagged entry (single-repo), starting or joining a fresh basic
+// observation that is published to the tracker's cache and stream.
+func (c *Client) GetGitStatusMultiFresh(ctx context.Context) (*MultiRepoGitStatusResult, error) {
+	return c.getGitStatusMulti(ctx, "/api/v1/git/status/multi?fresh=true", "git status multi")
+}
+
+// GetGitStatusMultiRefresh runs one supported foreground refresh mode.
+func (c *Client) GetGitStatusMultiRefresh(ctx context.Context, mode string) (*MultiRepoGitStatusResult, error) {
+	path := "/api/v1/git/status/multi?mode=" + url.QueryEscape(mode)
+	if mode != "fresh" && mode != "recover" && mode != "replay" {
+		return nil, fmt.Errorf("unsupported git status refresh mode %q", mode)
+	}
+	return c.getGitStatusMulti(ctx, path, "git status multi "+mode)
+}
+
+func (c *Client) getGitStatusMulti(ctx context.Context, path, operation string) (*MultiRepoGitStatusResult, error) {
+	var result MultiRepoGitStatusResult
+	status, err := c.fetchJSONResult(ctx, path, &result)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return &result, fmt.Errorf("%s failed with status %d: %s", operation, status, result.Error)
+	}
+	return &result, nil
+}

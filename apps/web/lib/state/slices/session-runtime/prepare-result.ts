@@ -1,0 +1,77 @@
+import type { SessionPrepareState } from "./types";
+
+/**
+ * Raw `prepare_result` shape as stored in a session's `metadata` (snake_case,
+ * straight off the backend). Mapped into the camelCase {@link SessionPrepareState}
+ * the store and UI consume.
+ */
+type RawPrepareStep = {
+  name: string;
+  kind?: string;
+  remote_platform?: string;
+  mcp_server_id?: string;
+  mcp_provider?: string;
+  failure_code?: string;
+  command?: string;
+  status: string;
+  output?: string;
+  error?: string;
+  warning?: string;
+  warning_detail?: string;
+  started_at?: string;
+  ended_at?: string;
+};
+
+type RawPrepareResult = {
+  status?: string;
+  steps?: RawPrepareStep[];
+  error_message?: string;
+  duration_ms?: number;
+  preparation_id?: string;
+  preparation_started_at?: string;
+};
+
+/**
+ * Map a session's `metadata.prepare_result` into the store's
+ * {@link SessionPrepareState}. Returns `null` when the session has no prepare
+ * result (nothing to render).
+ *
+ * Used by both the SSR page-state builder and the client-side session loader so
+ * the "Environment prepared" timeline message is populated the same way whether
+ * the page is freshly loaded or the user switches tasks client-side.
+ */
+export function prepareResultToSessionState(
+  sessionId: string,
+  metadata: Record<string, unknown> | null | undefined,
+): SessionPrepareState | null {
+  const pr = metadata?.prepare_result as RawPrepareResult | undefined;
+  if (!pr) return null;
+
+  return {
+    sessionId,
+    status: pr.status ?? "completed",
+    preparationId: pr.preparation_id,
+    preparationStartedAt: pr.preparation_started_at,
+    steps: (pr.steps ?? []).map((s) => {
+      const isMcp = s.kind?.startsWith("agent_mcp_") === true;
+      return {
+        name: isMcp ? "" : s.name,
+        kind: s.kind,
+        remotePlatform: s.remote_platform,
+        mcpServerId: s.mcp_server_id,
+        mcpProvider: s.mcp_provider,
+        failureCode: s.failure_code,
+        command: isMcp ? undefined : s.command,
+        status: s.status,
+        output: isMcp ? undefined : s.output,
+        error: isMcp ? undefined : s.error,
+        warning: isMcp ? undefined : s.warning,
+        warningDetail: isMcp ? undefined : s.warning_detail,
+        startedAt: s.started_at,
+        endedAt: s.ended_at,
+      };
+    }),
+    errorMessage: pr.error_message,
+    durationMs: pr.duration_ms,
+  };
+}

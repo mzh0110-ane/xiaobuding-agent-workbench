@@ -1,0 +1,520 @@
+// Package acp implements the ACP client interface for agentctl
+package acp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/coder/acp-go-sdk"
+	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.uber.org/zap"
+)
+
+// UpdateHandler is called when session updates are received from the agent
+type UpdateHandler func(notification acp.SessionNotification)
+
+// PermissionRequestHandler is called when the agent requests permission
+// Returns the selected option ID, or empty string with cancelled=true to cancel
+type PermissionRequestHandler func(ctx context.Context, req *types.PermissionRequest) (*types.PermissionResponse, error)
+
+// CursorTaskHandler is called when Cursor sends its non-standard `cursor/task`
+// request with subagent metadata. The handler is fire-and-forget: it must be
+// best-effort, return without surfacing errors to Cursor, and has no
+// cancellation semantics, so it takes no context.
+type CursorTaskHandler func(params json.RawMessage)
+
+// Client implements acp.Client interface and handles all agent requests
+type Client struct {
+	logger        *zap.Logger
+	workspaceRoot string
+	terminals     *TerminalManager
+
+	mu                sync.RWMutex
+	updateHandler     UpdateHandler
+	permissionHandler PermissionRequestHandler
+	cursorTaskHandler CursorTaskHandler
+}
+
+// ClientOption configures a Client
+type ClientOption func(*Client)
+
+// WithLogger sets the logger
+func WithLogger(l *zap.Logger) ClientOption {
+	return func(c *Client) {
+		c.logger = l
+	}
+}
+
+// WithWorkspaceRoot sets the workspace root for file operations
+func WithWorkspaceRoot(root string) ClientOption {
+	return func(c *Client) {
+		c.workspaceRoot = root
+	}
+}
+
+// WithUpdateHandler sets the handler for session updates
+func WithUpdateHandler(h UpdateHandler) ClientOption {
+	return func(c *Client) {
+		c.updateHandler = h
+	}
+}
+
+// WithPermissionHandler sets the handler for permission requests
+func WithPermissionHandler(h PermissionRequestHandler) ClientOption {
+	return func(c *Client) {
+		c.permissionHandler = h
+	}
+}
+
+// WithCursorTaskHandler sets the handler for Cursor's `cursor/task` request.
+func WithCursorTaskHandler(h CursorTaskHandler) ClientOption {
+	return func(c *Client) {
+		c.cursorTaskHandler = h
+	}
+}
+
+// NewClient creates a new ACP client implementation
+func NewClient(opts ...ClientOption) *Client {
+	c := &Client{
+		logger:        zap.NewNop(),
+		workspaceRoot: "/workspace",
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	c.terminals = NewTerminalManager(c.logger)
+	return c
+}
+
+// SetUpdateHandler sets the update handler (thread-safe)
+func (c *Client) SetUpdateHandler(h UpdateHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updateHandler = h
+}
+
+// SetPermissionHandler sets the permission request handler (thread-safe)
+func (c *Client) SetPermissionHandler(h PermissionRequestHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.permissionHandler = h
+}
+
+// SetCursorTaskHandler sets the Cursor `cursor/task` handler (thread-safe).
+func (c *Client) SetCursorTaskHandler(h CursorTaskHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cursorTaskHandler = h
+}
+
+// RequestPermission handles permission requests from the agent
+// If a permission handler is set, it forwards the request to the handler.
+// Otherwise, auto-approves by selecting the first "allow" option.
+func (c *Client) RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	ctx, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.permission")
+	defer span.End()
+
+	title := ""
+	if p.ToolCall.Title != nil {
+		title = *p.ToolCall.Title
+	}
+	span.SetAttributes(
+		attribute.String("tool_call_id", string(p.ToolCall.ToolCallId)),
+		attribute.Int("options_count", len(p.Options)),
+	)
+
+	c.logger.Info("received permission request",
+		zap.String("session_id", string(p.SessionId)),
+		zap.String("tool_call_id", string(p.ToolCall.ToolCallId)),
+		zap.String("title", title),
+		zap.Int("num_options", len(p.Options)))
+
+	// An empty option list is not a decision. Forward it to the handler, which
+	// surfaces it as a pending permission a person can answer; cancelling here
+	// reaches the agent as a refusal the user never saw.
+	if len(p.Options) == 0 {
+		c.logger.Warn("permission request carries no options, forwarding for a decision")
+	}
+
+	// Check if we have a permission handler
+	c.mu.RLock()
+	handler := c.permissionHandler
+	c.mu.RUnlock()
+
+	if handler != nil {
+		// Forward to external handler (e.g., backend/user)
+		return c.forwardPermissionRequest(ctx, handler, p)
+	}
+
+	// Fall back to auto-approve
+	return c.autoApprovePermission(p)
+}
+
+// forwardPermissionRequest forwards the permission request to an external handler
+func (c *Client) forwardPermissionRequest(ctx context.Context, handler PermissionRequestHandler, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	// Convert ACP types to shared types
+	options := make([]types.PermissionOption, len(p.Options))
+	for i, opt := range p.Options {
+		options[i] = types.PermissionOption{
+			OptionID: string(opt.OptionId),
+			Name:     opt.Name,
+			Kind:     types.PermissionOptionKind(opt.Kind),
+		}
+	}
+
+	// Prefer the agent's human-readable ToolCall.Title for the user-facing label
+	// (e.g. "Run bash command 'ls -la'", "Read 216 lines from foo.go"). Fall back
+	// to Kind only when no Title was provided — many agents send Kind="other"
+	// for tools they can't classify, which on its own is meaningless to the user.
+	description := ""
+	if p.ToolCall.Title != nil {
+		description = strings.TrimSpace(*p.ToolCall.Title)
+	}
+
+	actionType := ""
+	if p.ToolCall.Kind != nil {
+		actionType = string(*p.ToolCall.Kind)
+	}
+
+	title := description
+	if title == "" {
+		title = actionType
+	}
+
+	// Build action details from raw input if available. The frontend de-dups
+	// description against title at render time, so always forward description
+	// when present — useful for future agents where the two may diverge.
+	actionDetails := make(map[string]any)
+	if p.ToolCall.RawInput != nil {
+		actionDetails["raw_input"] = p.ToolCall.RawInput
+	}
+	if description != "" {
+		actionDetails["description"] = description
+	}
+
+	var toolName *string
+	if p.ToolCall.Name != nil {
+		name := *p.ToolCall.Name
+		toolName = &name
+	}
+
+	req := &types.PermissionRequest{
+		SessionID:     string(p.SessionId),
+		ToolCallID:    string(p.ToolCall.ToolCallId),
+		Title:         title,
+		ToolName:      toolName,
+		ToolMeta:      p.ToolCall.Meta,
+		ActionType:    actionType,
+		ActionDetails: actionDetails,
+		Options:       options,
+	}
+
+	c.logger.Info("forwarding permission request to handler",
+		zap.String("session_id", req.SessionID),
+		zap.String("tool_call_id", req.ToolCallID))
+
+	resp, err := handler(ctx, req)
+	if err != nil {
+		c.logger.Error("permission handler failed", zap.Error(err))
+		// On error, cancel the permission request
+		return acp.RequestPermissionResponse{
+			Outcome: acp.RequestPermissionOutcome{
+				Cancelled: &acp.RequestPermissionOutcomeCancelled{},
+			},
+		}, nil
+	}
+
+	if resp.Cancelled {
+		c.logger.Info("permission request cancelled by user")
+		return acp.RequestPermissionResponse{
+			Outcome: acp.RequestPermissionOutcome{
+				Cancelled: &acp.RequestPermissionOutcomeCancelled{},
+			},
+		}, nil
+	}
+
+	c.logger.Info("permission request approved by user",
+		zap.String("option_id", resp.OptionID))
+	return acp.RequestPermissionResponse{
+		Outcome: acp.RequestPermissionOutcome{
+			Selected: &acp.RequestPermissionOutcomeSelected{
+				OptionId: acp.PermissionOptionId(resp.OptionID),
+			},
+		},
+	}, nil
+}
+
+// autoApprovePermission is the no-handler fallback. It selects the first
+// offered option whose kind is an allow and cancels when none exists, because
+// selecting an unrecognized option by position turns a missing handler into a
+// silent approval or a silent refusal depending on the provider's option order.
+func (c *Client) autoApprovePermission(p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	// Find the first "allow" option
+	var selectedOption *acp.PermissionOption
+	for i := range p.Options {
+		opt := &p.Options[i]
+		if opt.Kind == acp.PermissionOptionKindAllowOnce || opt.Kind == acp.PermissionOptionKindAllowAlways {
+			selectedOption = opt
+			break
+		}
+	}
+
+	if selectedOption == nil {
+		c.logger.Warn("no allow option offered and no permission handler installed, cancelling",
+			zap.Int("option_count", len(p.Options)))
+		return acp.RequestPermissionResponse{
+			Outcome: acp.RequestPermissionOutcome{
+				Cancelled: &acp.RequestPermissionOutcomeCancelled{},
+			},
+		}, nil
+	}
+
+	c.logger.Info("auto-approving permission request",
+		zap.String("option_id", string(selectedOption.OptionId)),
+		zap.String("option_name", selectedOption.Name),
+		zap.String("kind", string(selectedOption.Kind)))
+
+	return acp.RequestPermissionResponse{
+		Outcome: acp.RequestPermissionOutcome{
+			Selected: &acp.RequestPermissionOutcomeSelected{
+				OptionId: selectedOption.OptionId,
+			},
+		},
+	}, nil
+}
+
+// SessionUpdate handles session update notifications from the agent
+func (c *Client) SessionUpdate(ctx context.Context, n acp.SessionNotification) error {
+	c.mu.RLock()
+	handler := c.updateHandler
+	c.mu.RUnlock()
+
+	// Forward to handler if set
+	if handler != nil {
+		handler(n)
+	}
+
+	return nil
+}
+
+// HandleExtensionMethod accepts explicitly-supported inbound extension-style
+// requests from the agent. Cursor currently sends subagent metadata over the
+// non-standard vendor method `cursor/task`; unknown methods still decline with
+// method-not-found. The ctx satisfies the SDK's ExtensionMethodHandler
+// signature; the fire-and-forget cursor/task handler does not consume it.
+func (c *Client) HandleExtensionMethod(_ context.Context, method string, params json.RawMessage) (any, error) {
+	if method != cursorTaskMethod {
+		return nil, acp.NewMethodNotFound(method)
+	}
+
+	c.mu.RLock()
+	handler := c.cursorTaskHandler
+	c.mu.RUnlock()
+	if handler != nil {
+		handler(params)
+	}
+
+	return struct{}{}, nil
+}
+
+const cursorTaskMethod = "cursor/task"
+
+// resolvePath resolves a file path, making relative paths relative to the workspace root.
+// It validates that the resolved path stays within the workspace root to prevent path traversal.
+func (c *Client) resolvePath(reqPath string) (string, error) {
+	var resolved string
+	if filepath.IsAbs(reqPath) {
+		resolved = filepath.Clean(reqPath)
+	} else {
+		resolved = filepath.Join(c.workspaceRoot, reqPath)
+	}
+	// Ensure the resolved path is within the workspace root to prevent path traversal
+	root := filepath.Clean(c.workspaceRoot) + string(filepath.Separator)
+	if resolved != filepath.Clean(c.workspaceRoot) && !strings.HasPrefix(resolved, root) {
+		return "", fmt.Errorf("path %q resolves outside workspace root %q", reqPath, c.workspaceRoot)
+	}
+	return resolved, nil
+}
+
+// ReadTextFile reads a text file
+func (c *Client) ReadTextFile(ctx context.Context, p acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.read_file")
+	defer span.End()
+	span.SetAttributes(attribute.String("path", p.Path))
+
+	c.logger.Debug("reading file", zap.String("path", p.Path))
+
+	filePath, err := c.resolvePath(p.Path)
+	if err != nil {
+		span.RecordError(err)
+		return acp.ReadTextFileResponse{}, err
+	}
+
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		span.RecordError(err)
+		return acp.ReadTextFileResponse{}, err
+	}
+
+	content := string(b)
+
+	// Handle line/limit parameters
+	if p.Line != nil || p.Limit != nil {
+		lines := strings.Split(content, "\n")
+		start := 0
+		if p.Line != nil && *p.Line > 0 {
+			start = *p.Line - 1
+			if start > len(lines) {
+				start = len(lines)
+			}
+		}
+		end := len(lines)
+		if p.Limit != nil && *p.Limit > 0 && start+*p.Limit < end {
+			end = start + *p.Limit
+		}
+		content = strings.Join(lines[start:end], "\n")
+	}
+
+	span.SetAttributes(attribute.Int("content_length", len(content)))
+	return acp.ReadTextFileResponse{Content: content}, nil
+}
+
+// WriteTextFile writes a text file
+func (c *Client) WriteTextFile(ctx context.Context, p acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.write_file")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("path", p.Path),
+		attribute.Int("content_length", len(p.Content)),
+	)
+
+	c.logger.Debug("writing file", zap.String("path", p.Path))
+
+	filePath, err := c.resolvePath(p.Path)
+	if err != nil {
+		span.RecordError(err)
+		return acp.WriteTextFileResponse{}, err
+	}
+
+	// Create directory if needed
+	if dir := filepath.Dir(filePath); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			span.RecordError(err)
+			return acp.WriteTextFileResponse{}, err
+		}
+	}
+
+	err = os.WriteFile(filePath, []byte(p.Content), 0o644)
+	if err != nil {
+		span.RecordError(err)
+	}
+	return acp.WriteTextFileResponse{}, err
+}
+
+// CreateTerminal starts a command in a new terminal.
+func (c *Client) CreateTerminal(ctx context.Context, p acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.create_terminal")
+	defer span.End()
+	span.SetAttributes(attribute.String("command", p.Command))
+
+	c.logger.Debug("create terminal request",
+		zap.String("command", p.Command),
+		zap.Strings("args", p.Args),
+	)
+
+	cwd := c.workspaceRoot
+	if p.Cwd != nil {
+		cwd = *p.Cwd
+	}
+	env := make(map[string]string, len(p.Env))
+	for _, e := range p.Env {
+		env[e.Name] = e.Value
+	}
+	limit := 0
+	if p.OutputByteLimit != nil {
+		limit = *p.OutputByteLimit
+	}
+
+	id, err := c.terminals.Create(p.Command, p.Args, cwd, env, limit)
+	if err != nil {
+		span.RecordError(err)
+		return acp.CreateTerminalResponse{}, err
+	}
+	return acp.CreateTerminalResponse{TerminalId: acp.TerminalId(id)}, nil
+}
+
+// KillTerminal sends SIGTERM to a terminal's process.
+func (c *Client) KillTerminal(ctx context.Context, p acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.kill_terminal")
+	defer span.End()
+	terminalID := string(p.TerminalId)
+	span.SetAttributes(attribute.String("terminal_id", terminalID))
+
+	if err := c.terminals.Kill(terminalID); err != nil {
+		span.RecordError(err)
+		return acp.KillTerminalResponse{}, err
+	}
+	return acp.KillTerminalResponse{}, nil
+}
+
+// TerminalOutput returns the current output of a terminal.
+func (c *Client) TerminalOutput(ctx context.Context, p acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.terminal_output")
+	defer span.End()
+	terminalID := string(p.TerminalId)
+	span.SetAttributes(attribute.String("terminal_id", terminalID))
+
+	output, truncated, exitCode, signal, err := c.terminals.Output(terminalID)
+	if err != nil {
+		span.RecordError(err)
+		return acp.TerminalOutputResponse{}, err
+	}
+
+	resp := acp.TerminalOutputResponse{
+		Output:    output,
+		Truncated: truncated,
+	}
+	if exitCode != nil || signal != nil {
+		resp.ExitStatus = &acp.TerminalExitStatus{
+			ExitCode: exitCode,
+			Signal:   signal,
+		}
+	}
+	return resp, nil
+}
+
+// ReleaseTerminal kills (if running) and releases a terminal.
+func (c *Client) ReleaseTerminal(ctx context.Context, p acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.release_terminal")
+	defer span.End()
+	terminalID := string(p.TerminalId)
+	span.SetAttributes(attribute.String("terminal_id", terminalID))
+
+	_ = c.terminals.Release(terminalID)
+	return acp.ReleaseTerminalResponse{}, nil
+}
+
+// WaitForTerminalExit blocks until the terminal's command exits.
+func (c *Client) WaitForTerminalExit(ctx context.Context, p acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
+	_, span := shared.TraceProtocolRequest(ctx, shared.ProtocolACP, "", "request.wait_for_terminal_exit")
+	defer span.End()
+	terminalID := string(p.TerminalId)
+	span.SetAttributes(attribute.String("terminal_id", terminalID))
+
+	exitCode, signal, err := c.terminals.WaitForExit(terminalID)
+	if err != nil {
+		span.RecordError(err)
+		return acp.WaitForTerminalExitResponse{}, err
+	}
+	return acp.WaitForTerminalExitResponse{ExitCode: exitCode, Signal: signal}, nil
+}
+
+// Verify interface implementation
+var _ acp.Client = (*Client)(nil)

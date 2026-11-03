@@ -1,0 +1,245 @@
+package client
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/gorilla/websocket"
+	"github.com/kandev/kandev/internal/agentctl/tracing"
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/common/logger"
+	"go.uber.org/zap"
+)
+
+// WorkspaceStreamCallbacks defines callbacks for workspace stream events
+type WorkspaceStreamCallbacks struct {
+	OnShellOutput   func(data string)
+	OnShellExit     func(code int)
+	OnGitStatus     func(update *GitStatusUpdate)
+	OnGitCommit     func(notification *GitCommitNotification)
+	OnGitReset      func(notification *GitResetNotification)
+	OnBranchSwitch  func(notification *GitBranchSwitchNotification)
+	OnFileChange    func(notification *FileChangeNotification)
+	OnProcessOutput func(output *types.ProcessOutput)
+	OnProcessStatus func(status *types.ProcessStatusUpdate)
+	OnConnected     func()
+	OnError         func(err string)
+}
+
+// WorkspaceStream represents an active workspace stream connection
+type WorkspaceStream struct {
+	conn      *websocket.Conn
+	inputCh   chan types.WorkspaceStreamMessage
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	// wg tracks the read + write goroutines so Wait() can block until they have
+	// fully unwound. Close()/Done() only signal shutdown; the read loop may
+	// still be returning from a blocked ReadJSON when they fire, so callers
+	// that need a true drain barrier (StreamManager shutdown, leak-sensitive
+	// tests) must call Wait after Close/Done.
+	wg     sync.WaitGroup
+	logger *logger.Logger
+}
+
+// StreamWorkspace opens a unified WebSocket connection for all workspace events
+func (c *Client) StreamWorkspace(ctx context.Context, callbacks WorkspaceStreamCallbacks) (*WorkspaceStream, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("agentctl client closed")
+	}
+	if c.workspaceStreamConn != nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("workspace stream already connected")
+	}
+	c.mu.Unlock()
+
+	const wsRoute = "/api/v1/workspace/stream"
+	conn, _, err := c.dialWebSocket(ctx, wsRoute, c.wsAuthHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to workspace stream: %w", err)
+	}
+
+	stream := &WorkspaceStream{
+		conn:    conn,
+		inputCh: make(chan types.WorkspaceStreamMessage, 64),
+		closeCh: make(chan struct{}),
+		logger:  c.logger,
+	}
+
+	// Race: Close may have fired between the dial returning and us re-acquiring
+	// the lock. Drop the new conn + stream instead of leaking the read/write
+	// goroutines past Client.Close's drain barrier.
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return nil, fmt.Errorf("agentctl client closed during workspace stream dial")
+	}
+	// Re-check after dial: two concurrent StreamWorkspace callers can both pass
+	// the pre-dial guard and race here. The later one would orphan the first
+	// conn and its goroutines without this check.
+	if c.workspaceStreamConn != nil {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return nil, fmt.Errorf("workspace stream already connected")
+	}
+	// Track both goroutines on the per-stream wg so WorkspaceStream.Wait can
+	// block until they have fully unwound. Add(2) must happen-before the
+	// stream pointer is published to c.workspaceStream: otherwise a concurrent
+	// Client.Close captures the new stream, calls ws.Wait() at counter 0, and
+	// races the subsequent Add(2). The read loop only invokes data callbacks
+	// (shell/git/process) and self-closes on exit — it never re-enters manager
+	// teardown — so draining it is side-effect-free.
+	stream.wg.Add(2)
+	c.workspaceStreamConn = conn
+	c.workspaceStream = stream
+	c.mu.Unlock()
+
+	c.logger.Info("connected to workspace stream", zap.String("path", wsRoute))
+
+	go func() {
+		defer stream.wg.Done()
+		c.readWorkspaceStream(conn, stream, callbacks)
+	}()
+	go func() {
+		defer stream.wg.Done()
+		stream.writeLoop(conn)
+	}()
+
+	return stream, nil
+}
+
+// workspaceTracedTypes contains message types that are low-volume and worth tracing.
+// High-volume types (shell_output, process_output, shell_input, ping, pong) are excluded.
+var workspaceTracedTypes = map[types.WorkspaceMessageType]bool{
+	types.WorkspaceMessageTypeGitStatus:     true,
+	types.WorkspaceMessageTypeGitCommit:     true,
+	types.WorkspaceMessageTypeGitReset:      true,
+	types.WorkspaceMessageTypeBranchSwitch:  true,
+	types.WorkspaceMessageTypeFileChange:    true,
+	types.WorkspaceMessageTypeProcessStatus: true,
+	types.WorkspaceMessageTypeConnected:     true,
+	types.WorkspaceMessageTypeError:         true,
+}
+
+// readWorkspaceStream is the read loop for the workspace WebSocket stream.
+func (c *Client) readWorkspaceStream(conn *websocket.Conn, stream *WorkspaceStream, callbacks WorkspaceStreamCallbacks) {
+	defer func() {
+		c.mu.Lock()
+		// Guard both resets by identity — a concurrent StreamWorkspace caller
+		// may have replaced the conn/stream pointers since this read loop started.
+		if c.workspaceStreamConn == conn {
+			c.workspaceStreamConn = nil
+		}
+		if c.workspaceStream == stream {
+			c.workspaceStream = nil
+		}
+		c.mu.Unlock()
+		stream.Close()
+	}()
+
+	for {
+		var msg types.WorkspaceStreamMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				c.logger.Debug("workspace stream read error", zap.Error(err))
+			}
+			return
+		}
+		if workspaceTracedTypes[msg.Type] {
+			tracing.TraceWorkspaceEvent(c.getTraceCtx(), string(msg.Type), c.executionID, c.sessionID)
+		}
+		dispatchWorkspaceMessage(msg, callbacks)
+	}
+}
+
+// writeLoop reads from the inputCh and writes messages to the WebSocket connection.
+func (ws *WorkspaceStream) writeLoop(conn *websocket.Conn) {
+	for {
+		select {
+		case <-ws.closeCh:
+			return
+		case msg, ok := <-ws.inputCh:
+			if !ok {
+				return
+			}
+			if err := conn.WriteJSON(msg); err != nil {
+				ws.logger.Debug("workspace stream write error", zap.Error(err))
+				return
+			}
+		}
+	}
+}
+
+// WriteShellInput sends input to the shell through the workspace stream
+func (ws *WorkspaceStream) WriteShellInput(data string) error {
+	msg := types.NewWorkspaceShellInput(data)
+	select {
+	case ws.inputCh <- msg:
+		return nil
+	case <-ws.closeCh:
+		return fmt.Errorf("workspace stream closed")
+	}
+}
+
+// ResizeShell sends a shell resize command through the workspace stream
+func (ws *WorkspaceStream) ResizeShell(cols, rows int) error {
+	msg := types.NewWorkspaceShellResize(cols, rows)
+	select {
+	case ws.inputCh <- msg:
+		return nil
+	case <-ws.closeCh:
+		return fmt.Errorf("workspace stream closed")
+	}
+}
+
+// Ping sends a ping message through the workspace stream
+func (ws *WorkspaceStream) Ping() error {
+	msg := types.NewWorkspacePing()
+	select {
+	case ws.inputCh <- msg:
+		return nil
+	case <-ws.closeCh:
+		return fmt.Errorf("workspace stream closed")
+	}
+}
+
+// Close closes the workspace stream
+func (ws *WorkspaceStream) Close() {
+	ws.closeOnce.Do(func() {
+		close(ws.closeCh)
+		if ws.conn != nil {
+			if err := ws.conn.Close(); err != nil {
+				ws.logger.Debug("failed to close workspace stream connection", zap.Error(err))
+			}
+		}
+	})
+}
+
+// Done returns a channel that is closed when the stream is closed
+func (ws *WorkspaceStream) Done() <-chan struct{} {
+	return ws.closeCh
+}
+
+// Wait blocks until the stream's read and write goroutines have fully exited.
+// Done() only reports that shutdown was *requested* (closeCh closed); Wait
+// reports that the goroutines have actually drained. Call after Close (or after
+// Done fires) to make teardown a true barrier for leak detection.
+func (ws *WorkspaceStream) Wait() {
+	ws.wg.Wait()
+}
+
+// CloseWorkspaceStream closes the workspace stream connection
+func (c *Client) CloseWorkspaceStream() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.workspaceStreamConn != nil {
+		if err := c.workspaceStreamConn.Close(); err != nil {
+			c.logger.Debug("failed to close workspace stream", zap.Error(err))
+		}
+		c.workspaceStreamConn = nil
+	}
+}

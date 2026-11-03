@@ -1,0 +1,625 @@
+// Package api provides the HTTP REST API for agentctl
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/pprof"
+	"os"
+	"runtime"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
+	"github.com/kandev/kandev/internal/agentctl/server/config"
+	"github.com/kandev/kandev/internal/agentctl/server/process"
+	"github.com/kandev/kandev/internal/agentctl/server/utility"
+	agentctltypes "github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/common/httpmw"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/mcpmode"
+	lspinstaller "github.com/kandev/kandev/internal/lsp/installer"
+	"github.com/kandev/kandev/internal/mcp/plugintools"
+	mcpproviders "github.com/kandev/kandev/internal/mcp/providers"
+	"github.com/kandev/kandev/internal/mcp/server"
+	"github.com/kandev/kandev/internal/system/metrics"
+	"go.uber.org/zap"
+)
+
+// Server is the HTTP API server for a single agent instance.
+type Server struct {
+	cfg              *config.InstanceConfig
+	procMgr          *process.Manager
+	mcpServer        *mcp.Server
+	mcpBackendClient *mcp.ChannelBackendClient
+	logger           *logger.Logger
+	router           *gin.Engine
+	portProxies      *portProxyCache
+	metricsCollector *metrics.Collector
+	lspInstaller     lspInstallerRegistry
+
+	// credentialSource, when set via SetCredentialSource, authenticates this
+	// instance's requests and streams against the control server's single
+	// rotating credential instead of the static cfg.AuthToken captured at
+	// construction (design 01 "Single driver",
+	// AC-EXECUTORS-CONTROL-OWNERSHIP-002.6). Nil preserves the legacy
+	// static-token behavior every test constructing a Server without a
+	// running control server alongside it relies on.
+	credentialSource InstanceCredentialSource
+
+	upgrader websocket.Upgrader
+}
+
+// SetCredentialSource wires this instance server's authentication and
+// stream lifetime to the control server's single rotating credential,
+// replacing the static per-instance token captured at construction. Call
+// once, before the server starts accepting requests.
+func (s *Server) SetCredentialSource(src InstanceCredentialSource) {
+	s.credentialSource = src
+}
+
+// NewServer creates a new API server for an agent instance.
+// If mcpServer is provided, MCP routes will be registered.
+// If mcpBackendClient is provided, the agent stream becomes bidirectional for MCP.
+func NewServer(cfg *config.InstanceConfig, procMgr *process.Manager, mcpServer *mcp.Server, mcpBackendClient *mcp.ChannelBackendClient, log *logger.Logger) *Server {
+	gin.SetMode(gin.ReleaseMode)
+
+	s := &Server{
+		cfg:              cfg,
+		procMgr:          procMgr,
+		mcpServer:        mcpServer,
+		mcpBackendClient: mcpBackendClient,
+		logger:           log.WithFields(zap.String("component", "api-server")),
+		router:           gin.New(),
+		portProxies:      newPortProxyCache(),
+		metricsCollector: metrics.NewCollector(),
+		lspInstaller:     lspinstaller.NewRegistry("", log, lspinstaller.WithCommandRunner(procMgr)),
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow all origins for container-local communication
+			},
+		},
+	}
+	if mcpBackendClient != nil && !cfg.DisableAskQuestion && cfg.SessionID != "" {
+		mcpBackendClient.SetSessionID(cfg.SessionID)
+		procMgr.SetUserInputRequestHandler(newCodexUserInputRequestHandler(cfg, mcpBackendClient, s.logger))
+	}
+
+	s.router.Use(httpmw.RequestLogger(s.logger, "agentctl-instance"))
+	// Exempt paths from auth:
+	// - /health: liveness probe
+	// - /sse, /message, /mcp: MCP endpoints used by the agent subprocess which
+	//   runs in the same trust boundary but does not possess the auth token.
+	s.router.Use(s.instanceAuth(cfg.AuthToken, "/health", "/sse", "/message", "/mcp"))
+	// Validate X-Instance-ID so a client that holds a stale port (because
+	// the previous instance was deleted and the port recycled to a new
+	// instance) gets a clean 404 instead of accidentally configuring or
+	// starting the new instance's agent. Missing header is allowed for
+	// backward compatibility with curl/tests; mismatch is rejected.
+	s.router.Use(instanceIDGuard(cfg.InstanceID))
+
+	s.setupRoutes()
+	return s
+}
+
+// Router returns the HTTP router
+func (s *Server) Router() http.Handler {
+	return s.router
+}
+
+func (s *Server) setupRoutes() {
+	// Health check
+	s.router.GET("/health", s.handleHealth)
+
+	// Agent control
+	api := s.router.Group("/api/v1")
+	{
+		// Status and info
+		api.GET("/status", s.handleStatus)
+		api.GET("/info", s.handleInfo)
+		api.GET("/system/metrics", s.handleSystemMetrics)
+
+		// Process control
+		api.POST("/agent/configure", s.handleAgentConfigure)
+		api.POST("/agent/managed-runtime/cache-repair", s.handleManagedRuntimeCacheRepair)
+		api.POST("/agent/background-work/action", s.handleBackgroundWorkAction)
+		api.POST("/start", s.handleStart)
+		api.POST("/stop", s.handleStop)
+
+		// Agent stream: bidirectional WebSocket for agent events, MCP, and agent operations
+		// (initialize, session/new, session/load, prompt, cancel, stderr, permissions/respond)
+		api.GET("/agent/stream", s.handleAgentStreamWS)
+		api.GET("/lsp/stream", s.handleLSPStreamWS)
+
+		// Unified workspace stream (git status, files, shell)
+		api.GET("/workspace/stream", s.handleWorkspaceStreamWS)
+
+		// Workspace state (poll mode driven by gateway focus signal)
+		api.POST("/workspace/poll-mode", s.handleSetPollMode)
+		api.POST("/workspace/refresh", s.handleRefreshWorkspace)
+
+		// Workspace rescan: triggered by the kandev backend after a new
+		// sibling worktree appears on disk (multi-branch add_branch flow).
+		// Rebuilds the per-repo tracker set so the new worktree's git/file
+		// events reach the UI without a session restart.
+		api.POST("/workspace/rescan", s.handleRescanWorkspace)
+		api.POST("/workspace/reconcile", s.handleReconcileWorkspace)
+		api.POST("/workspace/rebind", s.handleRebindWorkspace)
+
+		// Per-task base-branch map update: kandev backend hits this when
+		// the user picks a different "Compare against" branch via the
+		// changes-panel dropdown. Mutates the manager's BaseBranches map
+		// and triggers a fresh git-status emit so the UI updates without
+		// waiting for the next poll tick.
+		api.POST("/workspace/base-branches", s.handleSetBaseBranches)
+		// Provider-qualified comparison targets are authenticated internal state;
+		// the backend uses this route after association, retarget, and resume.
+		api.POST("/workspace/comparison-targets", s.handleSetComparisonTargets)
+
+		// Workspace file operations (simple HTTP)
+		api.GET("/workspace/tree", s.handleFileTree)
+		api.GET("/workspace/file/content", s.handleFileContent)
+		api.GET("/workspace/file/content-at-ref", s.handleFileContentAtRef)
+		api.POST("/workspace/file/content", s.handleFileUpdate)
+		api.POST("/workspace/html-previews", s.handleWorkspacePreviewPublish)
+		api.POST("/workspace/file/create", s.handleFileCreate)
+		api.POST("/workspace/file/upload", s.handleFileUpload)
+		api.POST("/workspace/file/upload-preflight", s.handleUploadPreflight)
+		api.POST("/workspace/file/rename", s.handleFileRename)
+		api.DELETE("/workspace/file", s.handleFileDelete)
+		api.GET("/workspace/search", s.handleFileSearch)
+		api.GET("/workspace/content-search", s.handleWorkspaceContentSearch)
+
+		// Batched copy of files from the host (used by remote executors —
+		// Docker, Sprites — to seed the workspace with gitignored config
+		// after the in-container clone).
+		api.POST("/workspace/copy-files", s.handleWorkspaceCopyFiles)
+		api.POST(agentctltypes.CanvasSourceTransferPath[len("/api/v1"):], s.handleCanvasSourceTransfer)
+		api.POST("/attachments/materialize", s.handleMaterializeAttachment)
+		api.POST("/workspace/diagnostics/:id", s.handleWorkspaceDiagnostics)
+		api.POST("/workspace/materialize-repository", s.handleWorkspaceMaterializeRepository)
+		api.POST("/workspace/materialize-repository/remove", s.handleWorkspaceRemoveMaterializedRepository)
+
+		// Shell access (HTTP endpoints only - streaming is via /workspace/stream)
+		api.GET("/shell/status", s.handleShellStatus)
+		api.GET("/shell/buffer", s.handleShellBuffer)
+		api.POST("/shell/start", s.handleShellStart)
+
+		// Per-terminal shell sessions (for remote executor multi-terminal support)
+		api.POST("/shell/terminal/start", s.handleShellTerminalStart)
+		api.GET("/shell/terminal/:id/stream", s.handleShellTerminalStreamWS)
+		api.GET("/shell/terminal/:id/buffer", s.handleShellTerminalBuffer)
+		api.DELETE("/shell/terminal/:id", s.handleShellTerminalStop)
+
+		// Process runner
+		api.POST("/processes/start", s.handleStartProcess)
+		api.POST("/processes/stop", s.handleStopProcess)
+		api.GET("/processes", s.handleListProcesses)
+		api.GET("/processes/:id", s.handleGetProcess)
+
+		// VS Code server management
+		api.POST("/vscode/start", s.handleVscodeStart)
+		api.POST("/vscode/stop", s.handleVscodeStop)
+		api.GET("/vscode/status", s.handleVscodeStatus)
+		api.POST("/vscode/open-file", s.handleVscodeOpenFile)
+		api.Any("/vscode/proxy", s.handleVscodeProxy)
+		api.Any("/vscode/proxy/*path", s.handleVscodeProxy)
+
+		// Port proxy - generic reverse proxy for any localhost port
+		api.Any("/port-proxy/:port", s.handlePortProxy)
+		api.Any("/port-proxy/:port/*path", s.handlePortProxy)
+
+		// Port listener detection
+		api.GET("/ports", s.handleListPorts)
+
+		// Git operations
+		api.POST("/git/pull", s.handleGitPull)
+		api.POST("/git/push", s.handleGitPush)
+		api.POST("/git/push-preflight", s.handleGitPushPreflight)
+		api.POST("/git/contribution/replace", s.handleGitReplaceContribution)
+		api.POST("/git/contribution/use", s.handleGitUseContribution)
+		api.POST("/git/contribution/history-explanation", s.handleGitContributionHistoryExplanation)
+		api.POST("/git/rebase", s.handleGitRebase)
+		api.POST("/git/merge", s.handleGitMerge)
+		api.POST("/git/abort", s.handleGitAbort)
+		api.POST("/git/commit", s.handleGitCommit)
+		api.POST("/git/stage", s.handleGitStage)
+		api.POST("/git/unstage", s.handleGitUnstage)
+		api.POST("/git/discard", s.handleGitDiscard)
+		api.POST("/git/create-pr", s.handleGitCreatePR)
+		api.POST("/git/revert-commit", s.handleGitRevertCommit)
+		api.POST("/git/rename-branch", s.handleGitRenameBranch)
+		api.POST("/git/reset", s.handleGitReset)
+		api.GET("/git/commit/:sha", s.handleGitShowCommit)
+		api.GET("/git/log", s.handleGitLog)
+		api.GET("/git/cumulative-diff", s.handleGitCumulativeDiff)
+		api.GET("/git/status", s.handleGitStatus)
+		api.GET("/git/status/multi", s.handleGitStatusMulti)
+	}
+
+	// Utility agent routes
+	auxHandler := utility.NewHandler(s.cfg.WorkDir, s.logger.Zap())
+	auxHandler.RegisterRoutes(api)
+
+	// MCP routes (if MCP server is configured)
+	if s.mcpServer != nil {
+		s.mcpServer.RegisterRoutes(s.router)
+		api.PUT("/mcp/mode", s.handleSetMcpMode)
+		api.PUT("/mcp/providers", s.handleSetMcpProviders)
+		api.PUT("/mcp/plugin-tools", s.handleSetPluginTools)
+	}
+
+	// pprof + memory stats (enabled via KANDEV_DEBUG_PPROF_ENABLED=true)
+	if os.Getenv("KANDEV_DEBUG_PPROF_ENABLED") == "true" { //nolint:goconst // env-var check, not a query param
+		s.registerPprofRoutes()
+	}
+
+	// Dev-only live tail of a session's recent ACP frames from an in-memory
+	// ring buffer (zero disk growth). Complements the file sink for
+	// investigating a currently-stuck session. Frames carry full prompt/tool
+	// content, so require BOTH frame logging and dev mode to be on — message
+	// logging alone (e.g. someone debugging a non-dev deployment) must not
+	// expose this endpoint.
+	if acpDebugTailEnabled() {
+		s.router.GET("/api/v1/debug/acp/:session", s.handleACPRingTail)
+	}
+	if acpDebugExportEnabled() {
+		s.router.GET("/api/v1/debug/acp/:session/export", s.handleACPDebugExport)
+	}
+}
+
+// acpDebugTailEnabled gates the ACP live-tail endpoint on both ACP frame
+// logging and dev mode. Read live (like the pprof gate) so it is testable.
+func acpDebugTailEnabled() bool {
+	return os.Getenv("KANDEV_DEBUG_AGENT_MESSAGES") == "true" && //nolint:goconst // env-var values, not query params
+		os.Getenv("KANDEV_DEBUG_DEV_MODE") == "true"
+}
+
+// handleACPRingTail returns the most recent normalized ACP events for a
+// session from the in-memory ring buffer. Query param n caps the count
+// (default 200, max 1000).
+func (s *Server) handleACPRingTail(c *gin.Context) {
+	const (
+		defaultACPRingTailCount = 200
+		maxACPRingTailCount     = 1000
+	)
+	session := c.Param("session")
+	n := defaultACPRingTailCount
+	// Bound the untrusted n at the source so it can't drive an oversized
+	// allocation downstream (the ring tail clamps to its size too, but
+	// keeping the limit explicit here is the defensive default).
+	if v := c.Query("n"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= maxACPRingTailCount {
+			n = parsed
+		}
+	}
+	events := shared.ACPRingTail(session, n)
+	if events == nil {
+		events = []json.RawMessage{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"session": session,
+		"count":   len(events),
+		"events":  events,
+	})
+}
+
+// Health check response
+type HealthResponse struct {
+	Status    string `json:"status"`
+	Timestamp string `json:"timestamp"`
+}
+
+func (s *Server) handleHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, HealthResponse{
+		Status:    "ok",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) registerPprofRoutes() {
+	g := s.router.Group("/debug/pprof")
+	g.GET("/", gin.WrapF(pprof.Index))
+	g.GET("/cmdline", gin.WrapF(pprof.Cmdline))
+	g.GET("/profile", gin.WrapF(pprof.Profile))
+	g.GET("/symbol", gin.WrapF(pprof.Symbol))
+	g.POST("/symbol", gin.WrapF(pprof.Symbol))
+	g.GET("/trace", gin.WrapF(pprof.Trace))
+	for _, name := range []string{"allocs", "block", "goroutine", "heap", "mutex", "threadcreate"} {
+		g.GET("/"+name, gin.WrapH(pprof.Handler(name)))
+	}
+
+	s.router.GET("/api/v1/debug/memory", func(c *gin.Context) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		c.JSON(http.StatusOK, gin.H{
+			"heap_alloc_mb":  float64(m.HeapAlloc) / (1024 * 1024),
+			"heap_inuse_mb":  float64(m.HeapInuse) / (1024 * 1024),
+			"heap_sys_mb":    float64(m.HeapSys) / (1024 * 1024),
+			"heap_objects":   m.HeapObjects,
+			"goroutines":     runtime.NumGoroutine(),
+			"num_gc":         m.NumGC,
+			"sys_mb":         float64(m.Sys) / (1024 * 1024),
+			"stack_inuse_mb": float64(m.StackInuse) / (1024 * 1024),
+		})
+	})
+
+	s.logger.Info("pprof endpoints registered at /debug/pprof/")
+}
+
+// handleSetMcpMode changes the MCP tool mode for this instance.
+func (s *Server) handleSetMcpMode(c *gin.Context) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// ModeExternal stays rejected on purpose: it belongs to the backend's own
+	// MCP endpoint for external coding agents, and no launch path can emit it.
+	if !mcpmode.IsInstanceMode(req.Mode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mode: must be 'task', 'task-title-pending', 'config', 'office', or 'automation'"})
+		return
+	}
+	s.mcpServer.SetMode(req.Mode)
+	c.JSON(http.StatusOK, gin.H{"mode": req.Mode})
+}
+
+// handleSetMcpProviders replaces the provider capabilities advertised by the
+// task-mode MCP server. Unknown providers are ignored by the MCP boundary.
+func (s *Server) handleSetMcpProviders(c *gin.Context) {
+	var req struct {
+		Providers []string `json:"mcp_providers"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	providers := mcpproviders.Normalize(req.Providers)
+	s.mcpServer.SetProviders(providers)
+	c.JSON(http.StatusOK, gin.H{"mcp_providers": providers})
+}
+
+func (s *Server) handleSetPluginTools(c *gin.Context) {
+	var snapshot plugintools.Snapshot
+	if err := c.ShouldBindJSON(&snapshot); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.mcpServer.SetPluginTools(snapshot); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"generation": snapshot.Generation, "revision": snapshot.Revision})
+}
+
+// Status response
+type StatusResponse struct {
+	AgentStatus string                 `json:"agent_status"`
+	ProcessInfo map[string]interface{} `json:"process_info"`
+	Uptime      string                 `json:"uptime,omitempty"`
+}
+
+func (s *Server) handleStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, StatusResponse{
+		AgentStatus: string(s.procMgr.Status()),
+		ProcessInfo: s.procMgr.GetProcessInfo(),
+	})
+}
+
+// Info response
+type InfoResponse struct {
+	Version      string `json:"version"`
+	AgentCommand string `json:"agent_command"`
+	WorkDir      string `json:"work_dir"`
+	Port         int    `json:"port"`
+}
+
+func (s *Server) handleInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, InfoResponse{
+		Version:      "0.1.0",
+		AgentCommand: s.cfg.AgentCommand,
+		WorkDir:      s.cfg.WorkDir,
+		Port:         s.cfg.Port,
+	})
+}
+
+// Start request/response
+type StartRequest struct {
+	// Future: could add options like custom command, env overrides
+}
+
+type StartResponse struct {
+	Success           bool   `json:"success"`
+	Message           string `json:"message,omitempty"`
+	Command           string `json:"command,omitempty"`
+	ProcessGeneration uint64 `json:"process_generation,omitempty"`
+	Error             string `json:"error,omitempty"`
+}
+
+func (s *Server) handleStart(c *gin.Context) {
+	processGeneration, err := s.procMgr.StartWithGeneration(c.Request.Context())
+	if err != nil {
+		s.logger.Error("failed to start agent", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, StartResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, StartResponse{
+		Success:           true,
+		Message:           "agent started",
+		Command:           s.procMgr.GetFinalCommand(),
+		ProcessGeneration: processGeneration,
+	})
+}
+
+// AgentConfigure request/response - configures the agent command before starting
+type AgentConfigureRequest struct {
+	Command         string            `json:"command"`
+	AgentArgs       optionalArgs      `json:"agent_args"`
+	ContinueCommand string            `json:"continue_command,omitempty"` // For one-shot agents: command for follow-up prompts
+	ContinueArgs    optionalArgs      `json:"continue_args"`
+	Env             map[string]string `json:"env,omitempty"`
+	ReplaceEnv      bool              `json:"replace_env,omitempty"`
+	// ApprovalPolicy is accepted and ignored. It was never consulted by any
+	// code path; the field remains so an older backend configuring a newer
+	// agentctl still succeeds. Permission auto-approval travels on
+	// CreateInstanceRequest.AutoApprovePermissions.
+	ApprovalPolicy string `json:"approval_policy,omitempty"`
+}
+
+type optionalArgs struct {
+	Present bool
+	Args    []string
+}
+
+func (a *optionalArgs) UnmarshalJSON(data []byte) error {
+	a.Present = true
+	return json.Unmarshal(data, &a.Args)
+}
+
+type AgentConfigureResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (s *Server) handleAgentConfigure(c *gin.Context) {
+	var req AgentConfigureRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, AgentConfigureResponse{
+			Success: false,
+			Error:   "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if !req.AgentArgs.Present && req.Command == "" {
+		c.JSON(http.StatusBadRequest, AgentConfigureResponse{
+			Success: false,
+			Error:   "command is required",
+		})
+		return
+	}
+
+	var configureErr error
+	if req.ReplaceEnv {
+		configureErr = s.procMgr.ConfigureWithEnvironment(req.Command, req.AgentArgs.Args, req.AgentArgs.Present, req.Env, req.ContinueCommand, req.ContinueArgs.Args, req.ContinueArgs.Present)
+	} else {
+		configureErr = s.procMgr.Configure(req.Command, req.AgentArgs.Args, req.AgentArgs.Present, req.Env, req.ContinueCommand, req.ContinueArgs.Args, req.ContinueArgs.Present)
+	}
+	if configureErr != nil {
+		s.logger.Error("failed to configure agent", zap.Error(configureErr), zap.String("command", req.Command))
+		c.JSON(http.StatusInternalServerError, AgentConfigureResponse{
+			Success: false,
+			Error:   configureErr.Error(),
+		})
+		return
+	}
+
+	s.logger.Info("agent configured", zap.String("command", req.Command))
+	c.JSON(http.StatusOK, AgentConfigureResponse{
+		Success: true,
+		Message: "agent configured",
+	})
+}
+
+// Stop request/response
+type StopRequest struct {
+	Force bool `json:"force"`
+}
+
+type StopResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (s *Server) handleStop(c *gin.Context) {
+	if err := s.procMgr.Stop(c.Request.Context()); err != nil {
+		s.logger.Error("failed to stop agent", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, StopResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, StopResponse{
+		Success: true,
+		Message: "agent stopped",
+	})
+}
+
+// ShellStatusResponse represents shell status
+type ShellStatusResponse struct {
+	Available bool   `json:"available"`
+	Running   bool   `json:"running"`
+	Pid       int    `json:"pid,omitempty"`
+	Shell     string `json:"shell,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func (s *Server) handleShellStatus(c *gin.Context) {
+	shell := s.procMgr.Shell()
+	if shell == nil {
+		c.JSON(http.StatusOK, ShellStatusResponse{
+			Available: false,
+			Error:     "shell not available",
+		})
+		return
+	}
+
+	status := shell.Status()
+	c.JSON(http.StatusOK, ShellStatusResponse{
+		Available: true,
+		Running:   status.Running,
+		Pid:       status.Pid,
+		Shell:     status.Shell,
+		Cwd:       status.Cwd,
+		StartedAt: status.StartedAt.Format("2006-01-02T15:04:05Z07:00"),
+	})
+}
+
+// ShellMessage represents a shell I/O message
+type ShellMessage struct {
+	Type string `json:"type"` // "input", "output", "ping", "pong", "exit"
+	Data string `json:"data,omitempty"`
+	Code int    `json:"code,omitempty"`
+}
+
+// ShellBufferResponse is the response for GET /api/v1/shell/buffer
+type ShellBufferResponse struct {
+	Data string `json:"data"`
+}
+
+func (s *Server) handleShellBuffer(c *gin.Context) {
+	shell := s.procMgr.Shell()
+	if shell == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "shell not available"})
+		return
+	}
+
+	buffered := shell.GetBufferedOutput()
+	c.JSON(http.StatusOK, ShellBufferResponse{
+		Data: string(buffered),
+	})
+}
+
+// handleShellStart starts the shell session without starting the agent process.
+// This is used in passthrough mode where the agent runs directly via InteractiveRunner.
+func (s *Server) handleShellStart(c *gin.Context) {
+	if err := s.procMgr.StartShell(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "shell started"})
+}

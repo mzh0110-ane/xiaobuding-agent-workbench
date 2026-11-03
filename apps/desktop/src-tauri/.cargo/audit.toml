@@ -1,0 +1,36 @@
+# Temporary advisory ignores for cargo-audit.
+# Each entry must have a tracking note. Remove the entry once the fix lands.
+
+[advisories]
+ignore = [
+    # tauri 2.8.4 — IPC origin confusion on Windows (CVE-2026-42184, CVSS 8.8).
+    # Remote page in WebView can invoke local-only Tauri commands (incl. fs access).
+    # Fix: upgrade tauri to >= 2.11.1.
+    "GHSA-7gmj-67g7-phm9",
+
+    # time 0.3.41 — stack exhaustion via malformed RFC 2822 input (CVE-2026-25727, CVSS 6.9).
+    # Limited attack surface in a local desktop app; no known reachable path via Tauri shell.
+    # Fix: upgrade time to >= 0.3.47.
+    "RUSTSEC-2026-0009",
+
+    # rand 0.7.3 — memory unsoundness; UB only when all three hold simultaneously:
+    # `log` feature enabled + custom logger installed + rand::rng() called.
+    # That combination is not present in the kandev desktop shell.
+    # Fix: upgrade rand to >= 0.8.6 (semver-breaking; requires coordinating dependents).
+    "RUSTSEC-2026-0097",
+
+    # glib 0.18.5 — unsound VariantStrIter::impl_get, Linux-only via the gtk 0.18
+    # chain that Tauri v2 uses for its Linux backend.
+    #
+    # The advisory's fix version (0.20.0) is not reachable: gtk-rs/gtk3-rs, which
+    # publishes gtk/gdk/webkit2gtk, was archived in March 2024 and will never
+    # release a version depending on glib >= 0.20. Tauri closed its own tracking
+    # issue as not_planned and targets the GTK4 migration at Tauri v3
+    # (tauri-apps/tauri#12564).
+    #
+    # A glib 0.18.6 patch release would fix this for us automatically, since
+    # gtk 0.18.2 depends on glib with a caret requirement. Backport submitted
+    # upstream: gtk-rs/gtk-rs-core#2009, release request #2010. Drop this entry
+    # once 0.18.6 ships.
+    "RUSTSEC-2024-0429",
+]

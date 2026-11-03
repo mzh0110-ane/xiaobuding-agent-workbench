@@ -1,0 +1,157 @@
+import type { LayoutColumn, LayoutGroup } from "./types";
+import { LAYOUT_RIGHT_RATIO, LAYOUT_SIDEBAR_RATIO } from "./constants";
+import { computePinnedMaxPxFor, computeSidebarMaxPx, LAYOUT_PINNED_MIN_PX } from "./caps";
+import { getGlobalSidebarWidth } from "@/lib/local-storage";
+
+// Legacy hard caps used to clamp the *initial* default width. Users can still
+// drag past these via setConstraints (which uses the larger runtime cap),
+// but a fresh task env opens at the same width it always did.
+const LEGACY_SIDEBAR_INITIAL_CAP = 350;
+const LEGACY_RIGHT_INITIAL_CAP = 450;
+
+/**
+ * Get the effective pinned width for a column.
+ *
+ * - User overrides (from a prior resize, captured in the in-memory
+ *   pinnedWidths map) are clamped to the runtime cap.
+ * - The initial default (no override) preserves legacy behavior: ratio-based
+ *   width clamped to the old hard cap. New environments open exactly as
+ *   they did before this PR.
+ */
+export function getPinnedWidth(
+  column: LayoutColumn,
+  totalWidth: number,
+  override?: number,
+): number {
+  const runtimeMax = column.maxWidth ?? computePinnedMaxPxFor(column.id);
+  const min = column.minWidth ?? LAYOUT_PINNED_MIN_PX;
+  if (override !== undefined) {
+    return Math.max(min, Math.min(override, runtimeMax));
+  }
+  // No override: the left sidebar honors the persisted GLOBAL width pref so it
+  // opens identically across every task. Clamp-to-fit against the current
+  // screen (the raw value stays in storage, so a wider monitor restores it).
+  if (column.id === "sidebar") {
+    const pref = getGlobalSidebarWidth();
+    if (pref !== null) {
+      const max = column.maxWidth ?? computeSidebarMaxPx(totalWidth);
+      return Math.max(min, Math.min(pref, max));
+    }
+  }
+  const ratio = column.id === "sidebar" ? LAYOUT_SIDEBAR_RATIO : LAYOUT_RIGHT_RATIO;
+  const ratioWidth = Math.round(totalWidth * ratio);
+  const initialCap =
+    column.maxWidth ??
+    (column.id === "sidebar" ? LEGACY_SIDEBAR_INITIAL_CAP : LEGACY_RIGHT_INITIAL_CAP);
+  return Math.max(min, Math.min(ratioWidth, initialCap));
+}
+
+type ColumnBucket = {
+  pinnedTotal: number;
+  pinnedWidths: number[];
+  explicitIndices: number[];
+  explicitTotal: number;
+  flexIndices: number[];
+};
+
+/** First pass: classify columns and compute pinned widths. */
+function classifyColumns(
+  columns: LayoutColumn[],
+  totalWidth: number,
+  pinnedOverrides: Map<string, number>,
+): ColumnBucket {
+  const bucket: ColumnBucket = {
+    pinnedTotal: 0,
+    pinnedWidths: new Array(columns.length).fill(0),
+    explicitIndices: [],
+    explicitTotal: 0,
+    flexIndices: [],
+  };
+
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i];
+    if (col.pinned) {
+      const w = getPinnedWidth(col, totalWidth, pinnedOverrides.get(col.id));
+      bucket.pinnedWidths[i] = w;
+      bucket.pinnedTotal += w;
+    } else if (col.width !== undefined && col.width > 0) {
+      bucket.explicitIndices.push(i);
+      bucket.explicitTotal += col.width;
+    } else {
+      bucket.flexIndices.push(i);
+    }
+  }
+  return bucket;
+}
+
+/** Second pass: compute non-pinned column widths. */
+function computeFlexWidths(
+  columns: LayoutColumn[],
+  bucket: ColumnBucket,
+  remainingSpace: number,
+): number[] {
+  const widths = [...bucket.pinnedWidths];
+
+  if (bucket.explicitIndices.length > 0 && bucket.flexIndices.length === 0) {
+    // All non-pinned have explicit widths → scale proportionally
+    const scale = bucket.explicitTotal > 0 ? remainingSpace / bucket.explicitTotal : 1;
+    for (const i of bucket.explicitIndices) {
+      widths[i] = Math.round((columns[i].width ?? 0) * scale);
+    }
+    return widths;
+  }
+
+  if (bucket.explicitIndices.length > 0) {
+    // Mix of explicit and flex — use explicit as-is (capped), flex splits remainder
+    let explicitUsed = 0;
+    for (const i of bucket.explicitIndices) {
+      const w = Math.min(columns[i].width ?? 0, remainingSpace);
+      widths[i] = w;
+      explicitUsed += w;
+    }
+    const flexSpace = Math.max(0, remainingSpace - explicitUsed);
+    const perFlex =
+      bucket.flexIndices.length > 0 ? Math.floor(flexSpace / bucket.flexIndices.length) : 0;
+    for (const i of bucket.flexIndices) {
+      widths[i] = perFlex;
+    }
+    return widths;
+  }
+
+  // All non-pinned are flex → equal split
+  const perFlex =
+    bucket.flexIndices.length > 0 ? Math.floor(remainingSpace / bucket.flexIndices.length) : 0;
+  for (const i of bucket.flexIndices) {
+    widths[i] = perFlex;
+  }
+  return widths;
+}
+
+/**
+ * Compute absolute pixel widths for each column.
+ *
+ * Strategy:
+ * 1. Pinned columns: use getPinnedWidth (ratio-based default or user override)
+ * 2. Non-pinned columns with explicit width (from captured layouts): scale
+ *    proportionally to fill remaining space
+ * 3. Non-pinned columns without width: split remaining space equally
+ */
+export function computeColumnWidths(
+  columns: LayoutColumn[],
+  totalWidth: number,
+  pinnedWidths: Map<string, number>,
+): number[] {
+  const bucket = classifyColumns(columns, totalWidth, pinnedWidths);
+  const remainingSpace = Math.max(0, totalWidth - bucket.pinnedTotal);
+  return computeFlexWidths(columns, bucket, remainingSpace);
+}
+
+/**
+ * Compute absolute pixel heights for groups within a column.
+ * Equal distribution among groups.
+ */
+export function computeGroupHeights(groups: LayoutGroup[], totalHeight: number): number[] {
+  if (groups.length === 0) return [];
+  const h = Math.floor(totalHeight / groups.length);
+  return groups.map(() => h);
+}

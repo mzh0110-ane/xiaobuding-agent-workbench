@@ -1,0 +1,476 @@
+"use client";
+
+import { useCallback, useState } from "react";
+import { type IDockviewHeaderActionsProps } from "dockview-react";
+import { IconPlus, IconTerminal2, IconPlayerPlay } from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@kandev/ui/dropdown-menu";
+import { useDockviewStore, performLayoutSwitch } from "@/lib/state/dockview-store";
+import { useAppStore, useAppStoreApi } from "@/components/state-provider";
+import { useEnvironmentId } from "@/hooks/use-environment-session-id";
+import { useTaskPR } from "@/hooks/domains/github/use-task-pr";
+import { useTaskMRs } from "@/hooks/domains/gitlab/use-task-mr";
+import { createUserShell } from "@/lib/api/domains/user-shell-api";
+import { useRepositoryScripts } from "@/hooks/domains/workspace/use-repository-scripts";
+import { replaceTaskUrl } from "@/lib/links";
+import type { Task } from "@/lib/types/http";
+import { sessionId as toSessionId } from "@/lib/types/ids";
+import { AddPanelMenuItems, MENU_ITEM_CLASS } from "./dockview-add-panel-items";
+import { useUserShells } from "@/hooks/domains/session/use-user-shells";
+import { useEnsureDefaultTerminalOrdinary } from "@/hooks/domains/session/use-ensure-default-terminal-ordinary";
+import { NewSessionDialog } from "./new-session-dialog";
+import { NewTaskDropdown } from "./new-task-dropdown";
+import { useActiveSessionDevScript } from "./repository-scripts-menu";
+import { DevServerPreviewButton } from "./dev-server-preview-button";
+import { GroupSplitCloseActionsView, useDockviewGroupWidth } from "./dockview-group-actions";
+import { useTranslation } from "react-i18next";
+import { useOptionalPortForwardingVisibility } from "./port-forwarding-visibility-provider";
+
+const HEADER_ACTION_BUTTON_CLASS =
+  "h-6 w-6 p-0 cursor-pointer text-muted-foreground hover:bg-muted/70 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring";
+const HEADER_ICON_CLASS = "h-3.5 w-3.5";
+
+function useLeftHeaderState(
+  groupId: string,
+  containerApi: IDockviewHeaderActionsProps["containerApi"],
+) {
+  const sidebarGroupId = useDockviewStore((s) => s.sidebarGroupId);
+  const centerGroupId = useDockviewStore((s) => s.centerGroupId);
+  const activeSessionId = useAppStore((state) => state.tasks.activeSessionId);
+  const taskId = useAppStore((state) => state.tasks.activeTaskId);
+  const isPassthrough = useAppStore((state) => {
+    if (!activeSessionId) return false;
+    return state.taskSessions.items[activeSessionId]?.is_passthrough === true;
+  });
+  const { prs } = useTaskPR(taskId);
+  const mrs = useTaskMRs(taskId);
+  const portForwarding = useOptionalPortForwardingVisibility();
+  const hasChanges = Boolean(
+    containerApi.getPanel("changes") ?? containerApi.getPanel("diff-files"),
+  );
+  const hasFiles = Boolean(containerApi.getPanel("files") ?? containerApi.getPanel("all-files"));
+  return {
+    isSidebarGroup: groupId === sidebarGroupId,
+    isCenterGroup: groupId === centerGroupId,
+    activeSessionId,
+    taskId,
+    isPassthrough,
+    prs,
+    mrs,
+    hasChanges,
+    hasFiles,
+    portForwarding,
+  };
+}
+
+export function LeftHeaderActions(props: IDockviewHeaderActionsProps) {
+  const { t } = useTranslation();
+  const { group, containerApi } = props;
+  const state = useLeftHeaderState(group.id, containerApi);
+  const environmentId = useEnvironmentId();
+  const taskID = useAppStore((s) => s.tasks?.activeTaskId ?? null);
+  const addTerminalPanel = useDockviewStore((s) => s.addTerminalPanel);
+  const addUserShell = useAppStore((s) => s.addUserShell);
+  const devScript = useActiveSessionDevScript();
+  const [showNewSessionDialog, setShowNewSessionDialog] = useState(false);
+  // Eagerly populate the user-shell store for this env+task so the
+  // dockview "+" menu's Terminals submenu and the per-tab badge logic
+  // both have the data ready on first open. Without this call, the
+  // store stays empty on desktop (the mobile right-panel hook is the
+  // only other call site) and the menu would render an empty section.
+  useUserShells(environmentId, taskID);
+  // Migrate the static `terminal-default` panel into a DB-backed
+  // ordinary terminal so its tab gets a real seq badge alongside any
+  // user-created terminals.
+  useEnsureDefaultTerminalOrdinary();
+
+  const handleAddTerminal = useCallback(async () => {
+    if (!environmentId) return;
+    try {
+      // Pass taskId so the backend creates a DB-backed ordinary terminal
+      // (with seq/kind) instead of a legacy passthrough shell. Also stamp
+      // taskID into the dockview panel params so the destroy cleanup
+      // passes ownership verification.
+      const result = await createUserShell(environmentId, { taskId: taskID ?? undefined });
+      // Push the new ordinary terminal into the user-shell store
+      // synchronously so TerminalTab's store lookup finds it on first
+      // render. Without this, the tab would briefly show the panel's
+      // initial title ("Terminal {seq}") before the next WS list
+      // catches up and rewrites it to the normalized "Terminal".
+      addUserShell(environmentId, {
+        terminalId: result.terminalId,
+        kind: result.kind,
+        seq: result.seq,
+        displayName: result.displayName,
+        customName: null,
+        state: result.state ?? "open",
+        ptyStatus: result.ptyStatus ?? "stopped",
+        running: result.ptyStatus === "running",
+        label: result.label,
+        closable: result.closable ?? true,
+        initialCommand: result.initialCommand,
+      });
+      // Panel title is always set to "Terminal" — TerminalTab pushes the
+      // custom name (or "Terminal") onto api.title via setTitle once it
+      // mounts; passing "Terminal" here avoids a "Terminal 1" → "Terminal"
+      // flash on first paint.
+      addTerminalPanel(result.terminalId, group.id, environmentId, taskID ?? undefined, "Terminal");
+    } catch (error) {
+      console.error("Failed to create terminal:", error);
+    }
+  }, [environmentId, taskID, addTerminalPanel, addUserShell, group.id]);
+
+  const handleRunScript = useCallback(
+    async (scriptId: string) => {
+      if (!environmentId) return;
+      try {
+        const result = await createUserShell(environmentId, { scriptId });
+        const title = result.label ?? t("common:script");
+        addTerminalPanel(result.terminalId, group.id, environmentId, undefined, title);
+      } catch (error) {
+        console.error("Failed to run script:", error);
+      }
+    },
+    [environmentId, addTerminalPanel, group.id],
+  );
+
+  const handleRunDevScript = useCallback(async () => {
+    if (!environmentId || !devScript) return;
+    try {
+      const result = await createUserShell(environmentId, {
+        command: devScript,
+        label: t("task:devServer"),
+      });
+      addTerminalPanel(result.terminalId, group.id, environmentId, undefined, t("task:devServer"));
+    } catch (error) {
+      console.error("Failed to start dev script:", error);
+    }
+  }, [environmentId, devScript, addTerminalPanel, group.id]);
+
+  if (state.isSidebarGroup) return null;
+
+  return (
+    <div className="flex items-center gap-0.5 pl-0.5">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={HEADER_ACTION_BUTTON_CLASS}
+            data-testid="dockview-add-panel-btn"
+            aria-label={t("task:addPanel")}
+            title={t("task:addPanel")}
+          >
+            <IconPlus className={HEADER_ICON_CLASS} />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-44">
+          <AddPanelMenuItems
+            groupId={group.id}
+            state={state}
+            onNewSession={() => setShowNewSessionDialog(true)}
+            onAddTerminal={handleAddTerminal}
+            onRunScript={handleRunScript}
+            onRunDevScript={handleRunDevScript}
+          />
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {state.taskId && (
+        <NewSessionDialog
+          open={showNewSessionDialog}
+          onOpenChange={setShowNewSessionDialog}
+          taskId={state.taskId}
+          groupId={group.id}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Faded maximize, split, and close buttons for any non-sidebar group. */
+function GroupSplitCloseActions({ group, containerApi }: IDockviewHeaderActionsProps) {
+  const centerGroupId = useDockviewStore((s) => s.centerGroupId);
+  const isChatGroup = group.id === centerGroupId;
+  const isMaximized = useDockviewStore((s) => s.preMaximizeLayout !== null);
+  const storeMaximize = useDockviewStore((s) => s.maximizeGroup);
+  const storeExitMaximize = useDockviewStore((s) => s.exitMaximizedLayout);
+  const width = useDockviewGroupWidth(group);
+
+  const handleMaximize = useCallback(() => {
+    if (isMaximized) {
+      storeExitMaximize();
+    } else {
+      storeMaximize(group.id);
+    }
+  }, [group.id, isMaximized, storeMaximize, storeExitMaximize]);
+
+  const handleSplitRight = useCallback(() => {
+    containerApi.addGroup({ referenceGroup: group, direction: "right" });
+  }, [group, containerApi]);
+
+  const handleSplitDown = useCallback(() => {
+    containerApi.addGroup({ referenceGroup: group, direction: "below" });
+  }, [group, containerApi]);
+
+  const handleCloseGroup = useCallback(() => {
+    const panels = [...group.panels];
+    if (panels.length === 0) {
+      try {
+        containerApi.removeGroup(group);
+      } catch {
+        /* already removed */
+      }
+      return;
+    }
+    for (const panel of panels) {
+      try {
+        containerApi.removePanel(panel);
+      } catch {
+        /* already removed */
+      }
+    }
+  }, [group, containerApi]);
+
+  return (
+    <GroupSplitCloseActionsView
+      width={width}
+      isChatGroup={isChatGroup}
+      isMaximized={isMaximized}
+      onMaximize={handleMaximize}
+      onSplitRight={handleSplitRight}
+      onSplitDown={handleSplitDown}
+      onCloseGroup={handleCloseGroup}
+    />
+  );
+}
+
+export function RightHeaderActions(props: IDockviewHeaderActionsProps) {
+  const { group } = props;
+  const centerGroupId = useDockviewStore((s) => s.centerGroupId);
+  const sidebarGroupId = useDockviewStore((s) => s.sidebarGroupId);
+  const rightBottomGroupId = useDockviewStore((s) => s.rightBottomGroupId);
+
+  const isSidebarGroup = group.id === sidebarGroupId;
+  if (isSidebarGroup) return <SidebarRightActions />;
+
+  const isCenterGroup = group.id === centerGroupId;
+  const isTerminalGroup = group.id === rightBottomGroupId;
+
+  return (
+    <div className="flex items-center gap-0.5 pr-0.5">
+      {isCenterGroup && <CenterRightActions />}
+      {isTerminalGroup && <TerminalGroupRightActions />}
+      <GroupSplitCloseActions {...props} />
+    </div>
+  );
+}
+
+function SidebarRightActions() {
+  const workspaceId = useAppStore((state) => state.workspaces.activeId);
+  const kanban = useAppStore((state) => state.kanban);
+  // Use kanban.workflowId (task context) not workflows.activeId so "All Workflows" isn't clobbered when viewing a task.
+  const workflowId = kanban.workflowId;
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const activeTaskTitle = useAppStore((state) => {
+    const id = state.tasks.activeTaskId;
+    if (!id) return "";
+    return state.kanban.tasks.find((t: { id: string }) => t.id === id)?.title ?? "";
+  });
+  const setActiveTask = useAppStore((state) => state.setActiveTask);
+  const setActiveSession = useAppStore((state) => state.setActiveSession);
+  const appStore = useAppStoreApi();
+  const steps = (kanban?.steps ?? []).map(
+    (s: {
+      id: string;
+      title: string;
+      color?: string;
+      events?: {
+        on_enter?: Array<{ type: string; config?: Record<string, unknown> }>;
+        on_turn_complete?: Array<{ type: string; config?: Record<string, unknown> }>;
+      };
+    }) => ({
+      id: s.id,
+      title: s.title,
+      color: s.color,
+      events: s.events,
+    }),
+  );
+
+  const handleTaskCreated = useCallback(
+    (
+      task: Task,
+      _mode: "create" | "edit",
+      meta?: { taskSessionId?: string | null; autoFocus?: boolean },
+    ) => {
+      if (meta?.autoFocus === false) return;
+      const state = appStore.getState();
+      const oldSessionId = state.tasks.activeSessionId;
+      const oldEnvId = oldSessionId ? (state.environmentIdBySessionId[oldSessionId] ?? null) : null;
+      setActiveTask(task.id);
+      if (meta?.taskSessionId) {
+        const taskSessionId = toSessionId(meta.taskSessionId);
+        setActiveSession(task.id, taskSessionId);
+        const nextState = appStore.getState();
+        const newEnvId = nextState.environmentIdBySessionId[taskSessionId] ?? null;
+        const sessionIds = (nextState.taskSessionsByTask.itemsByTaskId[task.id] ?? []).map(
+          (session) => session.id,
+        );
+        if (!sessionIds.includes(taskSessionId)) sessionIds.unshift(taskSessionId);
+        if (newEnvId) performLayoutSwitch(oldEnvId, newEnvId, taskSessionId, sessionIds);
+      }
+      replaceTaskUrl(task.id);
+    },
+    [setActiveTask, setActiveSession, appStore],
+  );
+
+  return (
+    <div className="flex items-center gap-1 pr-2">
+      <NewTaskDropdown
+        workspaceId={workspaceId}
+        workflowId={workflowId}
+        steps={steps}
+        activeTaskId={activeTaskId}
+        activeTaskTitle={activeTaskTitle}
+        onTaskCreated={handleTaskCreated}
+      />
+    </div>
+  );
+}
+
+function CenterRightActions() {
+  const hasDevScript = Boolean(useActiveSessionDevScript());
+
+  return (
+    <div className="flex items-center gap-1">
+      {/* Mode is shown in the chat input ModeSelector instead */}
+      {hasDevScript && (
+        <DevServerPreviewButton
+          className={HEADER_ACTION_BUTTON_CLASS}
+          iconClassName={HEADER_ICON_CLASS}
+          testId="dev-server-preview-toggle-center"
+        />
+      )}
+    </div>
+  );
+}
+
+function TerminalGroupRightActions() {
+  const environmentId = useEnvironmentId();
+  const repositoryId = useAppStore((state) => {
+    const sessionId = state.tasks.activeSessionId;
+    if (!sessionId) return null;
+    return state.taskSessions.items[sessionId]?.repository_id ?? null;
+  });
+  const hasDevScript = Boolean(useActiveSessionDevScript());
+  const { scripts } = useRepositoryScripts(repositoryId);
+  const rightBottomGroupId = useDockviewStore((s) => s.rightBottomGroupId);
+
+  if (scripts.length === 0 && !hasDevScript) return null;
+
+  return (
+    <>
+      <TerminalScriptsDropdown
+        scripts={scripts}
+        environmentId={environmentId}
+        rightBottomGroupId={rightBottomGroupId}
+      />
+      <TerminalDevPreviewButton rightBottomGroupId={rightBottomGroupId} visible={hasDevScript} />
+    </>
+  );
+}
+
+type TerminalScriptsDropdownProps = {
+  scripts: ReturnType<typeof useRepositoryScripts>["scripts"];
+  environmentId: string | null;
+  rightBottomGroupId: string | null;
+};
+
+function TerminalScriptsDropdown({
+  scripts,
+  environmentId,
+  rightBottomGroupId,
+}: TerminalScriptsDropdownProps) {
+  const { t } = useTranslation();
+  const addTerminalPanel = useDockviewStore((s) => s.addTerminalPanel);
+
+  const handleRunScript = useCallback(
+    async (scriptId: string) => {
+      if (!environmentId) return;
+      try {
+        const result = await createUserShell(environmentId, { scriptId });
+        addTerminalPanel(
+          result.terminalId,
+          rightBottomGroupId ?? undefined,
+          environmentId,
+          undefined,
+          result.label ?? t("common:script"),
+        );
+      } catch (error) {
+        console.error("Failed to run script:", error);
+      }
+    },
+    [environmentId, addTerminalPanel, rightBottomGroupId],
+  );
+
+  if (scripts.length === 0) return null;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          size="sm"
+          variant="ghost"
+          className={HEADER_ACTION_BUTTON_CLASS}
+          aria-label={t("task:runScript")}
+          title={t("task:runScript")}
+        >
+          <IconPlayerPlay className={HEADER_ICON_CLASS} />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[min(18rem,calc(100vw-1rem))]">
+        {scripts.map((script) => (
+          <DropdownMenuItem
+            key={script.id}
+            onClick={() => handleRunScript(script.id)}
+            className={`${MENU_ITEM_CLASS} grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 gap-y-0 py-1.5`}
+          >
+            <IconTerminal2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 overflow-hidden">
+              <span className="block truncate leading-4" title={script.name}>
+                {script.name}
+              </span>
+              <span
+                className="mt-0.5 block truncate font-mono text-[10px] leading-3 text-muted-foreground"
+                title={script.command}
+              >
+                {script.command}
+              </span>
+            </span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+type TerminalDevPreviewButtonProps = {
+  rightBottomGroupId: string | null;
+  visible: boolean;
+};
+
+function TerminalDevPreviewButton({ rightBottomGroupId, visible }: TerminalDevPreviewButtonProps) {
+  if (!visible) return null;
+
+  return (
+    <DevServerPreviewButton
+      outputGroupId={rightBottomGroupId}
+      className={HEADER_ACTION_BUTTON_CLASS}
+      iconClassName={HEADER_ICON_CLASS}
+    />
+  );
+}

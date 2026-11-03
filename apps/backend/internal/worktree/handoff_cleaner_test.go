@@ -1,0 +1,244 @@
+package worktree
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+// newCleanerWithTasksRoot constructs a HandoffCleaner whose managed
+// tasks-base path points at a tmp dir, so tests can write into it
+// safely.
+func newCleanerWithTasksRoot(t *testing.T, tasksRoot string) *HandoffCleaner {
+	t.Helper()
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	if err != nil {
+		t.Fatalf("logger: %v", err)
+	}
+	mgr := &Manager{
+		config: Config{TasksBasePath: tasksRoot},
+		logger: log,
+	}
+	return NewHandoffCleaner(mgr, log)
+}
+
+func TestRequireManagedRoot_AcceptsTasksRootDescendants(t *testing.T) {
+	tmp := t.TempDir()
+	c := newCleanerWithTasksRoot(t, tmp)
+
+	cases := []string{
+		filepath.Join(tmp, "task-1", "repo"),
+		filepath.Join(tmp, "deeply", "nested", "path"),
+		tmp, // the root itself is allowed
+	}
+	for _, p := range cases {
+		if err := c.requireManagedRoot(p); err != nil {
+			t.Errorf("expected %q under managed root to be accepted, got error: %v", p, err)
+		}
+	}
+}
+
+func TestRequireManagedRoot_RejectsPathsOutsideRoot(t *testing.T) {
+	tasksRoot := t.TempDir()
+	otherRoot := t.TempDir()
+	c := newCleanerWithTasksRoot(t, tasksRoot)
+
+	rejected := []string{
+		"/etc",
+		"/Users/somebody/projects/repo",
+		filepath.Join(otherRoot, "task-1"),
+		filepath.Join(tasksRoot, "..", "outside"),
+	}
+	for _, p := range rejected {
+		err := c.requireManagedRoot(p)
+		if err == nil {
+			t.Errorf("expected %q to be REJECTED by managed-root guard", p)
+		}
+	}
+}
+
+func TestRequireManagedRoot_EmptyPath(t *testing.T) {
+	c := newCleanerWithTasksRoot(t, t.TempDir())
+	if err := c.requireManagedRoot(""); err == nil {
+		t.Error("empty path must be rejected")
+	}
+}
+
+func TestRequireManagedRoot_NoRootsConfigured(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	mgr := &Manager{config: Config{TasksBasePath: ""}, logger: log}
+	c := NewHandoffCleaner(mgr, log)
+	if err := c.requireManagedRoot("/anywhere"); err == nil {
+		t.Error("cleaner with no managed roots configured must reject every path")
+	}
+}
+
+func TestCleanupPlainFolder_RemovesPathOnlyUnderRoot(t *testing.T) {
+	tasksRoot := t.TempDir()
+	target := filepath.Join(tasksRoot, "task-abc", "scratch")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "file.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	c := newCleanerWithTasksRoot(t, tasksRoot)
+
+	if err := c.CleanupPlainFolder(context.Background(), target); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("expected target to be removed; stat err=%v", err)
+	}
+}
+
+// REGRESSION: the managed-root guard MUST run before os.RemoveAll. A
+// path outside the managed root never touches disk regardless of the
+// caller's intent.
+func TestCleanupPlainFolder_RejectsPathOutsideManagedRoot(t *testing.T) {
+	tasksRoot := t.TempDir()
+	outside := t.TempDir()
+	canary := filepath.Join(outside, "do-not-touch.txt")
+	if err := os.WriteFile(canary, []byte("preserve me"), 0o600); err != nil {
+		t.Fatalf("write canary: %v", err)
+	}
+
+	c := newCleanerWithTasksRoot(t, tasksRoot)
+	err := c.CleanupPlainFolder(context.Background(), outside)
+	if err == nil {
+		t.Fatal("cleanup must refuse paths outside the managed root")
+	}
+	if !strings.Contains(err.Error(), "managed-root guard") {
+		t.Errorf("error should mention managed-root guard; got: %v", err)
+	}
+	// Canary survives.
+	if _, err := os.Stat(canary); err != nil {
+		t.Errorf("canary file was disturbed: %v", err)
+	}
+}
+
+func TestCleanupPlainFolder_EmptyPath(t *testing.T) {
+	c := newCleanerWithTasksRoot(t, t.TempDir())
+	if err := c.CleanupPlainFolder(context.Background(), ""); err == nil {
+		t.Error("empty path must be rejected")
+	}
+}
+
+func TestCleanupSingleRepoWorktree_RequiresWorktreeID(t *testing.T) {
+	c := newCleanerWithTasksRoot(t, t.TempDir())
+	if err := c.CleanupSingleRepoWorktree(context.Background(), ""); err == nil {
+		t.Error("empty worktree id must be rejected")
+	}
+}
+
+func TestCleanupMultiRepoRoot_RejectsPathOutsideManagedRoot(t *testing.T) {
+	c := newCleanerWithTasksRoot(t, t.TempDir())
+	err := c.CleanupMultiRepoRoot(context.Background(), "/somewhere/else", []string{"wt-1"})
+	if err == nil {
+		t.Error("multi-repo root outside managed root must be rejected")
+	}
+}
+func TestCleanupMultiRepoRoot_RequiresWorktreeManager(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	if err != nil {
+		t.Fatalf("logger: %v", err)
+	}
+	c := NewHandoffCleaner(nil, log, t.TempDir())
+	if err := c.CleanupMultiRepoRoot(context.Background(), t.TempDir(), nil); err == nil {
+		t.Fatal("multi-repo cleanup must reject a missing worktree manager")
+	}
+}
+func TestCleanupMultiRepoRoot_RequiresWorktreeInventory(t *testing.T) {
+	tasksRoot := t.TempDir()
+	root := filepath.Join(tasksRoot, "task-empty-inventory")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	c := newCleanerWithTasksRoot(t, tasksRoot)
+
+	err := c.CleanupMultiRepoRoot(context.Background(), root, nil)
+	if err == nil {
+		t.Fatal("multi-repo cleanup accepted an empty worktree inventory")
+	}
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("multi-repo root was removed after invalid inventory: %v", statErr)
+	}
+}
+
+func TestCleanupRemoteEnvironmentRejectsUnimplementedDeletion(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	if err != nil {
+		t.Fatalf("logger: %v", err)
+	}
+	c := NewHandoffCleaner(nil, log)
+	if err := c.CleanupRemoteEnvironment(context.Background(), "sprites", "env-1"); err == nil {
+		t.Fatal("remote cleanup must not report success without provider deletion")
+	}
+}
+
+func TestCleanupMultiRepoRoot_PreservesRootWhenChildIsShared(t *testing.T) {
+	mgr, store := newReferenceCleanupTestManager(t)
+	ctx := context.Background()
+	seedReferenceCleanupSession(t, store, "task-owner", "session-owner", models.TaskSessionStateRunning)
+	seedReferenceCleanupSession(t, store, "task-borrower", "session-borrower", models.TaskSessionStateRunning)
+	if err := store.linkSessionToEnvironment(ctx, "session-borrower", "env-owner"); err != nil {
+		t.Fatalf("link borrower session: %v", err)
+	}
+
+	wt := createReferenceCleanupWorktree(t, mgr, "task-owner", "session-owner")
+	root := filepath.Dir(wt.Path)
+	cleaner := NewHandoffCleaner(mgr, newTestLogger())
+
+	if err := cleaner.CleanupMultiRepoRoot(ctx, root, []string{wt.ID}); err == nil {
+		t.Fatal("cleanup should remain retryable while a shared child is retained")
+	}
+	if _, err := os.Stat(wt.Path); err != nil {
+		t.Fatalf("shared child was removed: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("multi-repo root was removed despite retained child: %v", err)
+	}
+}
+
+func TestCleanupMultiRepoRoot_RemovesRootWhenOnlyBranchIsRetained(t *testing.T) {
+	mgr, store := newReferenceCleanupTestManager(t)
+	ctx := context.Background()
+	seedReferenceCleanupSession(t, store, "task-branch", "session-branch", models.TaskSessionStateCompleted)
+	wt := createReferenceCleanupWorktree(t, mgr, "task-branch", "session-branch")
+	runGit(t, wt.Path, "commit", "--allow-empty", "-m", "unintegrated branch")
+	root := filepath.Dir(wt.Path)
+	cleaner := NewHandoffCleaner(mgr, newTestLogger())
+
+	if err := cleaner.CleanupMultiRepoRoot(ctx, root, []string{wt.ID}); err != nil {
+		t.Fatalf("cleanup should remove root after removing child: %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("multi-repo root remains after child removal, stat error = %v", err)
+	}
+}
+
+func TestIsDescendant_HappyAndUnhappyPaths(t *testing.T) {
+	cases := []struct {
+		root, path string
+		want       bool
+	}{
+		{"/a", "/a/b/c", true},
+		{"/a", "/a", true},
+		{"/a", "/b", false},
+		{"/a/b", "/a", false},
+		{"/a", "/a/../b", false}, // traversal
+		{"", "/a", false},
+		{"/a", "", false},
+	}
+	for _, tc := range cases {
+		got := isDescendant(filepath.Clean(tc.root), filepath.Clean(tc.path))
+		if got != tc.want {
+			t.Errorf("isDescendant(%q, %q) = %v, want %v", tc.root, tc.path, got, tc.want)
+		}
+	}
+}

@@ -1,0 +1,49 @@
+"use client";
+
+import { IconCheck, IconCopy } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
+import { Button } from "@kandev/ui/button";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@kandev/ui/dialog";
+import { Textarea } from "@kandev/ui/textarea";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+
+type WorkflowExportDialogProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  content: string;
+};
+
+export function WorkflowExportDialog({
+  open,
+  onOpenChange,
+  title,
+  content,
+}: WorkflowExportDialogProps) {
+  const { t } = useTranslation();
+  const { copied, copy } = useCopyToClipboard();
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        <Textarea readOnly value={content} className="font-mono text-xs max-h-96 overflow-y-auto" />
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} className="cursor-pointer">
+            {t("workflows:close")}
+          </Button>
+          <Button onClick={() => copy(content)} className="cursor-pointer">
+            {copied ? (
+              <IconCheck className="h-4 w-4 mr-2" />
+            ) : (
+              <IconCopy className="h-4 w-4 mr-2" />
+            )}
+            {copied ? t("workflows:copied") : t("workflows:copy")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

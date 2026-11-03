@@ -1,0 +1,163 @@
+package agents
+
+import (
+	"context"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+// TUIAgentConfig is a declarative specification for CLI passthrough / TUI agents.
+// TUI tools like k9s or lazydocker can be defined in ~20 lines instead of ~90.
+type TUIAgentConfig struct {
+	// Required
+	AgentID   string
+	AgentName string
+	Command   string // binary name, e.g. "claude"
+	Desc      string
+
+	// Optional (zero values get sensible defaults)
+	Display     string         // defaults to AgentName
+	Order       *int           // defaults to 99 when nil; use a pointer so 0 is a valid explicit value
+	Protocol    agent.Protocol // defaults to ProtocolACP
+	LogoLight   []byte         // nil = no logo (frontend shows a blank placeholder)
+	LogoDark    []byte         // nil = no logo
+	IdleTimeout time.Duration  // defaults to 3s
+	BufferMax   int64          // defaults to DefaultBufferMaxBytes
+	WaitForTerm bool           // delay process start until the terminal WebSocket connects and sends its first resize
+	ModelFlag   Param          // e.g. NewParam("--model", "{model}") — lets users pick a model in profile settings
+	CommandArgs []string       // extra args after Command
+	DetectOpts  []DetectOption // defaults to WithCommand(Command)
+	// MCPStrategy materializes kandev's per-session MCP server (and the
+	// profile's configured servers) into the wrapped CLI's own shape. Nil — the
+	// default — means no injection, which is correct for a TUI tool that is not
+	// an MCP client at all. Resolved from the user's stored strategy key; see
+	// mcpconfig.StrategyByKey for why it is chosen rather than inferred.
+	MCPStrategy mcpconfig.PassthroughMCPStrategy
+	// DisableBracketedPaste selects the paced unframed delivery path for a
+	// terminal that does not accept bracketed-paste delimiters.
+	DisableBracketedPaste bool
+}
+
+// TUIAgent implements Agent + PassthroughAgent for CLI passthrough TUI tools.
+type TUIAgent struct {
+	StandardPassthrough
+	cfg TUIAgentConfig
+	cmd Command // cached command built once from cfg.Command + cfg.CommandArgs
+}
+
+// NewTUIAgent creates a TUIAgent from a declarative config, applying defaults.
+func NewTUIAgent(cfg TUIAgentConfig) *TUIAgent {
+	if cfg.Display == "" {
+		cfg.Display = cfg.AgentName
+	}
+	if cfg.Order == nil {
+		defaultOrder := 99
+		cfg.Order = &defaultOrder
+	}
+	if cfg.Protocol == "" {
+		cfg.Protocol = agent.ProtocolACP
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 3 * time.Second
+	}
+	if cfg.BufferMax == 0 {
+		cfg.BufferMax = DefaultBufferMaxBytes
+	}
+	if len(cfg.DetectOpts) == 0 {
+		cfg.DetectOpts = []DetectOption{WithCommand(cfg.Command)}
+	}
+
+	cmdArgs := append([]string{cfg.Command}, cfg.CommandArgs...)
+
+	cmd := Cmd(cfg.Command).Flag(cfg.CommandArgs...).Build()
+
+	a := &TUIAgent{
+		StandardPassthrough: StandardPassthrough{
+			Cfg: PassthroughConfig{
+				Supported:             true,
+				Label:                 "CLI Passthrough",
+				Description:           cfg.Desc,
+				PassthroughCmd:        NewCommand(cmdArgs...),
+				ModelFlag:             cfg.ModelFlag,
+				IdleTimeout:           cfg.IdleTimeout,
+				BufferMaxBytes:        cfg.BufferMax,
+				WaitForTerminal:       cfg.WaitForTerm,
+				MCPStrategy:           cfg.MCPStrategy,
+				DisableBracketedPaste: cfg.DisableBracketedPaste,
+				// Ink-based TUIs (Claude Code and similar) coalesce multi-byte
+				// stdin reads into a paste burst, absorbing a trailing "\r" into
+				// the pasted content instead of dispatching Enter. The submit
+				// byte is therefore a separate delayed keystroke, and the body
+				// travels as a bracketed paste so it arrives whole at any
+				// length. Matches the built-in Claude passthrough agent.
+				SubmitDelay: 150 * time.Millisecond,
+			},
+		},
+		cfg: cfg,
+		cmd: cmd,
+	}
+	return a
+}
+
+// Compile-time interface checks.
+var (
+	_ Agent            = (*TUIAgent)(nil)
+	_ PassthroughAgent = (*TUIAgent)(nil)
+)
+
+func (a *TUIAgent) ID() string          { return a.cfg.AgentID }
+func (a *TUIAgent) Name() string        { return a.cfg.AgentName }
+func (a *TUIAgent) DisplayName() string { return a.cfg.Display }
+func (a *TUIAgent) Description() string { return a.cfg.Desc }
+func (a *TUIAgent) Enabled() bool       { return true }
+func (a *TUIAgent) DisplayOrder() int   { return *a.cfg.Order }
+
+func (a *TUIAgent) Logo(v LogoVariant) []byte {
+	if v == LogoDark {
+		return a.cfg.LogoDark
+	}
+	return a.cfg.LogoLight
+}
+
+func (a *TUIAgent) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+	result, err := Detect(ctx, a.cfg.DetectOpts...)
+	if err != nil {
+		return result, err
+	}
+	// Derive MCP support from the configured strategy rather than storing it as
+	// an independent flag. Discovery writes this value back over agents.supports_mcp
+	// on every sweep (see controller.upsertAgent), so anything set separately at
+	// creation time is reverted within a boot. Deriving makes that write the
+	// mechanism that keeps the flag correct instead of the thing fighting it,
+	// and makes "supports MCP but has no way to inject it" unrepresentable.
+	result.SupportsMCP = a.cfg.MCPStrategy != nil
+	return result, nil
+}
+
+// MCPStrategy returns the configured passthrough MCP injection strategy, or nil
+// when the agent does no injection.
+func (a *TUIAgent) MCPStrategy() mcpconfig.PassthroughMCPStrategy {
+	return a.cfg.MCPStrategy
+}
+
+func (a *TUIAgent) BuildCommand(_ CommandOptions) Command {
+	return a.cmd
+}
+
+func (a *TUIAgent) InstallScript() string                            { return "" }
+func (a *TUIAgent) RemoteAuth() *RemoteAuth                          { return nil }
+func (a *TUIAgent) BillingType() usage.BillingType                   { return defaultBillingType() }
+func (a *TUIAgent) PermissionSettings() map[string]PermissionSetting { return nil }
+
+func (a *TUIAgent) Runtime() *RuntimeConfig {
+	return &RuntimeConfig{
+		Cmd:            a.cmd,
+		WorkingDir:     "{workspace}",
+		Env:            map[string]string{},
+		ResourceLimits: DefaultResourceLimits,
+		Protocol:       a.cfg.Protocol,
+	}
+}

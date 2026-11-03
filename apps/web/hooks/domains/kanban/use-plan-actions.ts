@@ -1,0 +1,365 @@
+import React, { useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useAppStore } from "@/components/state-provider";
+import { useToast } from "@/components/toast-provider";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import { setChatDraftContent } from "@/lib/local-storage";
+import { moveTask } from "@/lib/api/domains/kanban-api";
+import { getTaskMoveErrorDetail } from "@/components/task/task-move-error-message";
+import { resolveLatestTaskProjection } from "@/components/task/task-page-content-helpers";
+import { useContextFilesStore } from "@/lib/state/context-files-store";
+import { useLayoutStore } from "@/lib/state/layout-store";
+import { useDockviewStore } from "@/lib/state/dockview-store";
+import { generateUUID } from "@/lib/utils";
+import { useImplementFresh } from "./use-implement-fresh";
+import { markPlanImplementationStarted } from "@/lib/api/domains/plan-api";
+import type {
+  ChatInputContainerHandle,
+  MessageAttachment,
+} from "@/components/task/chat/chat-input-container";
+import type { WorkflowMoveEntryOptions } from "@/lib/api/domains/kanban-api";
+import type { KanbanState } from "@/lib/state/slices";
+
+const PLAN_CONTEXT_PATH = "plan:context";
+const EMPTY_WORKFLOW_STEPS: KanbanState["steps"] = [];
+
+const AUTO_TRANSITION_ACTIONS = ["move_to_next", "move_to_previous", "move_to_step"];
+
+export function useNextWorkflowStep(taskId: string | null) {
+  const { toast } = useToast();
+  const { t } = useTranslation("task");
+  const taskProjection = useAppStore((s) =>
+    resolveLatestTaskProjection(taskId, s.kanban.tasks, s.kanbanMulti.snapshots),
+  );
+  const workflowId = taskProjection?.workflowId ?? null;
+  const taskStepId = taskProjection?.workflowStepId ?? null;
+  const steps = useAppStore((s) => {
+    if (!workflowId) return EMPTY_WORKFLOW_STEPS;
+    if (workflowId === s.kanban.workflowId) return s.kanban.steps;
+    const snapshot = s.kanbanMulti.snapshots[workflowId];
+    if (!snapshot || snapshot.isPlaceholder === true || snapshot.workflowId !== workflowId) {
+      return EMPTY_WORKFLOW_STEPS;
+    }
+    return snapshot.steps;
+  });
+
+  // Track agent switching: isMoving stays true from "proceed" click until the
+  // new session is adopted (activeSessionId changes from the original).
+  const [moveFromSessionId, setMoveFromSessionId] = useState<string | null>(null);
+  const activeSessionId = useAppStore((s) => s.tasks.activeSessionId);
+  const isMoving = moveFromSessionId != null && activeSessionId === moveFromSessionId;
+
+  const sortedSteps = useMemo(() => [...steps].sort((a, b) => a.position - b.position), [steps]);
+
+  const { currentStep, nextStep } = useMemo(() => {
+    const currentIndex = sortedSteps.findIndex((s) => s.id === taskStepId);
+    const current = currentIndex >= 0 ? sortedSteps[currentIndex] : null;
+    const next =
+      currentIndex >= 0 && currentIndex < sortedSteps.length - 1
+        ? sortedSteps[currentIndex + 1]
+        : null;
+    return { currentStep: current, nextStep: next };
+  }, [sortedSteps, taskStepId]);
+
+  const currentStepAutoTransitions = useMemo(() => {
+    if (!currentStep) return false;
+    return (
+      currentStep.events?.on_turn_complete?.some(
+        (a) =>
+          AUTO_TRANSITION_ACTIONS.includes(a.type) &&
+          (currentStep.auto_advance_requires_signal !== true || a.type !== "move_to_next"),
+      ) ?? false
+    );
+  }, [currentStep]);
+
+  const nextStepIsWorkStep = useMemo(() => {
+    if (!nextStep) return false;
+    const hasAutoStart =
+      nextStep.events?.on_enter?.some((a) => a.type === "auto_start_agent") ?? false;
+    const hasPlanMode =
+      nextStep.events?.on_enter?.some((a) => a.type === "enable_plan_mode") ?? false;
+    return hasAutoStart && !hasPlanMode;
+  }, [nextStep]);
+
+  const proceed = useCallback(
+    async (entryOptions?: WorkflowMoveEntryOptions) => {
+      if (!taskId || !workflowId || !nextStep) return false;
+      const capturedSessionId = activeSessionId;
+      setMoveFromSessionId(capturedSessionId);
+      try {
+        await moveTask(taskId, {
+          workflow_id: workflowId,
+          workflow_step_id: nextStep.id,
+          position: 0,
+          entry_options: entryOptions,
+        });
+        // Safety: if the next step reuses the same session (no agent-profile
+        // override), activeSessionId never changes and isMoving would be stuck.
+        // Clear after 10 s if no session handoff occurred.
+        setTimeout(() => {
+          setMoveFromSessionId((prev) => (prev === capturedSessionId ? null : prev));
+        }, 10_000);
+        return true;
+      } catch (err) {
+        console.error("Failed to proceed to next step:", err);
+        // The backend refuses some transitions (an active session, a WIP limit)
+        // and says why in the response. Reporting only the headline left the user
+        // on a phone with no way to see the reason short of devtools.
+        const title = t("task:failedToProceedToNextStep");
+        const detail = getTaskMoveErrorDetail(err, title, t);
+        toast({
+          title,
+          ...(detail !== null && { description: detail }),
+          variant: "error",
+        });
+        setMoveFromSessionId(null);
+        return false;
+      }
+    },
+    [taskId, workflowId, nextStep, activeSessionId, t, toast],
+  );
+
+  const proceedStepName = nextStep && !currentStepAutoTransitions ? nextStep.title : null;
+
+  const proceedPreviewTarget =
+    taskId && workflowId && nextStep
+      ? { taskId, workflowId, workflowStepId: nextStep.id }
+      : undefined;
+  return { proceedStepName, proceedPreviewTarget, nextStepIsWorkStep, proceed, isMoving };
+}
+
+// i18n-exempt: system block sent verbatim to the agent.
+const IMPLEMENT_PLAN_SYSTEM_BLOCK = `<kandev-system>
+IMPLEMENT PLAN: The user has approved the plan and wants you to implement it now.
+Read the current plan using the get_task_plan_kandev MCP tool.
+Implement all changes described in the plan step by step.
+After completing the implementation, provide a summary of what was done.
+</kandev-system>`;
+
+export function buildImplementPlanContent(userText: string): string {
+  // i18n-exempt: becomes the message content sent to the agent and stored in the transcript.
+  const visibleText = userText.trim() || "Implement the plan";
+  return `${visibleText}\n\n${IMPLEMENT_PLAN_SYSTEM_BLOCK}`;
+}
+
+/** Reads context files for the session, dropping the special plan:context and prompt: paths
+ *  that are only meaningful in-session and not as standalone file references. */
+export function readContextFilesMeta(sessionId: string): Array<{ path: string; name: string }> {
+  const files = useContextFilesStore.getState().filesBySessionId[sessionId] ?? [];
+  return files
+    .filter((f) => !f.path.startsWith("prompt:") && f.path !== PLAN_CONTEXT_PATH)
+    .map((f) => ({ path: f.path, name: f.name }));
+}
+
+export function collectImplementPlanInput(
+  chatInput: ChatInputContainerHandle | null | undefined,
+  sessionId: string | null,
+): {
+  userText: string;
+  attachments: MessageAttachment[];
+  contextFilesMeta: Array<{ path: string; name: string }>;
+} {
+  if (!chatInput || !sessionId) {
+    return { userText: "", attachments: [], contextFilesMeta: [] };
+  }
+  return {
+    userText: chatInput.getValue(),
+    attachments: chatInput.getAttachments(),
+    contextFilesMeta: readContextFilesMeta(sessionId),
+  };
+}
+
+export function planAttachmentsAreReady(attachments: MessageAttachment[]): boolean {
+  return attachments.every((attachment) => Boolean(attachment.attachment_id));
+}
+
+export async function markPlanImplementationStartedBestEffort(
+  taskId: string,
+  sessionId: string,
+  setTaskPlan: (
+    taskId: string,
+    plan: Awaited<ReturnType<typeof markPlanImplementationStarted>>,
+  ) => void,
+) {
+  try {
+    const markedPlan = await markPlanImplementationStarted(taskId, sessionId);
+    setTaskPlan(taskId, markedPlan);
+  } catch (err) {
+    console.error("Failed to mark plan implementation started:", err);
+  }
+}
+
+function useImplementPlan(
+  resolvedSessionId: string | null,
+  taskId: string | null,
+  handlePlanModeChange: ((enabled: boolean) => void) | undefined,
+  clearPlanModeAfterSend: boolean,
+  chatInputRef?: React.RefObject<ChatInputContainerHandle | null>,
+) {
+  const setTaskPlan = useAppStore((s) => s.setTaskPlan);
+  const { toast } = useToast();
+  const { t } = useTranslation("task");
+  return useCallback(async (): Promise<boolean> => {
+    if (!resolvedSessionId || !taskId) return false;
+
+    const client = getWebSocketClient();
+    if (!client) return false;
+
+    const { userText, attachments, contextFilesMeta } = collectImplementPlanInput(
+      chatInputRef?.current,
+      resolvedSessionId,
+    );
+    if (!planAttachmentsAreReady(attachments)) return false;
+
+    const content = buildImplementPlanContent(userText);
+
+    try {
+      await client.request(
+        "message.add",
+        {
+          task_id: taskId,
+          session_id: resolvedSessionId,
+          client_message_id: generateUUID(),
+          content,
+          plan_mode: false,
+          ...(attachments.length > 0 && { attachments }),
+          ...(contextFilesMeta.length > 0 && { context_files: contextFilesMeta }),
+        },
+        attachments.length > 0 ? 30000 : 10000,
+      );
+      await markPlanImplementationStartedBestEffort(taskId, resolvedSessionId, setTaskPlan);
+      // Exit plan mode + clear composer only on success so a failed send
+      // leaves the layout and input intact for retry.
+      if (clearPlanModeAfterSend) {
+        handlePlanModeChange?.(false);
+      }
+      if (chatInputRef) {
+        chatInputRef.current?.clear();
+        setChatDraftContent(resolvedSessionId, null);
+      }
+      // Authoritatively clear plan_mode in session metadata so a refresh
+      // mid-implementation cannot re-hydrate plan mode from the server.
+      // Run as a separate request with its own catch so a set_plan_mode
+      // failure doesn't masquerade as a message send failure.
+      if (clearPlanModeAfterSend) {
+        client
+          .request("session.set_plan_mode", { session_id: resolvedSessionId, enabled: false }, 5000)
+          .catch((err: unknown) =>
+            console.error("Failed to clear plan mode after implement:", err),
+          );
+      }
+      return true;
+    } catch (err) {
+      console.error("Failed to start implementation:", err);
+      toast({ description: t("task:failedToStartImplementingPlan"), variant: "error" });
+      return false;
+    }
+  }, [
+    resolvedSessionId,
+    taskId,
+    chatInputRef,
+    setTaskPlan,
+    clearPlanModeAfterSend,
+    handlePlanModeChange,
+    toast,
+    t,
+  ]);
+}
+
+/** Directly disable plan mode state + layout, bypassing the MCP availability guard. */
+function useDirectDisablePlanMode(resolvedSessionId: string | null) {
+  const setPlanMode = useAppStore((s) => s.setPlanMode);
+  const setActiveDocument = useAppStore((s) => s.setActiveDocument);
+  const closeDocument = useLayoutStore((s) => s.closeDocument);
+  const removeContextFile = useContextFilesStore((s) => s.removeFile);
+  const applyBuiltInPreset = useDockviewStore((s) => s.applyBuiltInPreset);
+
+  return useCallback(() => {
+    if (!resolvedSessionId) return;
+    applyBuiltInPreset("default");
+    closeDocument(resolvedSessionId);
+    setActiveDocument(resolvedSessionId, null);
+    setPlanMode(resolvedSessionId, false);
+    removeContextFile(resolvedSessionId, PLAN_CONTEXT_PATH);
+  }, [
+    resolvedSessionId,
+    applyBuiltInPreset,
+    closeDocument,
+    setActiveDocument,
+    setPlanMode,
+    removeContextFile,
+  ]);
+}
+
+export function usePlanActions(opts: {
+  resolvedSessionId: string | null;
+  taskId: string | null;
+  planModeEnabled: boolean;
+  handlePlanModeChange: (enabled: boolean) => void;
+  chatInputRef: React.RefObject<ChatInputContainerHandle | null>;
+}) {
+  const implementPlan = useImplementPlanRunner({
+    resolvedSessionId: opts.resolvedSessionId,
+    taskId: opts.taskId,
+    handlePlanModeChange: opts.handlePlanModeChange,
+    chatInputRef: opts.chatInputRef,
+  });
+  const {
+    proceedStepName,
+    proceedPreviewTarget,
+    nextStepIsWorkStep,
+    proceed: rawProceed,
+    isMoving,
+  } = useNextWorkflowStep(opts.taskId);
+
+  const disablePlanMode = useDirectDisablePlanMode(opts.resolvedSessionId);
+  const { planModeEnabled } = opts;
+  // Disable plan mode only after a successful move. A failed workflow move
+  // should leave the plan layout and context intact for retry.
+  const proceed = useCallback(
+    async (entryOptions?: WorkflowMoveEntryOptions) => {
+      const moved = await rawProceed(entryOptions);
+      if (moved && planModeEnabled) {
+        disablePlanMode();
+      }
+      return moved;
+    },
+    [planModeEnabled, disablePlanMode, rawProceed],
+  );
+
+  const showImplement = opts.planModeEnabled;
+  const implementPlanHandler = showImplement
+    ? async (fresh: boolean) => {
+        const attachments = opts.chatInputRef.current?.getAttachments() ?? [];
+        if (!planAttachmentsAreReady(attachments)) return false;
+        if (nextStepIsWorkStep) return proceed();
+        return implementPlan(fresh);
+      }
+    : undefined;
+  return { implementPlanHandler, proceedStepName, proceedPreviewTarget, proceed, isMoving };
+}
+
+export function useImplementPlanRunner(opts: {
+  resolvedSessionId: string | null;
+  taskId: string | null;
+  handlePlanModeChange?: (enabled: boolean) => void;
+  clearPlanModeAfterSend?: boolean;
+  chatInputRef?: React.RefObject<ChatInputContainerHandle | null>;
+}) {
+  const handleImplementPlan = useImplementPlan(
+    opts.resolvedSessionId,
+    opts.taskId,
+    opts.handlePlanModeChange,
+    opts.clearPlanModeAfterSend ?? true,
+    opts.chatInputRef,
+  );
+  const handleImplementFresh = useImplementFresh(
+    opts.resolvedSessionId,
+    opts.taskId,
+    opts.chatInputRef,
+  );
+  return useCallback(
+    (fresh: boolean) => (fresh ? handleImplementFresh() : handleImplementPlan()),
+    [handleImplementFresh, handleImplementPlan],
+  );
+}

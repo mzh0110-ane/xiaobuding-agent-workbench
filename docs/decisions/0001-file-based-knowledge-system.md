@@ -1,0 +1,62 @@
+# 0001: File-based knowledge system
+
+**Status:** accepted (specification layout amended by ADR-2026-08-22-system-oriented-specifications and ADR-2026-09-07-on-demand-document-catalogs)
+**Date:** 2026-03-28 (amended 2026-08-22)
+**Area:** infra
+
+## Context
+
+Agents working on Kandev had no way to record architectural decisions or store implementation plans for future reference. This led to repeated questions about "why was X done this way?" and lost context when features were revisited. The project needed a knowledge system that works across agent providers (Claude Code, Codex, Copilot) without custom infrastructure.
+
+## Decision
+
+Use a three-tier, file-based knowledge system:
+
+- **Tier 1 (always loaded):** `CLAUDE.md` stays slim and points to Tier 2 indexes.
+- **Tier 2 (catalog entry pages):** `docs/decisions/INDEX.md` and `docs/specs/INDEX.md` explain how to query source files with `scripts/list-docs.py`.
+- **Tier 3 (individual files):** Individual ADRs and specification documents,
+  loaded only when needed.
+
+ADRs `0001` through `0042` retain their numeric IDs. New ADRs use decentralized,
+date-prefixed IDs in the form `YYYY-MM-DD-short-title`, with a sufficiently specific slug to avoid
+same-day collisions. The complete filename stem is the stable ADR ID. This removes the need for
+parallel branches to reserve a shared next number.
+
+Architecture decisions are recorded as ADRs (this file is an example). Product
+behavior is captured in the system-oriented specification layout defined by
+`ADR-2026-08-22-system-oriented-specifications`. Implementation plans live
+under `docs/plans/<initiative>/` and are durable records linked to their
+requirements and system designs.
+
+> The current specification and plan layout is defined by
+> `ADR-2026-08-22-system-oriented-specifications`. The paragraph above records
+> the original layout.
+
+A `/record` skill creates ADRs and a `/spec` skill creates specs, but the system works without them — agents can create files directly following the conventions.
+
+ADRs are reserved for durable architectural constraints, boundaries, contracts, ownership rules,
+operational invariants, and repo-wide conventions for which meaningful alternatives existed.
+Simple features belong in specs, implementation sequencing belongs in plans, and local tactics or
+ordinary bug fixes remain in code, tests, and commit history unless they establish a rule that
+future work must follow.
+
+## Consequences
+
+- Agents can discover past decisions with stable filters, then drill into specific ADRs.
+- No file grows unbounded — each decision is its own file.
+- Knowledge is committed to git and survives across sessions, branches, and agent providers.
+- The `/spec` skill integrates with the decision log (reads in design, writes when a durable decision is needed).
+- Requires discipline to record decisions — this is a convention, not an enforcement mechanism.
+- Date-prefixed IDs are longer than sequence numbers, but branches can create them independently
+  without filename collisions over the next shared integer.
+
+## Alternatives Considered
+
+- **Continue allocating sequential ADR numbers:** Rejected for new ADRs because parallel branches
+  must read and update the same allocation point, producing duplicate IDs and avoidable conflicts.
+- **Use random UUIDs:** Rejected because they avoid coordination but make filenames and references
+  difficult to scan. A date plus specific slug is decentralized while remaining recognizable.
+- **Database-backed memory (SQLite, vector search):** Too complex, requires infrastructure, doesn't work for agents that only read files.
+- **Append-only daily logs (OpenClaw pattern):** Good for persistent agents but Kandev agents are session-scoped — daily logs would accumulate noise.
+- **Auto-compaction system:** Not needed — the tiered index approach prevents unbounded growth in the first place.
+- **CLAUDE.md inline decisions:** Would make CLAUDE.md grow unbounded and overwhelm agent context.

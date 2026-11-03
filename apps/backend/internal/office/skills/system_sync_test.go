@@ -1,0 +1,849 @@
+package skills_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sort"
+	"strings"
+	"testing"
+
+	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/office/skills"
+)
+
+// stubSyncRepo is an in-memory implementation of SystemSyncRepo so
+// the table-driven tests can drive insert / update / remove paths
+// without spinning up SQLite. Each map is keyed by (workspaceID,
+// slug) so we exercise per-workspace isolation.
+type stubSyncRepo struct {
+	rows   map[string]map[string]*models.Skill                // workspaceID → slug → row
+	agents map[string]map[string]*settingsmodels.AgentProfile // workspaceID → agentID → profile
+
+	// failUpdateAgentFor injects an error from UpdateAgentInstance for
+	// the named agent ID, so a test can simulate a mid-sequence failure
+	// (e.g. the agent-reference rewrite half of a slug normalization)
+	// without it actually persisting.
+	failUpdateAgentFor map[string]bool
+}
+
+func newStubSyncRepo() *stubSyncRepo {
+	return &stubSyncRepo{
+		rows:               map[string]map[string]*models.Skill{},
+		agents:             map[string]map[string]*settingsmodels.AgentProfile{},
+		failUpdateAgentFor: map[string]bool{},
+	}
+}
+
+func (s *stubSyncRepo) ListSystemSkills(
+	_ context.Context, workspaceID string,
+) ([]*models.Skill, error) {
+	ws := s.rows[workspaceID]
+	out := make([]*models.Skill, 0, len(ws))
+	for _, sk := range ws {
+		if sk.IsSystem {
+			out = append(out, sk)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	return out, nil
+}
+
+func (s *stubSyncRepo) ListNonSystemSkills(
+	_ context.Context, workspaceID string,
+) ([]*models.Skill, error) {
+	ws := s.rows[workspaceID]
+	out := make([]*models.Skill, 0, len(ws))
+	for _, sk := range ws {
+		if !sk.IsSystem {
+			out = append(out, sk)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	return out, nil
+}
+
+func (s *stubSyncRepo) GetSkillBySlug(
+	_ context.Context, workspaceID, slug string,
+) (*models.Skill, error) {
+	if ws, ok := s.rows[workspaceID]; ok {
+		if sk, ok := ws[slug]; ok {
+			return sk, nil
+		}
+	}
+	return nil, errors.New("not found")
+}
+
+func (s *stubSyncRepo) CreateSkill(_ context.Context, skill *models.Skill) error {
+	if err := syncTestCreateSkillError(s, skill.Slug); err != nil {
+		return err
+	}
+	if _, ok := s.rows[skill.WorkspaceID]; !ok {
+		s.rows[skill.WorkspaceID] = map[string]*models.Skill{}
+	}
+	copy := *skill
+	if copy.ID == "" {
+		copy.ID = skill.WorkspaceID + ":" + skill.Slug
+	}
+	s.rows[skill.WorkspaceID][skill.Slug] = &copy
+	return nil
+}
+
+// UpdateSkill mirrors the real repository's update-by-ID semantics
+// (sqlite.Repository.UpdateSkill writes `WHERE id = ?`): it locates
+// the row by ID, not by the caller-supplied slug, so a slug rewrite
+// (e.g. normalizeUserSkillSlugs) re-keys the map instead of failing
+// to find a row under its now-stale old slug.
+func (s *stubSyncRepo) UpdateSkill(_ context.Context, skill *models.Skill) error {
+	ws, ok := s.rows[skill.WorkspaceID]
+	if !ok {
+		return errors.New("not found for update")
+	}
+	for slug, sk := range ws {
+		if sk.ID == skill.ID {
+			delete(ws, slug)
+			copy := *skill
+			ws[skill.Slug] = &copy
+			return nil
+		}
+	}
+	return errors.New("not found for update")
+}
+
+func (s *stubSyncRepo) DeleteSkill(_ context.Context, id string) error {
+	for _, ws := range s.rows {
+		for slug, sk := range ws {
+			if sk.ID == id {
+				delete(ws, slug)
+				return nil
+			}
+		}
+	}
+	return errors.New("not found for delete")
+}
+
+// ListAgentInstances returns copies, matching the real repository's
+// read-from-DB semantics: a caller mutating a returned profile (as
+// renameSkillSlugOnAgents does before its UpdateAgentInstance call)
+// must not silently affect stored state until that write succeeds.
+func (s *stubSyncRepo) ListAgentInstances(
+	_ context.Context, workspaceID string,
+) ([]*settingsmodels.AgentProfile, error) {
+	ws := s.agents[workspaceID]
+	out := make([]*settingsmodels.AgentProfile, 0, len(ws))
+	for _, a := range ws {
+		copy := *a
+		out = append(out, &copy)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (s *stubSyncRepo) UpdateAgentInstance(
+	_ context.Context, agent *settingsmodels.AgentProfile,
+) error {
+	if s.failUpdateAgentFor[agent.ID] {
+		return errors.New("injected failure: agent update unavailable")
+	}
+	ws, ok := s.agents[agent.WorkspaceID]
+	if !ok {
+		return errors.New("workspace not found")
+	}
+	if _, ok := ws[agent.ID]; !ok {
+		return errors.New("agent not found")
+	}
+	copy := *agent
+	ws[agent.ID] = &copy
+	return nil
+}
+
+// TestSyncSystemSkills_InsertsBundledSkillsForFreshWorkspace pins
+// that on a workspace with no rows yet, every embedded SKILL.md
+// that declares `kandev.system: true` gets inserted with is_system
+// = true and the role defaults from frontmatter.
+func TestSyncSystemSkills_InsertsBundledSkillsForFreshWorkspace(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	report, err := skills.SyncSystemSkills(context.Background(), repo, []string{"ws-1"}, nil, log)
+	if err != nil {
+		t.Fatalf("SyncSystemSkills error: %v", err)
+	}
+	if len(report.Inserted) == 0 {
+		t.Fatalf("expected inserts on fresh workspace, got none")
+	}
+	rows, _ := repo.ListSystemSkills(context.Background(), "ws-1")
+	if len(rows) != len(report.Inserted) {
+		t.Fatalf("row count mismatch: rows=%d inserted=%d", len(rows), len(report.Inserted))
+	}
+	for _, r := range rows {
+		if !r.IsSystem {
+			t.Errorf("row %s missing is_system flag", r.Slug)
+		}
+		if r.SourceType != skills.SourceTypeSystem {
+			t.Errorf("row %s source_type = %q, want %q", r.Slug, r.SourceType, skills.SourceTypeSystem)
+		}
+		if r.ContentHash == "" {
+			t.Errorf("row %s missing content_hash", r.Slug)
+		}
+	}
+}
+
+func TestBundledProjectSkillDefaultsOnlyToCEO(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+	for _, spec := range specs {
+		if spec.Slug != "kandev-projects" {
+			continue
+		}
+		if len(spec.DefaultForRoles) != 1 || spec.DefaultForRoles[0] != "ceo" {
+			t.Fatalf("kandev-projects default roles = %v, want [ceo]", spec.DefaultForRoles)
+		}
+		if !strings.Contains(spec.Content, "$KANDEV_CLI kandev projects create") {
+			t.Fatalf("kandev-projects does not document project creation: %q", spec.Content)
+		}
+		if !strings.Contains(spec.Content, "$KANDEV_CLI kandev task create") ||
+			!strings.Contains(spec.Content, "--project") {
+			t.Fatalf("kandev-projects does not document project task creation: %q", spec.Content)
+		}
+		return
+	}
+	t.Fatal("kandev-projects bundled system skill not found")
+}
+
+func TestBundledTaskCreateSkillContract(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+
+	contents := make(map[string]string)
+	for _, spec := range specs {
+		if strings.Contains(spec.Content, "task create") {
+			contents[spec.Slug] = spec.Content
+		}
+	}
+	if len(contents) == 0 {
+		t.Fatal("no bundled system skill documents task create")
+	}
+	for slug, content := range contents {
+		for _, flag := range []string{
+			"--priority",
+			"--blocked-by",
+			"--workspace-mode",
+			"--workspace-group-id",
+			"--default-child-workspace",
+			"--default-child-ordering",
+		} {
+			if strings.Contains(content, flag) {
+				t.Errorf("%s advertises unsupported task create flag %s", slug, flag)
+			}
+		}
+	}
+
+	expectedFlags := map[string][]string{
+		"kandev-escalation": {"--title", "--description"},
+		"kandev-projects":   {"--title", "--project", "--assignee"},
+		"kandev-protocol":   {"--title", "--description", "--parent", "--assignee", "--project"},
+	}
+	for slug, flags := range expectedFlags {
+		content, ok := contents[slug]
+		if !ok {
+			t.Errorf("%s bundled system skill does not document task create", slug)
+			continue
+		}
+		for _, flag := range flags {
+			if !strings.Contains(content, flag) {
+				t.Errorf("%s omits supported task create flag %s", slug, flag)
+			}
+		}
+	}
+}
+
+func TestBundledEscalationSkillUsesSupportedTaskWorkflow(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+
+	for _, spec := range specs {
+		if spec.Slug != "kandev-escalation" {
+			continue
+		}
+		for _, expected := range []string{
+			"HUMAN_TASK_ID=$(echo \"$HUMAN_TASK\" | jq -r '.task_id')",
+			"kandev tasks message --id \"$KANDEV_TASK_ID\"",
+			"kandev task update --status blocked",
+			"`task_blockers_resolved` wake reason will NOT occur",
+		} {
+			if !strings.Contains(spec.Content, expected) {
+				t.Errorf("kandev-escalation omits supported workflow fragment %q", expected)
+			}
+		}
+		for _, unsupported := range []string{
+			"jq -r '.id'",
+			"--add-blocker",
+			"tasks message --id \"$HUMAN_TASK_ID\"",
+			"/api/v1/office/tasks/",
+			"author_type",
+		} {
+			if strings.Contains(spec.Content, unsupported) {
+				t.Errorf("kandev-escalation advertises unsupported workflow fragment %q", unsupported)
+			}
+		}
+		createAt := strings.Index(spec.Content, "$KANDEV_CLI kandev task create")
+		parseAt := strings.Index(spec.Content, "jq -r '.task_id'")
+		messageAt := strings.Index(spec.Content, "kandev tasks message --id \"$KANDEV_TASK_ID\"")
+		blockedAt := strings.Index(spec.Content, "kandev task update --status blocked")
+		if createAt >= parseAt || parseAt >= messageAt || messageAt >= blockedAt {
+			t.Errorf("kandev-escalation command order is unsafe: create=%d parse=%d message=%d blocked=%d",
+				createAt, parseAt, messageAt, blockedAt)
+		}
+		if count := strings.Count(spec.Content, "$KANDEV_CLI kandev tasks message"); count != 1 {
+			t.Errorf("kandev-escalation message commands = %d, want only the blocked-task backlink", count)
+		}
+		return
+	}
+	t.Fatal("kandev-escalation bundled system skill not found")
+}
+
+func TestBundledSkillCLIExamplesAvoidKnownUnsupportedOperations(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+
+	unsupported := []string{
+		"/api/v1/office/tasks/",
+		"author_id",
+		"author_type",
+		"--add-blocker",
+		"--blocked-by",
+		"--default-child-ordering",
+		"--default-child-workspace",
+		"--priority",
+		"--workspace-group-id",
+		"--workspace-mode",
+		"$KANDEV_CLI kandev task message",
+		"$KANDEV_CLI kandev comment add",
+		"$KANDEV_CLI kandev tasks create",
+		"$KANDEV_CLI kandev tasks update",
+		"$KANDEV_CLI kandev tasks move",
+		"$KANDEV_CLI kandev tasks archive",
+	}
+	for _, spec := range specs {
+		content := spec.Content + "\n" + spec.FileInventory
+		for _, fragment := range unsupported {
+			if strings.Contains(content, fragment) {
+				t.Errorf("%s advertises unsupported CLI operation %q", spec.Slug, fragment)
+			}
+		}
+	}
+}
+
+func TestBundledDecisionSkillContract(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+
+	for _, spec := range specs {
+		if spec.Slug != "kandev-step-decision" {
+			continue
+		}
+		if len(spec.DefaultForRoles) != 0 {
+			t.Fatalf("decision skill default roles = %v, want none", spec.DefaultForRoles)
+		}
+		for _, fragment := range []string{
+			`$KANDEV_CLI kandev task decision --decision approved --reason "..."`,
+			"approved",
+			"rejected",
+			"non-empty reason",
+			"supersedes",
+			"decision",
+			"role",
+			"step_id",
+			"decision_id",
+			"decided_at",
+			"transition_applied",
+			"guards",
+			"comments do not count",
+			"Approval-inbox commands do not count",
+		} {
+			if !strings.Contains(spec.Content, fragment) {
+				t.Errorf("decision skill missing %q:\n%s", fragment, spec.Content)
+			}
+		}
+		return
+	}
+	t.Fatal("kandev-step-decision bundled system skill not found")
+}
+
+func TestBundledProtocolSkillDocumentsScopedTaskMessages(t *testing.T) {
+	specs, err := skills.LoadBundledSystemSkills()
+	if err != nil {
+		t.Fatalf("LoadBundledSystemSkills: %v", err)
+	}
+
+	for _, spec := range specs {
+		if spec.Slug != "kandev-protocol" {
+			continue
+		}
+		for _, expected := range []string{
+			"tasks message [--id ID] --prompt P",
+			"Use --prompt - to read from stdin",
+			"signed runtime scope",
+			"derives the agent attribution from the run token",
+			"task update [--id ID] --status S [--comment C]",
+		} {
+			if !strings.Contains(spec.Content, expected) {
+				t.Errorf("kandev-protocol omits secure message contract %q", expected)
+			}
+		}
+		if strings.Contains(spec.Content, "task update [--id ID] --comment C") {
+			t.Error("kandev-protocol advertises unsupported comment-only task update")
+		}
+		return
+	}
+	t.Fatal("kandev-protocol bundled system skill not found")
+}
+
+// TestSyncSystemSkills_UpdatesChangedContentInPlace pins that a
+// content drift triggers an in-place UpdateSkill, preserving the
+// row ID (and thereby per-agent desired_skills references).
+func TestSyncSystemSkills_UpdatesChangedContentInPlace(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	if _, err := skills.SyncSystemSkills(
+		context.Background(), repo, []string{"ws-1"}, nil, log,
+	); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	before, _ := repo.ListSystemSkills(context.Background(), "ws-1")
+	if len(before) == 0 {
+		t.Fatalf("expected rows after first sync")
+	}
+	// Mutate one row's content_hash so the second pass treats it as drifted.
+	target := before[0]
+	originalID := target.ID
+	target.ContentHash = "stale"
+	target.Content = "stale content"
+	repo.rows["ws-1"][target.Slug] = target
+
+	report, err := skills.SyncSystemSkills(context.Background(), repo, []string{"ws-1"}, nil, log)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(report.Updated) == 0 {
+		t.Fatalf("expected at least one update, got %v", report.Updated)
+	}
+	got, _ := repo.GetSkillBySlug(context.Background(), "ws-1", target.Slug)
+	if got.ID != originalID {
+		t.Errorf("row ID changed across update: was %s, now %s", originalID, got.ID)
+	}
+	if got.ContentHash == "stale" {
+		t.Error("content_hash was not refreshed")
+	}
+}
+
+// TestSyncSystemSkills_RemovesOrphanedSystemRows pins that a
+// previously-bundled slug which is no longer present in the embed
+// gets deleted from office_skills. Simulates a kandev release that
+// retires a system skill.
+func TestSyncSystemSkills_RemovesOrphanedSystemRows(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	// Seed an orphan: a system row whose slug is NOT in the bundle.
+	repo.rows["ws-1"] = map[string]*models.Skill{}
+	orphan := &models.Skill{
+		ID:          "orphan-1",
+		WorkspaceID: "ws-1",
+		Slug:        "kandev-legacy-removed",
+		Name:        "kandev-legacy-removed",
+		IsSystem:    true,
+		SourceType:  skills.SourceTypeSystem,
+	}
+	repo.rows["ws-1"]["kandev-legacy-removed"] = orphan
+
+	report, err := skills.SyncSystemSkills(context.Background(), repo, []string{"ws-1"}, nil, log)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(report.Removed) == 0 {
+		t.Fatalf("expected an orphan removal, got %v", report.Removed)
+	}
+	if _, err := repo.GetSkillBySlug(context.Background(), "ws-1", "kandev-legacy-removed"); err == nil {
+		t.Error("orphan still present after sync")
+	}
+}
+
+// TestSyncSystemSkills_NoChangeOnSecondPass pins that running the
+// sync twice without any drift produces zero inserts/updates/
+// removes (and therefore zero DB writes on a hot path).
+func TestSyncSystemSkills_NoChangeOnSecondPass(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	if _, err := skills.SyncSystemSkills(
+		context.Background(), repo, []string{"ws-1"}, nil, log,
+	); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	report, err := skills.SyncSystemSkills(context.Background(), repo, []string{"ws-1"}, nil, log)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(report.Inserted) != 0 || len(report.Updated) != 0 || len(report.Removed) != 0 {
+		t.Errorf("expected no-op second pass, got %+v", report)
+	}
+}
+
+// TestSyncSystemSkills_UpdatesContentWhenBundledHashDiffers pins the
+// "kandev release rev'd the SKILL.md body" scenario: an existing row
+// matches the slug but the bundled `bundled` spec carries a newer
+// content + hash. SyncSystemSkills must run UpdateSkill so the row
+// reflects the new body, version, and hash without changing the row
+// ID. Uses an injected synthetic spec to avoid mutating the //go:embed
+// FS.
+func TestSyncSystemSkills_UpdatesContentWhenBundledHashDiffers(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	const slug = "drift-skill"
+	const initialHash = "hash-v1"
+	const newHash = "hash-v2"
+	const newBody = "## Updated guidance body"
+
+	// Seed an existing system row representing the prior release.
+	repo.rows["ws-1"] = map[string]*models.Skill{
+		slug: {
+			ID:            "skill-drift-1",
+			WorkspaceID:   "ws-1",
+			Slug:          slug,
+			Name:          "Drift Skill",
+			SourceType:    skills.SourceTypeSystem,
+			SourceLocator: "bundled:" + slug,
+			Content:       "## Old guidance body",
+			ContentHash:   initialHash,
+			Version:       "1.0.0",
+			IsSystem:      true,
+			SystemVersion: "1.0.0",
+			ApprovalState: "approved",
+		},
+	}
+
+	bundled := []skills.SystemSkillSpec{{
+		Slug:        slug,
+		Name:        "Drift Skill",
+		Description: "Drift demo",
+		Version:     "2.0.0",
+		Content:     newBody,
+		ContentHash: newHash,
+	}}
+
+	report, err := skills.SyncSystemSkills(
+		context.Background(), repo, []string{"ws-1"}, bundled, log,
+	)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(report.Updated) != 1 || !strings.HasSuffix(report.Updated[0], slug) {
+		t.Fatalf("expected one update for %s, got %v", slug, report.Updated)
+	}
+	got, err := repo.GetSkillBySlug(context.Background(), "ws-1", slug)
+	if err != nil {
+		t.Fatalf("get after sync: %v", err)
+	}
+	if got.ID != "skill-drift-1" {
+		t.Errorf("row ID changed across update: now %s", got.ID)
+	}
+	if got.ContentHash != newHash {
+		t.Errorf("content_hash = %q, want %q", got.ContentHash, newHash)
+	}
+	if got.Content != newBody {
+		t.Errorf("content = %q, want %q", got.Content, newBody)
+	}
+	if got.Version != "2.0.0" {
+		t.Errorf("version = %q, want 2.0.0", got.Version)
+	}
+}
+
+// TestSyncSystemSkills_UpdatesBodyOnlyRowsWithMatchingHash pins the
+// migration from the old parser, which stored only the markdown body
+// while already recording the hash of the full SKILL.md. The sync
+// must refresh content even when content_hash already matches.
+func TestSyncSystemSkills_UpdatesBodyOnlyRowsWithMatchingHash(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	const slug = "frontmatter-skill"
+	const fullContent = "---\nname: Frontmatter Skill\ndescription: Use for frontmatter preservation.\n---\n# Guidance\n"
+	const existingHash = "hash-full-content"
+
+	repo.rows["ws-1"] = map[string]*models.Skill{
+		slug: {
+			ID:            "skill-frontmatter-1",
+			WorkspaceID:   "ws-1",
+			Slug:          slug,
+			Name:          "Frontmatter Skill",
+			Description:   "Use for frontmatter preservation.",
+			SourceType:    skills.SourceTypeSystem,
+			SourceLocator: "bundled:" + slug,
+			Content:       "# Guidance\n",
+			ContentHash:   existingHash,
+			Version:       "1.0.0",
+			IsSystem:      true,
+			SystemVersion: "1.0.0",
+			ApprovalState: "approved",
+		},
+	}
+
+	bundled := []skills.SystemSkillSpec{{
+		Slug:        slug,
+		Name:        "Frontmatter Skill",
+		Description: "Use for frontmatter preservation.",
+		Version:     "1.0.0",
+		Content:     fullContent,
+		ContentHash: existingHash,
+	}}
+
+	report, err := skills.SyncSystemSkills(
+		context.Background(), repo, []string{"ws-1"}, bundled, log,
+	)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(report.Updated) != 1 || !strings.HasSuffix(report.Updated[0], slug) {
+		t.Fatalf("expected one update for %s, got %v", slug, report.Updated)
+	}
+	got, err := repo.GetSkillBySlug(context.Background(), "ws-1", slug)
+	if err != nil {
+		t.Fatalf("get after sync: %v", err)
+	}
+	if got.Content != fullContent {
+		t.Errorf("content = %q, want full SKILL.md %q", got.Content, fullContent)
+	}
+	if got.ContentHash != existingHash {
+		t.Errorf("content_hash = %q, want %q", got.ContentHash, existingHash)
+	}
+}
+
+// TestSyncSystemSkills_RemovesOrphanedSlugAndDetachesFromAgents pins
+// the "kandev release retired a bundled skill" scenario: a system
+// row whose slug is missing from the injected `bundled` slice must be
+// deleted, AND its ID must be stripped from every agent_profiles
+// row's skill_ids JSON array in the same workspace. Other agents'
+// untouched IDs and other-workspace agents must not be modified.
+func TestSyncSystemSkills_RemovesOrphanedSlugAndDetachesFromAgents(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	const orphanID = "skill-retired-1"
+	const keptID = "skill-other-1"
+
+	// Seed a system skill that is no longer in the bundle, plus one
+	// that is — so we can prove only the orphan is detached.
+	repo.rows["ws-1"] = map[string]*models.Skill{
+		"retired-slug": {
+			ID:          orphanID,
+			WorkspaceID: "ws-1",
+			Slug:        "retired-slug",
+			Name:        "Retired",
+			IsSystem:    true,
+			SourceType:  skills.SourceTypeSystem,
+			ContentHash: "hash-old",
+		},
+	}
+
+	// One agent in ws-1 references both the orphan and a kept ID.
+	repo.agents["ws-1"] = map[string]*settingsmodels.AgentProfile{
+		"agent-1": {
+			ID:          "agent-1",
+			WorkspaceID: "ws-1",
+			SkillIDs:    mustJSONArray(t, []string{orphanID, keptID}),
+		},
+		"agent-2": {
+			ID:          "agent-2",
+			WorkspaceID: "ws-1",
+			SkillIDs:    mustJSONArray(t, []string{keptID}),
+		},
+	}
+	// Agent in a different workspace that happens to share the orphan
+	// ID — must NOT be touched because we only scrub the workspace
+	// whose system row was deleted.
+	repo.agents["ws-2"] = map[string]*settingsmodels.AgentProfile{
+		"agent-other": {
+			ID:          "agent-other",
+			WorkspaceID: "ws-2",
+			SkillIDs:    mustJSONArray(t, []string{orphanID}),
+		},
+	}
+
+	// Bundled set is empty for ws-1 → orphan must be deleted.
+	report, err := skills.SyncSystemSkills(
+		context.Background(), repo, []string{"ws-1"}, []skills.SystemSkillSpec{}, log,
+	)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(report.Removed) != 1 || !strings.HasSuffix(report.Removed[0], "retired-slug") {
+		t.Fatalf("expected one removal for retired-slug, got %v", report.Removed)
+	}
+
+	if _, err := repo.GetSkillBySlug(context.Background(), "ws-1", "retired-slug"); err == nil {
+		t.Error("orphan office_skills row still present after sync")
+	}
+
+	// Agent in ws-1 that had the orphan ID must now omit it but keep the other ID.
+	a1 := repo.agents["ws-1"]["agent-1"]
+	got1 := decodeIDs(t, a1.SkillIDs)
+	if containsID(got1, orphanID) {
+		t.Errorf("agent-1.skill_ids still contains orphan %q: %v", orphanID, got1)
+	}
+	if !containsID(got1, keptID) {
+		t.Errorf("agent-1.skill_ids dropped kept ID %q: %v", keptID, got1)
+	}
+
+	// Agent in ws-1 that didn't reference the orphan must be untouched.
+	a2 := repo.agents["ws-1"]["agent-2"]
+	got2 := decodeIDs(t, a2.SkillIDs)
+	if len(got2) != 1 || got2[0] != keptID {
+		t.Errorf("agent-2.skill_ids unexpectedly mutated: %v", got2)
+	}
+
+	// Agent in ws-2 must not be touched even though its skill_ids
+	// references the same string ID — the sync scope is per-workspace.
+	other := repo.agents["ws-2"]["agent-other"]
+	gotOther := decodeIDs(t, other.SkillIDs)
+	if len(gotOther) != 1 || gotOther[0] != orphanID {
+		t.Errorf("ws-2 agent must not be scrubbed: %v", gotOther)
+	}
+}
+
+func TestSyncSystemSkills_ReplacesRetiredDefaultSkillReferences(t *testing.T) {
+	repo := newStubSyncRepo()
+	log := logger.Default()
+
+	const oldTasksID = "skill-old-tasks"
+	const oldCommentID = "skill-old-comment"
+	const newTaskOpsID = "skill-new-task-ops"
+
+	repo.rows["ws-1"] = map[string]*models.Skill{
+		"kandev-tasks": {
+			ID:          oldTasksID,
+			WorkspaceID: "ws-1",
+			Slug:        "kandev-tasks",
+			Name:        "Tasks",
+			IsSystem:    true,
+			SourceType:  skills.SourceTypeSystem,
+		},
+		"kandev-task-comment": {
+			ID:          oldCommentID,
+			WorkspaceID: "ws-1",
+			Slug:        "kandev-task-comment",
+			Name:        "Task Comment",
+			IsSystem:    true,
+			SourceType:  skills.SourceTypeSystem,
+		},
+		"kandev-task-ops": {
+			ID:          newTaskOpsID,
+			WorkspaceID: "ws-1",
+			Slug:        "kandev-task-ops",
+			Name:        "Task Ops",
+			IsSystem:    true,
+			SourceType:  skills.SourceTypeSystem,
+			ContentHash: "old-task-ops-hash",
+		},
+	}
+	repo.agents["ws-1"] = map[string]*settingsmodels.AgentProfile{
+		"agent-1": {
+			ID:            "agent-1",
+			WorkspaceID:   "ws-1",
+			SkillIDs:      mustJSONArray(t, []string{oldTasksID, oldCommentID}),
+			DesiredSkills: mustJSONArray(t, []string{"kandev-tasks", "kandev-task-comment"}),
+		},
+		"agent-2": {
+			ID:            "agent-2",
+			WorkspaceID:   "ws-1",
+			SkillIDs:      mustJSONArray(t, []string{oldTasksID, newTaskOpsID}),
+			DesiredSkills: mustJSONArray(t, []string{"kandev-tasks", "kandev-task-ops"}),
+		},
+	}
+
+	bundled := []skills.SystemSkillSpec{{
+		Slug:        "kandev-task-ops",
+		Name:        "Task Ops",
+		Description: "Task operations",
+		Version:     "1.0.0",
+		Content:     "---\nname: kandev-task-ops\ndescription: Task operations\n---\n# Task Ops\n",
+		ContentHash: "hash-task-ops",
+	}}
+
+	report, err := skills.SyncSystemSkills(context.Background(), repo, []string{"ws-1"}, bundled, log)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(report.Removed) != 2 {
+		t.Fatalf("expected two retired removals, got %v", report.Removed)
+	}
+
+	gotTaskOps, err := repo.GetSkillBySlug(context.Background(), "ws-1", "kandev-task-ops")
+	if err != nil {
+		t.Fatalf("replacement skill missing: %v", err)
+	}
+	if gotTaskOps.ID == "" {
+		t.Fatal("replacement skill should have an ID")
+	}
+
+	agent1 := repo.agents["ws-1"]["agent-1"]
+	if got := decodeIDs(t, agent1.SkillIDs); len(got) != 1 || got[0] != gotTaskOps.ID {
+		t.Fatalf("agent-1.skill_ids = %v, want replacement %s", got, gotTaskOps.ID)
+	}
+	if got := decodeIDs(t, agent1.DesiredSkills); len(got) != 1 || got[0] != "kandev-task-ops" {
+		t.Fatalf("agent-1.desired_skills = %v, want kandev-task-ops", got)
+	}
+
+	agent2 := repo.agents["ws-1"]["agent-2"]
+	if got := decodeIDs(t, agent2.SkillIDs); len(got) != 1 || got[0] != newTaskOpsID {
+		t.Fatalf("agent-2.skill_ids should dedupe existing replacement, got %v", got)
+	}
+	if got := decodeIDs(t, agent2.DesiredSkills); len(got) != 1 || got[0] != "kandev-task-ops" {
+		t.Fatalf("agent-2.desired_skills should dedupe existing replacement, got %v", got)
+	}
+}
+
+func mustJSONArray(t *testing.T, ids []string) string {
+	t.Helper()
+	b, err := json.Marshal(ids)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
+}
+
+func decodeIDs(t *testing.T, raw string) []string {
+	t.Helper()
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("unmarshal %q: %v", raw, err)
+	}
+	return out
+}
+
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}

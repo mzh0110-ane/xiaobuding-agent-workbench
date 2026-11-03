@@ -1,0 +1,990 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	runtimeapi "github.com/kandev/kandev/internal/agent/runtime"
+	"github.com/kandev/kandev/internal/agentruntime"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository"
+	"github.com/kandev/kandev/internal/worktree"
+)
+
+// --- isCleanableSessionState ---
+
+func TestIsCleanableSessionState(t *testing.T) {
+	cleanable := []models.TaskSessionState{
+		models.TaskSessionStateCancelled,
+		models.TaskSessionStateCompleted,
+		models.TaskSessionStateFailed,
+		models.TaskSessionStateIdle,
+	}
+	for _, s := range cleanable {
+		if !isCleanableSessionState(s) {
+			t.Errorf("expected %q to be cleanable", s)
+		}
+	}
+
+	nonCleanable := []models.TaskSessionState{
+		models.TaskSessionStateRunning,
+		models.TaskSessionStateCreated,
+		models.TaskSessionStateStarting,
+	}
+	for _, s := range nonCleanable {
+		if isCleanableSessionState(s) {
+			t.Errorf("expected %q to NOT be cleanable", s)
+		}
+	}
+}
+
+// TestIsCleanableSessionState_IdleIncluded guards against a future change that
+// accidentally excludes IDLE (the orchestrator's same-named function does NOT
+// include IDLE, but in the cleanup path IDLE sessions have no live execution).
+func TestIsCleanableSessionState_IdleIncluded(t *testing.T) {
+	if !isCleanableSessionState(models.TaskSessionStateIdle) {
+		t.Error("IDLE must be cleanable: an idle session has no live execution and StopSession will return ErrExecutionNotFound")
+	}
+}
+
+// --- buildStopTargets ---
+
+// stubExecutors is a minimal repository.ExecutorRepository implementation for tests.
+type stubExecutors struct {
+	repository.ExecutorRepository
+	runningByTaskID  []*models.ExecutorRunning
+	runningByTaskErr error
+	runningBySession *models.ExecutorRunning
+	runningBySessErr error
+	deletedSessions  []string
+	deleteErr        error
+	repairedSessions []string
+}
+
+func (s *stubExecutors) ListExecutorsRunningByTaskID(_ context.Context, _ string) ([]*models.ExecutorRunning, error) {
+	return s.runningByTaskID, s.runningByTaskErr
+}
+
+func (s *stubExecutors) GetExecutorRunningBySessionID(_ context.Context, _ string) (*models.ExecutorRunning, error) {
+	return s.runningBySession, s.runningBySessErr
+}
+func (s *stubExecutors) DeleteExecutorRunningBySessionID(_ context.Context, sessionID string) error {
+	s.deletedSessions = append(s.deletedSessions, sessionID)
+	return s.deleteErr
+}
+
+func (s *stubExecutors) RepairExecutorRunningDead(_ context.Context, sessionID string) error {
+	s.repairedSessions = append(s.repairedSessions, sessionID)
+	return nil
+}
+
+func (s *stubExecutors) HasExecutorRunningRow(_ context.Context, _ string) (bool, error) {
+	return s.runningBySession != nil, nil
+}
+
+func TestBuildStopTargets_TerminalExecutorRow(t *testing.T) {
+
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{
+		runningByTaskID: []*models.ExecutorRunning{
+			{SessionID: "sess-1", AgentExecutionID: "exec-1"},
+		},
+	}
+
+	// Session is CANCELLED — stop target must be marked terminal.
+	sessions := []*models.TaskSession{
+		{ID: "sess-1", State: models.TaskSessionStateCancelled, AgentExecutionID: "exec-1"},
+	}
+
+	targets, err := svc.buildStopTargets(context.Background(), "task-1", sessions)
+	if err != nil {
+		t.Fatalf("buildStopTargets error: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if !targets[0].terminal {
+		t.Error("expected target to be marked terminal for a CANCELLED session")
+	}
+}
+func TestPerformTaskCleanupReportsExecutorRowDeletionFailure(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	deleteErr := errors.New("executor row deletion failed")
+	svc.executors = &stubExecutors{deleteErr: deleteErr}
+	errs := svc.performTaskCleanup(
+		context.Background(),
+		"task-executor-row-failure",
+		[]*models.TaskSession{{ID: "session-executor-row-failure"}},
+		nil,
+		nil,
+		taskEnvironmentCleanup{},
+		nil,
+	)
+	if !errors.Is(errors.Join(errs...), deleteErr) {
+		t.Fatalf("cleanup errors = %v, want executor deletion error", errs)
+	}
+}
+
+func TestBuildStopTargets_NonTerminalExecutorRow(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{
+		runningByTaskID: []*models.ExecutorRunning{
+			{SessionID: "sess-2", AgentExecutionID: "exec-2"},
+		},
+	}
+
+	// Session is RUNNING — stop target must NOT be terminal.
+	sessions := []*models.TaskSession{
+		{ID: "sess-2", State: models.TaskSessionStateRunning, AgentExecutionID: "exec-2"},
+	}
+
+	targets, err := svc.buildStopTargets(context.Background(), "task-2", sessions)
+	if err != nil {
+		t.Fatalf("buildStopTargets error: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if targets[0].terminal {
+		t.Error("expected target to NOT be terminal for a RUNNING session")
+	}
+}
+
+func TestBuildStopTargets_TerminalSessionWithoutExecutorRow(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{
+		runningByTaskID: nil, // no executor_running rows
+	}
+
+	// Session is COMPLETED with no executor_running row → no stop target created.
+	sessions := []*models.TaskSession{
+		{ID: "sess-3", State: models.TaskSessionStateCompleted, AgentExecutionID: "exec-3"},
+	}
+
+	targets, err := svc.buildStopTargets(context.Background(), "task-3", sessions)
+	if err != nil {
+		t.Fatalf("buildStopTargets error: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("expected 0 targets for terminal session without executor row, got %d", len(targets))
+	}
+}
+
+func TestRefreshTaskRuntimeStopTargets_MergesLateExecutionBeforeSnapshot(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executionStopper = &stubStopper{}
+	svc.executors = &stubExecutors{
+		runningByTaskID: []*models.ExecutorRunning{
+			{SessionID: "sess-1", AgentExecutionID: "exec-late"},
+		},
+	}
+
+	targets, err := svc.refreshTaskRuntimeStopTargets(
+		context.Background(),
+		"task-1",
+		[]taskStopTarget{{sessionID: "sess-1", executionID: "exec-snapshot", terminal: true}},
+	)
+	if err != nil {
+		t.Fatalf("refreshTaskRuntimeStopTargets error: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets = %#v, want late and snapshot executions", targets)
+	}
+	if targets[0].sessionID != "sess-1" || targets[0].executionID != "exec-late" || targets[0].terminal {
+		t.Fatalf("first target = %#v, want live late execution", targets[0])
+	}
+	if targets[1].sessionID != "sess-1" || targets[1].executionID != "exec-snapshot" || !targets[1].terminal {
+		t.Fatalf("second target = %#v, want retained snapshot execution", targets[1])
+	}
+}
+
+func TestRefreshTaskRuntimeStopTargets_ExactRuntimeSupersedesEmptySessionFallback(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	stopper := &stubStopper{
+		stopSessionErr: fmt.Errorf("not registered: %w", runtimeapi.ErrNotFound),
+	}
+	svc.executionStopper = stopper
+	svc.executors = &stubExecutors{
+		runningByTaskID: []*models.ExecutorRunning{
+			{SessionID: "sess-1", AgentExecutionID: "exec-late"},
+		},
+	}
+
+	targets, err := svc.refreshTaskRuntimeStopTargets(
+		context.Background(),
+		"task-1",
+		[]taskStopTarget{{sessionID: "sess-1"}},
+	)
+	if err != nil {
+		t.Fatalf("refreshTaskRuntimeStopTargets error: %v", err)
+	}
+	failed := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-1",
+		targets,
+		"archive",
+		"stop failed",
+	).failed
+	if len(failed) != 0 {
+		t.Fatalf("late exact execution left retryable fallback failure: %v", failed)
+	}
+	if stopper.stopExecutionCalls != 1 || stopper.stopSessionCalls != 0 {
+		t.Fatalf(
+			"stop calls = execution:%d session:%d, want execution:1 session:0",
+			stopper.stopExecutionCalls,
+			stopper.stopSessionCalls,
+		)
+	}
+}
+
+// --- stopTaskRuntimeTargets ---
+
+// stubStopper is a minimal TaskExecutionStopper for tests.
+type stubStopper struct {
+	stopSessionErr     error
+	stopExecutionErr   error
+	stopSessionCalls   int
+	stopExecutionCalls int
+	onStopSession      func()
+}
+
+type synchronousStubStopper struct {
+	stubStopper
+	synchronousSessionCalls int
+}
+
+func (s *synchronousStubStopper) StopSessionSynchronously(_ context.Context, _, _ string, _ bool) error {
+	s.synchronousSessionCalls++
+	return nil
+}
+
+func (s *stubStopper) StopTask(_ context.Context, _, _ string, _ bool) error { return nil }
+func (s *stubStopper) StopExecution(_ context.Context, _, _ string, _ bool) error {
+	s.stopExecutionCalls++
+	return s.stopExecutionErr
+}
+func (s *stubStopper) RegisterExecutionStopOwner(string, string, bool) {}
+func (s *stubStopper) StopSession(_ context.Context, _, _ string, _ bool) error {
+	s.stopSessionCalls++
+	if s.onStopSession != nil {
+		s.onStopSession()
+	}
+	return s.stopSessionErr
+}
+
+func TestStopTaskRuntimeSession_WaitsForSynchronousStopWhenAvailable(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	stopper := &synchronousStubStopper{}
+	svc.executionStopper = stopper
+
+	outcome := svc.stopTaskRuntimeTargetsWithTaskDeleted(
+		context.Background(),
+		"task-sync-stop",
+		[]taskStopTarget{{sessionID: "session-sync-stop"}},
+		"task deleted",
+		"stop failed",
+		true,
+		true,
+	)
+	if len(outcome.failed) != 0 {
+		t.Fatalf("synchronous session stop failed: %v", outcome.failed)
+	}
+	if stopper.synchronousSessionCalls != 1 {
+		t.Fatalf("synchronous stop calls = %d, want 1", stopper.synchronousSessionCalls)
+	}
+	if stopper.stopSessionCalls != 0 {
+		t.Fatalf("asynchronous StopSession calls = %d, want 0", stopper.stopSessionCalls)
+	}
+}
+
+type cancelAfterFirstStopper struct {
+	cancel context.CancelFunc
+	calls  []string
+}
+
+func (s *cancelAfterFirstStopper) StopTask(context.Context, string, string, bool) error {
+	return nil
+}
+
+func (s *cancelAfterFirstStopper) RegisterExecutionStopOwner(string, string, bool) {}
+
+func (s *cancelAfterFirstStopper) StopExecution(_ context.Context, id, _ string, _ bool) error {
+	s.calls = append(s.calls, id)
+	if len(s.calls) == 1 {
+		s.cancel()
+	}
+	return nil
+}
+
+func (s *cancelAfterFirstStopper) StopSession(_ context.Context, id, _ string, _ bool) error {
+	s.calls = append(s.calls, id)
+	if len(s.calls) == 1 {
+		s.cancel()
+	}
+	return nil
+}
+
+func TestStopTaskRuntimeTargets_TerminalStopFailureBlocksCleanup(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  taskStopTarget
+		stopper *stubStopper
+	}{
+		{
+			name:    "session",
+			target:  taskStopTarget{sessionID: "sess-cancelled", terminal: true},
+			stopper: &stubStopper{stopSessionErr: errors.New("runtime transport unavailable")},
+		},
+		{
+			name:    "execution",
+			target:  taskStopTarget{sessionID: "sess-cancelled", executionID: "exec-cancelled", terminal: true},
+			stopper: &stubStopper{stopExecutionErr: errors.New("runtime transport unavailable")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, _ := createTestService(t)
+			execs := &stubExecutors{}
+			svc.executors = execs
+			svc.executionStopper = tt.stopper
+
+			outcome := svc.stopTaskRuntimeTargets(context.Background(), "task-a", []taskStopTarget{tt.target}, "archive", "stop failed")
+			if _, ok := outcome.failed[tt.target.sessionID]; !ok {
+				t.Fatalf("terminal stop failure must remain retryable; got %v", outcome.failed)
+			}
+
+			svc.performTaskCleanup(
+				context.Background(),
+				"task-a",
+				[]*models.TaskSession{{ID: tt.target.sessionID}},
+				nil,
+				[]taskStopTarget{tt.target},
+				taskEnvironmentCleanup{},
+				taskCleanupPreserveRows(outcome),
+			)
+			if len(execs.deletedSessions) != 0 {
+				t.Fatalf("cleanup deleted executor rows after failed stop: %v", execs.deletedSessions)
+			}
+		})
+	}
+}
+
+func TestStopTaskRuntimeTargets_KubernetesTerminalCleanupFailurePreservesRow(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	executors := &stubExecutors{}
+	svc.executors = executors
+	svc.executionStopper = &stubStopper{stopExecutionErr: errors.New("exact Kubernetes cleanup failed")}
+	targets := []taskStopTarget{{
+		sessionID: "sess-k8s", executionID: "exec-k8s", terminal: true,
+		runtime: agentruntime.RuntimeKubernetes,
+	}}
+
+	outcome := svc.stopTaskRuntimeTargets(context.Background(), "task-k8s", targets, "delete", "stop failed")
+	svc.performTaskCleanup(
+		context.Background(), "task-k8s", nil, nil, targets, taskEnvironmentCleanup{},
+		taskCleanupPreserveRows(outcome),
+	)
+
+	if _, ok := outcome.failed["sess-k8s"]; !ok {
+		t.Fatalf("Kubernetes cleanup failure must remain retryable: %#v", outcome.failed)
+	}
+	if len(executors.deletedSessions) != 0 {
+		t.Fatalf("failed Kubernetes cleanup deleted authoritative row: %v", executors.deletedSessions)
+	}
+}
+
+func TestStopTaskRuntimeTargets_ExactRuntimeAbsenceIsIdempotent(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{}
+	svc.executionStopper = &stubStopper{
+		stopExecutionErr: fmt.Errorf("already stopped: %w", runtimeapi.ErrNotFound),
+	}
+	failed := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-a",
+		[]taskStopTarget{{sessionID: "sess-running", executionID: "exec-running"}},
+		"archive",
+		"stop failed",
+	).failed
+	if len(failed) != 0 {
+		t.Errorf("exact runtime absence must be idempotent; got %v", failed)
+	}
+}
+
+func TestStopTaskRuntimeTargets_SessionRuntimeAbsenceRemainsRetryable(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{}
+	svc.executionStopper = &stubStopper{
+		stopSessionErr: fmt.Errorf("not registered yet: %w", runtimeapi.ErrNotFound),
+	}
+	failed := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-a",
+		[]taskStopTarget{{sessionID: "sess-running"}},
+		"archive",
+		"stop failed",
+	).failed
+	if _, ok := failed["sess-running"]; !ok {
+		t.Errorf("session-level absence must remain retryable; got %v", failed)
+	}
+}
+
+func TestStopTaskRuntimeTargetsAfterTaskDeletionWithoutRuntimeIsComplete(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{}
+	stopper := &stubStopper{
+		stopSessionErr: fmt.Errorf("session deleted: %w", runtimeapi.ErrNotFound),
+	}
+	svc.executionStopper = stopper
+
+	outcome := svc.stopTaskRuntimeTargetsWithTaskDeleted(
+		context.Background(),
+		"task-deleted",
+		[]taskStopTarget{{sessionID: "sess-deleted"}},
+		"task deleted",
+		"stop failed",
+		true,
+	)
+	if len(outcome.failed) != 0 {
+		t.Fatalf("deleted task with no runtime must not retry cleanup: %v", outcome.failed)
+	}
+	if stopper.stopSessionCalls != 1 {
+		t.Fatalf("stop session calls = %d, want 1", stopper.stopSessionCalls)
+	}
+}
+
+func TestStopTaskRuntimeTargetsAfterTaskDeletionKeepsUnidentifiedRuntimeRetryable(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{
+		runningBySession: &models.ExecutorRunning{SessionID: "sess-unknown"},
+	}
+	svc.executionStopper = &stubStopper{
+		stopSessionErr: fmt.Errorf("session deleted: %w", runtimeapi.ErrNotFound),
+	}
+
+	outcome := svc.stopTaskRuntimeTargetsWithTaskDeleted(
+		context.Background(),
+		"task-deleted",
+		[]taskStopTarget{{sessionID: "sess-unknown"}},
+		"task deleted",
+		"stop failed",
+		true,
+	)
+	if _, ok := outcome.failed["sess-unknown"]; !ok {
+		t.Fatalf("unidentified runtime row must remain retryable: %v", outcome.failed)
+	}
+}
+
+func TestStopTaskRuntimeTargetsAfterTaskDeletionStopsLateExactRuntime(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	execs := &stubExecutors{}
+	stopper := &stubStopper{
+		stopSessionErr: fmt.Errorf("session deleted: %w", runtimeapi.ErrNotFound),
+		onStopSession: func() {
+			execs.runningBySession = &models.ExecutorRunning{
+				SessionID:        "sess-late",
+				AgentExecutionID: "exec-late",
+			}
+		},
+	}
+	svc.executors = execs
+	svc.executionStopper = stopper
+
+	outcome := svc.stopTaskRuntimeTargetsWithTaskDeleted(
+		context.Background(),
+		"task-deleted",
+		[]taskStopTarget{{sessionID: "sess-late"}},
+		"task deleted",
+		"stop failed",
+		true,
+	)
+	if len(outcome.failed) != 0 {
+		t.Fatalf("late exact runtime should be stopped, not retried: %v", outcome.failed)
+	}
+	if stopper.stopExecutionCalls != 1 {
+		t.Fatalf("stop execution calls = %d, want 1", stopper.stopExecutionCalls)
+	}
+}
+
+func TestTaskResourceCleanupDeletesTask(t *testing.T) {
+	tests := []struct {
+		trigger models.TaskResourceCleanupTrigger
+		want    bool
+	}{
+		{models.TaskResourceCleanupTriggerArchive, false},
+		{models.TaskResourceCleanupTriggerDelete, true},
+		{models.TaskResourceCleanupTriggerCascadeArchive, false},
+		{models.TaskResourceCleanupTriggerCascadeDelete, true},
+		{models.TaskResourceCleanupTriggerWorkspaceDelete, true},
+		{models.TaskResourceCleanupTriggerQuickChatExpire, true},
+		{models.TaskResourceCleanupTriggerReconcile, false},
+		{models.TaskResourceCleanupTrigger("unknown"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.trigger), func(t *testing.T) {
+			if got := taskResourceCleanupDeletesTask(tt.trigger); got != tt.want {
+				t.Fatalf("taskResourceCleanupDeletesTask(%q) = %t, want %t", tt.trigger, got, tt.want)
+			}
+		})
+	}
+}
+
+// stubRowLivenessProber is a minimal TaskRowLivenessProber for tests.
+type stubRowLivenessProber struct {
+	liveness models.ProcessLiveness
+}
+
+func (s stubRowLivenessProber) RowLiveness(*models.ExecutorRunning) models.ProcessLiveness {
+	return s.liveness
+}
+
+// TestStopTaskRuntimeTargets_SessionAbsenceDeadLocalIsIdempotent is the
+// regression test for the infinite cleanup-retry bug: a session-only stop that
+// returns not-found for a CONFIRMED-DEAD LOCAL row must be treated as an
+// already-stopped runtime (not a failed stop) so the durable cleanup job stops
+// retrying forever.
+func TestStopTaskRuntimeTargets_SessionAbsenceDeadLocalIsIdempotent(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	execs := &stubExecutors{
+		runningBySession: &models.ExecutorRunning{
+			SessionID: "sess-dead", Runtime: agentruntime.RuntimeStandalone, LocalPID: 4242,
+		},
+	}
+	svc.executors = execs
+	svc.executionStopper = &stubStopper{
+		stopSessionErr: fmt.Errorf("gone: %w", runtimeapi.ErrNotFound),
+	}
+	svc.rowLivenessProber = stubRowLivenessProber{liveness: models.ProcessLivenessDead}
+
+	outcome := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-dead",
+		[]taskStopTarget{{sessionID: "sess-dead"}},
+		"archive",
+		"stop failed",
+	)
+	if len(outcome.failed) != 0 {
+		t.Errorf("session absence for a confirmed-dead local row must be idempotent; got %v", outcome.failed)
+	}
+	// A tokenless, non-resumable dead-local row is prunable: it must NOT be
+	// preserved and must NOT be repaired in place — the normal cleanup path
+	// deletes it.
+	if len(outcome.preserve) != 0 {
+		t.Errorf("tokenless dead-local row must be prunable, not preserved; got %v", outcome.preserve)
+	}
+	if len(execs.repairedSessions) != 0 {
+		t.Errorf("tokenless dead-local row must not be repaired in place; got %v", execs.repairedSessions)
+	}
+}
+
+// TestStopTaskRuntimeTargets_DeadLocalResumeSafeRowPreservedNotRetried is the
+// resume-safety regression: a confirmed-dead local row that still carries a
+// resume_token must be repaired in place (never torn down) AND excluded from the
+// retryable failedStops set, so the durable cleanup job neither retries forever
+// nor loses the only resume handle.
+func TestStopTaskRuntimeTargets_DeadLocalResumeSafeRowPreservedNotRetried(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	execs := &stubExecutors{
+		runningBySession: &models.ExecutorRunning{
+			SessionID: "sess-tok", Runtime: agentruntime.RuntimeStandalone,
+			LocalPID: 4242, ResumeToken: "tok-tok",
+		},
+	}
+	svc.executors = execs
+	svc.executionStopper = &stubStopper{
+		stopSessionErr: fmt.Errorf("gone: %w", runtimeapi.ErrNotFound),
+	}
+	svc.rowLivenessProber = stubRowLivenessProber{liveness: models.ProcessLivenessDead}
+
+	outcome := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-tok",
+		[]taskStopTarget{{sessionID: "sess-tok"}},
+		"archive",
+		"stop failed",
+	)
+	if _, retried := outcome.failed["sess-tok"]; retried {
+		t.Errorf("resume-safe dead-local row must not be a retryable failed stop; got %v", outcome.failed)
+	}
+	if _, preserved := outcome.preserve["sess-tok"]; !preserved {
+		t.Errorf("resume-safe dead-local row must be preserved from teardown; got %v", outcome.preserve)
+	}
+	if len(execs.repairedSessions) != 1 || execs.repairedSessions[0] != "sess-tok" {
+		t.Errorf("resume-safe dead-local row must be repaired in place; got %v", execs.repairedSessions)
+	}
+	if len(execs.deletedSessions) != 0 {
+		t.Errorf("resume-safe dead-local row must never be deleted; got %v", execs.deletedSessions)
+	}
+}
+
+// TestStopTaskRuntimeTargets_SessionAbsenceUnknownRemainsRetryable guards the
+// anti-blanket-ignore rule for the cleanup worker: a session-only not-found stop
+// for a row whose liveness is Unknown (remote/no local handle) stays a failed,
+// retryable stop.
+func TestStopTaskRuntimeTargets_SessionAbsenceUnknownRemainsRetryable(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{
+		runningBySession: &models.ExecutorRunning{
+			SessionID: "sess-remote", Runtime: agentruntime.RuntimeSSH,
+		},
+	}
+	svc.executionStopper = &stubStopper{
+		stopSessionErr: fmt.Errorf("not registered yet: %w", runtimeapi.ErrNotFound),
+	}
+	svc.rowLivenessProber = stubRowLivenessProber{liveness: models.ProcessLivenessUnknown}
+
+	failed := svc.stopTaskRuntimeTargets(
+		context.Background(),
+		"task-remote",
+		[]taskStopTarget{{sessionID: "sess-remote"}},
+		"archive",
+		"stop failed",
+	).failed
+	if _, ok := failed["sess-remote"]; !ok {
+		t.Errorf("session absence for an unknown/remote row must remain retryable; got %v", failed)
+	}
+}
+
+func TestStopTaskRuntimeTargets_NonTerminalStopFailureBlocksCleanup(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	svc.executors = &stubExecutors{}
+	svc.executionStopper = &stubStopper{stopSessionErr: errors.New("unexpected error")}
+
+	targets := []taskStopTarget{
+		{sessionID: "sess-running", terminal: false},
+	}
+
+	failed := svc.stopTaskRuntimeTargets(context.Background(), "task-b", targets, "archive", "stop failed").failed
+	if _, ok := failed["sess-running"]; !ok {
+		t.Error("non-terminal stop failure must add session to failedStops")
+	}
+}
+
+func TestStopTaskRuntimeTargets_CancellationStopsBeforeNextTarget(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	stopper := &cancelAfterFirstStopper{cancel: cancel}
+	svc.executionStopper = stopper
+
+	svc.stopTaskRuntimeTargets(ctx, "task-cancel", []taskStopTarget{
+		{sessionID: "session-1", executionID: "execution-1"},
+		{sessionID: "session-2", executionID: "execution-2"},
+	}, "archive", "stop failed")
+
+	if len(stopper.calls) != 1 || stopper.calls[0] != "execution-1" {
+		t.Fatalf("stop calls after cancellation = %v, want [execution-1]", stopper.calls)
+	}
+}
+
+// --- CleanupTaskResources cascade regression tests ---
+//
+// These tests reproduce the archive cleanup regression: ArchiveTaskTree calls
+// cancelActiveRuns (sessions → CANCELLED) before CleanupTaskResources, leaving
+// executor_running rows whose StopExecution returns ErrExecutionNotFound. The
+// stop failure must not block environment teardown for terminal sessions.
+
+func seedCascadeFixtures(t *testing.T, repo interface {
+	CreateWorkspace(context.Context, *models.Workspace) error
+	CreateWorkflow(context.Context, *models.Workflow) error
+	CreateTask(context.Context, *models.Task) error
+	CreateTaskSession(context.Context, *models.TaskSession) error
+	UpsertExecutorRunning(context.Context, *models.ExecutorRunning) error
+}, wsID, wfID, taskID, sessID, execID string, state models.TaskSessionState) {
+	t.Helper()
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: wsID, Name: "WS"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: wfID, WorkspaceID: wsID, Name: "WF"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: taskID, WorkspaceID: wsID, WorkflowID: wfID, WorkflowStepID: "step-1", Title: "T", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:               sessID,
+		TaskID:           taskID,
+		State:            state,
+		AgentExecutionID: execID,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               sessID,
+		SessionID:        sessID,
+		TaskID:           taskID,
+		ExecutorID:       "executor-1",
+		AgentExecutionID: execID,
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+	}); err != nil {
+		t.Fatalf("seed executor_running: %v", err)
+	}
+}
+
+// TestCleanupTaskResources_TerminalSessionRuntimeAbsenceDoesNotBlockCleanup is
+// a regression test for archive cleanup: a CANCELLED session with a stale
+// executor_running row can be removed when StopExecution confirms absence.
+func TestCleanupTaskResources_TerminalSessionRuntimeAbsenceDoesNotBlockCleanup(t *testing.T) {
+	svc, _, repo := createTestService(t)
+
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErr = fmt.Errorf("execution not found: %w", runtimeapi.ErrNotFound)
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	seedCascadeFixtures(t, repo, "ws-c1", "wf-c1", "task-c1", "sess-cancelled", "exec-cancelled", models.TaskSessionStateCancelled)
+
+	svc.CleanupTaskResources(context.Background(), "task-c1", false)
+	waitForCleanupDone(t, svc)
+
+	_, err := repo.GetExecutorRunningBySessionID(context.Background(), "sess-cancelled")
+	if err == nil {
+		t.Error("executor_running row must be removed after cleanup when terminal runtime absence is confirmed")
+	}
+}
+
+// TestCleanupTaskResources_NonTerminalSessionStopFailureBlocksCleanup is the
+// companion case: a RUNNING session whose StopExecution fails must keep its
+// executor_running row so the runtime is not torn down unexpectedly.
+func TestCleanupTaskResources_NonTerminalSessionStopFailureBlocksCleanup(t *testing.T) {
+	svc, _, repo := createTestService(t)
+
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErr = errors.New("stop failed")
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	seedCascadeFixtures(t, repo, "ws-c2", "wf-c2", "task-c2", "sess-running", "exec-running", models.TaskSessionStateRunning)
+
+	svc.CleanupTaskResources(context.Background(), "task-c2", false)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetExecutorRunningBySessionID(context.Background(), "sess-running"); err != nil {
+		t.Error("executor_running row must be preserved when stop fails for a non-terminal (RUNNING) session")
+	}
+}
+
+// seedDeadLocalSessionOnly seeds a session and a session-only executor_running
+// row (empty agent_execution_id) so cleanup takes the StopSession path rather
+// than StopExecution. resumeToken, when set, makes the row resume-safe.
+func seedDeadLocalSessionOnly(t *testing.T, repo interface {
+	CreateWorkspace(context.Context, *models.Workspace) error
+	CreateWorkflow(context.Context, *models.Workflow) error
+	CreateTask(context.Context, *models.Task) error
+	CreateTaskSession(context.Context, *models.TaskSession) error
+	UpsertExecutorRunning(context.Context, *models.ExecutorRunning) error
+}, wsID, wfID, taskID, sessID, resumeToken string, state models.TaskSessionState) {
+	t.Helper()
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: wsID, Name: "WS"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: wfID, WorkspaceID: wsID, Name: "WF"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: taskID, WorkspaceID: wsID, WorkflowID: wfID, WorkflowStepID: "step-1", Title: "T", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{ID: sessID, TaskID: taskID, State: state})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID: sessID, SessionID: sessID, TaskID: taskID, ExecutorID: "executor-1",
+		Runtime: agentruntime.RuntimeStandalone, Status: models.ExecutorRunningStatusRunning,
+		LocalPID: 4242, ResumeToken: resumeToken,
+	}); err != nil {
+		t.Fatalf("seed executor_running: %v", err)
+	}
+}
+
+// TestCleanupTaskResources_NonTerminalDeadLocalSessionGetsCleanedUp is the
+// end-to-end companion for the confirmed-dead prune path: a non-terminal but
+// non-resumable (CREATED, no resume token) session with a session-only
+// executor_running row whose StopSession reports the runtime not-found and whose
+// local liveness is Dead must have its executor_running row removed after
+// cleanup — the durable job does not retry solely because the runtime was gone.
+func TestCleanupTaskResources_NonTerminalDeadLocalSessionGetsCleanedUp(t *testing.T) {
+	svc, _, repo := createTestService(t)
+
+	stopper := newRecordingTaskExecutionStopper()
+	// Mirror the not-found result executor.Stop now surfaces for a genuinely
+	// missing session (the runtime seam normalizes to runtimeapi.ErrNotFound).
+	stopper.stopSessionErr = fmt.Errorf("execution not found: %w: gone", runtimeapi.ErrNotFound)
+	svc.SetExecutionStopper(stopper)
+	svc.SetRowLivenessProber(stubRowLivenessProber{liveness: models.ProcessLivenessDead})
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	seedDeadLocalSessionOnly(t, repo, "ws-dl", "wf-dl", "task-dl", "sess-dead-local", "", models.TaskSessionStateCreated)
+
+	svc.CleanupTaskResources(context.Background(), "task-dl", false)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetExecutorRunningBySessionID(context.Background(), "sess-dead-local"); err == nil {
+		t.Error("executor_running row must be removed for a confirmed-dead local non-resumable session")
+	}
+}
+
+// TestCleanupTaskResources_DeadLocalResumeSafeSessionRepairedNotDeleted is the
+// resume-safety end-to-end case: a confirmed-dead local row that still carries a
+// resume_token must be repaired in place (row preserved, token intact,
+// local_pid cleared) rather than deleted.
+func TestCleanupTaskResources_DeadLocalResumeSafeSessionRepairedNotDeleted(t *testing.T) {
+	svc, _, repo := createTestService(t)
+
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopSessionErr = fmt.Errorf("execution not found: %w: gone", runtimeapi.ErrNotFound)
+	svc.SetExecutionStopper(stopper)
+	svc.SetRowLivenessProber(stubRowLivenessProber{liveness: models.ProcessLivenessDead})
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	// CREATED (non-resumable) state isolates the resume_token as the sole
+	// preservation driver.
+	seedDeadLocalSessionOnly(t, repo, "ws-rs", "wf-rs", "task-rs", "sess-resume-safe", "tok-keep", models.TaskSessionStateCreated)
+
+	svc.CleanupTaskResources(context.Background(), "task-rs", false)
+	waitForCleanupDone(t, svc)
+
+	row, err := repo.GetExecutorRunningBySessionID(context.Background(), "sess-resume-safe")
+	if err != nil {
+		t.Fatalf("resume-safe dead-local row must be preserved, not deleted: %v", err)
+	}
+	if row.ResumeToken != "tok-keep" {
+		t.Errorf("resume_token must survive repair; got %q", row.ResumeToken)
+	}
+	if row.Status != models.ExecutorRunningStatusStopped || row.LocalPID != 0 {
+		t.Errorf("dead row must be repaired to stopped with cleared local_pid; got status=%q local_pid=%d", row.Status, row.LocalPID)
+	}
+}
+
+func TestCleanupTaskResources_SkipsBorrowedInheritedWorktree(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	seedParentChildWorkspace(t, repo, "ws-inherited", "wf-inherited", "parent-task", "child-task")
+	if err := repo.CreateTaskEnvironment(ctx, &models.TaskEnvironment{
+		ID:     "env-parent",
+		TaskID: "parent-task",
+		Status: models.TaskEnvironmentStatusReady,
+		Repos:  []*models.TaskEnvironmentRepo{{RepositoryID: "repo-parent", WorktreeID: "wt-parent", WorktreePath: "/tmp/parent-worktree"}},
+	}); err != nil {
+		t.Fatalf("create parent environment: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:                "session-child",
+		TaskID:            "child-task",
+		State:             models.TaskSessionStateCancelled,
+		TaskEnvironmentID: "env-parent",
+	}); err != nil {
+		t.Fatalf("create child session: %v", err)
+	}
+
+	cleanup := &recordingWorktreeCleanup{
+		worktreesByTaskID: map[string][]*worktree.Worktree{
+			"child-task": {{
+				ID:        "wt-parent",
+				TaskID:    "child-task",
+				SessionID: "session-child",
+				Path:      "/tmp/parent-worktree",
+			}},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	svc.CleanupTaskResources(ctx, "child-task", true)
+	waitForCleanupDone(t, svc)
+
+	if cleanedIDs := cleanup.cleanedIDs(); len(cleanedIDs) != 0 {
+		t.Fatalf("child cleanup must not clean inherited parent worktrees, got %#v", cleanedIDs)
+	}
+}
+
+func TestCleanupTaskResources_SkipsWorktreeWhenSessionOwnershipUnknown(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	seedParentChildWorkspace(t, repo, "ws-unknown", "wf-unknown", "parent-task", "child-task")
+
+	cleanup := &recordingWorktreeCleanup{
+		worktreesByTaskID: map[string][]*worktree.Worktree{
+			"child-task": {{
+				ID:        "wt-unknown",
+				TaskID:    "child-task",
+				SessionID: "missing-session",
+				Path:      "/tmp/unknown-worktree",
+			}},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	svc.CleanupTaskResources(ctx, "child-task", true)
+	waitForCleanupDone(t, svc)
+
+	if cleanedIDs := cleanup.cleanedIDs(); len(cleanedIDs) != 0 {
+		t.Fatalf("cleanup must fail closed when session ownership is unknown, got %#v", cleanedIDs)
+	}
+}
+
+func TestCleanupTaskResources_PreservesOwnedEnvironmentWithActiveInheritedChild(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	seedParentChildWorkspace(t, repo, "ws-shared", "wf-shared", "parent-task", "child-task")
+	if err := repo.CreateTaskEnvironment(ctx, &models.TaskEnvironment{
+		ID:     "env-parent",
+		TaskID: "parent-task",
+		Status: models.TaskEnvironmentStatusReady,
+		Repos:  []*models.TaskEnvironmentRepo{{RepositoryID: "repo-parent", WorktreeID: "wt-parent", WorktreePath: "/tmp/parent-worktree"}},
+	}); err != nil {
+		t.Fatalf("create parent environment: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:                "session-parent",
+		TaskID:            "parent-task",
+		State:             models.TaskSessionStateCancelled,
+		TaskEnvironmentID: "env-parent",
+	}); err != nil {
+		t.Fatalf("create parent session: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:                "session-child",
+		TaskID:            "child-task",
+		State:             models.TaskSessionStateRunning,
+		TaskEnvironmentID: "env-parent",
+	}); err != nil {
+		t.Fatalf("create child session: %v", err)
+	}
+
+	destroyer := &stubDestroyer{}
+	svc.SetEnvironmentDestroyer(destroyer)
+	cleanup := &recordingWorktreeCleanup{
+		worktreesByTaskID: map[string][]*worktree.Worktree{
+			"parent-task": {{
+				ID:        "wt-parent",
+				TaskID:    "parent-task",
+				SessionID: "session-parent",
+				Path:      "/tmp/parent-worktree",
+			}},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	svc.CleanupTaskResources(ctx, "parent-task", false)
+	waitForCleanupDone(t, svc)
+
+	if len(destroyer.worktreeCalls) != 0 {
+		t.Fatalf("parent cleanup must not destroy a worktree while an active child inherits it, got %#v", destroyer.worktreeCalls)
+	}
+	if cleanedIDs := cleanup.cleanedIDs(); len(cleanedIDs) != 0 {
+		t.Fatalf("parent cleanup must not batch-clean a shared inherited worktree, got %#v", cleanedIDs)
+	}
+}
+
+func seedParentChildWorkspace(t *testing.T, repo interface {
+	CreateWorkspace(context.Context, *models.Workspace) error
+	CreateWorkflow(context.Context, *models.Workflow) error
+	CreateTask(context.Context, *models.Task) error
+}, wsID, wfID, parentID, childID string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: wsID, Name: "Workspace"}); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: wfID, WorkspaceID: wsID, Name: "Workflow"}); err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{ID: parentID, WorkspaceID: wsID, WorkflowID: wfID, WorkflowStepID: "step-1", Title: "Parent", Priority: "medium"}); err != nil {
+		t.Fatalf("create parent task: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{ID: childID, WorkspaceID: wsID, WorkflowID: wfID, WorkflowStepID: "step-1", ParentID: parentID, Title: "Child", Priority: "medium"}); err != nil {
+		t.Fatalf("create child task: %v", err)
+	}
+}

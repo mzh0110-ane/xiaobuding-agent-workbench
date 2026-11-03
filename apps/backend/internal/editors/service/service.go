@@ -1,0 +1,612 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kandev/kandev/internal/common/securityutil"
+	"github.com/kandev/kandev/internal/editors/capabilities"
+	"github.com/kandev/kandev/internal/editors/models"
+	"github.com/kandev/kandev/internal/editors/store"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	usermodels "github.com/kandev/kandev/internal/user/models"
+)
+
+// taskSessionReader is the minimal task repository interface required by the editors service.
+type taskSessionReader interface {
+	GetTaskSession(ctx context.Context, id string) (*taskmodels.TaskSession, error)
+	GetRepository(ctx context.Context, id string) (*taskmodels.Repository, error)
+	GetExecutor(ctx context.Context, id string) (*taskmodels.Executor, error)
+}
+
+var (
+	ErrEditorNotFound      = errors.New("editor not found")
+	ErrEditorUnavailable   = errors.New("editor not available")
+	ErrEditorConfigInvalid = errors.New("editor configuration invalid")
+	ErrWorkspaceNotFound   = errors.New("workspace path not found")
+)
+
+// Editor kind constants for custom editor types.
+const (
+	editorKindCustomRemoteSSH = "custom_remote_ssh"
+	editorKindCustomHostedURL = "custom_hosted_url"
+	editorKindCustomCommand   = "custom_command"
+	editorKindInternalVscode  = "internal_vscode"
+)
+
+type UserSettingsProvider interface {
+	GetUserSettings(ctx context.Context) (*usermodels.UserSettings, error)
+	ClearDefaultEditorID(ctx context.Context, editorID string) error
+}
+
+type Service struct {
+	repo         store.Repository
+	taskRepo     taskSessionReader
+	userSettings UserSettingsProvider
+}
+
+func NewService(repo store.Repository, taskRepo taskSessionReader, userSettings UserSettingsProvider) *Service {
+	return &Service{
+		repo:         repo,
+		taskRepo:     taskRepo,
+		userSettings: userSettings,
+	}
+}
+
+func (s *Service) ListEditors(ctx context.Context) ([]*models.Editor, error) {
+	return s.repo.ListEditors(ctx)
+}
+
+type OpenEditorInput struct {
+	SessionID  string
+	EditorID   string
+	EditorType string
+	FilePath   string
+	Line       int
+	Column     int
+	WorktreeID string
+}
+
+func (s *Service) OpenEditor(ctx context.Context, input OpenEditorInput) (string, error) {
+	if input.SessionID == "" {
+		return "", ErrEditorConfigInvalid
+	}
+	session, err := s.taskRepo.GetTaskSession(ctx, input.SessionID)
+	if err != nil {
+		return "", err
+	}
+	if session == nil {
+		return "", ErrWorkspaceNotFound
+	}
+
+	settings, err := s.userSettings.GetUserSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	if settings == nil {
+		return "", ErrEditorConfigInvalid
+	}
+
+	editor, err := s.resolveEditor(ctx, input.EditorID, input.EditorType, settings.DefaultEditorID)
+	if err != nil {
+		return "", err
+	}
+	if editor.Kind == editorKindInternalVscode && !s.supportsEmbeddedVscode(ctx, session) {
+		return "", ErrEditorUnavailable
+	}
+	// Opening the embedded editor at folder level only needs a valid session.
+	// Repository-less sessions still have an executor workspace where code-server
+	// can run, but they intentionally have no task worktree to resolve here.
+	if editor.Kind == editorKindInternalVscode && input.FilePath == "" {
+		return buildInternalVscodeURL("", "", input.Line, input.Column), nil
+	}
+
+	worktreePath, err := s.resolveSessionPath(ctx, session, input.WorktreeID)
+	if err != nil {
+		return "", err
+	}
+
+	absPath, err := s.resolveFilePath(worktreePath, input.FilePath)
+	if err != nil {
+		return "", err
+	}
+
+	return s.dispatchEditorKind(editor, worktreePath, absPath, input.Line, input.Column)
+}
+
+func (s *Service) supportsEmbeddedVscode(ctx context.Context, session *taskmodels.TaskSession) bool {
+	if session == nil || session.ExecutorID == "" {
+		return false
+	}
+	executor, err := s.taskRepo.GetExecutor(ctx, session.ExecutorID)
+	if err != nil || executor == nil {
+		return false
+	}
+	return capabilities.SupportsEmbeddedVscode(executor.Type, runtime.GOOS)
+}
+
+func (s *Service) dispatchEditorKind(editor *models.Editor, worktreePath, absPath string, line, column int) (string, error) {
+	switch editor.Kind {
+	case editorKindInternalVscode:
+		return buildInternalVscodeURL(worktreePath, absPath, line, column), nil
+	case editorKindCustomRemoteSSH:
+		return openRemoteSSHEditor(editor, absPath, line, column)
+	case editorKindCustomHostedURL:
+		cfg, err := parseHostedURLConfig(editor.Config)
+		if err != nil {
+			return "", err
+		}
+		return buildHostedURL(cfg.URL, absPath, line, column)
+	case editorKindCustomCommand:
+		cfg, err := parseCommandConfig(editor.Config)
+		if err != nil {
+			return "", err
+		}
+		return launchCommand(cfg.Command, worktreePath, absPath, line, column)
+	default:
+		return openBuiltinEditor(editor, absPath, line, column)
+	}
+}
+
+// buildInternalVscodeURL returns a sentinel URL that the frontend intercepts
+// to open the embedded code-server panel. Includes goto params when a specific
+// file is requested.
+func buildInternalVscodeURL(worktreePath, absPath string, line, column int) string {
+	if absPath == "" || absPath == worktreePath {
+		return "internal://vscode"
+	}
+	// Build goto param: relative/path:line:col
+	relPath := absPath
+	if worktreePath != "" {
+		rel, err := filepath.Rel(worktreePath, absPath)
+		if err == nil {
+			relPath = rel
+		}
+	}
+	goto_ := relPath
+	if line > 0 {
+		goto_ = fmt.Sprintf("%s:%d", goto_, line)
+		if column > 0 {
+			goto_ = fmt.Sprintf("%s:%d", goto_, column)
+		}
+	}
+	return fmt.Sprintf("internal://vscode?goto=%s", goto_)
+}
+
+func openRemoteSSHEditor(editor *models.Editor, absPath string, line, column int) (string, error) {
+	cfg, err := parseRemoteSSHConfig(editor.Config)
+	if err != nil {
+		return "", err
+	}
+	scheme := cfg.Scheme
+	if scheme == "" {
+		scheme = editor.Scheme
+	}
+	return buildRemoteSSHURL(scheme, cfg.User, cfg.Host, absPath, line, column), nil
+}
+
+func openBuiltinEditor(editor *models.Editor, absPath string, line, column int) (string, error) {
+	if !editor.Installed {
+		return "", ErrEditorUnavailable
+	}
+	if editor.Command == "" {
+		return "", ErrEditorConfigInvalid
+	}
+	args := buildLocalArgs(editor.Type, absPath, line, column)
+	cmd := exec.Command(editor.Command, args...)
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("launch failed: %w", err)
+	}
+	return "", nil
+}
+
+func (s *Service) OpenFolder(ctx context.Context, sessionID, worktreeID string) error {
+	if sessionID == "" {
+		return ErrEditorConfigInvalid
+	}
+	if !FolderOpeningAvailable() {
+		return ErrFolderUnavailable
+	}
+
+	session, err := s.taskRepo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	worktreePath, err := s.resolveSessionPath(ctx, session, worktreeID)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(folderOpenCommand(runtime.GOOS), worktreePath)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to open folder: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) resolveEditor(ctx context.Context, editorID, editorType, fallbackID string) (*models.Editor, error) {
+	if editorID == "" {
+		editorID = strings.TrimSpace(fallbackID)
+	}
+	if editorID != "" {
+		editor, err := s.repo.GetEditorByID(ctx, editorID)
+		if err != nil || editor == nil {
+			return nil, ErrEditorNotFound
+		}
+		if !editor.Enabled {
+			return nil, ErrEditorUnavailable
+		}
+		return editor, nil
+	}
+	if editorType == "" {
+		editors, err := s.repo.ListEditors(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, editor := range editors {
+			if editor.Enabled {
+				return editor, nil
+			}
+		}
+		return nil, ErrEditorNotFound
+	}
+	editor, err := s.repo.GetEditorByType(ctx, editorType)
+	if err != nil || editor == nil {
+		return nil, ErrEditorNotFound
+	}
+	if !editor.Enabled {
+		return nil, ErrEditorUnavailable
+	}
+	return editor, nil
+}
+
+func (s *Service) resolveSessionPath(ctx context.Context, session *taskmodels.TaskSession, worktreeID string) (string, error) {
+	if session == nil {
+		return "", ErrWorkspaceNotFound
+	}
+	if worktreeID != "" {
+		return findSessionWorktreePath(session, worktreeID)
+	}
+	if len(session.Worktrees) > 0 && session.Worktrees[0].WorktreePath != "" {
+		return session.Worktrees[0].WorktreePath, nil
+	}
+	if session.RepositoryID != "" {
+		repo, err := s.taskRepo.GetRepository(ctx, session.RepositoryID)
+		if err != nil {
+			return "", err
+		}
+		if repo != nil && repo.LocalPath != "" {
+			return repo.LocalPath, nil
+		}
+	}
+	return "", ErrWorkspaceNotFound
+}
+
+// findSessionWorktreePath returns the path of the session worktree matching
+// worktreeID. It matches both the worktree ID and the session-worktree
+// association ID, since clients may hold either.
+func findSessionWorktreePath(session *taskmodels.TaskSession, worktreeID string) (string, error) {
+	for _, worktree := range session.Worktrees {
+		if worktree == nil || (worktree.WorktreeID != worktreeID && worktree.ID != worktreeID) {
+			continue
+		}
+		if worktree.WorktreePath == "" {
+			return "", ErrWorkspaceNotFound
+		}
+		return worktree.WorktreePath, nil
+	}
+	return "", ErrWorkspaceNotFound
+}
+
+func (s *Service) resolveFilePath(worktreePath, filePath string) (string, error) {
+	if worktreePath == "" {
+		return "", ErrWorkspaceNotFound
+	}
+	if filePath == "" {
+		return worktreePath, nil
+	}
+	clean := filepath.Clean(filePath)
+	abs := filepath.Join(worktreePath, clean)
+	rel, err := filepath.Rel(worktreePath, abs)
+	if err != nil {
+		return "", ErrEditorConfigInvalid
+	}
+	if strings.HasPrefix(rel, "..") {
+		return "", ErrEditorConfigInvalid
+	}
+	return abs, nil
+}
+
+func buildRemoteSSHURL(scheme, user, host, path string, line, column int) string {
+	if scheme == "" {
+		scheme = "vscode"
+	}
+	remoteHost := host
+	if user != "" {
+		remoteHost = fmt.Sprintf("%s@%s", user, host)
+	}
+	location := path
+	if line > 0 {
+		location = fmt.Sprintf("%s:%d", path, line)
+		if column > 0 {
+			location = fmt.Sprintf("%s:%d", location, column)
+		}
+	}
+	return fmt.Sprintf("%s://vscode-remote/ssh-remote+%s:%s", scheme, remoteHost, location)
+}
+
+func buildHostedURL(baseURL, path string, line, column int) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", ErrEditorConfigInvalid
+	}
+	query := parsed.Query()
+	if path != "" {
+		location := path
+		if line > 0 {
+			location = fmt.Sprintf("%s:%d", path, line)
+			if column > 0 {
+				location = fmt.Sprintf("%s:%d", location, column)
+			}
+		}
+		query.Set("file", location)
+	} else {
+		query.Set("folder", "/")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func buildLocalArgs(editorType, path string, line, column int) []string {
+	if path == "" {
+		return nil
+	}
+	normalized := strings.TrimSpace(editorType)
+	switch normalized {
+	case "vscode", "cursor", "windsurf":
+		if line > 0 {
+			location := path + ":" + strconv.Itoa(line)
+			if column > 0 {
+				location += ":" + strconv.Itoa(column)
+			}
+			return []string{"--goto", location}
+		}
+		return []string{path}
+	default:
+		return []string{path}
+	}
+}
+
+type CreateEditorInput struct {
+	Name    string
+	Kind    string
+	Config  json.RawMessage
+	Enabled *bool
+}
+
+type UpdateEditorInput struct {
+	EditorID string
+	Name     *string
+	Kind     *string
+	Config   json.RawMessage
+	Enabled  *bool
+}
+
+func (s *Service) CreateEditor(ctx context.Context, input CreateEditorInput) (*models.Editor, error) {
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		return nil, ErrEditorConfigInvalid
+	}
+	if !isCustomKind(input.Kind) {
+		return nil, ErrEditorConfigInvalid
+	}
+	editorID := uuid.New().String()
+	editor := &models.Editor{
+		ID:        editorID,
+		Type:      "custom:" + editorID,
+		Name:      name,
+		Kind:      input.Kind,
+		Command:   "",
+		Scheme:    "",
+		Config:    input.Config,
+		Installed: true,
+		Enabled:   true,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if input.Enabled != nil {
+		editor.Enabled = *input.Enabled
+	}
+	if err := validateEditorConfig(editor); err != nil {
+		return nil, err
+	}
+	if err := s.repo.CreateEditor(ctx, editor); err != nil {
+		return nil, err
+	}
+	return editor, nil
+}
+
+func (s *Service) UpdateEditor(ctx context.Context, input UpdateEditorInput) (*models.Editor, error) {
+	if input.EditorID == "" {
+		return nil, ErrEditorConfigInvalid
+	}
+	editor, err := s.repo.GetEditorByID(ctx, input.EditorID)
+	if err != nil || editor == nil {
+		return nil, ErrEditorNotFound
+	}
+	if !isCustomKind(editor.Kind) {
+		return nil, ErrEditorConfigInvalid
+	}
+	if input.Name != nil {
+		editor.Name = strings.TrimSpace(*input.Name)
+	}
+	if input.Kind != nil {
+		if !isCustomKind(*input.Kind) {
+			return nil, ErrEditorConfigInvalid
+		}
+		editor.Kind = *input.Kind
+	}
+	if len(input.Config) > 0 {
+		editor.Config = input.Config
+	}
+	if input.Enabled != nil {
+		editor.Enabled = *input.Enabled
+	}
+	if err := validateEditorConfig(editor); err != nil {
+		return nil, err
+	}
+	if err := s.repo.UpdateEditor(ctx, editor); err != nil {
+		return nil, err
+	}
+	return editor, nil
+}
+
+func (s *Service) DeleteEditor(ctx context.Context, editorID string) error {
+	if editorID == "" {
+		return ErrEditorConfigInvalid
+	}
+	editor, err := s.repo.GetEditorByID(ctx, editorID)
+	if err != nil {
+		return err
+	}
+	if editor == nil {
+		return ErrEditorNotFound
+	}
+	if !isCustomKind(editor.Kind) {
+		return ErrEditorConfigInvalid
+	}
+	if err := s.repo.DeleteEditor(ctx, editorID); err != nil {
+		return err
+	}
+	return s.userSettings.ClearDefaultEditorID(ctx, editorID)
+}
+
+type commandConfig struct {
+	Command string `json:"command"`
+}
+
+type remoteSSHConfig struct {
+	Host   string `json:"host"`
+	User   string `json:"user"`
+	Scheme string `json:"scheme"`
+}
+
+type hostedURLConfig struct {
+	URL string `json:"url"`
+}
+
+func parseCommandConfig(data json.RawMessage) (commandConfig, error) {
+	if len(data) == 0 {
+		return commandConfig{}, ErrEditorConfigInvalid
+	}
+	var cfg commandConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return commandConfig{}, ErrEditorConfigInvalid
+	}
+	if strings.TrimSpace(cfg.Command) == "" {
+		return commandConfig{}, ErrEditorConfigInvalid
+	}
+	return cfg, nil
+}
+
+func parseRemoteSSHConfig(data json.RawMessage) (remoteSSHConfig, error) {
+	var cfg remoteSSHConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return remoteSSHConfig{}, ErrEditorConfigInvalid
+	}
+	if strings.TrimSpace(cfg.Host) == "" {
+		return remoteSSHConfig{}, ErrEditorConfigInvalid
+	}
+	return cfg, nil
+}
+
+func parseHostedURLConfig(data json.RawMessage) (hostedURLConfig, error) {
+	var cfg hostedURLConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return hostedURLConfig{}, ErrEditorConfigInvalid
+	}
+	if strings.TrimSpace(cfg.URL) == "" {
+		return hostedURLConfig{}, ErrEditorConfigInvalid
+	}
+	return cfg, nil
+}
+
+func launchCommand(commandTemplate, worktreePath, absPath string, line, column int) (string, error) {
+	expanded := expandCommandPlaceholders(commandTemplate, worktreePath, absPath, line, column)
+	parts, err := securityutil.SplitShellCommand(expanded)
+	if err != nil {
+		return "", fmt.Errorf("invalid command template: %w", err)
+	}
+	if len(parts) == 0 {
+		return "", ErrEditorConfigInvalid
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+	if worktreePath != "" {
+		cmd.Dir = worktreePath
+	}
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("launch failed: %w", err)
+	}
+	return "", nil
+}
+
+func expandCommandPlaceholders(template, worktreePath, absPath string, line, column int) string {
+	relPath := absPath
+	if worktreePath != "" && absPath != "" {
+		if relative, err := filepath.Rel(worktreePath, absPath); err == nil {
+			relPath = relative
+		}
+	}
+	// Shell-escape paths to handle spaces and special characters safely
+	replacements := map[string]string{
+		"{cwd}":    securityutil.ShellEscape(worktreePath),
+		"{file}":   securityutil.ShellEscape(absPath),
+		"{rel}":    securityutil.ShellEscape(relPath),
+		"{line}":   strconv.Itoa(line),
+		"{column}": strconv.Itoa(column),
+	}
+	result := template
+	for key, value := range replacements {
+		result = strings.ReplaceAll(result, key, value)
+	}
+	return result
+}
+
+func isCustomKind(kind string) bool {
+	switch kind {
+	case editorKindCustomCommand, editorKindCustomRemoteSSH, editorKindCustomHostedURL:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateEditorConfig(editor *models.Editor) error {
+	if editor == nil {
+		return ErrEditorConfigInvalid
+	}
+	switch editor.Kind {
+	case editorKindCustomCommand:
+		_, err := parseCommandConfig(editor.Config)
+		return err
+	case editorKindCustomRemoteSSH:
+		_, err := parseRemoteSSHConfig(editor.Config)
+		return err
+	case editorKindCustomHostedURL:
+		_, err := parseHostedURLConfig(editor.Config)
+		return err
+	default:
+		return ErrEditorConfigInvalid
+	}
+}

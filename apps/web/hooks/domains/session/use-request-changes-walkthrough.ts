@@ -1,0 +1,134 @@
+import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { useAppStoreApi } from "@/components/state-provider";
+import { useToast } from "@/components/toast-provider";
+import { listPrompts } from "@/lib/api";
+import { queueMessage } from "@/lib/api/domains/queue-api";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import {
+  buildChangesWalkthroughPrompt,
+  CHANGES_WALKTHROUGH_PROMPT_NAME,
+} from "@/lib/walkthrough-request";
+import type { Message } from "@/lib/types/http";
+import type { AppState } from "@/lib/state/store";
+import { deriveSessionInputMode } from "./session-input-mode";
+import { generateUUID } from "@/lib/utils";
+
+const TERMINAL_SESSION_STATES = new Set(["FAILED", "CANCELLED", "COMPLETED"]);
+
+type UseRequestChangesWalkthroughParams = {
+  taskId: string | null | undefined;
+  sessionId: string | null | undefined;
+  ready?: boolean;
+};
+
+function planModePayload(enabled: boolean): { plan_mode?: true } {
+  return enabled ? { plan_mode: true } : {};
+}
+
+async function loadChangesWalkthroughPromptTemplate(): Promise<string> {
+  const { prompts } = await listPrompts({ cache: "no-store" });
+  const prompt = prompts.find((p) => p.name === CHANGES_WALKTHROUGH_PROMPT_NAME);
+  const content = prompt?.content?.trim();
+  if (!content) {
+    throw new Error(`${CHANGES_WALKTHROUGH_PROMPT_NAME} prompt is not available`);
+  }
+  return content;
+}
+
+async function queueWalkthroughRequest(params: {
+  taskId: string;
+  sessionId: string;
+  sessionIncarnationId: string;
+  content: string;
+  planModeEnabled: boolean;
+}) {
+  await queueMessage({
+    session_id: params.sessionId,
+    session_incarnation_id: params.sessionIncarnationId,
+    task_id: params.taskId,
+    content: params.content,
+    ...planModePayload(params.planModeEnabled),
+  });
+}
+
+async function sendWalkthroughRequest(params: {
+  taskId: string;
+  sessionId: string;
+  content: string;
+  planModeEnabled: boolean;
+  state: AppState;
+}) {
+  const client = getWebSocketClient();
+  if (!client) throw new Error("WebSocket client unavailable");
+  const created = await client.request<Message | undefined>(
+    "message.add",
+    {
+      task_id: params.taskId,
+      session_id: params.sessionId,
+      client_message_id: generateUUID(),
+      content: params.content,
+      ...planModePayload(params.planModeEnabled),
+    },
+    10000,
+  );
+  if (created?.id && created.session_id) params.state.addMessage(created);
+}
+
+export function useRequestChangesWalkthrough({
+  taskId,
+  sessionId,
+  ready = true,
+}: UseRequestChangesWalkthroughParams) {
+  const storeApi = useAppStoreApi();
+  const { toast } = useToast();
+  const { t } = useTranslation("review");
+
+  return useCallback(async () => {
+    if (!taskId || !sessionId) return;
+
+    const state = storeApi.getState();
+    const activeSession = state.taskSessions.items[sessionId] ?? null;
+    const inputMode = deriveSessionInputMode(activeSession);
+    const planModeEnabled = state.chatInput.planModeBySessionId[sessionId] ?? false;
+    if (!ready) {
+      toast({ title: t("review:changesStillLoading"), variant: "error" });
+      return;
+    }
+    if (inputMode === "unavailable") {
+      // A terminal session row (agent process has exited) gets the backend's
+      // actionable copy; a missing row keeps the generic message since there
+      // is nothing session-specific to say.
+      const title =
+        activeSession && TERMINAL_SESSION_STATES.has(activeSession.state)
+          ? t("task:sessionEndedCreateNew")
+          : t("task:sessionUnavailableForInput");
+      toast({ title, variant: "error" });
+      return;
+    }
+    try {
+      const template = await loadChangesWalkthroughPromptTemplate();
+      const content = buildChangesWalkthroughPrompt(template);
+      if (inputMode === "queue") {
+        if (!activeSession?.queue_incarnation_id) {
+          throw new Error("Session is not available for input");
+        }
+        await queueWalkthroughRequest({
+          taskId,
+          sessionId,
+          sessionIncarnationId: activeSession.queue_incarnation_id,
+          content,
+          planModeEnabled,
+        });
+        toast({ title: t("review:walkthroughRequestQueued"), variant: "success" });
+        return;
+      }
+
+      await sendWalkthroughRequest({ taskId, sessionId, content, planModeEnabled, state });
+      toast({ title: t("review:walkthroughRequestSent"), variant: "success" });
+    } catch (error) {
+      console.error("Failed to request walkthrough:", error);
+      toast({ title: t("review:failedToRequestWalkthrough"), variant: "error" });
+    }
+  }, [ready, sessionId, storeApi, t, taskId, toast]);
+}

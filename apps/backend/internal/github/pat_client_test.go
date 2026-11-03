@@ -1,0 +1,1127 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestConvertPatPR(t *testing.T) {
+	raw := &patPR{
+		Number:    10,
+		Title:     "Feature Y",
+		HTMLURL:   "https://github.com/org/repo/pull/10",
+		State:     "open",
+		Draft:     boolPtr(false),
+		Additions: 200,
+		Deletions: 30,
+		CreatedAt: time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2025, 3, 2, 0, 0, 0, 0, time.UTC),
+		RequestedReviewers: []struct {
+			Login string `json:"login"`
+		}{
+			{Login: "alice-reviewer"},
+		},
+		RequestedTeams: []struct {
+			Slug string `json:"slug"`
+			Name string `json:"name"`
+		}{
+			{Slug: "platform-team"},
+		},
+		User: struct {
+			Login string `json:"login"`
+		}{Login: "bob"},
+		Head: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "feature-y", SHA: "deadbeef1234"},
+		Base: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "main"},
+	}
+
+	pr := convertPatPR(raw, "org", "repo")
+
+	if pr.Number != 10 {
+		t.Errorf("number = %d, want 10", pr.Number)
+	}
+	if pr.State != "open" {
+		t.Errorf("state = %q, want open", pr.State)
+	}
+	if pr.AuthorLogin != "bob" {
+		t.Errorf("author = %q, want bob", pr.AuthorLogin)
+	}
+	if pr.HeadBranch != "feature-y" {
+		t.Errorf("head = %q, want feature-y", pr.HeadBranch)
+	}
+	if pr.HeadSHA != "deadbeef1234" {
+		t.Errorf("head_sha = %q, want deadbeef1234", pr.HeadSHA)
+	}
+	if pr.Mergeable {
+		t.Error("expected mergeable = false when nil")
+	}
+	if !pr.IsDraftObserved {
+		t.Error("expected IsDraftObserved = true when draft is present in the response")
+	}
+	if len(pr.RequestedReviewers) != 2 {
+		t.Fatalf("requested reviewers = %d, want 2", len(pr.RequestedReviewers))
+	}
+	if pr.RequestedReviewers[0] != (RequestedReviewer{Login: "alice-reviewer", Type: reviewerTypeUser}) {
+		t.Errorf("unexpected first requested reviewer: %#v", pr.RequestedReviewers[0])
+	}
+	if pr.RequestedReviewers[1] != (RequestedReviewer{Login: "platform-team", Type: reviewerTypeTeam}) {
+		t.Errorf("unexpected second requested reviewer: %#v", pr.RequestedReviewers[1])
+	}
+	if pr.MergedAt != nil {
+		t.Error("expected nil MergedAt")
+	}
+}
+
+func TestExecuteGraphQLPreservesHTTPProviderRetryDeadline(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		configure func(http.Header, time.Time)
+		minWait   time.Duration
+	}{
+		{
+			name:    "429 retry-after",
+			status:  http.StatusTooManyRequests,
+			body:    `{"message":"rate limit exceeded"}`,
+			minWait: 119 * time.Second,
+			configure: func(headers http.Header, _ time.Time) {
+				headers.Set("Retry-After", "120")
+			},
+		},
+		{
+			name:    "403 reset",
+			status:  http.StatusForbidden,
+			body:    `{"message":"API rate limit exceeded"}`,
+			minWait: 119 * time.Second,
+			configure: func(headers http.Header, now time.Time) {
+				headers.Set("X-RateLimit-Limit", "5000")
+				headers.Set("X-RateLimit-Remaining", "0")
+				headers.Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(120*time.Second).Unix(), 10))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				tt.configure(w.Header(), now)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(srv.Close)
+			client := newPATClientPointingAt(t, srv.URL)
+			var out map[string]any
+			err := client.ExecuteGraphQL(context.Background(), "query Test { rateLimit { resetAt } }", nil, &out)
+			if err == nil {
+				t.Fatal("ExecuteGraphQL succeeded, want provider error")
+			}
+			var apiErr *GitHubAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %T %v, want GitHubAPIError", err, err)
+			}
+			if apiErr.RetryAt == nil || apiErr.RetryAt.Before(now.Add(tt.minWait)) {
+				t.Fatalf("retry deadline = %v, want at least %v", apiErr.RetryAt, now.Add(tt.minWait))
+			}
+		})
+	}
+}
+
+// TestConvertPatPR_MissingDraftAndChangedFilesLeavesUnobserved covers
+// AC-12a on the REST decode path: a response that omits draft and
+// changed_files must decode to unobserved (Observed=false), not a
+// fabricated false/0 masquerading as a real observation.
+func TestConvertPatPR_MissingDraftAndChangedFilesLeavesUnobserved(t *testing.T) {
+	raw := &patPR{Number: 11, State: "open"}
+	pr := convertPatPR(raw, "org", "repo")
+	if pr.IsDraftObserved {
+		t.Error("IsDraftObserved = true, want false when draft is absent from the response")
+	}
+	if pr.ChangedFilesObserved {
+		t.Error("ChangedFilesObserved = true, want false when changed_files is absent from the response")
+	}
+}
+
+// TestConvertPatPR_ExplicitFalseAndZeroAreObserved covers AC-12a's other
+// half: a response that genuinely reports draft=false and changed_files=0
+// must be distinguishable from one that omits them — both mark
+// Observed=true.
+func TestConvertPatPR_ExplicitFalseAndZeroAreObserved(t *testing.T) {
+	raw := &patPR{Number: 11, State: "open", Draft: boolPtr(false), ChangedFiles: intPtr(0)}
+	pr := convertPatPR(raw, "org", "repo")
+	if !pr.IsDraftObserved {
+		t.Error("IsDraftObserved = false, want true for an explicit draft=false")
+	}
+	if pr.Draft {
+		t.Error("Draft = true, want false")
+	}
+	if !pr.ChangedFilesObserved {
+		t.Error("ChangedFilesObserved = false, want true for an explicit changed_files=0")
+	}
+	if pr.ChangedFiles != 0 {
+		t.Errorf("ChangedFiles = %d, want 0", pr.ChangedFiles)
+	}
+}
+
+func TestConvertPatPR_Merged(t *testing.T) {
+	mergedAt := "2025-03-05T10:00:00Z"
+	raw := &patPR{
+		Number:   5,
+		State:    "closed",
+		MergedAt: &mergedAt,
+		User: struct {
+			Login string `json:"login"`
+		}{Login: "alice"},
+		Head: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "fix"},
+		Base: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "main"},
+	}
+
+	pr := convertPatPR(raw, "org", "repo")
+
+	if pr.State != prStateMerged {
+		t.Errorf("state = %q, want merged", pr.State)
+	}
+	if pr.MergedAt == nil {
+		t.Fatal("expected non-nil MergedAt")
+	}
+}
+
+func TestPATClientSearchPreservesImmutableIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/search/issues" {
+			t.Errorf("path = %q, want /search/issues", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"total_count":1,"items":[{"id":101,"node_id":"PR_kwDOA","number":7,"title":"Fix auth","html_url":"https://github.com/acme/web/pull/7","state":"open","repository_url":"https://api.github.com/repos/acme/web","pull_request":{}}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newPATClientPointingAt(t, srv.URL)
+	page, err := client.SearchPRsPaged(context.Background(), "", "auth", 1, 5)
+	if err != nil {
+		t.Fatalf("search PRs: %v", err)
+	}
+	if len(page.PRs) != 1 || page.PRs[0].ID != 101 || page.PRs[0].NodeID != "PR_kwDOA" {
+		t.Fatalf("PRs = %#v", page.PRs)
+	}
+}
+
+func TestPATClient_RequestReviewers_UsesGitHubReviewRequestEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/repos/acme/widget/pulls/42/requested_reviewers" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var body struct {
+			Reviewers []string `json:"reviewers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if got := strings.Join(body.Reviewers, ","); got != "octocat,hubot" {
+			t.Errorf("reviewers = %q", got)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(srv.Close)
+
+	if err := newPATClientPointingAt(t, srv.URL).RequestReviewers(context.Background(), "acme", "widget", 42, []string{"octocat", "hubot"}); err != nil {
+		t.Fatalf("RequestReviewers: %v", err)
+	}
+}
+
+func TestPATClient_ListCheckRunsPaginatesCheckRuns(t *testing.T) {
+	var requestedPages []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/acme/widget/commits/sha/status" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"statuses":[]}`))
+			return
+		}
+		if r.URL.Path != "/repos/acme/widget/commits/sha/check-runs" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		requestedPages = append(requestedPages, r.URL.Query().Get("page"))
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Errorf("per_page = %q, want 100", r.URL.Query().Get("per_page"))
+		}
+		if r.URL.Query().Get("page") == "2" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"check_runs":[{"id":52,"name":"late failure","status":"completed","conclusion":"failure","html_url":"https://checks/fail","app":{"id":18,"slug":"github-actions"},"check_suite":{"id":109}}]}`))
+			return
+		}
+		w.Header().Set("Link", `<https://api.github.com/repos/acme/widget/commits/sha/check-runs?per_page=100&page=2>; rel="next"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"check_runs":[{"name":"new success","status":"completed","conclusion":"success","html_url":"https://checks/ok"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	checks, err := c.ListCheckRuns(context.Background(), "acme", "widget", "sha")
+	if err != nil {
+		t.Fatalf("ListCheckRuns: %v", err)
+	}
+	if len(requestedPages) != 2 {
+		t.Fatalf("requested pages = %v, want first page and page 2", requestedPages)
+	}
+	if got := computeOverallCheckStatus(checks); got != "failure" {
+		t.Fatalf("overall check status = %q, want failure; checks=%#v", got, checks)
+	}
+	var late *CheckRun
+	for i := range checks {
+		if checks[i].Name == "late failure" {
+			late = &checks[i]
+		}
+	}
+	if late == nil || late.ID != 52 || late.AppID != 18 || late.AppSlug != "github-actions" || late.CheckSuiteID != 109 {
+		t.Fatalf("page-two provider identity = %+v, checks=%#v", late, checks)
+	}
+}
+
+func TestPATClient_ListWorkflowRunsPaginatesAndListsAttemptJobs(t *testing.T) {
+	c, requests := newLinkPaginatedPATServer(t, "/repos/acme/widget/actions/runs", []string{
+		`{"workflow_runs":[{"id":7,"check_suite_id":88,"run_attempt":1,"workflow_id":9,"name":"Run tests","event":"pull_request","status":"completed","conclusion":"action_required","head_sha":"sha","head_branch":"feature","head_repository":{"full_name":"contributor/widget-fork","name":"widget-fork","owner":{"login":"contributor"}},"html_url":"https://github.com/acme/widget/actions/runs/7","created_at":"2026-09-01T10:00:00Z","updated_at":"2026-09-01T10:00:00Z","pull_requests":[]}]}`,
+		`{"workflow_runs":[{"id":8,"run_attempt":1,"workflow_id":10,"name":"Lint","event":"pull_request","status":"completed","conclusion":"success","head_sha":"sha","head_branch":"feature","html_url":"https://github.com/acme/widget/actions/runs/8","created_at":"2026-09-01T10:00:00Z","updated_at":"2026-09-01T11:00:00Z","pull_requests":[]}]}`,
+	})
+
+	runs, err := c.ListWorkflowRuns(context.Background(), "acme", "widget", "sha")
+	if err != nil {
+		t.Fatalf("ListWorkflowRuns: %v", err)
+	}
+	if len(runs) != 2 || runs[0].HeadRepoOwner != "contributor" || runs[0].HeadRepoName != "widget-fork" || runs[0].CheckSuiteID != 88 {
+		t.Fatalf("runs = %#v", runs)
+	}
+	if len(*requests) != 2 {
+		t.Fatalf("workflow run requests = %d, want 2", len(*requests))
+	}
+	if got := parseQueryValues(t, (*requests)[0].Query).Get("head_sha"); got != "sha" {
+		t.Fatalf("head_sha = %q, want sha", got)
+	}
+	if got := parseQueryValues(t, (*requests)[0].Query).Get("per_page"); got != "100" {
+		t.Fatalf("per_page = %q, want 100", got)
+	}
+
+	jobClient, jobRequests := newRecordingPATServer(t, map[string]string{
+		"/repos/acme/widget/actions/runs/7/attempts/1/jobs": `{"jobs":[{"id":70,"name":"approval gate","status":"completed","conclusion":null}]}`,
+	})
+	jobs, err := jobClient.ListWorkflowRunJobs(context.Background(), "acme", "widget", 7, 1)
+	if err != nil {
+		t.Fatalf("ListWorkflowRunJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Name != "approval gate" || jobs[0].Conclusion != "" {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	if len(*jobRequests) != 1 || parseQueryValues(t, (*jobRequests)[0].Query).Get("per_page") != "100" {
+		t.Fatalf("job requests = %#v", *jobRequests)
+	}
+}
+
+func TestPATClient_PRCommitDetailUsesExactSHAAndMergesPages(t *testing.T) {
+	var requested []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.RequestURI())
+		if r.URL.Path != "/repos/acme/widget/commits/2222222222222222222222222222222222222222" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Errorf("per_page = %q, want 100", r.URL.Query().Get("per_page"))
+		}
+		if r.URL.Query().Get("page") == "2" {
+			_, _ = w.Write([]byte(`{"sha":"2222222222222222222222222222222222222222","commit":{"message":"ignored","author":{"name":"Other","date":"2026-08-05T11:00:00Z"}},"stats":{"additions":99,"deletions":99},"files":[{"filename":"two.txt","status":"removed","additions":0,"deletions":2,"patch":"@@ -1 +0,0 @@\n-gone"}]}`))
+			return
+		}
+		w.Header().Set("Link", `<`+githubAPIBase+`/repos/acme/widget/commits/2222222222222222222222222222222222222222?per_page=100&page=2>; rel="next"`)
+		_, _ = w.Write([]byte(`{"sha":"2222222222222222222222222222222222222222","commit":{"message":"remote detail","author":{"name":"Octo Cat","date":"2026-08-04T11:00:00Z"}},"author":{"login":"octocat"},"stats":{"additions":7,"deletions":3},"files":[{"filename":"one.txt","status":"modified","additions":4,"deletions":1,"patch":"@@ -1 +1 @@\n-old\n+new"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	detail, err := newPATClientPointingAt(t, srv.URL).GetPRCommitDetail(
+		context.Background(), "acme", "widget", "2222222222222222222222222222222222222222",
+	)
+	if err != nil {
+		t.Fatalf("GetPRCommitDetail: %v", err)
+	}
+	if detail.AuthorLogin != "octocat" || detail.AuthorName != "Octo Cat" || detail.FilesChanged != 2 {
+		t.Fatalf("detail = %#v", detail)
+	}
+	if detail.Additions != 7 || detail.Deletions != 3 || len(detail.Files) != 2 {
+		t.Fatalf("detail stats/files = %#v", detail)
+	}
+	if len(requested) != 2 {
+		t.Fatalf("requests = %#v, want two pages", requested)
+	}
+}
+
+func TestConvertPatPR_Mergeable(t *testing.T) {
+	mergeable := true
+	raw := &patPR{
+		Number:    1,
+		State:     "open",
+		Mergeable: &mergeable,
+		User: struct {
+			Login string `json:"login"`
+		}{Login: "alice"},
+		Head: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "b"},
+		Base: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "main"},
+	}
+
+	pr := convertPatPR(raw, "o", "r")
+	if !pr.Mergeable {
+		t.Error("expected mergeable = true")
+	}
+}
+
+func TestConvertPatPR_MergeableState(t *testing.T) {
+	raw := &patPR{
+		Number:         2,
+		State:          "open",
+		MergeableState: "CLEAN", // GitHub REST uses lowercase but be defensive
+		User: struct {
+			Login string `json:"login"`
+		}{Login: "alice"},
+		Head: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "b"},
+		Base: struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		}{Ref: "main"},
+	}
+
+	pr := convertPatPR(raw, "o", "r")
+	if pr.MergeableState != "clean" {
+		t.Errorf("expected normalized mergeable_state=clean, got %q", pr.MergeableState)
+	}
+}
+
+func TestPATClient_ListCheckRuns_PaginatesCheckRuns(t *testing.T) {
+	var checkRunQueries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/widget/commits/sha/check-runs":
+			checkRunQueries = append(checkRunQueries, r.URL.RawQuery)
+			switch r.URL.Query().Get("page") {
+			case "", "1":
+				w.Header().Set("Link", `<`+githubAPIBase+`/repos/acme/widget/commits/sha/check-runs?per_page=100&page=2>; rel="next"`)
+				_, _ = w.Write([]byte(`{"check_runs":[{"name":"unit","status":"completed","conclusion":"success","html_url":"https://ci/unit"}]}`))
+			case "2":
+				_, _ = w.Write([]byte(`{"check_runs":[{"name":"lint","status":"completed","conclusion":"failure","html_url":"https://ci/lint"}]}`))
+			default:
+				t.Errorf("unexpected check-runs page %q", r.URL.Query().Get("page"))
+				http.Error(w, "unexpected page", http.StatusInternalServerError)
+			}
+		case "/repos/acme/widget/commits/sha/status":
+			_, _ = w.Write([]byte(`{"statuses":[]}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	checks, err := c.ListCheckRuns(context.Background(), "acme", "widget", "sha")
+	if err != nil {
+		t.Fatalf("ListCheckRuns: %v", err)
+	}
+	if len(checks) != 2 {
+		t.Fatalf("checks = %d, want 2: %+v", len(checks), checks)
+	}
+	if checks[1].Name != "lint" || checks[1].Conclusion != "failure" {
+		t.Fatalf("expected failed lint check from page 2, got %+v", checks[1])
+	}
+	if len(checkRunQueries) != 2 {
+		t.Fatalf("check-runs requests = %d, want 2 (%v)", len(checkRunQueries), checkRunQueries)
+	}
+	if !strings.Contains(checkRunQueries[0], "per_page=100") {
+		t.Fatalf("first check-runs request should request per_page=100, got %q", checkRunQueries[0])
+	}
+}
+
+func TestPATClient_FindPRByBranch_UsesGraphQLHeadRefName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			t.Errorf("unexpected path %q, want /graphql", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if !strings.Contains(body.Query, `pullRequests(first: 2, states: OPEN, headRefName: "feature")`) {
+			t.Errorf("query should look up branch by headRefName, got: %s", body.Query)
+		}
+		if strings.Contains(body.Query, `head=acme:feature`) || strings.Contains(body.Query, `ref(qualifiedName:`) {
+			t.Errorf("query should not require a base-repo branch ref, got: %s", body.Query)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"b0": {
+					"pullRequests": {
+						"nodes": [{
+							"number": 12,
+							"state": "OPEN", "title": "fork PR", "url": "https://x/12",
+							"isDraft": false, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+							"headRefName": "feature", "baseRefName": "main", "headRefOid": "abc123",
+							"author": {"login":"alice"},
+							"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+							"reviews": {"nodes": []}, "reviewRequests": {"totalCount": 0},
+							"commits": {"nodes": []}
+						}]
+					}
+				}
+			}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	pr, err := c.FindPRByBranch(context.Background(), "acme", "widget", "feature")
+	if err != nil {
+		t.Fatalf("FindPRByBranch: %v", err)
+	}
+	if pr == nil || pr.Number != 12 || pr.HeadBranch != "feature" {
+		t.Fatalf("unexpected PR: %#v", pr)
+	}
+}
+
+func TestPATClient_FindPRByHead_UsesExactSourceRepository(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/kdlbs/kandev/pulls" {
+			t.Errorf("path = %q, want /repos/kdlbs/kandev/pulls", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("head"); got != "alice:feature" {
+			t.Errorf("head = %q, want alice:feature", got)
+		}
+		if got := r.URL.Query().Get("per_page"); got != "100" {
+			t.Errorf("per_page = %q, want 100", got)
+		}
+		_, _ = w.Write([]byte(`[{"number":12,"title":"fork PR","html_url":"https://x/12","state":"open",
+			"head":{"ref":"feature","sha":"abc123","repo":{"id":200,"name":"kandev","full_name":"alice/kandev","owner":{"login":"alice"}}},
+			"base":{"ref":"main","repo":{"id":100,"name":"kandev","full_name":"kdlbs/kandev","owner":{"login":"kdlbs"}}},
+			"user":{"login":"alice"}}]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	pr, err := newPATClientPointingAt(t, srv.URL).FindPRByHead(
+		context.Background(), "kdlbs", "kandev", "alice", "kandev", "feature",
+	)
+	if err != nil {
+		t.Fatalf("FindPRByHead: %v", err)
+	}
+	if pr == nil || pr.Number != 12 || pr.HeadRepoOwner != "alice" || pr.HeadRepoName != "kandev" {
+		t.Fatalf("PR = %#v, want source alice/kandev", pr)
+	}
+}
+
+func TestConvertPatRequestedReviewers(t *testing.T) {
+	raw := &patPR{
+		RequestedReviewers: []struct {
+			Login string `json:"login"`
+		}{
+			{Login: "alice"},
+			{},
+		},
+		RequestedTeams: []struct {
+			Slug string `json:"slug"`
+			Name string `json:"name"`
+		}{
+			{Slug: "my-team"},
+			{Name: "fallback-team"},
+			{},
+		},
+	}
+
+	got := convertPatRequestedReviewers(raw)
+	if len(got) != 3 {
+		t.Fatalf("requested reviewers = %d, want 3", len(got))
+	}
+	if got[0] != (RequestedReviewer{Login: "alice", Type: reviewerTypeUser}) {
+		t.Errorf("unexpected first reviewer: %#v", got[0])
+	}
+	if got[1] != (RequestedReviewer{Login: "my-team", Type: reviewerTypeTeam}) {
+		t.Errorf("unexpected second reviewer: %#v", got[1])
+	}
+	if got[2] != (RequestedReviewer{Login: "fallback-team", Type: reviewerTypeTeam}) {
+		t.Errorf("unexpected third reviewer: %#v", got[2])
+	}
+}
+
+func TestPATClient_RecordsRateHeadersOnSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4998")
+		w.Header().Set("X-RateLimit-Reset", "2000000000")
+		w.Header().Set("X-RateLimit-Resource", "core")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	tracker := NewRateTracker(nil, nil)
+	c.WithRateTracker(tracker)
+
+	var out struct {
+		Login string `json:"login"`
+	}
+	if err := c.get(context.Background(), "/user", &out); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	snap, ok := tracker.Snapshot(ResourceCore)
+	if !ok {
+		t.Fatalf("expected core snapshot")
+	}
+	if snap.Remaining != 4998 || snap.Limit != 5000 {
+		t.Fatalf("snap = %+v", snap)
+	}
+}
+
+// Regression: when a 429 carries valid X-RateLimit-Reset headers, the reset
+// time from the headers must win — not the synthetic +1h fallback in
+// markRateExhausted. Previously, recordRateHeaders called Record(snap)
+// followed by markRateExhausted(time.Time{}), and the second call clobbered
+// the real reset with a 1-hour pause that could over-throttle the poller.
+func TestPATClient_RateLimit429_PreservesRealReset(t *testing.T) {
+	realReset := time.Now().Add(7 * time.Minute).UTC().Truncate(time.Second)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(realReset.Unix(), 10))
+		w.Header().Set("X-RateLimit-Resource", "core")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	tracker := NewRateTracker(nil, nil)
+	c.WithRateTracker(tracker)
+
+	var out struct{}
+	if err := c.get(context.Background(), "/repos/o/r/pulls/1", &out); err == nil {
+		t.Fatalf("expected error from 429")
+	}
+	snap, ok := tracker.Snapshot(ResourceCore)
+	if !ok {
+		t.Fatalf("expected core snapshot")
+	}
+	if !snap.ResetAt.Equal(realReset) {
+		t.Errorf("expected reset_at preserved from headers (%s), got %s (off by %s)",
+			realReset, snap.ResetAt, snap.ResetAt.Sub(realReset))
+	}
+	if !tracker.IsExhausted(ResourceCore) {
+		t.Errorf("expected core to be exhausted")
+	}
+}
+
+// When a 429 has no rate-limit headers, the synthetic 1h fallback still
+// applies so the poller pauses instead of hammering the secondary limit.
+func TestPATClient_RateLimit429_NoHeaders_UsesSyntheticReset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"abuse detection"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	tracker := NewRateTracker(nil, nil)
+	c.WithRateTracker(tracker)
+
+	var out struct{}
+	if err := c.get(context.Background(), "/repos/o/r/pulls/1", &out); err == nil {
+		t.Fatalf("expected error from 429")
+	}
+	if !tracker.IsExhausted(ResourceCore) {
+		t.Fatalf("expected core exhausted via synthetic fallback")
+	}
+}
+
+func TestPATClient_MarksExhaustedFromRateLimitBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No headers — secondary limits sometimes omit them entirely.
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"API rate limit exceeded for user."}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	tracker := NewRateTracker(nil, nil)
+	c.WithRateTracker(tracker)
+
+	var out struct{}
+	if err := c.get(context.Background(), "/repos/o/r/pulls/1", &out); err == nil {
+		t.Fatalf("expected error from 403")
+	}
+	if !tracker.IsExhausted(ResourceCore) {
+		t.Fatalf("expected core exhausted from body parse")
+	}
+}
+
+func TestPATClient_FetchBranchProtection(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		body         string
+		wantHasRule  bool
+		wantRequired int
+		wantErr      bool
+	}{
+		{
+			name:         "200 with required reviews",
+			status:       http.StatusOK,
+			body:         `{"required_pull_request_reviews":{"required_approving_review_count":2}}`,
+			wantHasRule:  true,
+			wantRequired: 2,
+		},
+		{
+			name:        "200 with rule but no required reviews block",
+			status:      http.StatusOK,
+			body:        `{"required_pull_request_reviews":null}`,
+			wantHasRule: true,
+		},
+		{
+			name:        "404 maps to no rule",
+			status:      http.StatusNotFound,
+			body:        `{"message":"Branch not protected"}`,
+			wantHasRule: false,
+		},
+		{
+			name:        "403 (no admin scope) maps to no rule",
+			status:      http.StatusForbidden,
+			body:        `{"message":"Resource not accessible by integration"}`,
+			wantHasRule: false,
+		},
+		{
+			name:    "500 propagates as error",
+			status:  http.StatusInternalServerError,
+			body:    `{"message":"server error"}`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wantPath := "/repos/o/r/branches/main/protection"
+				if r.URL.Path != wantPath {
+					t.Fatalf("path = %q, want %q", r.URL.Path, wantPath)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			c := newPATClientPointingAt(t, srv.URL)
+			bp, err := c.FetchBranchProtection(context.Background(), "o", "r", "main")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("want error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if bp.HasRule != tc.wantHasRule {
+				t.Fatalf("HasRule = %v, want %v", bp.HasRule, tc.wantHasRule)
+			}
+			if bp.RequiredApprovingReviewCount != tc.wantRequired {
+				t.Fatalf("RequiredApprovingReviewCount = %d, want %d",
+					bp.RequiredApprovingReviewCount, tc.wantRequired)
+			}
+		})
+	}
+}
+
+func TestListUserRepos_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/search/repositories":
+			q := r.URL.Query().Get("q")
+			if !strings.Contains(q, "user:octocat") {
+				t.Errorf("q = %q, want to contain user:octocat", q)
+			}
+			if !strings.Contains(q, "demo") {
+				t.Errorf("q = %q, want to contain demo", q)
+			}
+			if got := r.URL.Query().Get("per_page"); got != "50" {
+				t.Errorf("per_page = %q, want 50", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[
+				{"full_name":"octocat/demo","owner":{"login":"octocat"},"name":"demo","private":false,"default_branch":"main","description":"Public demo"},
+				{"full_name":"octocat/demo-private","owner":{"login":"octocat"},"name":"demo-private","private":true,"default_branch":"trunk","description":null}
+			]}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListUserRepos(context.Background(), "demo", 50)
+	if err != nil {
+		t.Fatalf("ListUserRepos: %v", err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("repos = %d, want 2", len(repos))
+	}
+	if repos[0].FullName != "octocat/demo" || repos[0].Owner != "octocat" || repos[0].Name != "demo" || repos[0].Private {
+		t.Errorf("unexpected first repo: %#v", repos[0])
+	}
+	if repos[0].DefaultBranch != "main" {
+		t.Errorf("first repo default_branch = %q, want main", repos[0].DefaultBranch)
+	}
+	if repos[0].Description != "Public demo" {
+		t.Errorf("first repo description = %q, want Public demo", repos[0].Description)
+	}
+	if !repos[1].Private {
+		t.Errorf("expected second repo private")
+	}
+	if repos[1].DefaultBranch != "trunk" {
+		t.Errorf("second repo default_branch = %q, want trunk", repos[1].DefaultBranch)
+	}
+	// JSON `null` description must decode to an empty string (omitempty drops it on serialize).
+	if repos[1].Description != "" {
+		t.Errorf("second repo description = %q, want empty string", repos[1].Description)
+	}
+}
+
+func TestListUserRepos_EmptyQuery(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"login":"alice"}`))
+		case "/search/repositories":
+			gotQuery = r.URL.Query().Get("q")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListUserRepos(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("ListUserRepos: %v", err)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("repos = %d, want 0", len(repos))
+	}
+	if gotQuery != "user:alice" {
+		t.Errorf("q = %q, want exactly %q", gotQuery, "user:alice")
+	}
+}
+
+func TestListUserRepos_LimitClamping(t *testing.T) {
+	cases := []struct {
+		name        string
+		inLimit     int
+		wantPerPage string
+	}{
+		{"zero defaults to 20", 0, "20"},
+		{"negative defaults to 20", -5, "20"},
+		{"in range passes through", 42, "42"},
+		{"exceeds cap clamps to 100", 500, "100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPerPage string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/user":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"login":"alice"}`))
+				case "/search/repositories":
+					gotPerPage = r.URL.Query().Get("per_page")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"items":[]}`))
+				default:
+					t.Fatalf("unexpected path %q", r.URL.Path)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			c := newPATClientPointingAt(t, srv.URL)
+			if _, err := c.ListUserRepos(context.Background(), "", tc.inLimit); err != nil {
+				t.Fatalf("ListUserRepos: %v", err)
+			}
+			if gotPerPage != tc.wantPerPage {
+				t.Errorf("per_page = %q, want %q", gotPerPage, tc.wantPerPage)
+			}
+		})
+	}
+}
+
+func TestListUserRepos_APIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"login":"alice"}`))
+		case "/search/repositories":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"boom"}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListUserRepos(context.Background(), "", 0)
+	if err == nil {
+		t.Fatal("expected error from 500, got nil")
+	}
+	if repos != nil {
+		t.Errorf("expected nil repos on error, got %v", repos)
+	}
+}
+
+func TestListUserRepos_AuthError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"bad creds"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListUserRepos(context.Background(), "", 0)
+	if err == nil {
+		t.Fatal("expected error when /user returns 401")
+	}
+	if repos != nil {
+		t.Errorf("expected nil repos on auth error, got %v", repos)
+	}
+}
+
+func TestClampRepoSearchLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero", 0, 20},
+		{"negative", -1, 20},
+		{"small", 10, 10},
+		{"exact cap", 100, 100},
+		{"over cap", 1000, 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampRepoSearchLimit(tc.in); got != tc.want {
+				t.Errorf("clampRepoSearchLimit(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// newPATClientPointingAt builds a PATClient whose underlying HTTP client
+// reroutes any github API URL to the given test server.
+func newPATClientPointingAt(t *testing.T, baseURL string) *PATClient {
+	t.Helper()
+	c := NewPATClient("test-token")
+	c.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: baseURL},
+		Timeout:   2 * time.Second,
+	}
+	return c
+}
+
+type rewriteTransport struct{ base string }
+
+func (rt *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rewritten := strings.Replace(req.URL.String(), githubAPIBase, rt.base, 1)
+	req2, err := http.NewRequestWithContext(req.Context(), req.Method, rewritten, req.Body)
+	if err != nil {
+		return nil, err
+	}
+	req2.Header = req.Header.Clone()
+	return http.DefaultTransport.RoundTrip(req2)
+}
+
+func TestListAccessibleRepos_Success(t *testing.T) {
+	var gotAffiliation, gotSort, gotPerPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/repos" {
+			// t.Fatalf must not run in a handler goroutine (it's a data race);
+			// use Errorf+return and let the main goroutine fail the assertion.
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		gotAffiliation = r.URL.Query().Get("affiliation")
+		gotSort = r.URL.Query().Get("sort")
+		gotPerPage = r.URL.Query().Get("per_page")
+		w.WriteHeader(http.StatusOK)
+		// Flat array (NOT a search wrapper with .items).
+		_, _ = w.Write([]byte(`[
+			{"full_name":"kdlbs/kandev","owner":{"login":"kdlbs"},"name":"kandev","private":false,"default_branch":"main","description":"the app","pushed_at":"2025-05-01T10:00:00Z"},
+			{"full_name":"alice/secret","owner":{"login":"alice"},"name":"secret","private":true,"default_branch":"trunk","description":null}
+		]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListAccessibleRepos(context.Background(), "", 50)
+	if err != nil {
+		t.Fatalf("ListAccessibleRepos: %v", err)
+	}
+	if gotAffiliation != "owner,collaborator,organization_member" {
+		t.Errorf("affiliation = %q, want owner,collaborator,organization_member", gotAffiliation)
+	}
+	if gotSort != "pushed" {
+		t.Errorf("sort = %q, want pushed", gotSort)
+	}
+	if gotPerPage != "50" {
+		t.Errorf("per_page = %q, want 50", gotPerPage)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("repos = %d, want 2", len(repos))
+	}
+	if repos[0].FullName != "kdlbs/kandev" || repos[0].Owner != "kdlbs" || repos[0].DefaultBranch != "main" {
+		t.Errorf("unexpected first repo: %#v", repos[0])
+	}
+	if repos[0].Description != "the app" {
+		t.Errorf("first repo description = %q, want 'the app'", repos[0].Description)
+	}
+	if repos[0].PushedAt == nil {
+		t.Errorf("first repo PushedAt nil, want non-nil")
+	}
+	if !repos[1].Private || repos[1].DefaultBranch != "trunk" {
+		t.Errorf("unexpected second repo: %#v", repos[1])
+	}
+	// JSON null description must decode to empty string.
+	if repos[1].Description != "" {
+		t.Errorf("second repo description = %q, want empty", repos[1].Description)
+	}
+}
+
+func TestListAccessibleRepos_QueryFilterAndClamp(t *testing.T) {
+	var gotPerPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/repos" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		gotPerPage = r.URL.Query().Get("per_page")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[
+			{"full_name":"acme/widget","owner":{"login":"acme"},"name":"widget"},
+			{"full_name":"acme/gadget","owner":{"login":"acme"},"name":"gadget"},
+			{"full_name":"u/other","owner":{"login":"u"},"name":"other"}
+		]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	// limit above cap must clamp per_page to 100; query filters client-side.
+	repos, err := c.ListAccessibleRepos(context.Background(), "WIDGET", 5000)
+	if err != nil {
+		t.Fatalf("ListAccessibleRepos: %v", err)
+	}
+	if gotPerPage != "100" {
+		t.Errorf("per_page = %q, want 100 (clamped)", gotPerPage)
+	}
+	if len(repos) != 1 || repos[0].FullName != "acme/widget" {
+		t.Fatalf("got %v, want [acme/widget] (case-insensitive substring on full_name)", repos)
+	}
+}
+
+func TestListAccessibleRepos_InstallationUsesInstallationEndpoint(t *testing.T) {
+	var gotPerPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/installation/repositories" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		gotPerPage = r.URL.Query().Get("per_page")
+		_, _ = w.Write([]byte(`{"repositories":[
+			{"full_name":"acme/widget","owner":{"login":"acme"},"name":"widget","private":true,"default_branch":"main"}
+		]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewTokenClient("installation-token", TokenPrincipal{Kind: TokenCredentialInstallation})
+	c.httpClient = &http.Client{Transport: &rewriteTransport{base: srv.URL}}
+	repos, err := c.ListAccessibleRepos(context.Background(), "widget", 50)
+	if err != nil {
+		t.Fatalf("ListAccessibleRepos: %v", err)
+	}
+	if gotPerPage != "50" || len(repos) != 1 || repos[0].FullName != "acme/widget" {
+		t.Fatalf("per_page=%q repos=%+v", gotPerPage, repos)
+	}
+}
+
+func TestListAccessibleRepos_AuthError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/repos" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"bad creds"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newPATClientPointingAt(t, srv.URL)
+	repos, err := c.ListAccessibleRepos(context.Background(), "", 0)
+	if err == nil {
+		t.Fatal("expected error on 401")
+	}
+	if repos != nil {
+		t.Errorf("expected nil repos on error, got %v", repos)
+	}
+	var apiErr *GitHubAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("err = %v, want *GitHubAPIError with 401", err)
+	}
+}

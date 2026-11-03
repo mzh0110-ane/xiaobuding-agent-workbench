@@ -1,0 +1,169 @@
+"use client";
+
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { IconSelector } from "@tabler/icons-react";
+import { cn } from "@/lib/utils";
+import { Button } from "@kandev/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@kandev/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@kandev/ui/command";
+import type { ModelEntry } from "@/lib/types/http";
+import { settingsControlClassName } from "@/components/settings/settings-control";
+
+type ModelComboboxProps = {
+  value: string;
+  onChange: (value: string) => void;
+  models: ModelComboboxModel[];
+  currentModelId?: string;
+  placeholder?: string;
+  disabled?: boolean;
+};
+
+// ModelComboboxModel adds the optional unavailable ("gone") marker used by
+// profile editors to keep a configured-but-unadvertised model visible while
+// preventing its selection.
+type ModelComboboxModel = ModelEntry & { disabled?: boolean };
+
+function copilotUsage(model: ModelEntry): string | undefined {
+  const raw = model.meta?.copilotUsage;
+  return typeof raw === "string" ? raw : undefined;
+}
+
+/** Selected-model summary shown on the closed trigger, or the placeholder. */
+function TriggerLabel({
+  selectedModel,
+  currentModelId,
+  placeholderLabel,
+}: {
+  selectedModel: ModelEntry | undefined;
+  currentModelId: string | undefined;
+  placeholderLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (!selectedModel) {
+    return <span className="text-muted-foreground">{placeholderLabel}</span>;
+  }
+  const usage = copilotUsage(selectedModel);
+  return (
+    <span className="flex items-center gap-2 truncate">
+      {selectedModel.name}
+      {selectedModel.id === currentModelId && (
+        <span className="text-muted-foreground">{t("agents:defaultSuffix")}</span>
+      )}
+      {usage && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-medium">
+          {usage}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Searchable model picker. The user can only choose from the agent's
+ * advertised model list — custom model IDs are not allowed for ACP agents
+ * since the agent CLI is authoritative for what it will accept.
+ */
+export function ModelCombobox({
+  value,
+  onChange,
+  models,
+  currentModelId,
+  placeholder,
+  disabled,
+}: ModelComboboxProps) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  // A parameter default is evaluated before the component body, so `t` is not
+  // in scope there — resolve the fallback here instead.
+  const placeholderLabel = placeholder ?? t("agents:selectAModelShort");
+  const effectiveValue = value || currentModelId || "";
+  const selectedModel = models.find((m) => m.id === effectiveValue);
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          disabled={disabled}
+          className={settingsControlClassName("w-full justify-between font-normal cursor-pointer")}
+          data-testid="profile-model-combobox-trigger"
+        >
+          <TriggerLabel
+            selectedModel={selectedModel}
+            currentModelId={currentModelId}
+            placeholderLabel={placeholderLabel}
+          />
+          <IconSelector className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-[--radix-popover-trigger-width] p-0"
+        align="start"
+        onWheel={(e) => e.stopPropagation()}
+      >
+        <Command>
+          <CommandInput placeholder={t("agents:searchModels")} />
+          <CommandList
+            className="max-h-[min(60vh,24rem)] overflow-y-auto overscroll-contain"
+            onWheel={(e) => e.stopPropagation()}
+          >
+            <CommandEmpty>{t("agents:noModelFound")}</CommandEmpty>
+            <CommandGroup>
+              {models.map((model) => {
+                const usage = copilotUsage(model);
+                return (
+                  <CommandItem
+                    key={model.id}
+                    value={`${model.id} ${model.name}`}
+                    onSelect={() => {
+                      if (model.disabled) return;
+                      onChange(model.id);
+                      setOpen(false);
+                    }}
+                    disabled={model.disabled}
+                    data-checked={effectiveValue === model.id}
+                    className={cn(
+                      "cursor-pointer",
+                      model.disabled && "opacity-40 cursor-not-allowed",
+                    )}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 truncate">
+                        <span className="truncate">{model.name}</span>
+                        {model.id === currentModelId && (
+                          <span className="text-muted-foreground text-xs">
+                            {t("agents:defaultSuffix")}
+                          </span>
+                        )}
+                      </div>
+                      {model.description && model.description !== model.name && (
+                        <p className="text-xs text-muted-foreground truncate">
+                          {model.description}
+                        </p>
+                      )}
+                    </div>
+                    {usage && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-medium ml-2">
+                        {usage}
+                      </span>
+                    )}
+                  </CommandItem>
+                );
+              })}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}

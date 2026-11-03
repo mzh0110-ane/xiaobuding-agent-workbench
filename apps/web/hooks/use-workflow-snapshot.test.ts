@@ -1,0 +1,306 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+
+const mockHydrate = vi.fn();
+const mockFetchWorkflowSnapshot = vi.fn();
+const mockSetState = vi.fn();
+
+type MockKanban = {
+  workflowId: string | null;
+  tasks: unknown[];
+  steps: unknown[];
+  isLoading?: boolean;
+};
+type MockState = {
+  connection: { status: string };
+  kanban: MockKanban;
+  workspaces: { activeId: string | null };
+  workspaceContextGeneration: number;
+  hydrate: typeof mockHydrate;
+};
+
+let mockState: MockState = {
+  connection: { status: "connected" },
+  kanban: { workflowId: null, tasks: [], steps: [], isLoading: false },
+  workspaces: { activeId: "ws-A" },
+  workspaceContextGeneration: 0,
+  hydrate: mockHydrate,
+};
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: (selector: (s: MockState) => unknown) => selector(mockState),
+  useAppStoreApi: () => ({
+    getState: () => mockState,
+    setState: (updater: (s: MockState) => MockState) => {
+      const next = updater(mockState);
+      mockSetState(next);
+      mockState = next;
+    },
+  }),
+}));
+
+vi.mock("@/lib/api", () => ({
+  fetchWorkflowSnapshot: (...args: unknown[]) => mockFetchWorkflowSnapshot(...args),
+}));
+
+vi.mock("@/lib/ssr/mapper", () => ({
+  snapshotToState: (snapshot: {
+    tasks?: Array<{
+      id: string;
+      auto_start_failed?: boolean;
+      workspace_orphaned?: boolean;
+      parked_on_background_work?: boolean;
+      parked_revision?: number;
+      parked_epoch?: number;
+    }>;
+  }) => ({
+    kanban: {
+      workflowId: "wf-1",
+      steps: [],
+      tasks: (snapshot.tasks ?? []).map((task) => ({
+        id: task.id,
+        autoStartFailed: task.auto_start_failed,
+        workspaceOrphaned: task.workspace_orphaned,
+        parkedOnBackgroundWork: task.parked_on_background_work,
+        parkedRevision: task.parked_revision,
+        parkedEpoch: task.parked_epoch,
+      })),
+    },
+  }),
+}));
+
+import { useWorkflowSnapshot } from "./use-workflow-snapshot";
+
+function resetState(kanban: Partial<MockKanban> = {}) {
+  vi.clearAllMocks();
+  mockState = {
+    connection: { status: "connected" },
+    kanban: {
+      workflowId: null,
+      tasks: [],
+      steps: [],
+      isLoading: false,
+      ...kanban,
+    },
+    workspaces: { activeId: "ws-A" },
+    workspaceContextGeneration: 0,
+    hydrate: mockHydrate,
+  };
+}
+
+describe("useWorkflowSnapshot — kanban.isLoading", () => {
+  beforeEach(() => resetState());
+
+  it("flips isLoading true while a fetch for an un-hydrated workflow is in flight", () => {
+    mockFetchWorkflowSnapshot.mockReturnValue(new Promise(() => {}));
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    expect(mockState.kanban.isLoading).toBe(true);
+  });
+
+  it("flips isLoading back to false after the fetch resolves", async () => {
+    mockFetchWorkflowSnapshot.mockResolvedValue({ steps: [], tasks: [] });
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockHydrate).toHaveBeenCalled());
+    await waitFor(() => expect(mockState.kanban.isLoading).toBe(false));
+  });
+
+  it("flips isLoading back to false after the fetch rejects", async () => {
+    mockFetchWorkflowSnapshot.mockRejectedValue(new Error("nope"));
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockState.kanban.isLoading).toBe(false));
+    expect(mockHydrate).not.toHaveBeenCalled();
+  });
+
+  it("does not flip isLoading true if the requested workflow is already hydrated", () => {
+    resetState({ workflowId: "wf-1", isLoading: false });
+    mockFetchWorkflowSnapshot.mockReturnValue(new Promise(() => {}));
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    expect(mockState.kanban.isLoading).toBe(false);
+  });
+
+  it("does not fetch on initial mount if the requested workflow snapshot is boot-hydrated", () => {
+    resetState({ workflowId: "wf-1", steps: [{ id: "step-1" }], tasks: [], isLoading: false });
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    expect(mockFetchWorkflowSnapshot).not.toHaveBeenCalled();
+    expect(mockState.kanban.isLoading).toBe(false);
+  });
+
+  it("does not clear isLoading on settle when it didn't raise the flag (already-hydrated re-fetch)", async () => {
+    // Mimic a workspace switch having set isLoading=true after the snapshot
+    // hydrated for this workflowId. A silent re-fetch (e.g. WS reconnect)
+    // must not collapse that skeleton.
+    resetState({ workflowId: "wf-1", isLoading: true });
+    mockFetchWorkflowSnapshot.mockResolvedValue({ steps: [], tasks: [] });
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockHydrate).toHaveBeenCalled());
+    expect(mockState.kanban.isLoading).toBe(true);
+  });
+
+  it("does nothing when workflowId is null", () => {
+    renderHook(() => useWorkflowSnapshot(null));
+    expect(mockFetchWorkflowSnapshot).not.toHaveBeenCalled();
+    expect(mockState.kanban.isLoading).toBe(false);
+  });
+
+  it("does not clear isLoading when an old fetch settles after workflowId changes", async () => {
+    // First fetch never settles synchronously — we resolve it manually
+    // *after* re-rendering with a new workflowId, simulating the race where
+    // the user switches workflows mid-fetch.
+    let resolveFirst!: (snapshot: { steps: unknown[]; tasks: unknown[] }) => void;
+    const firstFetch = new Promise<{ steps: unknown[]; tasks: unknown[] }>((r) => {
+      resolveFirst = r;
+    });
+    const secondFetch = new Promise<{ steps: unknown[]; tasks: unknown[] }>(() => {});
+    mockFetchWorkflowSnapshot.mockReturnValueOnce(firstFetch).mockReturnValueOnce(secondFetch);
+
+    const { rerender } = renderHook(({ id }: { id: string | null }) => useWorkflowSnapshot(id), {
+      initialProps: { id: "wf-1" as string | null },
+    });
+    expect(mockState.kanban.isLoading).toBe(true);
+
+    // User switches to wf-2 before wf-1 finishes loading
+    rerender({ id: "wf-2" });
+    expect(mockState.kanban.isLoading).toBe(true);
+
+    // Old fetch lands now; flush its .then/.finally microtask chain so we
+    // can assert the negatives without relying on waitFor (which would
+    // resolve immediately for never-true assertions).
+    resolveFirst({ steps: [], tasks: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockHydrate).not.toHaveBeenCalled();
+    expect(mockState.kanban.isLoading).toBe(true);
+  });
+
+  it("discards an A snapshot that resolves after reset activates B but before rerender", async () => {
+    let resolveA: (snapshot: { steps: unknown[]; tasks: unknown[] }) => void = () => {};
+    mockFetchWorkflowSnapshot.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveA = resolve;
+        }),
+    );
+
+    renderHook(() => useWorkflowSnapshot("wf-A"));
+    expect(mockState.kanban.isLoading).toBe(true);
+
+    mockState = {
+      ...mockState,
+      kanban: { workflowId: null, steps: [], tasks: [], isLoading: false },
+      workspaces: { activeId: "ws-B" },
+      workspaceContextGeneration: 1,
+    };
+    resolveA({ steps: [], tasks: [] });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    expect(mockHydrate).not.toHaveBeenCalled();
+    expect(mockState.kanban.isLoading).toBe(false);
+  });
+});
+
+describe("useWorkflowSnapshot marker races", () => {
+  beforeEach(() => resetState());
+
+  it("keeps a newer live auto-start marker when an older snapshot finishes later", async () => {
+    let resolveFetch: (snapshot: { steps: unknown[]; tasks: unknown[] }) => void = () => {};
+    mockFetchWorkflowSnapshot.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockFetchWorkflowSnapshot).toHaveBeenCalled());
+
+    mockState.kanban.tasks = [{ id: "task-live-marker", autoStartFailed: true }];
+    resolveFetch({
+      steps: [],
+      tasks: [{ id: "task-live-marker", auto_start_failed: false }],
+    });
+
+    await waitFor(() => expect(mockHydrate).toHaveBeenCalled());
+    expect(mockHydrate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kanban: expect.objectContaining({
+          tasks: [expect.objectContaining({ id: "task-live-marker", autoStartFailed: true })],
+        }),
+      }),
+    );
+  });
+
+  it("keeps a newer live workspace-orphaned marker when an older snapshot finishes later", async () => {
+    let resolveFetch: (snapshot: { steps: unknown[]; tasks: unknown[] }) => void = () => {};
+    mockFetchWorkflowSnapshot.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockFetchWorkflowSnapshot).toHaveBeenCalled());
+
+    mockState.kanban.tasks = [{ id: "task-live-orphan-marker", workspaceOrphaned: true }];
+    resolveFetch({
+      steps: [],
+      tasks: [{ id: "task-live-orphan-marker", workspace_orphaned: false }],
+    });
+
+    await waitFor(() => expect(mockHydrate).toHaveBeenCalled());
+    expect(mockHydrate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kanban: expect.objectContaining({
+          tasks: [
+            expect.objectContaining({ id: "task-live-orphan-marker", workspaceOrphaned: true }),
+          ],
+        }),
+      }),
+    );
+  });
+
+  it("keeps a newer live parked reading when a stale-epoch/revision snapshot finishes later", async () => {
+    // Regression guard mirroring the auto-start marker race above, for the
+    // (parked_epoch, parked_revision) discard rule (spec D1): a REST snapshot
+    // fetch can resolve after a live task.updated has already moved the
+    // parked reading forward, and must never roll it back.
+    let resolveFetch: (snapshot: { steps: unknown[]; tasks: unknown[] }) => void = () => {};
+    mockFetchWorkflowSnapshot.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+
+    renderHook(() => useWorkflowSnapshot("wf-1"));
+    await waitFor(() => expect(mockFetchWorkflowSnapshot).toHaveBeenCalled());
+
+    mockState.kanban.tasks = [
+      { id: "task-parked", parkedOnBackgroundWork: true, parkedEpoch: 2, parkedRevision: 5 },
+    ];
+    resolveFetch({
+      steps: [],
+      tasks: [
+        {
+          id: "task-parked",
+          parked_on_background_work: false,
+          parked_epoch: 1,
+          parked_revision: 1,
+        },
+      ],
+    });
+
+    await waitFor(() => expect(mockHydrate).toHaveBeenCalled());
+    expect(mockHydrate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kanban: expect.objectContaining({
+          tasks: [
+            expect.objectContaining({
+              id: "task-parked",
+              parkedOnBackgroundWork: true,
+              parkedEpoch: 2,
+              parkedRevision: 5,
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+});

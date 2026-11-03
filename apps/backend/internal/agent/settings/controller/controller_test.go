@@ -1,0 +1,687 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/discovery"
+	"github.com/kandev/kandev/internal/agent/managedruntime"
+	"github.com/kandev/kandev/internal/agent/registry"
+	"github.com/kandev/kandev/internal/agent/settings/dto"
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+// testAgent is a minimal implementation of agents.Agent for testing purposes.
+// Embeds StandardPassthrough to optionally satisfy agents.PassthroughAgent.
+type testAgent struct {
+	agents.StandardPassthrough
+	id                 string
+	name               string
+	displayName        string
+	description        string
+	enabled            bool
+	runtime            *agents.RuntimeConfig
+	permissionSettings map[string]agents.PermissionSetting
+	logoData           []byte
+	// supportsMCP feeds the DiscoveryResult returned by IsInstalled so the
+	// E2E-mock discovery bypass can verify capability propagation. Most
+	// tests don't care and the zero value matches the legacy behaviour.
+	supportsMCP    bool
+	mcpConfigPaths []string
+}
+
+func (a *testAgent) ID() string          { return a.id }
+func (a *testAgent) Name() string        { return a.name }
+func (a *testAgent) DisplayName() string { return a.displayName }
+func (a *testAgent) Description() string { return a.description }
+func (a *testAgent) Enabled() bool       { return a.enabled }
+func (a *testAgent) DisplayOrder() int   { return 0 }
+
+func (a *testAgent) Logo(v agents.LogoVariant) []byte { return a.logoData }
+
+func (a *testAgent) IsInstalled(ctx context.Context) (*agents.DiscoveryResult, error) {
+	return &agents.DiscoveryResult{
+		Available:      false,
+		SupportsMCP:    a.supportsMCP,
+		MCPConfigPaths: a.mcpConfigPaths,
+	}, nil
+}
+
+// BuildCommand builds a command using runtime config and permission flags.
+// Model/mode are applied through ACP session configuration at session start, not via CLI.
+func (a *testAgent) BuildCommand(opts agents.CommandOptions) agents.Command {
+	rt := a.Runtime()
+	if rt == nil {
+		return agents.Command{}
+	}
+	cmd := make([]string, len(rt.Cmd.Args()))
+	copy(cmd, rt.Cmd.Args())
+	cmd = applyTestPermissionFlags(cmd, a.permissionSettings, opts.PermissionValues)
+	return agents.NewCommand(cmd...)
+}
+
+func applyTestPermissionFlags(cmd []string, permSettings map[string]agents.PermissionSetting, values map[string]bool) []string {
+	if permSettings == nil || values == nil {
+		return cmd
+	}
+	for name, setting := range permSettings {
+		if !setting.Supported || setting.ApplyMethod != "cli_flag" || setting.CLIFlag == "" {
+			continue
+		}
+		v, ok := values[name]
+		if !ok || !v {
+			continue
+		}
+		if setting.CLIFlagValue != "" {
+			cmd = append(cmd, setting.CLIFlag, setting.CLIFlagValue)
+		} else {
+			parts := strings.Fields(setting.CLIFlag)
+			cmd = append(cmd, parts...)
+		}
+	}
+	return cmd
+}
+
+func (a *testAgent) PermissionSettings() map[string]agents.PermissionSetting {
+	return a.permissionSettings
+}
+
+func (a *testAgent) Runtime() *agents.RuntimeConfig {
+	return a.runtime
+}
+func (a *testAgent) BillingType() usage.BillingType { return usage.BillingTypeAPIKey }
+func (a *testAgent) RemoteAuth() *agents.RemoteAuth { return nil }
+func (a *testAgent) InstallScript() string          { return "" }
+
+func newTestController(agentList map[string]agents.Agent) *Controller {
+	log, _ := logger.NewLogger(logger.LoggingConfig{
+		Level:  "error",
+		Format: "json",
+	})
+	reg := registry.NewRegistry(log)
+	for _, ag := range agentList {
+		_ = reg.Register(ag)
+	}
+	return &Controller{
+		agentRegistry: reg,
+		logger:        log,
+	}
+}
+
+func TestController_PreviewAgentCommand_StandardCommand(t *testing.T) {
+	agentList := map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:      "test-agent",
+			name:    "test-agent",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{
+				Cmd:       agents.NewCommand("test-cli", "--verbose"),
+				ModelFlag: agents.NewParam("--model", "{model}"),
+			},
+			permissionSettings: map[string]agents.PermissionSetting{
+				"auto_approve": {
+					Supported:   true,
+					ApplyMethod: "cli_flag",
+					CLIFlag:     "--yes",
+				},
+			},
+		},
+	}
+
+	controller := newTestController(agentList)
+
+	req := CommandPreviewRequest{
+		Model:              "gpt-4",
+		PermissionSettings: map[string]bool{"auto_approve": true},
+		CLIPassthrough:     false,
+	}
+
+	result, err := controller.PreviewAgentCommand(context.Background(), "test-agent", req)
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+
+	if !result.Supported {
+		t.Error("PreviewAgentCommand() Supported = false, want true")
+	}
+
+	// --model is no longer emitted: model is applied through ACP session configuration.
+	expectedParts := []string{"test-cli", "--verbose", "--yes"}
+	for _, part := range expectedParts {
+		found := false
+		for _, cmdPart := range result.Command {
+			if cmdPart == part {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("PreviewAgentCommand() command missing %q, got %v", part, result.Command)
+		}
+	}
+	for _, cmdPart := range result.Command {
+		if cmdPart == "--model" {
+			t.Errorf("PreviewAgentCommand() should not emit --model, got %v", result.Command)
+		}
+	}
+}
+
+func TestController_PreviewAgentCommandUsesActiveManagedRuntimeVersion(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	agent := agents.NewOpenCodeACP()
+	controller := newTestController(map[string]agents.Agent{agent.ID(): agent})
+	selectionStore := newRecoverySelectionStore()
+	selectionStore.values[agent.ID()+"\x00opencode-ai"] = managedruntime.Selection{
+		Package: "opencode-ai",
+		Version: "1.18.5",
+	}
+	controller.SetManagedRuntimeSelectionStore(selectionStore)
+
+	result, err := controller.PreviewAgentCommand(context.Background(), agent.ID(), CommandPreviewRequest{})
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+	if !slices.Contains(result.Command, "opencode-ai@1.18.5") {
+		t.Fatalf("preview command = %v, want exact active version", result.Command)
+	}
+}
+
+func TestController_PreviewAgentCommand_RejectsInvalidCommandPrefix(t *testing.T) {
+	controller := newTestController(map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:      "test-agent",
+			name:    "test-agent",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{Cmd: agents.NewCommand("test-cli")},
+		},
+	})
+
+	for _, prefix := range []string{`greywall "unterminated`, `'' --arg`, `--not-a-launcher`} {
+		_, err := controller.PreviewAgentCommand(context.Background(), "test-agent", CommandPreviewRequest{
+			CommandPrefix: prefix,
+		})
+		if !errors.Is(err, ErrInvalidCommandPrefix) {
+			t.Errorf("prefix %q: expected ErrInvalidCommandPrefix, got %v", prefix, err)
+		}
+	}
+}
+
+func TestController_PreviewAgentCommand_PassthroughCommand(t *testing.T) {
+	agentList := map[string]agents.Agent{
+		"claude-code": &testAgent{
+			id:      "claude-code",
+			name:    "claude-code",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{
+				Cmd:       agents.NewCommand("claude"),
+				ModelFlag: agents.NewParam("--model", "{model}"),
+			},
+			StandardPassthrough: agents.StandardPassthrough{
+				Cfg: agents.PassthroughConfig{
+					Supported:      true,
+					PassthroughCmd: agents.NewCommand("npx", "-y", "@anthropic-ai/claude-code"),
+					ModelFlag:      agents.NewParam("--model", "{model}"),
+					PromptFlag:     agents.NewParam("--prompt", "{prompt}"),
+				},
+				PermSettings: map[string]agents.PermissionSetting{
+					"dangerously_skip_permissions": {
+						Supported:   true,
+						ApplyMethod: "cli_flag",
+						CLIFlag:     "--dangerously-skip-permissions",
+					},
+				},
+			},
+			permissionSettings: map[string]agents.PermissionSetting{
+				"dangerously_skip_permissions": {
+					Supported:   true,
+					ApplyMethod: "cli_flag",
+					CLIFlag:     "--dangerously-skip-permissions",
+				},
+			},
+		},
+	}
+
+	controller := newTestController(agentList)
+
+	req := CommandPreviewRequest{
+		Model:              "claude-sonnet-4-20250514",
+		PermissionSettings: map[string]bool{"dangerously_skip_permissions": true},
+		CLIPassthrough:     true,
+	}
+
+	result, err := controller.PreviewAgentCommand(context.Background(), "claude-code", req)
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+
+	// Verify it uses passthrough command
+	if len(result.Command) < 3 || result.Command[0] != "npx" {
+		t.Errorf("PreviewAgentCommand() should use passthrough command, got %v", result.Command)
+	}
+
+	// Verify model flag is present
+	hasModel := false
+	for i, part := range result.Command {
+		if part == "--model" && i+1 < len(result.Command) && result.Command[i+1] == "claude-sonnet-4-20250514" {
+			hasModel = true
+			break
+		}
+	}
+	if !hasModel {
+		t.Errorf("PreviewAgentCommand() missing model flag, got %v", result.Command)
+	}
+
+	// Verify permission flag is present
+	hasPermFlag := false
+	for _, part := range result.Command {
+		if part == "--dangerously-skip-permissions" {
+			hasPermFlag = true
+			break
+		}
+	}
+	if !hasPermFlag {
+		t.Errorf("PreviewAgentCommand() missing permission flag, got %v", result.Command)
+	}
+
+	// Verify prompt placeholder is NOT present in preview (prompt is injected at runtime, not in preview)
+	for _, part := range result.Command {
+		if part == "--prompt" || part == "{prompt}" {
+			t.Errorf("PreviewAgentCommand() should not include prompt placeholder in passthrough preview, got %v", result.Command)
+			break
+		}
+	}
+}
+
+func TestController_PreviewAgentCommand_AgentNotFound(t *testing.T) {
+	controller := newTestController(map[string]agents.Agent{})
+
+	_, err := controller.PreviewAgentCommand(context.Background(), "nonexistent", CommandPreviewRequest{})
+	if err == nil {
+		t.Error("PreviewAgentCommand() should return error for unknown agent")
+	}
+}
+
+func TestController_PreviewAgentCommand_PassthroughDisabled(t *testing.T) {
+	agentList := map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:      "test-agent",
+			name:    "test-agent",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{
+				Cmd: agents.NewCommand("test-cli"),
+			},
+			StandardPassthrough: agents.StandardPassthrough{
+				Cfg: agents.PassthroughConfig{
+					Supported:      true,
+					PassthroughCmd: agents.NewCommand("passthrough-cli"),
+				},
+			},
+		},
+	}
+
+	controller := newTestController(agentList)
+
+	// CLIPassthrough is false, so should use standard command
+	req := CommandPreviewRequest{
+		CLIPassthrough: false,
+	}
+
+	result, err := controller.PreviewAgentCommand(context.Background(), "test-agent", req)
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+
+	if result.Command[0] != "test-cli" {
+		t.Errorf("PreviewAgentCommand() should use standard command when passthrough disabled, got %v", result.Command)
+	}
+}
+
+// TestController_PreviewAgentCommand_PassthroughDoesNotDuplicateCLIFlag keeps
+// legacy permission CLI flags from being emitted twice when the same token is
+// also present in the profile CLI-flags list. Preview and launch use the shared
+// passthrough builder, so both paths must emit one token.
+func TestController_PreviewAgentCommand_PassthroughDoesNotDuplicateCLIFlag(t *testing.T) {
+	permSettings := map[string]agents.PermissionSetting{
+		"allow_indexing": {
+			Supported:   true,
+			ApplyMethod: "cli_flag",
+			CLIFlag:     "--allow-indexing",
+		},
+	}
+	agentList := map[string]agents.Agent{
+		"auggie": &testAgent{
+			id:      "auggie",
+			name:    "auggie",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{
+				Cmd: agents.NewCommand("auggie"),
+			},
+			StandardPassthrough: agents.StandardPassthrough{
+				Cfg: agents.PassthroughConfig{
+					Supported:      true,
+					PassthroughCmd: agents.NewCommand("npx", "-y", "@augmentcode/auggie"),
+				},
+				PermSettings: permSettings,
+			},
+			permissionSettings: permSettings,
+		},
+	}
+
+	controller := newTestController(agentList)
+
+	// Simulate the post-backfill state: allow_indexing toggle ON and the legacy
+	// backfill has seeded --allow-indexing into CLIFlags. Both sources would
+	// previously emit the flag.
+	req := CommandPreviewRequest{
+		PermissionSettings: map[string]bool{"allow_indexing": true},
+		CLIPassthrough:     true,
+		CLIFlags: []dto.CLIFlagDTO{
+			{Flag: "--allow-indexing", Enabled: true},
+		},
+	}
+
+	result, err := controller.PreviewAgentCommand(context.Background(), "auggie", req)
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+
+	count := 0
+	for _, part := range result.Command {
+		if part == "--allow-indexing" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("PreviewAgentCommand() emitted --allow-indexing %d times, want 1; got %v", count, result.Command)
+	}
+}
+
+// TestController_PreviewAgentCommand_ACPAppendsCLIFlagsOnce locks in that the
+// non-passthrough (ACP) branch still appends user-configured CLI flags exactly
+// once. Auggie's real BuildCommand intentionally does not emit --allow-indexing;
+// the flag must come through CLIFlagTokens.
+func TestController_PreviewAgentCommand_ACPAppendsCLIFlagsOnce(t *testing.T) {
+	agentList := map[string]agents.Agent{
+		"auggie": &testAgent{
+			id:      "auggie",
+			name:    "auggie",
+			enabled: true,
+			runtime: &agents.RuntimeConfig{
+				Cmd: agents.NewCommand("auggie", "--acp"),
+			},
+			// No permissionSettings: mirrors Auggie's real BuildCommand which
+			// does not emit --allow-indexing — it flows through CLIFlags only.
+		},
+	}
+
+	controller := newTestController(agentList)
+
+	req := CommandPreviewRequest{
+		CLIPassthrough: false,
+		CLIFlags: []dto.CLIFlagDTO{
+			{Flag: "--allow-indexing", Enabled: true},
+		},
+	}
+
+	result, err := controller.PreviewAgentCommand(context.Background(), "auggie", req)
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+
+	count := 0
+	for _, part := range result.Command {
+		if part == "--allow-indexing" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("PreviewAgentCommand() emitted --allow-indexing %d times, want 1; got %v", count, result.Command)
+	}
+}
+
+func TestBuildCommandString(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      []string
+		expected string
+	}{
+		{
+			name:     "simple command",
+			cmd:      []string{"echo", "hello"},
+			expected: "echo hello",
+		},
+		{
+			name:     "command with spaces",
+			cmd:      []string{"echo", "hello world"},
+			expected: `echo "hello world"`,
+		},
+		{
+			name:     "command with quotes",
+			cmd:      []string{"echo", `say "hi"`},
+			expected: `echo "say \"hi\""`,
+		},
+		{
+			name:     "command with special chars",
+			cmd:      []string{"bash", "-c", "echo $HOME"},
+			expected: `bash -c "echo $HOME"`,
+		},
+		{
+			name:     "empty command",
+			cmd:      []string{},
+			expected: "",
+		},
+		{
+			name:     "empty argument",
+			cmd:      []string{"node", "-e", ""},
+			expected: `node -e ""`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := buildCommandString(tt.cmd)
+			if result != tt.expected {
+				t.Errorf("buildCommandString(%v) = %q, want %q", tt.cmd, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCommandPreviewResponse_DTO(t *testing.T) {
+	resp := dto.CommandPreviewResponse{
+		Supported:     true,
+		Command:       []string{"npx", "claude-code", "--model", "gpt-4"},
+		CommandString: `npx claude-code --model gpt-4`,
+	}
+
+	if !resp.Supported {
+		t.Error("CommandPreviewResponse.Supported should be true")
+	}
+	if len(resp.Command) != 4 {
+		t.Errorf("CommandPreviewResponse.Command length = %d, want 4", len(resp.Command))
+	}
+	if resp.CommandString == "" {
+		t.Error("CommandPreviewResponse.CommandString should not be empty")
+	}
+}
+
+func TestController_GetAgentLogo_Success(t *testing.T) {
+	logoBytes := []byte("<svg>test</svg>")
+	agentList := map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:       "test-agent",
+			name:     "test-agent",
+			enabled:  true,
+			logoData: logoBytes,
+		},
+	}
+	ctrl := newTestController(agentList)
+
+	data, err := ctrl.GetAgentLogo(context.Background(), "test-agent", agents.LogoLight)
+	if err != nil {
+		t.Fatalf("GetAgentLogo() error = %v", err)
+	}
+	if string(data) != string(logoBytes) {
+		t.Errorf("GetAgentLogo() = %q, want %q", data, logoBytes)
+	}
+}
+
+func TestController_GetAgentLogo_AgentNotFound(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{})
+
+	_, err := ctrl.GetAgentLogo(context.Background(), "nonexistent", agents.LogoLight)
+	if err != ErrAgentNotFound {
+		t.Errorf("GetAgentLogo() error = %v, want ErrAgentNotFound", err)
+	}
+}
+
+func TestController_GetAgentLogo_NoLogoData(t *testing.T) {
+	agentList := map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:      "test-agent",
+			name:    "test-agent",
+			enabled: true,
+			// logoData is nil
+		},
+	}
+	ctrl := newTestController(agentList)
+
+	_, err := ctrl.GetAgentLogo(context.Background(), "test-agent", agents.LogoLight)
+	if err != ErrLogoNotAvailable {
+		t.Errorf("GetAgentLogo() error = %v, want ErrLogoNotAvailable", err)
+	}
+}
+
+// TestSyncAgentFromDiscovery_UnknownAgentSkipped verifies that
+// syncAgentFromDiscovery returns nil (not an error) when the discovered agent
+// is not in the registry. This is the expected behaviour when
+// KANDEV_MOCK_AGENT=only suppresses all real agents: the filesystem scanner may
+// still detect installed CLIs, but they should be silently skipped rather than
+// aborting the entire profile-sync loop.
+func TestSyncAgentFromDiscovery_UnknownAgentSkipped(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{}) // empty registry
+
+	result := discovery.Availability{
+		Name:      "some-unregistered-agent",
+		Available: true,
+	}
+	if err := ctrl.syncAgentFromDiscovery(context.Background(), result); err != nil {
+		t.Errorf("expected nil error for unknown agent, got: %v", err)
+	}
+}
+
+// TestDetectAgents_E2EMockBypassesFilesystem verifies that when
+// KANDEV_E2E_MOCK=true, detectAgents returns results synthesised from the
+// registry without calling c.discovery.Detect (which would panic here
+// because c.discovery is nil). Every enabled inference agent must appear as
+// Available, while virtual families remain outside host discovery.
+func TestDetectAgents_E2EMockBypassesFilesystem(t *testing.T) {
+	t.Setenv("KANDEV_E2E_MOCK", "true")
+
+	ctrl := newTestController(map[string]agents.Agent{
+		"mock-agent":          &testAgent{id: "mock-agent", name: "mock-agent", enabled: true},
+		"other-mock":          &testAgent{id: "other-mock", name: "other-mock", enabled: true},
+		agents.DynamicAgentID: agents.NewDynamicAgent(),
+	})
+
+	// c.discovery is nil — if detectAgents called it the test would panic.
+	results, err := ctrl.detectAgents(context.Background())
+	if err != nil {
+		t.Fatalf("detectAgents() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 inference results, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Name == agents.DynamicAgentID {
+			t.Fatal("virtual Dynamic family must not appear in host discovery")
+		}
+		if !r.Available {
+			t.Errorf("agent %q: Available = false, want true in E2E mock mode", r.Name)
+		}
+	}
+}
+
+// TestDetectAgents_E2EMockPropagatesSupportsMCP pins the regression
+// that broke plan mode in every E2E test: synthAvailabilityFromRegistry
+// was synthesising Availability records without calling IsInstalled, so
+// SupportsMCP defaulted to false. The frontend's useSessionMcp then
+// treated every agent as MCP-incapable, the plan-mode toggle took the
+// layout-only path, and `togglePlanMode()` tests timed out waiting for
+// `Continue working on the plan...`.
+func TestDetectAgents_E2EMockPropagatesSupportsMCP(t *testing.T) {
+	t.Setenv("KANDEV_E2E_MOCK", "true")
+
+	ctrl := newTestController(map[string]agents.Agent{
+		"mock-mcp": &testAgent{
+			id:             "mock-mcp",
+			name:           "mock-mcp",
+			enabled:        true,
+			supportsMCP:    true,
+			mcpConfigPaths: []string{"/some/path/.mock-mcp.json"},
+		},
+		"mock-no-mcp": &testAgent{
+			id:          "mock-no-mcp",
+			name:        "mock-no-mcp",
+			enabled:     true,
+			supportsMCP: false,
+		},
+	})
+
+	results, err := ctrl.detectAgents(context.Background())
+	if err != nil {
+		t.Fatalf("detectAgents() error = %v", err)
+	}
+
+	byID := make(map[string]struct {
+		supportsMCP   bool
+		mcpConfigPath string
+	}, len(results))
+	for _, r := range results {
+		byID[r.Name] = struct {
+			supportsMCP   bool
+			mcpConfigPath string
+		}{r.SupportsMCP, r.MCPConfigPath}
+	}
+
+	if got := byID["mock-mcp"]; !got.supportsMCP {
+		t.Error("mock-mcp: SupportsMCP = false, want true (IsInstalled said yes)")
+	} else if got.mcpConfigPath != "/some/path/.mock-mcp.json" {
+		t.Errorf("mock-mcp: MCPConfigPath = %q, want first entry from IsInstalled", got.mcpConfigPath)
+	}
+	if got := byID["mock-no-mcp"]; got.supportsMCP {
+		t.Error("mock-no-mcp: SupportsMCP = true, want false (IsInstalled said no)")
+	}
+}
+
+// TestController_PreviewAgentCommand_CopilotKeepsManagedPackage verifies that
+// a globally installed Copilot CLI does not make the command preview bypass
+// the managed npm runtime.
+func TestController_PreviewAgentCommand_CopilotKeepsManagedPackage(t *testing.T) {
+	controller := newTestController(map[string]agents.Agent{
+		"copilot-acp": agents.NewCopilotACP(),
+	})
+
+	// A copilot binary on PATH must not change the previewed launch command.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "copilot"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write fake copilot: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	res, err := controller.PreviewAgentCommand(context.Background(), "copilot-acp", CommandPreviewRequest{})
+	if err != nil {
+		t.Fatalf("PreviewAgentCommand() error = %v", err)
+	}
+	managed := agents.NewCopilotACP()
+	want := []string{"npx", "--yes", "--prefer-offline", "--prefix", "~/.kandev/managed-npm-runtime", managed.ManagedNPMRuntime().PackageSpec(""), "--acp"}
+	if got := res.Command; !slices.Equal(got, want) {
+		t.Errorf("preview with copilot on PATH = %v, want %v", got, want)
+	}
+}

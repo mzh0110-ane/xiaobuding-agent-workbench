@@ -1,0 +1,335 @@
+import { describe, it, expect } from "vitest";
+import {
+  computeDisabledReason,
+  isNativeSubmitDisabled,
+  resolveDisabledReason,
+  REASON_NO_COMPATIBLE_AGENT,
+  REASON_SELECTED_AGENT_INCOMPATIBLE,
+  REASON_TITLE,
+  REASON_REPO,
+  REASON_BRANCH,
+  REASON_WORKSPACE,
+  REASON_WORKFLOW,
+  REASON_AGENT,
+  REASON_DESCRIPTION,
+  REASON_PROMPT,
+  REASON_LOADING_DEPENDENCIES,
+} from "./task-create-dialog-footer";
+import { t } from "@/lib/i18n";
+import type { ButtonKind, TaskCreateDialogFooterProps } from "./task-create-dialog-footer";
+
+const KIND_START: ButtonKind = "start-task";
+const KIND_UPDATE: ButtonKind = "update";
+const KIND_DEFAULT: ButtonKind = "default";
+
+function makeProps(
+  overrides: Partial<TaskCreateDialogFooterProps> = {},
+): TaskCreateDialogFooterProps {
+  return {
+    isSessionMode: false,
+    isCreateMode: true,
+    isEditMode: false,
+    isTaskStarted: false,
+    isCreatingSession: false,
+    isCreatingTask: false,
+    hasTitle: true,
+    hasDescription: true,
+    hasRepositorySelection: true,
+    hasAllBranches: true,
+    agentProfileId: "agent-1",
+    workspaceId: "ws-1",
+    effectiveWorkflowId: "wf-1",
+    executorHint: null,
+    noCompatibleAgent: false,
+    agentCompatState: "compatible",
+    selectedAgentProfileName: null,
+    executorProfileName: null,
+    onCancel: () => {},
+    onUpdateWithoutAgent: () => {},
+    onCreateWithoutAgent: () => {},
+    onCreateWithPlanMode: () => {},
+    ...overrides,
+  };
+}
+
+describe("isNativeSubmitDisabled", () => {
+  it("matches pending uploads and other externally blocked native submissions", () => {
+    expect(isNativeSubmitDisabled(makeProps({ submitBlockedReason: "upload pending" }))).toBe(true);
+  });
+
+  it("matches missing-profile rejection for the start-task path", () => {
+    expect(isNativeSubmitDisabled(makeProps({ agentProfileId: "" }))).toBe(true);
+  });
+
+  it("allows a complete native submission", () => {
+    expect(isNativeSubmitDisabled(makeProps())).toBe(false);
+  });
+
+  it("blocks edit submission until dependencies are ready", () => {
+    expect(
+      isNativeSubmitDisabled(
+        makeProps({ isCreateMode: false, isEditMode: true, editDependenciesReady: false }),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("computeDisabledReason (start-task)", () => {
+  it("returns null when nothing is missing", () => {
+    expect(computeDisabledReason(makeProps(), KIND_START)).toBeNull();
+  });
+
+  it("returns null while a submission is in flight", () => {
+    expect(
+      computeDisabledReason(makeProps({ isCreatingTask: true, hasTitle: false }), KIND_START),
+    ).toBeNull();
+  });
+
+  it("flags missing title first", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ hasTitle: false, hasRepositorySelection: false }),
+        KIND_START,
+      ),
+    ).toBe(REASON_TITLE);
+  });
+
+  it("requires the prompt instead of a title in auto-title mode", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ autoTitle: true, hasTitle: false, hasDescription: false }),
+        KIND_START,
+      ),
+    ).toBe(REASON_PROMPT);
+    expect(
+      computeDisabledReason(
+        makeProps({ autoTitle: true, hasTitle: false, hasDescription: true }),
+        KIND_START,
+      ),
+    ).toBeNull();
+  });
+
+  it("flags missing repository selection", () => {
+    expect(computeDisabledReason(makeProps({ hasRepositorySelection: false }), KIND_START)).toBe(
+      REASON_REPO,
+    );
+  });
+
+  it("flags missing branch", () => {
+    expect(computeDisabledReason(makeProps({ hasAllBranches: false }), KIND_START)).toBe(
+      REASON_BRANCH,
+    );
+  });
+
+  it("flags missing workspace in create mode", () => {
+    expect(computeDisabledReason(makeProps({ workspaceId: null }), KIND_START)).toBe(
+      REASON_WORKSPACE,
+    );
+  });
+
+  it("flags missing workflow in create mode", () => {
+    expect(computeDisabledReason(makeProps({ effectiveWorkflowId: null }), KIND_START)).toBe(
+      REASON_WORKFLOW,
+    );
+  });
+
+  it("ignores missing workspace/workflow outside create mode", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ isCreateMode: false, isEditMode: true, workspaceId: null }),
+        KIND_START,
+      ),
+    ).toBeNull();
+  });
+
+  it("flags missing agent profile for start-task button", () => {
+    expect(computeDisabledReason(makeProps({ agentProfileId: "" }), KIND_START)).toBe(REASON_AGENT);
+  });
+
+  it("flags no compatible agent for the selected executor profile", () => {
+    const reason = computeDisabledReason(
+      makeProps({
+        agentProfileId: "",
+        noCompatibleAgent: true,
+        executorProfileName: "Docker (sandbox)",
+      }),
+      KIND_START,
+    );
+    expect(reason).toBe(REASON_NO_COMPATIBLE_AGENT);
+  });
+
+  // `computeDisabledReason` is pure and returns catalog keys, so the executor
+  // profile name only reaches the copy once the component resolves it.
+  it("resolves the no-compatible-agent key with the executor profile name", () => {
+    const text = resolveDisabledReason(t, REASON_NO_COMPATIBLE_AGENT, "Docker (sandbox)");
+    expect(text).toContain("Docker (sandbox)");
+    expect(text).toContain("credentials");
+  });
+
+  it("falls back to a generic target when no executor profile is named", () => {
+    expect(resolveDisabledReason(t, REASON_NO_COMPATIBLE_AGENT, null)).toContain("this executor");
+  });
+
+  it("passes caller-supplied blocked reasons through untranslated", () => {
+    expect(resolveDisabledReason(t, "Uploads still in progress", null)).toBe(
+      "Uploads still in progress",
+    );
+  });
+});
+
+describe("computeDisabledReason (update)", () => {
+  it("only flags missing title for the update button", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ hasTitle: false, hasRepositorySelection: false, agentProfileId: "" }),
+        KIND_UPDATE,
+      ),
+    ).toBe(REASON_TITLE);
+  });
+
+  it("returns null for update when title is present, even with other gaps", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ hasRepositorySelection: false, agentProfileId: "" }),
+        KIND_UPDATE,
+      ),
+    ).toBeNull();
+  });
+
+  it("explains why edit update waits for dependencies", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({
+          isCreateMode: false,
+          isEditMode: true,
+          editDependenciesReady: false,
+        }),
+        KIND_UPDATE,
+      ),
+    ).toBe(REASON_LOADING_DEPENDENCIES);
+  });
+});
+
+describe("computeDisabledReason (default)", () => {
+  it("does not require agent outside session mode", () => {
+    expect(computeDisabledReason(makeProps({ agentProfileId: "" }), KIND_DEFAULT)).toBeNull();
+  });
+
+  it("requires agent in session mode", () => {
+    expect(
+      computeDisabledReason(makeProps({ isSessionMode: true, agentProfileId: "" }), KIND_DEFAULT),
+    ).toBe(REASON_AGENT);
+  });
+
+  it("flags missing session description in session mode", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ isSessionMode: true, hasDescription: false }),
+        KIND_DEFAULT,
+      ),
+    ).toBe(REASON_DESCRIPTION);
+  });
+
+  it("requires description in session mode even for CLI/passthrough profiles", () => {
+    // CLI-mode parity: the backend now auto-injects the prompt into the CLI's
+    // stdin, so the prompt is required just like in ACP mode.
+    expect(
+      computeDisabledReason(
+        makeProps({ isSessionMode: true, hasDescription: false }),
+        KIND_DEFAULT,
+      ),
+    ).toBe(REASON_DESCRIPTION);
+  });
+
+  it("ignores base reasons in session mode to match DefaultSubmitButton disabled logic", () => {
+    // In session mode the default button is only disabled by !agentProfileId or
+    // missing description — NOT by missing title/repo/branch/workspace/workflow.
+    // The tooltip must not contradict that state.
+    expect(
+      computeDisabledReason(
+        makeProps({
+          isSessionMode: true,
+          hasTitle: false,
+          hasRepositorySelection: false,
+          hasAllBranches: false,
+        }),
+        KIND_DEFAULT,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("computeDisabledReason (submitBlockedReason)", () => {
+  const REASON = "Preparing kandev repository…";
+
+  it("returns the supplied reason for start-task even when nothing is missing", () => {
+    expect(computeDisabledReason(makeProps({ submitBlockedReason: REASON }), KIND_START)).toBe(
+      REASON,
+    );
+  });
+
+  it("returns the supplied reason for default in create mode", () => {
+    expect(computeDisabledReason(makeProps({ submitBlockedReason: REASON }), KIND_DEFAULT)).toBe(
+      REASON,
+    );
+  });
+
+  it("returns the supplied reason for update mode (overrides title check)", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ submitBlockedReason: REASON, hasTitle: false }),
+        KIND_UPDATE,
+      ),
+    ).toBe(REASON);
+  });
+
+  it("still suppresses the reason while a submission is in flight", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({ submitBlockedReason: REASON, isCreatingTask: true }),
+        KIND_START,
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores empty/null reason and falls back to normal logic", () => {
+    expect(computeDisabledReason(makeProps({ submitBlockedReason: null }), KIND_START)).toBeNull();
+    expect(computeDisabledReason(makeProps({ submitBlockedReason: "" }), KIND_START)).toBeNull();
+  });
+});
+
+describe("computeDisabledReason — agent compatibility states", () => {
+  // @covers AC-TASKS-TASK-CREATE-AGENT-COMPATIBILITY-001.7
+  it("names the selected agent, not a missing executor, when a compatible agent exists", () => {
+    const props = makeProps({
+      noCompatibleAgent: true,
+      agentCompatState: "selected-incompatible",
+      selectedAgentProfileName: "OpenCode",
+      executorProfileName: "Fly",
+    });
+    expect(computeDisabledReason(props, KIND_START)).toBe(REASON_SELECTED_AGENT_INCOMPATIBLE);
+    expect(computeDisabledReason({ ...props, isSessionMode: true }, KIND_DEFAULT)).toBe(
+      REASON_SELECTED_AGENT_INCOMPATIBLE,
+    );
+  });
+
+  it("resolves the selected-agent key with the agent and executor names", () => {
+    const text = resolveDisabledReason(t, REASON_SELECTED_AGENT_INCOMPATIBLE, "Fly", "OpenCode");
+    expect(text).toContain("OpenCode");
+    expect(text).toContain("Fly");
+    expect(text).toContain("credentials");
+  });
+
+  it("uses an unavailable-agent reason while an unlocked selection is replaced", () => {
+    expect(
+      computeDisabledReason(
+        makeProps({
+          noCompatibleAgent: true,
+          agentCompatState: "selected-unavailable" as never,
+          selectedAgentProfileName: "Disabled agent",
+        }),
+        KIND_START,
+      ),
+    ).toBe("task:selectedAgentProfileUnavailable");
+  });
+});

@@ -1,0 +1,269 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+)
+
+// Recovery stop reasons preserve runtime-specific teardown semantics through
+// the public runtime boundary.
+const (
+	StopReasonRecoverableAgentFailure = lifecycle.StopReasonRecoverableAgentFailure
+	StopReasonAgentBootstrapFailed    = lifecycle.StopReasonAgentBootstrapFailed
+)
+
+// New returns a Runtime backed by the supplied Backend (typically a
+// *lifecycle.Manager).
+func New(backend Backend) Runtime {
+	return &facade{backend: backend}
+}
+
+// IsNotFound reports whether err identifies runtime execution state that no
+// longer exists, including the lifecycle sentinel behind the runtime facade.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, lifecycle.ErrExecutionNotFound)
+}
+
+// facade is the default Runtime implementation: a thin adapter over
+// the lifecycle Manager (or any Backend).
+type facade struct {
+	backend Backend
+}
+
+// Launch translates a LaunchSpec into a lifecycle.LaunchRequest and
+// dispatches to the backend.
+//
+// If `spec.Metadata["launch_request"]` is a `*lifecycle.LaunchRequest`,
+// it is used as the base request and LaunchSpec's typed fields are
+// applied on top — this is how richer launch parameters (worktrees,
+// multi-repo specs, attachments) reach the runtime in Phase 1 without
+// canonicalising them onto LaunchSpec yet.
+func (f *facade) Launch(ctx context.Context, spec LaunchSpec) (ExecutionRef, error) {
+	if spec.Owner.Kind == ExecutionOwnerRun {
+		if spec.OwnerAdmission == nil {
+			return ExecutionRef{}, fmt.Errorf("execution owner %q has no admission provider", spec.Owner.Kind)
+		}
+		if err := spec.OwnerAdmission.AdmitExecution(ctx, spec.Owner); err != nil {
+			return ExecutionRef{}, err
+		}
+	}
+	req := launchRequestFromSpec(spec)
+	exec, err := f.backend.Launch(ctx, req)
+	if err != nil {
+		return ExecutionRef{}, err
+	}
+	return executionRefFromAgentExecution(exec), nil
+}
+
+// Start launches and starts an execution. The lifecycle manager owns initial
+// prompt delivery because it already coordinates ACP session initialization;
+// the facade only provides the atomic launch/start envelope and rolls back a
+// registered execution when startup fails.
+func (f *facade) Start(ctx context.Context, spec LaunchSpec) (ExecutionRef, error) {
+	ref, err := f.Launch(ctx, spec)
+	if err != nil {
+		return ExecutionRef{}, err
+	}
+	if err := f.StartExecution(ctx, ref.ID); err != nil {
+		cleanupErr := f.Stop(context.WithoutCancel(ctx), ref.ID, "runtime_start_failed")
+		return ExecutionRef{}, errors.Join(err, cleanupErr)
+	}
+	return ref, nil
+}
+
+// StartExecution starts a registered execution after rechecking its durable
+// owner admission. The lifecycle manager repeats the same check immediately
+// before process creation, so a pause or reassignment cannot be crossed by a
+// late process start.
+func (f *facade) StartExecution(ctx context.Context, executionID string) error {
+	if executionID == "" {
+		return fmt.Errorf("runtime: executionID is required")
+	}
+	execution, ok := f.backend.GetExecution(executionID)
+	if !ok || execution == nil {
+		return ErrNotFound
+	}
+	if execution.Owner.Kind == ExecutionOwnerRun && execution.OwnerAdmission != nil {
+		if err := execution.OwnerAdmission.AdmitExecution(ctx, execution.Owner); err != nil {
+			return err
+		}
+	}
+	return f.backend.StartAgentProcess(ctx, executionID)
+}
+
+// Resume sends a follow-up prompt to an existing execution. Attachments
+// and dispatchOnly are not surfaced on Runtime.Resume in Phase 1; callers
+// needing them should use the lifecycle Manager directly until Phase 3
+// canonicalises richer prompt semantics.
+func (f *facade) Resume(ctx context.Context, executionID string, prompt string) error {
+	if executionID == "" {
+		return fmt.Errorf("runtime: executionID is required")
+	}
+	_, err := f.backend.PromptAgent(ctx, executionID, prompt, nil, false)
+	return err
+}
+
+// Stop terminates an execution.
+func (f *facade) Stop(ctx context.Context, executionID string, reason string) error {
+	if executionID == "" {
+		return fmt.Errorf("runtime: executionID is required")
+	}
+	err := f.backend.StopAgentWithReason(ctx, executionID, reason, false)
+	if errors.Is(err, lifecycle.ErrExecutionNotFound) {
+		return errors.Join(ErrNotFound, err)
+	}
+	return err
+}
+
+// SuspendIdle delegates to the lifecycle backend's conditional suspension
+// operation without widening the legacy backend contract used by test fakes.
+func (f *facade) SuspendIdle(ctx context.Context, identity IdleSuspensionIdentity) error {
+	if identity.ExecutionID == "" || identity.SessionID == "" {
+		return fmt.Errorf("runtime: idle suspension identity is required")
+	}
+	backend, ok := f.backend.(interface {
+		SuspendIdle(context.Context, lifecycle.IdleSuspensionIdentity) error
+	})
+	if !ok {
+		return ErrUnsupported
+	}
+	return backend.SuspendIdle(ctx, identity)
+}
+
+// GetExecution returns a snapshot view of an execution.
+func (f *facade) GetExecution(_ context.Context, executionID string) (*Execution, error) {
+	if executionID == "" {
+		return nil, fmt.Errorf("runtime: executionID is required")
+	}
+	exec, ok := f.backend.GetExecution(executionID)
+	if !ok || exec == nil {
+		return nil, ErrNotFound
+	}
+	return executionFromAgentExecution(exec), nil
+}
+
+// SubscribeEvents is best-effort in Phase 1: the lifecycle manager
+// publishes events through the process-wide event bus rather than
+// per-execution channels, so we can't synthesize a raw event stream
+// without coupling Runtime to the bus subject conventions. Callers that
+// need raw streams should use the agentctl client; Phase 2/3 may add a
+// per-execution channel in the lifecycle manager and wire it through here.
+func (f *facade) SubscribeEvents(_ context.Context, _ string) (<-chan Event, error) {
+	return nil, ErrUnsupported
+}
+
+// SetMcpMode delegates to the backend.
+func (f *facade) SetMcpMode(ctx context.Context, executionID string, mode string) error {
+	if executionID == "" {
+		return fmt.Errorf("runtime: executionID is required")
+	}
+	return f.backend.SetMcpMode(ctx, executionID, mode)
+}
+
+// ExecuteBackgroundWorkAction delegates to the backend.
+func (f *facade) ExecuteBackgroundWorkAction(ctx context.Context, executionID string, req streams.BackgroundWorkActionRequest) (streams.BackgroundWorkActionResponse, error) {
+	if executionID == "" {
+		return streams.BackgroundWorkActionResponse{
+			Success: false,
+			WorkID:  req.WorkID,
+			RunID:   req.RunID,
+			Action:  req.Action,
+			Error:   "runtime: executionID is required",
+		}, nil
+	}
+	return f.backend.ExecuteBackgroundWorkAction(ctx, executionID, req)
+}
+
+// launchRequestFromSpec builds the lifecycle.LaunchRequest the backend
+// expects. If the caller supplies a pre-built *lifecycle.LaunchRequest
+// in Metadata["launch_request"], we use it as the base and overlay the
+// typed LaunchSpec fields on top.
+func launchRequestFromSpec(spec LaunchSpec) *lifecycle.LaunchRequest {
+	req := &lifecycle.LaunchRequest{}
+	if base, ok := spec.Metadata["launch_request"].(*lifecycle.LaunchRequest); ok && base != nil {
+		copy := *base
+		req = &copy
+	}
+	if spec.AgentProfileID != "" {
+		req.AgentProfileID = spec.AgentProfileID
+	}
+	if spec.ExecutorID != "" {
+		req.ExecutorType = spec.ExecutorID
+	}
+	if spec.Workspace.Path != "" {
+		req.WorkspacePath = spec.Workspace.Path
+	}
+	if spec.Workspace.RepositoryID != "" {
+		req.RepositoryID = spec.Workspace.RepositoryID
+	}
+	if spec.Workspace.IsEphemeral {
+		req.IsEphemeral = true
+	}
+	if spec.Prompt != "" {
+		req.TaskDescription = spec.Prompt
+	}
+	if spec.PriorACPSession != "" {
+		req.ACPSessionID = spec.PriorACPSession
+	}
+	if spec.McpMode != "" {
+		req.McpMode = spec.McpMode
+	}
+	if spec.Owner.Kind != "" {
+		req.Owner = spec.Owner
+		req.OwnerAdmission = spec.OwnerAdmission
+	}
+	if len(spec.Metadata) > 0 {
+		if req.Metadata == nil {
+			req.Metadata = map[string]interface{}{}
+		}
+		for k, v := range spec.Metadata {
+			if k == "launch_request" {
+				continue
+			}
+			req.Metadata[k] = v
+		}
+	}
+	return req
+}
+
+func executionRefFromAgentExecution(exec *lifecycle.AgentExecution) ExecutionRef {
+	if exec == nil {
+		return ExecutionRef{}
+	}
+	return ExecutionRef{
+		ID:          exec.ID,
+		SessionID:   exec.SessionID,
+		AgentctlURL: exec.AgentctlURL(),
+		StartedAt:   exec.StartedAt,
+	}
+}
+
+func executionFromAgentExecution(exec *lifecycle.AgentExecution) *Execution {
+	if exec == nil {
+		return nil
+	}
+	out := &Execution{
+		ID:             exec.ID,
+		SessionID:      exec.SessionID,
+		TaskID:         exec.TaskID,
+		AgentProfileID: exec.AgentProfileID,
+		WorkspacePath:  exec.WorkspacePath,
+		AgentctlURL:    exec.AgentctlURL(),
+		Status:         exec.Status,
+		StartedAt:      exec.StartedAt,
+		FinishedAt:     exec.FinishedAt,
+		ExitCode:       exec.ExitCode,
+		ErrorMessage:   exec.ErrorMessage,
+		ACPSessionID:   exec.ACPSessionID,
+		Owner:          exec.OwnerSnapshot(),
+		Metadata:       exec.MetadataSnapshot(),
+	}
+	return out
+}
+
+// Compile-time check: facade satisfies Runtime.
+var _ Runtime = (*facade)(nil)

@@ -1,0 +1,715 @@
+/* eslint-disable max-lines -- Integration coverage shares one Dockview fixture. */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { DockviewApi, SerializedDockview } from "dockview-react";
+import { performLayoutSwitch, useDockviewStore } from "./dockview-store";
+
+vi.mock("@/lib/local-storage", () => ({
+  getEnvLayout: vi.fn(() => null),
+  getEnvLayoutProfile: vi.fn(() => null),
+  setEnvLayout: vi.fn(() => true),
+  setEnvLayoutProfile: vi.fn(),
+  getEnvMaximizeState: vi.fn(() => null),
+  setEnvMaximizeState: vi.fn(),
+  removeEnvMaximizeState: vi.fn(),
+  getGlobalSidebarWidth: vi.fn(() => null),
+  getManualRightWidth: vi.fn(() => null),
+  getSessionStorage: vi.fn((_key: string, fallback: string[]) => fallback),
+  setGlobalSidebarWidth: vi.fn(),
+  setSessionStorage: vi.fn(),
+  clearGlobalSidebarWidth: vi.fn(),
+}));
+
+vi.mock("@/lib/layout/panel-portal-manager", () => ({
+  panelPortalManager: {
+    releaseByEnv: vi.fn(),
+    reconcile: vi.fn(),
+  },
+}));
+
+vi.mock("./layout-manager", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./layout-manager")>();
+  return {
+    ...actual,
+    fromDockviewApi: vi.fn(() => ({ columns: [] })),
+  };
+});
+
+import {
+  getEnvLayout,
+  getEnvLayoutProfile,
+  getEnvMaximizeState,
+  removeEnvMaximizeState,
+  setEnvLayout,
+  setEnvLayoutProfile,
+} from "@/lib/local-storage";
+import { panelPortalManager } from "@/lib/layout/panel-portal-manager";
+import { fromDockviewApi, toSerializedDockview } from "./layout-manager";
+
+function makeMockApi(): DockviewApi {
+  return {
+    width: 800,
+    height: 600,
+    panels: [],
+    groups: [],
+    fromJSON: vi.fn(),
+    toJSON: vi.fn(() => ({})),
+    layout: vi.fn(),
+    activeGroup: null,
+    onDidActivePanelChange: vi.fn(() => ({ dispose: vi.fn() })),
+    getPanel: vi.fn(() => null),
+    addPanel: vi.fn(),
+    hasMaximizedGroup: vi.fn(() => false),
+  } as unknown as DockviewApi;
+}
+
+function flushRaf(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+const visibleRightLayout = {
+  columns: [
+    {
+      id: "center",
+      groups: [
+        {
+          id: "runtime-center",
+          panels: [{ id: "session:session-b", component: "chat", title: "Agent" }],
+        },
+      ],
+    },
+    {
+      id: "right",
+      pinned: true,
+      groups: [
+        {
+          id: "group-right-top",
+          panels: [{ id: "files", component: "files", title: "Files" }],
+        },
+      ],
+    },
+  ],
+};
+
+const hiddenRightLayout = {
+  columns: [
+    {
+      id: "center",
+      groups: [
+        {
+          id: "runtime-center",
+          panels: [
+            { id: "session:session-a", component: "chat", title: "Agent" },
+            { id: "files", component: "files", title: "Files" },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+function testNormalizesStaleSessionPanelsOnSavedMaximize(): void {
+  const savedMaximizedJson = {
+    grid: {
+      root: {
+        type: "branch",
+        size: 600,
+        data: [{ type: "leaf", size: 600, data: { id: "g-center", views: ["chat"] } }],
+      },
+      height: 600,
+      width: 800,
+      orientation: "HORIZONTAL",
+    },
+    panels: {
+      chat: { id: "chat", contentComponent: "chat" },
+    },
+    activeGroup: "g-center",
+  };
+  vi.mocked(getEnvMaximizeState).mockImplementation((envId) =>
+    envId === "env-a"
+      ? { preMaximizeLayout: { columns: [] }, maximizedDockviewJson: savedMaximizedJson }
+      : null,
+  );
+
+  type TestPanel = {
+    id: string;
+    api: { component: string; close: () => void };
+    group: { id: string; panels: TestPanel[] };
+  };
+
+  const group = { id: "g-center", panels: [] as TestPanel[] };
+  const panels: TestPanel[] = [];
+  const removePanel = (id: string) => {
+    const panelIndex = panels.findIndex((p) => p.id === id);
+    if (panelIndex >= 0) panels.splice(panelIndex, 1);
+    const groupIndex = group.panels.findIndex((p) => p.id === id);
+    if (groupIndex >= 0) group.panels.splice(groupIndex, 1);
+  };
+  const closeStale = vi.fn(() => removePanel("session:stale"));
+  const stalePanel: TestPanel = {
+    id: "session:stale",
+    api: { component: "chat", close: closeStale },
+    group,
+  };
+  panels.push(stalePanel);
+  group.panels.push(stalePanel);
+
+  const api = {
+    ...makeMockApi(),
+    panels,
+    groups: [group],
+    getPanel: vi.fn((id: string) => panels.find((p) => p.id === id) ?? null),
+    addPanel: vi.fn((opts: { id: string; component: string }) => {
+      const panel: TestPanel = {
+        id: opts.id,
+        api: { component: opts.component, close: () => removePanel(opts.id) },
+        group,
+      };
+      panels.push(panel);
+      group.panels.push(panel);
+    }),
+  } as unknown as DockviewApi;
+
+  useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+  useDockviewStore
+    .getState()
+    .switchEnvLayout("env-b", "env-a", "session-a", ["session-a", "session-sibling"]);
+
+  expect(api.addPanel).toHaveBeenCalledWith(
+    expect.objectContaining({
+      id: "session:session-a",
+      position: { referenceGroup: group.id, index: 0 },
+    }),
+  );
+  expect(api.addPanel).toHaveBeenCalledWith(
+    expect.objectContaining({
+      id: "session:session-sibling",
+      params: { sessionId: "session-sibling" },
+      position: { referenceGroup: group.id, index: 1 },
+      inactive: true,
+    }),
+  );
+  expect(closeStale).toHaveBeenCalledOnce();
+}
+
+// eslint-disable-next-line max-lines-per-function
+describe("switchEnvLayout — root fix for terminal/layout swapping", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fromDockviewApi).mockReset().mockReturnValue({ columns: [] });
+    vi.mocked(getEnvMaximizeState).mockReset().mockReturnValue(null);
+    useDockviewStore.setState({
+      api: null,
+      currentLayoutEnvId: null,
+      preMaximizeLayout: null,
+      maximizedGroupId: null,
+      isRestoringLayout: false,
+      pendingChatInitialPlacement: null,
+    });
+  });
+
+  it("no-ops when switching between sessions of the same env", () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-shared" });
+
+    useDockviewStore.getState().switchEnvLayout("env-shared", "env-shared", "session-B");
+
+    // Same env = no layout rebuild + no portal release. This is the entire
+    // point of env-keyed layouts: terminals + panels stay put.
+    expect(api.fromJSON).not.toHaveBeenCalled();
+    expect(panelPortalManager.releaseByEnv).not.toHaveBeenCalled();
+    expect(setEnvLayout).not.toHaveBeenCalled();
+    expect(useDockviewStore.getState().pendingChatInitialPlacement).toBeNull();
+  });
+
+  it("saves outgoing env + releases its portals when switching to a new env", () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-old" });
+
+    useDockviewStore.getState().switchEnvLayout("env-old", "env-new", "session-X");
+
+    expect(setEnvLayout).toHaveBeenCalledWith("env-old", expect.anything());
+    expect(setEnvLayoutProfile).toHaveBeenCalledWith("env-old", expect.anything());
+    expect(panelPortalManager.releaseByEnv).toHaveBeenCalledWith("env-old");
+    expect(useDockviewStore.getState().currentLayoutEnvId).toBe("env-new");
+  });
+
+  it("arms fresh transcript placement for the incoming session without capturing scrollTop", () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({
+      api,
+      currentLayoutEnvId: "env-old",
+      pendingChatScrollTop: null,
+    });
+
+    useDockviewStore.getState().switchEnvLayout("env-old", "env-new", "session-X");
+
+    const state = useDockviewStore.getState();
+    expect(state.pendingChatInitialPlacement).toEqual({
+      sessionId: "session-X",
+      token: expect.any(Number),
+    });
+    expect(state.pendingChatScrollTop).toBeNull();
+  });
+
+  it("refreshes right-panel visibility across env switches and both toggle directions", async () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({
+      api,
+      currentLayoutEnvId: "env-a",
+      rightPanelsVisible: false,
+    });
+
+    vi.mocked(fromDockviewApi).mockReturnValue(visibleRightLayout);
+    useDockviewStore.getState().switchEnvLayout("env-a", "env-b", "session-b");
+    await flushRaf();
+    expect(useDockviewStore.getState().rightPanelsVisible).toBe(true);
+
+    // B's visible layout follows the hide action and must update its label/state.
+    vi.mocked(fromDockviewApi).mockReturnValue(visibleRightLayout);
+    useDockviewStore.getState().toggleRightPanels();
+    await flushRaf();
+    expect(useDockviewStore.getState().rightPanelsVisible).toBe(false);
+
+    // Returning to A restores its hidden layout, rather than retaining B's
+    // outgoing visibility value.
+    vi.mocked(fromDockviewApi).mockReturnValue(hiddenRightLayout);
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+    await flushRaf();
+    expect(useDockviewStore.getState().rightPanelsVisible).toBe(false);
+
+    // A has one workbench region and no retained recovery metadata, so Show
+    // remains disabled instead of fabricating the standard sidebar.
+    vi.mocked(fromDockviewApi).mockReturnValue(hiddenRightLayout);
+    useDockviewStore.getState().toggleRightPanels();
+    await flushRaf();
+    expect(useDockviewStore.getState().rightPanelsVisible).toBe(false);
+    expect(useDockviewStore.getState().rightPaneAvailable).toBe(false);
+  });
+
+  it("ignores completion from a superseded env-switch placement", () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-a" });
+
+    useDockviewStore.getState().switchEnvLayout("env-a", "env-b", "session-B");
+    const firstRequest = useDockviewStore.getState().pendingChatInitialPlacement;
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-c", "session-C");
+    const secondRequest = useDockviewStore.getState().pendingChatInitialPlacement;
+
+    expect(firstRequest).not.toBeNull();
+    expect(secondRequest).not.toBeNull();
+    useDockviewStore.getState().completePendingChatInitialPlacement(firstRequest?.token ?? -1);
+    expect(useDockviewStore.getState().pendingChatInitialPlacement).toEqual(secondRequest);
+
+    useDockviewStore.getState().completePendingChatInitialPlacement(secondRequest?.token ?? -1);
+    expect(useDockviewStore.getState().pendingChatInitialPlacement).toBeNull();
+  });
+
+  it("restores the saved env layout profile when switching to a new env", () => {
+    const api = makeMockApi();
+    vi.mocked(getEnvLayoutProfile).mockReturnValue({ kind: "built-in", id: "vscode" });
+    useDockviewStore.setState({ api, currentLayoutEnvId: null });
+
+    useDockviewStore.getState().switchEnvLayout(null, "env-saved", "session-X");
+
+    expect(useDockviewStore.getState().activeLayoutProfile).toEqual({
+      kind: "built-in",
+      id: "vscode",
+    });
+  });
+
+  it("first adoption applies the env's layout without overwriting it or releasing portals", () => {
+    const api = makeMockApi();
+    useDockviewStore.setState({ api, currentLayoutEnvId: null });
+
+    useDockviewStore.getState().switchEnvLayout(null, "env-first", "session-Y");
+
+    // No outgoing env to save/release.
+    expect(panelPortalManager.releaseByEnv).not.toHaveBeenCalled();
+    expect(useDockviewStore.getState().currentLayoutEnvId).toBe("env-first");
+    // Regression: the old "just adopt onReady's layout" shortcut persisted the
+    // stale global-fallback layout into the new env via setEnvLayout(newEnvId,
+    // toJSON()), overwriting any real saved layout and giving fresh tasks the
+    // previous env's proportions. First adoption must apply the env's layout
+    // (defaults here, since getEnvLayout is mocked null), never persist over it.
+    expect(setEnvLayout).not.toHaveBeenCalledWith("env-first", expect.anything());
+  });
+
+  it("prioritizes an explicit route layout over saved maximize state on first adoption", () => {
+    const api = makeMockApi();
+    const buildDefaultLayout = vi.fn();
+    vi.mocked(getEnvMaximizeState).mockReturnValue({
+      preMaximizeLayout: { columns: [] },
+      maximizedDockviewJson: { grid: {}, panels: {} },
+    });
+    useDockviewStore.setState({ api, currentLayoutEnvId: null, buildDefaultLayout });
+
+    performLayoutSwitch(null, "env-first", "session-Y", [], { initialLayout: "plan" });
+
+    expect(api.fromJSON).not.toHaveBeenCalled();
+    expect(buildDefaultLayout).toHaveBeenCalledWith(api, "plan");
+  });
+
+  it("does nothing when api is unset", () => {
+    useDockviewStore.setState({ api: null });
+    useDockviewStore.getState().switchEnvLayout("env-a", "env-b", null);
+    expect(setEnvLayout).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Regression suite for the "maximize Task A → click Task B in sidebar →
+ * click Task A again → centre group is shrunk" bug. The root cause is two
+ * separate state-management slips during a maximize-then-env-switch sequence:
+ *
+ *   1. `saveOutgoingEnv` wrote `api.toJSON()` (the 2-column maximize overlay)
+ *      into the env's regular layout slot. If we ever fall back to that slot
+ *      (maximize state cleared, slow-path switch, refresh after dropping max
+ *      state, etc.) the user sees the truncated 2-column layout instead of
+ *      their real one.
+ *   2. `restoreMaximizeFromStorage` only writes `preMaximizeLayout` and
+ *      forgets `maximizedGroupId` — leaving the store in an inconsistent
+ *      half-maximized state on the way back.
+ */
+// eslint-disable-next-line max-lines-per-function
+describe("switchEnvLayout — maximize+sidebar-switch regression", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fromDockviewApi).mockReset().mockReturnValue({ columns: [] });
+    vi.mocked(getEnvMaximizeState).mockReset().mockReturnValue(null);
+    useDockviewStore.setState({
+      api: null,
+      currentLayoutEnvId: null,
+      preMaximizeLayout: null,
+      maximizedGroupId: null,
+      isRestoringLayout: false,
+    });
+  });
+
+  it("persists pre-max (not the 2-col overlay) as the env's regular layout when maximized", () => {
+    const api = makeMockApi();
+    const preMaxLayout = {
+      columns: [
+        { id: "sidebar", pinned: true, width: 200, groups: [] },
+        { id: "center", width: 400, groups: [] },
+        { id: "right", pinned: true, width: 200, groups: [] },
+      ],
+    };
+    useDockviewStore.setState({
+      api,
+      currentLayoutEnvId: "env-a",
+      preMaximizeLayout: preMaxLayout as never,
+      maximizedGroupId: "g-center",
+    });
+
+    useDockviewStore.getState().switchEnvLayout("env-a", "env-b", "session-b");
+
+    expect(setEnvLayout).toHaveBeenCalled();
+    const [savedEnvId, savedLayout] = vi.mocked(setEnvLayout).mock.calls[0];
+    expect(savedEnvId).toBe("env-a");
+    // Structural marker: the persisted layout must be the 3-column user
+    // layout, not the 2-column maximize overlay from api.toJSON().
+    const grid = (savedLayout as { grid?: { root?: { data?: unknown[] } } }).grid;
+    const rootChildren = grid?.root?.data;
+    expect(Array.isArray(rootChildren)).toBe(true);
+    expect((rootChildren as unknown[]).length).toBe(3);
+  });
+
+  it("restores maximizedGroupId when switching back to an env with saved maximize", () => {
+    const api = makeMockApi();
+    const savedMaximizedJson = {
+      grid: {
+        root: {
+          type: "branch",
+          size: 600,
+          data: [
+            { type: "leaf", size: 200, data: { id: "g-sidebar", views: ["sidebar"] } },
+            { type: "leaf", size: 600, data: { id: "g-center", views: ["chat"] } },
+          ],
+        },
+        height: 600,
+        width: 800,
+        orientation: "HORIZONTAL",
+      },
+      panels: {
+        sidebar: { id: "sidebar", contentComponent: "sidebar" },
+        chat: { id: "chat", contentComponent: "chat" },
+      },
+      activeGroup: "g-center",
+    };
+    vi.mocked(getEnvMaximizeState).mockImplementation((envId) =>
+      envId === "env-a"
+        ? {
+            preMaximizeLayout: {
+              columns: [
+                { id: "center", groups: [{ id: "group-center", panels: [] }] },
+                { id: "right", groups: [{ id: "group-right-top", panels: [] }] },
+              ],
+            },
+            maximizedDockviewJson: savedMaximizedJson,
+          }
+        : null,
+    );
+
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+
+    const state = useDockviewStore.getState();
+    expect(state.preMaximizeLayout).not.toBeNull();
+    expect(state.maximizedGroupId).toBeTruthy();
+    expect(state.rightPanelsVisible).toBe(true);
+  });
+
+  it("restores hidden right-panel visibility with a saved maximize state", () => {
+    const api = makeMockApi();
+    const savedMaximizedJson = {
+      grid: {
+        root: {
+          type: "leaf",
+          size: 600,
+          data: { id: "g-center", views: ["chat", "files"] },
+        },
+        height: 600,
+        width: 800,
+        orientation: "HORIZONTAL",
+      },
+      panels: {
+        chat: { id: "chat", contentComponent: "chat" },
+        files: { id: "files", contentComponent: "files" },
+      },
+      activeGroup: "g-center",
+    };
+    vi.mocked(getEnvMaximizeState).mockReturnValue({
+      preMaximizeLayout: {
+        columns: [
+          {
+            id: "center",
+            groups: [
+              {
+                id: "runtime-center",
+                panels: [
+                  { id: "session:session-a", component: "chat", title: "Agent" },
+                  { id: "files", component: "files", title: "Files" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      maximizedDockviewJson: savedMaximizedJson,
+    });
+
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+
+    expect(useDockviewStore.getState().preMaximizeLayout).not.toBeNull();
+    expect(useDockviewStore.getState().rightPanelsVisible).toBe(false);
+  });
+
+  it("normalizes stale session panels when restoring a saved maximize layout", () => {
+    testNormalizesStaleSessionPanelsOnSavedMaximize();
+  });
+
+  it("does not add Agent when the saved maximized group intentionally excludes it", () => {
+    vi.mocked(getEnvMaximizeState).mockReturnValueOnce({
+      preMaximizeLayout: { columns: [] },
+      maximizedDockviewJson: {
+        grid: {
+          root: {
+            type: "leaf",
+            size: 600,
+            data: { id: "group-right-bottom", views: ["terminal-default"] },
+          },
+          height: 600,
+          width: 800,
+          orientation: "HORIZONTAL",
+        },
+        panels: {
+          "terminal-default": { contentComponent: "terminal" },
+        },
+        activeGroup: "group-right-bottom",
+      },
+    });
+    const api = makeMockApi();
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+
+    expect(api.addPanel).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A stored per-environment layout or maximize blob written by an earlier
+ * version can name a panel component core no longer registers. Both routes
+ * must drop it and keep restoring everything else, rather than throwing inside
+ * `api.fromJSON` (which the existing rollbacks answer by discarding the stored
+ * state and rebuilding the default).
+ */
+// eslint-disable-next-line max-lines-per-function
+describe("switchEnvLayout — retired panel compatibility", () => {
+  const RETIRED_COMPONENT = "prompt-history";
+
+  /** A healthy serialized env layout holding the retired panel beside two
+   *  canonical panels. */
+  function envLayoutWithRetiredPanel() {
+    return {
+      grid: {
+        root: {
+          type: "branch",
+          size: 600,
+          data: [
+            {
+              type: "leaf",
+              size: 400,
+              data: { id: "g-center", views: ["chat"], activeView: "chat" },
+            },
+            {
+              type: "leaf",
+              size: 400,
+              data: {
+                id: "g-right",
+                views: ["files", RETIRED_COMPONENT],
+                activeView: "files",
+              },
+            },
+          ],
+        },
+        height: 600,
+        width: 800,
+        orientation: "HORIZONTAL",
+      },
+      panels: {
+        chat: { id: "chat", contentComponent: "chat" },
+        files: { id: "files", contentComponent: "files" },
+        [RETIRED_COMPONENT]: { id: RETIRED_COMPONENT, contentComponent: RETIRED_COMPONENT },
+      },
+      activeGroup: "g-center",
+    };
+  }
+
+  /** A maximize overlay whose maximized group (`g-max`) holds the given tabs. */
+  function maximizeOverlay(maximizedViews: string[]) {
+    return {
+      grid: {
+        root: {
+          type: "branch",
+          size: 600,
+          data: [
+            {
+              type: "leaf",
+              size: 200,
+              data: { id: "g-sidebar", views: ["files"], activeView: "files" },
+            },
+            {
+              type: "leaf",
+              size: 600,
+              data: { id: "g-max", views: maximizedViews, activeView: maximizedViews[0] },
+            },
+          ],
+        },
+        height: 600,
+        width: 800,
+        orientation: "HORIZONTAL",
+      },
+      panels: Object.fromEntries(maximizedViews.map((id) => [id, { id, contentComponent: id }])),
+      activeGroup: "g-max",
+    };
+  }
+
+  const preMaximizeLayout = {
+    columns: [
+      {
+        id: "center",
+        groups: [
+          { id: "group-center", panels: [{ id: "chat", component: "chat", title: "Agent" }] },
+        ],
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fromDockviewApi).mockReset().mockReturnValue({ columns: [] });
+    vi.mocked(getEnvLayout).mockReset().mockReturnValue(null);
+    vi.mocked(getEnvMaximizeState).mockReset().mockReturnValue(null);
+    useDockviewStore.setState({
+      api: null,
+      currentLayoutEnvId: null,
+      preMaximizeLayout: null,
+      maximizedGroupId: null,
+      isRestoringLayout: false,
+    });
+  });
+
+  it("drops the retired panel from a saved env layout without falling back to the default", () => {
+    const api = makeMockApi();
+    const realBuildDefaultLayout = useDockviewStore.getState().buildDefaultLayout;
+    const buildDefaultLayout = vi.fn();
+    vi.mocked(getEnvLayout).mockReturnValue(envLayoutWithRetiredPanel());
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b", buildDefaultLayout });
+
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+    useDockviewStore.setState({ buildDefaultLayout: realBuildDefaultLayout });
+
+    expect(buildDefaultLayout).not.toHaveBeenCalled();
+    const applied = vi.mocked(api.fromJSON).mock.calls[0][0] as {
+      panels: Record<string, unknown>;
+    };
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    expect(Object.keys(applied.panels)).toEqual(expect.arrayContaining(["chat", "files"]));
+  });
+
+  it("applies a maximize overlay without the retired panel and still tracks maximize state", () => {
+    const api = makeMockApi();
+    vi.mocked(getEnvMaximizeState).mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay(["chat", RETIRED_COMPONENT]),
+      preMaximizeLayout,
+    });
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+
+    const applied = vi.mocked(api.fromJSON).mock.calls[0][0] as {
+      panels: Record<string, unknown>;
+    };
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    expect(Object.keys(applied.panels)).toContain("chat");
+    const state = useDockviewStore.getState();
+    expect(state.preMaximizeLayout).not.toBeNull();
+    expect(state.maximizedGroupId).toBeTruthy();
+  });
+  it("applies a pre-maximize fallback and retains its record after a failed write", () => {
+    const api = makeMockApi();
+    vi.mocked(api.toJSON)
+      .mockImplementationOnce(() => envLayoutWithRetiredPanel() as unknown as SerializedDockview)
+      .mockImplementation(() =>
+        toSerializedDockview(preMaximizeLayout, api.width, api.height, new Map()),
+      );
+    vi.mocked(getEnvLayout).mockReturnValue(envLayoutWithRetiredPanel());
+    vi.mocked(getEnvMaximizeState).mockReturnValue({
+      maximizedDockviewJson: maximizeOverlay([RETIRED_COMPONENT]),
+      preMaximizeLayout,
+    });
+    vi.mocked(setEnvLayout).mockReturnValue(false);
+    useDockviewStore.setState({ api, currentLayoutEnvId: "env-b" });
+
+    useDockviewStore.getState().switchEnvLayout("env-b", "env-a", "session-a");
+
+    const state = useDockviewStore.getState();
+    expect(state.preMaximizeLayout).toBeNull();
+    expect(state.maximizedGroupId).toBeNull();
+    const applied = vi.mocked(api.fromJSON).mock.calls[0][0] as {
+      panels: Record<string, unknown>;
+    };
+    expect(Object.keys(applied.panels)).not.toContain(RETIRED_COMPONENT);
+    expect(Object.keys(applied.panels)).not.toContain("files");
+    expect(Object.keys(applied.panels)).toContain("chat");
+    const attemptedFallback = vi.mocked(setEnvLayout).mock.calls.some(([envId, layout]) => {
+      const panels = (layout as { panels?: Record<string, unknown> }).panels;
+      return envId === "env-a" && panels?.chat !== undefined && panels.files === undefined;
+    });
+    expect(attemptedFallback).toBe(true);
+    expect(removeEnvMaximizeState).not.toHaveBeenCalledWith("env-a");
+  });
+});

@@ -1,0 +1,642 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/service"
+	workflowmodels "github.com/kandev/kandev/internal/workflow/models"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+// WorkflowStepLister provides access to workflow steps.
+type WorkflowStepLister interface {
+	ListStepsByWorkflow(ctx context.Context, workflowID string) ([]*workflowmodels.WorkflowStep, error)
+}
+
+type WorkflowHandlers struct {
+	service              *service.Service
+	workflowStepLister   WorkflowStepLister
+	foregroundActivity   dto.ForegroundActivityProvider
+	taskParkedProjection dto.TaskParkedProvider
+	logger               *logger.Logger
+}
+
+func NewWorkflowHandlers(svc *service.Service, stepLister WorkflowStepLister, log *logger.Logger) *WorkflowHandlers {
+	return &WorkflowHandlers{
+		service:            svc,
+		workflowStepLister: stepLister,
+		logger:             log.WithFields(zap.String("component", "task-workflow-handlers")),
+	}
+}
+
+func RegisterWorkflowRoutes(
+	router *gin.Engine,
+	dispatcher *ws.Dispatcher,
+	svc *service.Service,
+	stepLister WorkflowStepLister,
+	log *logger.Logger,
+) *WorkflowHandlers {
+	handlers := NewWorkflowHandlers(svc, stepLister, log)
+	handlers.registerHTTP(router)
+	handlers.registerWS(dispatcher)
+	return handlers
+}
+
+// SetForegroundActivityProvider wires live session activity into task snapshots.
+func (h *WorkflowHandlers) SetForegroundActivityProvider(provider dto.ForegroundActivityProvider) {
+	h.foregroundActivity = provider
+}
+
+// SetTaskParkedProvider wires the task-level parked_on_background_work
+// OR-aggregate into task snapshots (spec: docs/specs/disambiguate-waiting/spec.md).
+func (h *WorkflowHandlers) SetTaskParkedProvider(provider dto.TaskParkedProvider) {
+	h.taskParkedProjection = provider
+}
+
+func (h *WorkflowHandlers) registerHTTP(router *gin.Engine) {
+	api := router.Group("/api/v1")
+	api.GET("/workflows", h.httpListWorkflows)
+	api.GET("/workspaces/:id/workflows", h.httpListWorkflowsByWorkspace)
+	api.GET("/workspaces/:id/snapshot", h.httpGetWorkspaceSnapshot)
+	api.GET("/workflows/:id", h.httpGetWorkflow)
+	api.GET("/workflows/:id/snapshot", h.httpGetWorkflowSnapshot)
+	api.POST("/workflows", h.httpCreateWorkflow)
+	api.PATCH("/workflows/:id", h.httpUpdateWorkflow)
+	api.DELETE("/workflows/:id", h.httpDeleteWorkflow)
+	api.PUT("/workspaces/:id/workflows/reorder", h.httpReorderWorkflows)
+}
+
+func (h *WorkflowHandlers) registerWS(dispatcher *ws.Dispatcher) {
+	dispatcher.RegisterFunc(ws.ActionWorkflowList, h.wsListWorkflows)
+	dispatcher.RegisterFunc(ws.ActionWorkflowCreate, h.wsCreateWorkflow)
+	dispatcher.RegisterFunc(ws.ActionWorkflowGet, h.wsGetWorkflow)
+	dispatcher.RegisterFunc(ws.ActionWorkflowUpdate, h.wsUpdateWorkflow)
+	dispatcher.RegisterFunc(ws.ActionWorkflowDelete, h.wsDeleteWorkflow)
+	dispatcher.RegisterFunc(ws.ActionWorkflowReorder, h.wsReorderWorkflows)
+}
+
+func (h *WorkflowHandlers) listWorkflows(ctx context.Context, workspaceID string, includeHidden, excludeOffice bool) (dto.ListWorkflowsResponse, error) {
+	workflows, err := h.service.ListWorkflows(ctx, workspaceID, includeHidden)
+	if err != nil {
+		return dto.ListWorkflowsResponse{}, err
+	}
+
+	// Filter out office workflows so they don't appear on the kanban board.
+	if excludeOffice {
+		officeIDs := h.service.GetOfficeWorkflowIDs(ctx)
+		filtered := make([]*models.Workflow, 0, len(workflows))
+		for _, w := range workflows {
+			if _, isOffice := officeIDs[w.ID]; !isOffice {
+				filtered = append(filtered, w)
+			}
+		}
+		workflows = filtered
+	}
+
+	result := dto.ListWorkflowsResponse{
+		Workflows: make([]dto.WorkflowDTO, 0, len(workflows)),
+		Total:     len(workflows),
+	}
+	for _, w := range workflows {
+		result.Workflows = append(result.Workflows, dto.FromWorkflow(w))
+	}
+	if includeHidden {
+		result.TaskWorkflowCoverage, err = h.service.TaskWorkflowCoverage(ctx, workspaceID)
+		if err != nil {
+			h.logger.Warn("workflow task coverage unavailable", zap.Error(err))
+		}
+	}
+	return result, nil
+}
+
+func parseIncludeHidden(s string) bool {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return false
+	}
+	return v
+}
+
+// HTTP handlers
+
+func (h *WorkflowHandlers) httpListWorkflows(c *gin.Context) {
+	workspaceID := c.Query("workspace_id")
+	includeHidden := parseIncludeHidden(c.Query("include_hidden"))
+	excludeOffice := c.Query("exclude_office") != "false" // exclude by default
+	resp, err := h.listWorkflows(c.Request.Context(), workspaceID, includeHidden, excludeOffice)
+	if err != nil {
+		h.logger.Error("failed to list workflows", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workflows"})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *WorkflowHandlers) httpListWorkflowsByWorkspace(c *gin.Context) {
+	workspaceID := c.Param("id")
+	includeHidden := parseIncludeHidden(c.Query("include_hidden"))
+	excludeOffice := c.Query("exclude_office") != "false"
+	resp, err := h.listWorkflows(c.Request.Context(), workspaceID, includeHidden, excludeOffice)
+	if err != nil {
+		h.logger.Error("failed to list workflows", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workflows"})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *WorkflowHandlers) httpGetWorkflow(c *gin.Context) {
+	workflow, err := h.service.GetWorkflow(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromWorkflow(workflow))
+}
+
+type httpCreateWorkflowRequest struct {
+	WorkspaceID        string  `json:"workspace_id"`
+	Name               string  `json:"name"`
+	Description        string  `json:"description,omitempty"`
+	Prompt             string  `json:"prompt,omitempty"`
+	WorkflowTemplateID *string `json:"workflow_template_id,omitempty"`
+}
+
+func (h *WorkflowHandlers) httpCreateWorkflow(c *gin.Context) {
+	var body httpCreateWorkflowRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	if body.Name == "" || body.WorkspaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and name are required"})
+		return
+	}
+	if h.rejectReadOnlyWorkspaceHTTP(c, body.WorkspaceID) {
+		return
+	}
+	workflow, err := h.service.CreateWorkflow(c.Request.Context(), &service.CreateWorkflowRequest{
+		WorkspaceID:        body.WorkspaceID,
+		Name:               body.Name,
+		Description:        body.Description,
+		Prompt:             body.Prompt,
+		WorkflowTemplateID: body.WorkflowTemplateID,
+	})
+	if err != nil {
+		h.logger.Error("failed to create workflow", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create workflow"})
+		return
+	}
+	c.JSON(http.StatusCreated, dto.FromWorkflow(workflow))
+}
+
+// workflowReadOnlyMsg is returned when a UI mutation targets a workflow whose
+// definition is owned by workflow sync. The sync applier writes through the
+// service layer directly and never hits these handlers.
+const workflowReadOnlyMsg = "workflow is managed by GitHub sync and is read-only; edit its definition in the synced repository"
+
+// workspaceReadOnlyMsg is returned when a UI mutation targets the dedicated
+// Improve Kandev workspace, whose workflows and repositories are read-only.
+const workspaceReadOnlyMsg = "this workspace is managed by Improve Kandev and is read-only"
+
+// readOnlyWorkflowMessage returns the reason a workflow is read-only, when it
+// is: GitHub-sync-managed workflows and workflows living in the dedicated
+// Improve Kandev workspace are both immutable. Lookup errors surface as
+// ("", false) so callers keep their existing not-found handling.
+func (h *WorkflowHandlers) readOnlyWorkflowMessage(ctx context.Context, id string) (string, bool) {
+	workflow, err := h.service.GetWorkflow(ctx, id)
+	if err != nil {
+		return "", false
+	}
+	if workflow.Source == models.WorkflowSourceGitHub {
+		return workflowReadOnlyMsg, true
+	}
+	if workflow.WorkspaceID != "" {
+		workspace, err := h.service.GetWorkspace(ctx, workflow.WorkspaceID)
+		if err != nil {
+			return "", false
+		}
+		if workspace.IsImproveKandev() {
+			return workspaceReadOnlyMsg, true
+		}
+	}
+	return "", false
+}
+
+func (h *WorkflowHandlers) rejectReadOnlyWorkflowHTTP(c *gin.Context, id string) bool {
+	if msg, readOnly := h.readOnlyWorkflowMessage(c.Request.Context(), id); readOnly {
+		c.JSON(http.StatusConflict, gin.H{"error": msg})
+		return true
+	}
+	return false
+}
+
+// rejectReadOnlyWorkspaceHTTP returns 409 when the workspace is the dedicated
+// Improve Kandev workspace (matched by exact name). Lookup errors surface as
+// not-found so callers keep their existing error handling.
+func (h *WorkflowHandlers) rejectReadOnlyWorkspaceHTTP(c *gin.Context, workspaceID string) bool {
+	if workspaceID == "" {
+		return false
+	}
+	workspace, err := h.service.GetWorkspace(c.Request.Context(), workspaceID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workspace not found")
+		return true
+	}
+	if workspace.IsImproveKandev() {
+		c.JSON(http.StatusConflict, gin.H{"error": workspaceReadOnlyMsg})
+		return true
+	}
+	return false
+}
+
+// wsRejectReadOnlyWorkspace returns a conflict WS error when the workspace is
+// the dedicated Improve Kandev workspace. Returns (nil, false) when allowed.
+func (h *WorkflowHandlers) wsRejectReadOnlyWorkspace(ctx context.Context, msg *ws.Message, workspaceID string) (*ws.Message, bool) {
+	if workspaceID == "" {
+		return nil, false
+	}
+	workspace, err := h.service.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		errMsg, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Workspace not found", nil)
+		return errMsg, true
+	}
+	if workspace.IsImproveKandev() {
+		errMsg, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, workspaceReadOnlyMsg, nil)
+		return errMsg, true
+	}
+	return nil, false
+}
+
+type httpUpdateWorkflowRequest struct {
+	Name           *string `json:"name"`
+	Description    *string `json:"description"`
+	Prompt         *string `json:"prompt"`
+	AgentProfileID *string `json:"agent_profile_id"`
+}
+
+func (h *WorkflowHandlers) httpUpdateWorkflow(c *gin.Context) {
+	var body httpUpdateWorkflowRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": invalidRequestBody})
+		return
+	}
+	id := c.Param("id")
+	if h.rejectReadOnlyWorkflowHTTP(c, id) {
+		return
+	}
+	workflow, err := h.service.UpdateWorkflow(c.Request.Context(), id, &service.UpdateWorkflowRequest{
+		Name:           body.Name,
+		Description:    body.Description,
+		Prompt:         body.Prompt,
+		AgentProfileID: body.AgentProfileID,
+	})
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.FromWorkflow(workflow))
+}
+
+func (h *WorkflowHandlers) httpDeleteWorkflow(c *gin.Context) {
+	id := c.Param("id")
+	if h.rejectReadOnlyWorkflowHTTP(c, id) {
+		return
+	}
+	if err := h.service.DeleteWorkflow(c.Request.Context(), id); err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+	c.JSON(http.StatusOK, dto.SuccessResponse{Success: true})
+}
+
+func (h *WorkflowHandlers) httpGetWorkflowSnapshot(c *gin.Context) {
+	workflowID := c.Param("id")
+
+	workflow, err := h.service.GetWorkflow(c.Request.Context(), workflowID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	steps, err := h.getStepsForWorkflow(c.Request.Context(), workflow)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	tasks, err := h.service.ListTasks(c.Request.Context(), workflowID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	totalTasks := len(tasks)
+	tasks = applyTaskLimit(c, tasks)
+
+	taskDTOs, err := h.convertTasksWithPrimarySessions(c.Request.Context(), tasks)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	c.JSON(http.StatusOK, dto.WorkflowSnapshotDTO{
+		Workflow:     dto.FromWorkflow(workflow),
+		Steps:        steps,
+		Tasks:        taskDTOs,
+		TaskCoverage: h.service.WorkflowTaskCoverage(workflow, totalTasks, len(taskDTOs)),
+	})
+}
+
+func (h *WorkflowHandlers) httpGetWorkspaceSnapshot(c *gin.Context) {
+	workspaceID := c.Param("id")
+	if workspaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace id is required"})
+		return
+	}
+
+	workflowID := c.Query("workflow_id")
+	if workflowID == "" {
+		workflows, err := h.service.ListWorkflows(c.Request.Context(), workspaceID, false)
+		if err != nil {
+			handleNotFound(c, h.logger, err, "workflow not found")
+			return
+		}
+		if len(workflows) == 0 {
+			handleNotFound(c, h.logger,
+				fmt.Errorf("no workflows found for workspace: %s", workspaceID),
+				"workflow not found")
+			return
+		}
+		workflowID = workflows[0].ID
+	}
+
+	workflow, err := h.service.GetWorkflow(c.Request.Context(), workflowID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+	if workflow.WorkspaceID != workspaceID {
+		handleNotFound(c, h.logger,
+			fmt.Errorf("workflow does not belong to workspace: %s", workspaceID),
+			"workflow not found")
+		return
+	}
+
+	steps, err := h.getStepsForWorkflow(c.Request.Context(), workflow)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	tasks, err := h.service.ListTasks(c.Request.Context(), workflowID)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	totalTasks := len(tasks)
+	tasks = applyTaskLimit(c, tasks)
+
+	taskDTOs, err := h.convertTasksWithPrimarySessions(c.Request.Context(), tasks)
+	if err != nil {
+		handleNotFound(c, h.logger, err, "workflow not found")
+		return
+	}
+
+	c.JSON(http.StatusOK, dto.WorkflowSnapshotDTO{
+		Workflow:     dto.FromWorkflow(workflow),
+		Steps:        steps,
+		Tasks:        taskDTOs,
+		TaskCoverage: h.service.WorkflowTaskCoverage(workflow, totalTasks, len(taskDTOs)),
+	})
+}
+
+// applyTaskLimit truncates tasks if a task_limit query param is set.
+func applyTaskLimit(c *gin.Context, tasks []*models.Task) []*models.Task {
+	if limitStr := c.Query("task_limit"); limitStr != "" {
+		if limit, err := strconv.Atoi(limitStr); err == nil && limit > 0 && limit < len(tasks) {
+			return tasks[:limit]
+		}
+	}
+	return tasks
+}
+
+// WS handlers
+
+func (h *WorkflowHandlers) wsListWorkflows(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		WorkspaceID   string `json:"workspace_id,omitempty"`
+		IncludeHidden bool   `json:"include_hidden,omitempty"`
+		ExcludeOffice *bool  `json:"exclude_office,omitempty"`
+	}
+	if msg.Payload != nil {
+		if err := msg.ParsePayload(&req); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+		}
+	}
+	// Default to excluding office workflows unless explicitly set to false.
+	excludeOffice := req.ExcludeOffice == nil || *req.ExcludeOffice
+	resp, err := h.listWorkflows(ctx, req.WorkspaceID, req.IncludeHidden, excludeOffice)
+	if err != nil {
+		h.logger.Error("failed to list workflows", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to list workflows", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, resp)
+}
+
+type wsCreateWorkflowRequest struct {
+	WorkspaceID        string  `json:"workspace_id"`
+	Name               string  `json:"name"`
+	Description        string  `json:"description,omitempty"`
+	Prompt             string  `json:"prompt,omitempty"`
+	WorkflowTemplateID *string `json:"workflow_template_id,omitempty"`
+}
+
+func (h *WorkflowHandlers) wsCreateWorkflow(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsCreateWorkflowRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.Name == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "name is required", nil)
+	}
+	if req.WorkspaceID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workspace_id is required", nil)
+	}
+	if errMsg, blocked := h.wsRejectReadOnlyWorkspace(ctx, msg, req.WorkspaceID); blocked {
+		return errMsg, nil
+	}
+
+	workflow, err := h.service.CreateWorkflow(ctx, &service.CreateWorkflowRequest{
+		WorkspaceID:        req.WorkspaceID,
+		Name:               req.Name,
+		Description:        req.Description,
+		Prompt:             req.Prompt,
+		WorkflowTemplateID: req.WorkflowTemplateID,
+	})
+	if err != nil {
+		h.logger.Error("failed to create workflow", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to create workflow", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromWorkflow(workflow))
+}
+
+type wsGetWorkflowRequest struct {
+	ID string `json:"id"`
+}
+
+func (h *WorkflowHandlers) wsGetWorkflow(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsGetWorkflowRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+
+	workflow, err := h.service.GetWorkflow(ctx, req.ID)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeNotFound, "Workflow not found", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromWorkflow(workflow))
+}
+
+type wsUpdateWorkflowRequest struct {
+	ID             string  `json:"id"`
+	Name           *string `json:"name,omitempty"`
+	Description    *string `json:"description,omitempty"`
+	Prompt         *string `json:"prompt,omitempty"`
+	AgentProfileID *string `json:"agent_profile_id,omitempty"`
+}
+
+func (h *WorkflowHandlers) wsUpdateWorkflow(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsUpdateWorkflowRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.ID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "id is required", nil)
+	}
+	if reason, readOnly := h.readOnlyWorkflowMessage(ctx, req.ID); readOnly {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, reason, nil)
+	}
+
+	workflow, err := h.service.UpdateWorkflow(ctx, req.ID, &service.UpdateWorkflowRequest{
+		Name:           req.Name,
+		Description:    req.Description,
+		Prompt:         req.Prompt,
+		AgentProfileID: req.AgentProfileID,
+	})
+	if err != nil {
+		h.logger.Error("failed to update workflow", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update workflow", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromWorkflow(workflow))
+}
+
+func (h *WorkflowHandlers) wsDeleteWorkflow(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	// Check read-only before the generic ID-request helper so the client gets
+	// a CONFLICT with the actual reason instead of a generic internal error.
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := msg.ParsePayload(&req); err == nil && req.ID != "" {
+		if reason, readOnly := h.readOnlyWorkflowMessage(ctx, req.ID); readOnly {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, reason, nil)
+		}
+	}
+	return wsHandleIDRequest(ctx, msg, h.logger, "failed to delete workflow",
+		func(ctx context.Context, id string) (any, error) {
+			if err := h.service.DeleteWorkflow(ctx, id); err != nil {
+				return nil, err
+			}
+			return dto.SuccessResponse{Success: true}, nil
+		})
+}
+
+type httpReorderWorkflowsRequest struct {
+	WorkflowIDs []string `json:"workflow_ids"`
+}
+
+func (h *WorkflowHandlers) httpReorderWorkflows(c *gin.Context) {
+	workspaceID := c.Param("id")
+	var req httpReorderWorkflowsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+	if len(req.WorkflowIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workflow_ids is required"})
+		return
+	}
+	if h.rejectReadOnlyWorkspaceHTTP(c, workspaceID) {
+		return
+	}
+	if err := h.service.ReorderWorkflows(c.Request.Context(), workspaceID, req.WorkflowIDs); err != nil {
+		h.logger.Error("failed to reorder workflows", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reorder workflows"})
+		return
+	}
+	c.JSON(http.StatusOK, dto.SuccessResponse{Success: true})
+}
+
+func (h *WorkflowHandlers) wsReorderWorkflows(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		WorkspaceID string   `json:"workspace_id"`
+		WorkflowIDs []string `json:"workflow_ids"`
+	}
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.WorkspaceID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workspace_id is required", nil)
+	}
+	if len(req.WorkflowIDs) == 0 {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workflow_ids is required", nil)
+	}
+	if errMsg, blocked := h.wsRejectReadOnlyWorkspace(ctx, msg, req.WorkspaceID); blocked {
+		return errMsg, nil
+	}
+	if err := h.service.ReorderWorkflows(ctx, req.WorkspaceID, req.WorkflowIDs); err != nil {
+		h.logger.Error("failed to reorder workflows", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to reorder workflows", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.SuccessResponse{Success: true})
+}
+
+// getStepsForWorkflow returns workflow steps for a workflow as DTOs.
+func (h *WorkflowHandlers) getStepsForWorkflow(
+	ctx context.Context,
+	workflow *models.Workflow,
+) ([]dto.WorkflowStepDTO, error) {
+	if h.workflowStepLister == nil {
+		return nil, fmt.Errorf("workflow step lister not configured")
+	}
+	steps, err := h.workflowStepLister.ListStepsByWorkflow(ctx, workflow.ID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]dto.WorkflowStepDTO, 0, len(steps))
+	for _, step := range steps {
+		result = append(result, dto.FromWorkflowStepWithTimestamps(step))
+	}
+	return result, nil
+}
+
+// convertTasksWithPrimarySessions converts task models to DTOs with primary session IDs.
+func (h *WorkflowHandlers) convertTasksWithPrimarySessions(
+	ctx context.Context,
+	tasks []*models.Task,
+) ([]dto.TaskDTO, error) {
+	return buildTaskDTOsWithSessionInfo(ctx, h.service, h.logger, h.foregroundActivity, h.taskParkedProjection, tasks)
+}

@@ -1,0 +1,216 @@
+"use client";
+
+import { useEffect } from "react";
+import { IconPlus } from "@tabler/icons-react";
+import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import type { DialogFormState, TaskRemoteRepoRow } from "@/components/task-create-dialog-types";
+import {
+  RemoteRepoChip,
+  selectedRemoteRepositoryIdentity,
+  type RemoteRepoChipProps,
+} from "@/components/task-create-dialog-remote-repo-chip";
+import { useRemoteRepositories } from "@/hooks/domains/integrations/use-remote-repositories";
+import type { RepositoryInspection } from "@/lib/plugins/types";
+import { useTranslation } from "react-i18next";
+
+/**
+ * Chip row for the Remote tab. Renders one `RemoteRepoChip` per row in
+ * `fs.remoteRepos`, plus a trailing "+ Add" button. Mirrors the layout of
+ * `RepoChipsRow` (workspace/local mode) — same flex-wrap container, same
+ * pill-row spacing.
+ *
+ * Branch loading is driven from `fs.branchesByUrl`: every non-empty URL
+ * gets an `ensure(url)` call so the per-URL cache populates ahead of the
+ * branch pill being opened. Cleared rows (empty url) are skipped because
+ * `ensure("")` is a no-op anyway.
+ */
+export type RemoteRepoChipsRowProps = {
+  workspaceId?: string | null;
+  fs: DialogFormState;
+  onUpdateRow: (key: string, update: Partial<TaskRemoteRepoRow>) => void;
+  onAddRow: () => void;
+  onRemoveRow: (key: string) => void;
+};
+
+export function RemoteRepoChipsRow({
+  workspaceId = null,
+  fs,
+  onUpdateRow,
+  onAddRow,
+  onRemoveRow,
+}: RemoteRepoChipsRowProps) {
+  // Keep the per-URL caches warm. Destructure the stable `ensure` callbacks
+  // out of the parent cache objects so the effect deps array doesn't churn
+  // every render: `fs.branchesByUrl` / `fs.prInfoByUrl` themselves are new
+  // object refs each render (they wrap hook results), but the underlying
+  // `ensure` callbacks are stable until their workspace context changes. Both calls are
+  // internally idempotent so re-firing after a workspace change is cheap.
+  // PR-info is a no-op for plain repo URLs.
+  const { ensure: ensureBranches } = fs.branchesByUrl;
+  const { ensure: ensurePRInfo } = fs.prInfoByUrl;
+  useEffect(() => {
+    for (const row of fs.remoteRepos) {
+      if (!row.url) continue;
+      ensureBranches(row.url);
+      ensurePRInfo(row.url);
+    }
+  }, [fs.remoteRepos, ensureBranches, ensurePRInfo]);
+
+  const inspection = fs.prInfoByUrl.inspection;
+  useEffect(() => {
+    if (!inspection) return;
+    for (const row of fs.remoteRepos) {
+      const resolved = inspection(row.url);
+      const update = resolved ? inspectedRemoteRepositoryUpdate(resolved, row) : undefined;
+      if (update && remoteRepositoryUpdateNeeded(row, update)) onUpdateRow(row.key, update);
+    }
+  }, [fs.remoteRepos, inspection, onUpdateRow]);
+
+  // Hoist the accessible-repos hook to the row level so a single backend
+  // request serves every chip's popover. Previously each chip called the
+  // hook independently and every open popover fired its own request. Each
+  // chip still keeps its own local search-text state (typing in one
+  // popover doesn't reset another), at the cost of the shared cache: if
+  // two popovers are open with different searches, both see the latest
+  // search's results. In practice only one popover is open at a time.
+  const accessibleRepos = useRemoteRepositories(workspaceId ?? "");
+
+  const rows = fs.remoteRepos;
+  return (
+    <div className="flex min-h-9 flex-wrap items-center gap-2" data-testid="remote-repo-chips-row">
+      {rows.map((row) => {
+        const selectedRepositoryIdentities = rows
+          .filter((otherRow) => otherRow.key !== row.key)
+          .map(selectedRemoteRepositoryIdentity)
+          .filter((identity): identity is string => Boolean(identity));
+        return (
+          <RemoteRepoChip
+            key={row.key}
+            workspaceId={workspaceId}
+            executorProfileId={fs.executorProfileId}
+            onOptionsChange={(checkoutOptions) => onUpdateRow(row.key, { checkoutOptions })}
+            row={row}
+            branches={fs.branchesByUrl.branches(row.url)}
+            branchesLoading={fs.branchesByUrl.loading(row.url)}
+            prInfo={fs.prInfoByUrl.info(row.url)}
+            resolutionError={fs.branchesByUrl.error(row.url) ?? fs.prInfoByUrl.error(row.url)}
+            accessibleRepos={accessibleRepos}
+            selectedRepositoryIdentities={selectedRepositoryIdentities}
+            onURLChange={makeURLChange(onUpdateRow, row.key)}
+            onBranchChange={(branch) => onUpdateRow(row.key, { branch })}
+            onRetry={() => retryRemoteResolution(fs, row.url)}
+            onRemove={() => onRemoveRow(row.key)}
+          />
+        );
+      })}
+      <AddRowButton onAddRow={onAddRow} />
+    </div>
+  );
+}
+
+function inspectedRemoteRepositoryUpdate(
+  inspection: RepositoryInspection,
+  row: TaskRemoteRepoRow,
+): Partial<TaskRemoteRepoRow> {
+  return {
+    remoteUrl: inspection.cloneUrl,
+    provider: inspection.providerId,
+    providerHost: inspection.providerHost,
+    providerScope: inspection.providerScope,
+    providerRepoId: inspection.repositoryId,
+    providerOwner: inspection.ownerOrProject,
+    providerName: inspection.repositoryName,
+    fullName: `${inspection.ownerOrProject}/${inspection.repositoryName}`,
+    prNumber: inspection.pullRequest?.number,
+    prBaseBranch: inspection.baseBranch,
+    prHeadBranch: inspection.headBranch,
+    ...(!row.branch && (inspection.headBranch || inspection.defaultBranch)
+      ? { branch: inspection.headBranch || inspection.defaultBranch }
+      : {}),
+  };
+}
+
+function remoteRepositoryUpdateNeeded(
+  row: TaskRemoteRepoRow,
+  update: Partial<TaskRemoteRepoRow>,
+): boolean {
+  return Object.entries(update).some(
+    ([key, value]) => row[key as keyof TaskRemoteRepoRow] !== value,
+  );
+}
+
+function retryRemoteResolution(fs: DialogFormState, url: string): void {
+  fs.branchesByUrl.clear(url);
+  fs.prInfoByUrl.clear(url);
+  fs.branchesByUrl.ensure(url);
+  fs.prInfoByUrl.ensure(url);
+}
+
+/**
+ * Wires a per-row `onURLChange` so paste-mode strips picker metadata while
+ * picker-mode propagates it. Picker-mode also pre-fills `branch` with the
+ * repo's `default_branch` so the user can launch without waiting for the
+ * branch list to load (they can still pick another branch from the pill
+ * dropdown once it populates). Extracted so the JSX above stays compact and
+ * the metadata-clearing rule lives in one obvious spot.
+ */
+function makeURLChange(
+  onUpdateRow: (key: string, update: Partial<TaskRemoteRepoRow>) => void,
+  key: string,
+): RemoteRepoChipProps["onURLChange"] {
+  return (url, source, metadata) => {
+    if (source === "picker" && metadata) {
+      onUpdateRow(key, {
+        url,
+        source,
+        provider: metadata.provider,
+        remoteUrl: metadata.remoteUrl,
+        providerHost: metadata.providerHost,
+        providerScope: metadata.providerScope,
+        fullName: metadata.fullName,
+        providerRepoId: metadata.providerRepoId,
+        providerOwner: metadata.providerOwner,
+        providerName: metadata.providerName,
+        branch: metadata.defaultBranch ?? "",
+      });
+      return;
+    }
+    onUpdateRow(key, {
+      url,
+      source,
+      provider: undefined,
+      remoteUrl: undefined,
+      providerHost: undefined,
+      providerScope: undefined,
+      fullName: undefined,
+      providerRepoId: undefined,
+      providerOwner: undefined,
+      providerName: undefined,
+      branch: "",
+    });
+  };
+}
+
+function AddRowButton({ onAddRow }: { onAddRow: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={onAddRow}
+          aria-label={t("task:addRemoteRepository")}
+          data-testid="remote-add-row"
+          className={cn(
+            "h-7 w-7 inline-flex items-center justify-center rounded-md text-muted-foreground",
+            "hover:bg-muted hover:text-foreground cursor-pointer",
+          )}
+        >
+          <IconPlus className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>{t("task:addAnotherRemoteRepository")}</TooltipContent>
+    </Tooltip>
+  );
+}

@@ -1,0 +1,616 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/settings/dto"
+	"github.com/kandev/kandev/internal/agent/settings/models"
+)
+
+// TestSeedCLIFlags_FromCopilot verifies that a fresh Copilot profile gets
+// the four curated CLI-flag suggestions seeded with the expected default
+// state. `--allow-all-tools` is on by default so autonomous runs don't
+// stall on per-tool-call permission prompts; the other --allow-all-* and
+// --no-ask-user flags stay off as safe defaults until users opt in.
+func TestSeedCLIFlags_FromCopilot(t *testing.T) {
+	ag := agents.NewCopilotACP()
+	flags := seedCLIFlags(ag)
+
+	wantFlags := map[string]bool{
+		"--allow-all-tools": true,
+		"--allow-all-paths": false,
+		"--allow-all-urls":  false,
+		"--no-ask-user":     false,
+	}
+	if len(flags) != len(wantFlags) {
+		t.Fatalf("expected %d seeded flags, got %d: %+v", len(wantFlags), len(flags), flags)
+	}
+	for _, f := range flags {
+		want, ok := wantFlags[f.Flag]
+		if !ok {
+			t.Errorf("unexpected seeded flag: %q", f.Flag)
+			continue
+		}
+		if f.Enabled != want {
+			t.Errorf("%q: Enabled=%v, want %v", f.Flag, f.Enabled, want)
+		}
+		if f.Description == "" {
+			t.Errorf("%q: missing Description", f.Flag)
+		}
+	}
+	// Stable ordering — flags must sort lexicographically so the UI shows
+	// them in the same order every time.
+	for i := 1; i < len(flags); i++ {
+		if flags[i-1].Flag >= flags[i].Flag {
+			t.Errorf("flags not sorted: %q >= %q", flags[i-1].Flag, flags[i].Flag)
+		}
+	}
+}
+
+// TestSeedCLIFlags_EmptyForAgentWithNoCurated handles the common case:
+// most ACP agents advertise no curated flags so new profiles get an empty
+// list and the user can still add custom flags.
+func TestSeedCLIFlags_EmptyForAgentWithNoCurated(t *testing.T) {
+	ag := agents.NewClaudeACP()
+	flags := seedCLIFlags(ag)
+	if len(flags) != 0 {
+		t.Errorf("expected no curated flags for claude-acp, got %+v", flags)
+	}
+}
+
+// TestSeedCLIFlags_EmptyForCodexACP ensures the Agent Client Protocol bridge
+// does not expose stale @openai/codex -c overrides as ACP subprocess flags.
+func TestSeedCLIFlags_EmptyForCodexACP(t *testing.T) {
+	flags := seedCLIFlags(agents.NewCodexACP())
+	if len(flags) != 0 {
+		t.Fatalf("expected no seeded flags for codex-acp, got %+v", flags)
+	}
+}
+
+func TestSeedCLIFlags_FromCursorACP(t *testing.T) {
+	flags := seedCLIFlags(agents.NewCursorACP())
+	want := map[string]bool{"--force": false}
+	if len(flags) != len(want) {
+		t.Fatalf("expected %d seeded flags, got %d: %+v", len(want), len(flags), flags)
+	}
+	for _, f := range flags {
+		enabled, ok := want[f.Flag]
+		if !ok {
+			t.Errorf("unexpected seeded flag: %q", f.Flag)
+			continue
+		}
+		if f.Enabled != enabled {
+			t.Errorf("%q: Enabled=%v, want %v", f.Flag, f.Enabled, enabled)
+		}
+	}
+}
+
+// TestValidateCLIFlagDTOs rejects entries whose flag text is empty or
+// whitespace only. Empty descriptions are allowed (custom flags often
+// don't have one).
+func TestValidateCLIFlagDTOs(t *testing.T) {
+	cases := []struct {
+		name    string
+		flags   []dto.CLIFlagDTO
+		wantErr bool
+	}{
+		{name: "valid", flags: []dto.CLIFlagDTO{{Flag: "--ok", Enabled: true}}},
+		{name: "valid with empty description", flags: []dto.CLIFlagDTO{{Flag: "--x"}}},
+		{name: "empty flag rejected", flags: []dto.CLIFlagDTO{{Flag: ""}}, wantErr: true},
+		{name: "whitespace flag rejected", flags: []dto.CLIFlagDTO{{Flag: "   "}}, wantErr: true},
+		{name: "unterminated quote rejected", flags: []dto.CLIFlagDTO{{Flag: `--msg "hi`}}, wantErr: true},
+		{name: "trailing backslash rejected", flags: []dto.CLIFlagDTO{{Flag: `--path foo\`}}, wantErr: true},
+		{name: "double-quoted empty flag rejected", flags: []dto.CLIFlagDTO{{Flag: `""`}}, wantErr: true},
+		{name: "single-quoted empty flag rejected", flags: []dto.CLIFlagDTO{{Flag: `''`}}, wantErr: true},
+		{name: "flag with empty quoted value accepted", flags: []dto.CLIFlagDTO{{Flag: `--empty ""`}}},
+		{name: "empty list accepted", flags: []dto.CLIFlagDTO{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCLIFlagDTOs(tc.flags)
+			if tc.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateCommandPrefix accepts an empty prefix (run unwrapped) and
+// well-formed launcher strings, and rejects malformed shell tokens.
+func TestValidateCommandPrefix(t *testing.T) {
+	cases := []struct {
+		name    string
+		prefix  string
+		wantErr bool
+	}{
+		{name: "empty accepted", prefix: ""},
+		{name: "whitespace accepted", prefix: "   "},
+		{name: "simple launcher accepted", prefix: "greywall --"},
+		{name: "quoted arg accepted", prefix: `sandbox-exec -f "my profile.sb"`},
+		{name: "unterminated quote rejected", prefix: `greywall "unterminated`, wantErr: true},
+		{name: "trailing backslash rejected", prefix: `greywall foo\`, wantErr: true},
+		{name: "only-empty-quotes rejected", prefix: `""`, wantErr: true},
+		{name: "whitespace executable rejected", prefix: `"   " --arg`, wantErr: true},
+		{name: "leading flag rejected", prefix: `--foo greywall`, wantErr: true},
+		{name: "leading dash rejected", prefix: `-x sandbox`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCommandPrefix(tc.prefix)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				} else if !errors.Is(err, ErrInvalidCommandPrefix) {
+					// The handlers map only ErrInvalidCommandPrefix to HTTP 400;
+					// an unwrapped error would fall through to a 500.
+					t.Errorf("error does not wrap ErrInvalidCommandPrefix: %v", err)
+				}
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateProfileEnvVarDTOs(t *testing.T) {
+	cases := []struct {
+		name    string
+		envVars []dto.ProfileEnvVarDTO
+		wantErr bool
+	}{
+		{name: "valid value", envVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "bar"}}},
+		{name: "valid secret", envVars: []dto.ProfileEnvVarDTO{{Key: "TOKEN", SecretID: "sec-1"}}},
+		{name: "empty key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: ""}}, wantErr: true},
+		{name: "whitespace key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "   "}}, wantErr: true},
+		{name: "padded key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: " FOO ", Value: "x"}}, wantErr: true},
+		{name: "equals key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "BAD=KEY", Value: "x"}}, wantErr: true},
+		{name: "null key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "BAD\x00KEY", Value: "x"}}, wantErr: true},
+		{name: "shell injection keys rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "BAD; touch /tmp/pwned", Value: "x"}}, wantErr: true},
+		{name: "command substitution key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "$(touch /tmp/pwned)", Value: "x"}}, wantErr: true},
+		{name: "newline key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "BAD\nKEY", Value: "x"}}, wantErr: true},
+		{name: "numeric first character rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "1BAD", Value: "x"}}, wantErr: true},
+		{name: "duplicate key rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "one"}, {Key: " FOO ", Value: "two"}}, wantErr: true},
+		{name: "value and secret rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "bar", SecretID: "sec-1"}}, wantErr: true},
+		{name: "null value rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "bad\x00val"}}, wantErr: true},
+		{name: "KANDEV prefix rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "KANDEV_TASK_ID", Value: "x"}}, wantErr: true},
+		{name: "TASK_DESCRIPTION rejected", envVars: []dto.ProfileEnvVarDTO{{Key: "TASK_DESCRIPTION", Value: "x"}}, wantErr: true},
+		{name: "too many entries rejected", envVars: func() []dto.ProfileEnvVarDTO {
+			out := make([]dto.ProfileEnvVarDTO, maxProfileEnvVars+1)
+			for i := range out {
+				out[i] = dto.ProfileEnvVarDTO{Key: fmt.Sprintf("K%d", i), Value: "v"}
+			}
+			return out
+		}(), wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateProfileEnvVarDTOs(tc.envVars)
+			if tc.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateProfile_PersistsEnvVars(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "With env",
+		EnvVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "bar"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if len(profile.EnvVars) != 1 || profile.EnvVars[0].Key != "FOO" || profile.EnvVars[0].Value != "bar" {
+		t.Fatalf("response env vars: %+v", profile.EnvVars)
+	}
+	if len(st.created) != 1 || len(st.created[0].EnvVars) != 1 || st.created[0].EnvVars[0].Key != "FOO" {
+		t.Fatalf("stored env vars: %+v", st.created)
+	}
+}
+
+func TestCreateAndUpdateProfile_PersistsConfigOptions(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "With config",
+		ConfigOptions: map[string]string{
+			"effort": " high ",
+			"model":  "ignored",
+			"mode":   "ignored",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if profile.ConfigOptions["effort"] != "high" || len(profile.ConfigOptions) != 1 {
+		t.Fatalf("response config options: %+v", profile.ConfigOptions)
+	}
+	if len(st.created) != 1 || st.created[0].ConfigOptions["effort"] != "high" || len(st.created[0].ConfigOptions) != 1 {
+		t.Fatalf("stored config options: %+v", st.created)
+	}
+
+	next := map[string]string{"effort": "low"}
+	updated, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{
+		ID:            profile.ID,
+		ConfigOptions: &next,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.ConfigOptions["effort"] != "low" || len(updated.ConfigOptions) != 1 {
+		t.Fatalf("updated response config options: %+v", updated.ConfigOptions)
+	}
+}
+
+func TestCreateAgentProfiles_PersistsEnvVars(t *testing.T) {
+	ctrl := newTestController(nil)
+	st := newFakeStore()
+	ctrl.repo = st
+
+	profiles, err := ctrl.createAgentProfiles(context.Background(), "agent-1", "Test Agent", []CreateAgentProfileRequest{{
+		Name:    "With env",
+		Model:   "model-1",
+		EnvVars: []dto.ProfileEnvVarDTO{{Key: "FOO", Value: "bar"}},
+	}}, &testAgent{id: "test-agent", name: "test-agent"})
+	if err != nil {
+		t.Fatalf("createAgentProfiles: %v", err)
+	}
+	if len(profiles) != 1 || len(profiles[0].EnvVars) != 1 || profiles[0].EnvVars[0].Key != "FOO" {
+		t.Fatalf("created env vars: %+v", profiles)
+	}
+}
+
+// TestCreateAgentProfiles_PersistsCommandPrefix confirms a valid prefix on a
+// nested-create profile is trimmed and stored.
+func TestCreateAgentProfiles_PersistsCommandPrefix(t *testing.T) {
+	ctrl := newTestController(nil)
+	st := newFakeStore()
+	ctrl.repo = st
+
+	profiles, err := ctrl.createAgentProfiles(context.Background(), "agent-1", "Test Agent", []CreateAgentProfileRequest{{
+		Name:          "Sandboxed",
+		Model:         "model-1",
+		CommandPrefix: "  greywall --  ",
+	}}, &testAgent{id: "test-agent", name: "test-agent"})
+	if err != nil {
+		t.Fatalf("createAgentProfiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].CommandPrefix != "greywall --" {
+		t.Fatalf("created command prefix: %+v", profiles)
+	}
+}
+
+// TestCreateAgentProfiles_RejectsBadCommandPrefix confirms a malformed prefix on
+// a nested-create profile returns ErrInvalidCommandPrefix (mapped to HTTP 400)
+// rather than a generic error, and that the validate-first pass surfaces it.
+func TestCreateAgentProfiles_RejectsBadCommandPrefix(t *testing.T) {
+	ctrl := newTestController(nil)
+	st := newFakeStore()
+	ctrl.repo = st
+
+	_, err := ctrl.createAgentProfiles(context.Background(), "agent-1", "Test Agent", []CreateAgentProfileRequest{{
+		Name:          "Bad",
+		Model:         "model-1",
+		CommandPrefix: `greywall "unterminated`,
+	}}, &testAgent{id: "test-agent", name: "test-agent"})
+	if !errors.Is(err, ErrInvalidCommandPrefix) {
+		t.Fatalf("expected ErrInvalidCommandPrefix, got %v", err)
+	}
+	if len(st.created) != 0 {
+		t.Fatalf("bad nested profile create made %d profile writes", len(st.created))
+	}
+}
+
+func TestCreateAgent_RejectsBadNestedProfileBeforeAnyWrite(t *testing.T) {
+	t.Setenv("KANDEV_E2E_MOCK", "true")
+	ctrl := newTestController(map[string]agents.Agent{
+		"test-agent": &testAgent{
+			id:          "test-agent",
+			name:        "test-agent",
+			displayName: "Test Agent",
+			enabled:     true,
+		},
+	})
+	st := newFakeStore()
+	ctrl.repo = st
+
+	_, err := ctrl.CreateAgent(context.Background(), CreateAgentRequest{
+		Name: "test-agent",
+		Profiles: []CreateAgentProfileRequest{{
+			Name:          "Bad",
+			CommandPrefix: `--not-a-launcher`,
+		}},
+	})
+	if !errors.Is(err, ErrInvalidCommandPrefix) {
+		t.Fatalf("expected ErrInvalidCommandPrefix, got %v", err)
+	}
+	if len(st.agents) != 0 || len(st.created) != 0 {
+		t.Fatalf("bad create made writes: agents=%d profiles=%d", len(st.agents), len(st.created))
+	}
+}
+
+func TestCreateProfile_DefaultsEnabled(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "Fresh",
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if !profile.Enabled {
+		t.Fatal("expected new profile DTO to be enabled")
+	}
+	if len(st.created) != 1 || !st.created[0].Enabled {
+		t.Fatalf("expected stored profile to be enabled, got %+v", st.created)
+	}
+}
+
+func TestUpdateProfile_SetsEnabled(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	st.profiles[agent.ID] = []*models.AgentProfile{{
+		ID:               "profile-1",
+		AgentID:          agent.ID,
+		Name:             "Existing",
+		AgentDisplayName: "Test Agent",
+		Enabled:          true,
+	}}
+	ctrl.repo = st
+
+	disable := false
+	updated, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{
+		ID:      "profile-1",
+		Enabled: &disable,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.Enabled {
+		t.Fatal("expected updated DTO to be disabled")
+	}
+	if updated.UpdatedAt.IsZero() {
+		t.Fatal("expected enabled-only update to return the persisted updated_at")
+	}
+	if len(st.updated) != 1 || st.updated[0].Enabled {
+		t.Fatalf("expected stored profile to be disabled, got %+v", st.updated)
+	}
+
+	// Leaving Enabled nil must not touch the stored value.
+	if _, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{ID: "profile-1"}); err != nil {
+		t.Fatalf("nil Enabled UpdateProfile: %v", err)
+	}
+	if len(st.updated) != 2 || st.updated[1].Enabled {
+		t.Fatalf("expected omitted Enabled to preserve false, got %+v", st.updated)
+	}
+
+	enable := true
+	if _, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{ID: "profile-1", Enabled: &enable}); err != nil {
+		t.Fatalf("re-enable UpdateProfile: %v", err)
+	}
+	if len(st.updated) != 3 || !st.updated[2].Enabled {
+		t.Fatalf("expected stored profile to be re-enabled, got %+v", st.updated)
+	}
+}
+
+// TestUpdateProfile_MixedEnabledAndFallbackPersistsBoth verifies a request
+// carrying enabled plus the fallback fields takes the full-update path. The
+// enabled-only shortcut must never silently drop FallbackModel/AutoFallback
+// supplied in the same PATCH.
+func TestUpdateProfile_MixedEnabledAndFallbackPersistsBoth(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "Mixed",
+		Model:   "gpt-5",
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+
+	enabled := false
+	fallback := "gpt-5-mini"
+	autoFallback := true
+	selectedServers := []string{"plugin-atlassian-atlassian"}
+	updated, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{
+		ID:                 profile.ID,
+		Enabled:            &enabled,
+		FallbackModel:      &fallback,
+		AutoFallback:       &autoFallback,
+		MCPSelectionMode:   stringPointer("selected"),
+		MCPSelectedServers: &selectedServers,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.FallbackModel != fallback {
+		t.Fatalf("response fallback_model = %q, want %q (must not take the enabled-only path)", updated.FallbackModel, fallback)
+	}
+	if updated.Enabled {
+		t.Fatal("response enabled = true, want false")
+	}
+	if !updated.AutoFallback {
+		t.Fatal("response auto_fallback = false, want true")
+	}
+	stored, err := st.GetAgentProfile(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatalf("GetAgentProfile: %v", err)
+	}
+	if stored.FallbackModel != fallback || !stored.AutoFallback {
+		t.Fatalf("stored fallback fields lost: fallback_model=%q auto_fallback=%v",
+			stored.FallbackModel, stored.AutoFallback)
+	}
+	if stored.MCPSelectionMode != "selected" || len(stored.MCPSelectedServers) != 1 || stored.MCPSelectedServers[0] != "plugin-atlassian-atlassian" {
+		t.Fatalf("stored MCP selection lost on enabled patch: mode=%q servers=%#v", stored.MCPSelectionMode, stored.MCPSelectedServers)
+	}
+}
+
+// TestUpdateProfile_ModelOnlyLeavesNameUnchanged is the regression guard for
+// the MCP update_agent_profile silent-rename bug: a model-only patch (the
+// shape the MCP tool sends, since it omits name unless explicitly asked for
+// one) must not derive and overwrite the profile's name from the model ID.
+func TestUpdateProfile_ModelOnlyLeavesNameUnchanged(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "Product Manager",
+		Model:   "opus",
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+
+	model := "sonnet"
+	updated, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{
+		ID:    profile.ID,
+		Model: &model,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.Name != "Product Manager" {
+		t.Fatalf("response name = %q, want unchanged %q", updated.Name, "Product Manager")
+	}
+	if updated.Model != model {
+		t.Fatalf("response model = %q, want %q", updated.Model, model)
+	}
+	stored, err := st.GetAgentProfile(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatalf("GetAgentProfile: %v", err)
+	}
+	if stored.Name != "Product Manager" {
+		t.Fatalf("stored name = %q, want unchanged %q", stored.Name, "Product Manager")
+	}
+	if stored.AgentDisplayName != "Test Agent" {
+		t.Fatalf("stored agent_display_name = %q, want unchanged %q", stored.AgentDisplayName, "Test Agent")
+	}
+	if stored.Model != model {
+		t.Fatalf("stored model = %q, want %q", stored.Model, model)
+	}
+}
+
+// TestUpdateProfile_NameOnlyLeavesModelUnchanged pins the other half of the
+// acceptance criteria: a name-only patch must not touch the stored model.
+func TestUpdateProfile_NameOnlyLeavesModelUnchanged(t *testing.T) {
+	ctrl := newTestController(map[string]agents.Agent{"test-agent": &testAgent{
+		id:          "test-agent",
+		name:        "test-agent",
+		displayName: "Test Agent",
+		enabled:     true,
+	}})
+	st := newFakeStore()
+	agent := &models.Agent{ID: "agent-1", Name: "test-agent"}
+	st.agents[agent.ID] = agent
+	st.byName[agent.Name] = agent
+	ctrl.repo = st
+
+	profile, err := ctrl.CreateProfile(context.Background(), CreateProfileRequest{
+		AgentID: "agent-1",
+		Name:    "Product Manager",
+		Model:   "opus",
+	})
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+
+	newName := "Renamed"
+	updated, err := ctrl.UpdateProfile(context.Background(), UpdateProfileRequest{
+		ID:   profile.ID,
+		Name: &newName,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.Name != newName {
+		t.Fatalf("response name = %q, want %q", updated.Name, newName)
+	}
+	if updated.Model != "opus" {
+		t.Fatalf("response model = %q, want unchanged %q", updated.Model, "opus")
+	}
+	stored, err := st.GetAgentProfile(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatalf("GetAgentProfile: %v", err)
+	}
+	if stored.Name != newName {
+		t.Fatalf("stored name = %q, want %q", stored.Name, newName)
+	}
+	if stored.Model != "opus" {
+		t.Fatalf("stored model = %q, want unchanged %q", stored.Model, "opus")
+	}
+}

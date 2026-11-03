@@ -1,0 +1,912 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestIsNotFoundErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"HTTP 404", errors.New("gh api: HTTP 404"), true},
+		{"HTTP 404 with suffix", errors.New("gh: HTTP 404: Not Found (404)"), true},
+		{"404 Not Found", errors.New("404 Not Found"), true},
+		{"status: 404", errors.New("request failed (status: 404)"), true},
+		{"unrelated 500", errors.New("HTTP 500: server error"), false},
+		{"unrelated text", errors.New("connection refused"), false},
+		{"403 not 404", errors.New("HTTP 403: Forbidden"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNotFoundErr(tc.err); got != tc.want {
+				t.Fatalf("isNotFoundErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsForbiddenErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"HTTP 403", errors.New("gh api: HTTP 403"), true},
+		{"403 Forbidden", errors.New("403 Forbidden"), true},
+		{"status: 403", errors.New("request failed (status: 403)"), true},
+		{"404 not 403", errors.New("HTTP 404"), false},
+		{"500 not 403", errors.New("HTTP 500"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isForbiddenErr(tc.err); got != tc.want {
+				t.Fatalf("isForbiddenErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGhMergeStatusCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantOK   bool
+		wantCode int
+	}{
+		{"nil", nil, false, 0},
+		{"unrelated", errors.New("connection refused"), false, 0},
+		{"HTTP 404", errors.New("HTTP 404: Not Found"), true, 404},
+		{"404 Not Found phrase", errors.New("404 Not Found"), true, 404},
+		{"status 404", errors.New("request failed (status: 404)"), true, 404},
+		{"HTTP 403", errors.New("HTTP 403: Forbidden"), true, 403},
+		{"HTTP 400", errors.New("HTTP 400: Bad Request"), true, 400},
+		{"HTTP 405", errors.New("gh: HTTP 405: Method Not Allowed"), true, 405},
+		{"status 405", errors.New("status: 405"), true, 405},
+		{"405 phrase", errors.New("405 Method Not Allowed"), true, 405},
+		{"HTTP 409", errors.New("HTTP 409: Conflict"), true, 409},
+		{"status 409", errors.New("status: 409"), true, 409},
+		{"409 phrase", errors.New("409 Conflict"), true, 409},
+		{"500 not mapped", errors.New("HTTP 500: server error"), false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, ok := ghMergeStatusCode(tc.err)
+			if ok != tc.wantOK || code != tc.wantCode {
+				t.Fatalf("ghMergeStatusCode(%v) = (%d, %v), want (%d, %v)",
+					tc.err, code, ok, tc.wantCode, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestParseTimePtr(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantNil bool
+	}{
+		{"empty string", "", true},
+		{"valid RFC3339", "2025-01-15T10:30:00Z", false},
+		{"invalid format", "not-a-date", true},
+		{"date only", "2025-01-15", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseTimePtr(tt.input)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("expected nil, got %v", *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("expected non-nil, got nil")
+			}
+		})
+	}
+}
+
+func TestParseTimePtrValue(t *testing.T) {
+	got := parseTimePtr("2025-06-15T14:30:00Z")
+	if got == nil {
+		t.Fatal("expected non-nil")
+	}
+	expected := time.Date(2025, 6, 15, 14, 30, 0, 0, time.UTC)
+	if !got.Equal(expected) {
+		t.Errorf("got %v, want %v", *got, expected)
+	}
+}
+
+func TestGHSearchParsingPreservesImmutableIdentity(t *testing.T) {
+	prs, err := (&GHClient{}).parseSearchResults(`[{"id":202,"node_id":"PR_kwDOB","number":8,"title":"Fix auth","html_url":"https://github.com/acme/web/pull/8","state":"open","repository_url":"https://api.github.com/repos/acme/web","pull_request":{}}]`)
+	if err != nil {
+		t.Fatalf("parse search results: %v", err)
+	}
+	if len(prs) != 1 || prs[0].ID != 202 || prs[0].NodeID != "PR_kwDOB" {
+		t.Fatalf("PRs = %#v", prs)
+	}
+
+	issues := parseIssueSearchResults([]issueSearchItem{{
+		ID: 303, NodeID: "I_kwDOC", Number: 9, Title: "Broken login",
+		RepositoryURL: "https://api.github.com/repos/acme/web",
+	}})
+	if len(issues) != 1 || issues[0].ID != 303 || issues[0].NodeID != "I_kwDOC" {
+		t.Fatalf("issues = %#v", issues)
+	}
+}
+
+func TestPRBaseGHCLIQueriesAndRetainsBaseOID(t *testing.T) {
+	calls := newFakeGH(t,
+		ghResponse{
+			Prefix: "pr view 7",
+			Stdout: `{"number":7,"title":"Remote contribution","url":"https://github.com/acme/widget/pull/7","state":"OPEN","body":"","headRefName":"feature/remote","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefName":"main","author":{"login":"alice"},"isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","additions":1,"deletions":0,"createdAt":"2025-01-01T00:00:00Z","updatedAt":"2025-01-02T00:00:00Z","mergedAt":"","closedAt":"","reviewRequests":[],"maintainerCanModify":true,"headRepository":{"id":"R_kgDOFork123","name":"widget-fork","nameWithOwner":"contributor/widget-fork","url":"https://github.com/contributor/widget-fork","cloneUrl":"https://github.com/contributor/widget-fork.git"},"headRepositoryOwner":{"login":"contributor"}}`,
+		},
+		ghResponse{
+			Prefix: "api repos/acme/widget/pulls/7",
+			Stdout: `{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"release/next","repo":{"id":17,"name":"widget","owner":{"login":"upstream"}}}`,
+		},
+	)
+
+	pr, err := NewGHClient().GetPR(context.Background(), "acme", "widget", 7)
+	if err != nil {
+		t.Fatalf("GetPR() error = %v", err)
+	}
+	if pr.HeadRepoNodeID != "R_kgDOFork123" || pr.HeadRepoOwner != "contributor" || pr.HeadRepoName != "widget-fork" {
+		t.Fatalf("source repository = (%q, %q, %q), want CLI node ID and owner shape", pr.HeadRepoNodeID, pr.HeadRepoOwner, pr.HeadRepoName)
+	}
+	if pr.BaseRepoID != 17 || pr.BaseRepoOwner != "upstream" || pr.BaseRepoName != "widget" ||
+		pr.BaseBranch != "release/next" || pr.BaseDefaultBranch != "" {
+		t.Fatalf("target repository = (%d, %q, %q), base=%q default=%q, want REST target identity and ref", pr.BaseRepoID, pr.BaseRepoOwner, pr.BaseRepoName, pr.BaseBranch, pr.BaseDefaultBranch)
+	}
+	got := calls(t)
+	assertGHArgv(t, got, 0, []string{
+		"pr", "view", "7", "--repo", "acme/widget", "--json",
+		"number,title,url,state,body,headRefName,headRefOid,baseRefName,author,isDraft,mergeable,mergeStateStatus,additions,deletions,changedFiles,mergedBy,autoMergeRequest,createdAt,updatedAt,mergedAt,closedAt,reviewRequests,maintainerCanModify,headRepository,headRepositoryOwner",
+	})
+	assertGHArgv(t, got, 1, []string{
+		"api", "repos/acme/widget/pulls/7", "--jq",
+		"{sha: .base.sha, ref: .base.ref, repo: {id: .base.repo.id, name: .base.repo.name, owner: .base.repo.owner}}",
+	})
+	for _, invocation := range got {
+		for index, arg := range invocation {
+			if arg == "--json" && index+1 < len(invocation) && strings.Contains(invocation[index+1], "baseRefOid") {
+				t.Fatalf("unsupported baseRefOid requested from gh pr --json: %#v", invocation)
+			}
+		}
+	}
+	if pr.BaseSHA != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("BaseSHA = %q, want REST base.sha", pr.BaseSHA)
+	}
+}
+
+func TestGHClient_ListCheckRuns_PaginatesCheckRuns(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh-args.log")
+	ghPath := filepath.Join(binDir, "gh")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$GH_ARGS_LOG"
+case "$*" in
+  *check-runs*)
+    case "$*" in
+      *--slurp*) printf '%s\n' 'unsupported slurp' >&2; exit 1 ;;
+      *--paginate*) printf '%s\n' '{"name":"unit","status":"completed","conclusion":"success","html_url":"https://ci/unit"}' '{"id":42,"name":"lint","status":"completed","conclusion":"failure","html_url":"https://ci/lint","app":{"id":17,"slug":"github-actions"},"check_suite":{"id":99}}' ;;
+      *) printf '%s\n' '[{"name":"unit","status":"completed","conclusion":"success","html_url":"https://ci/unit"}]' ;;
+    esac
+    ;;
+  *status*) printf '%s\n' '[]' ;;
+  *) printf '%s\n' '[]' ;;
+esac
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_ARGS_LOG", logPath)
+
+	checks, err := NewGHClient().ListCheckRuns(context.Background(), "acme", "widget", "sha")
+	if err != nil {
+		t.Fatalf("ListCheckRuns: %v", err)
+	}
+	if len(checks) != 2 {
+		t.Fatalf("checks = %d, want 2: %+v", len(checks), checks)
+	}
+	var lint *CheckRun
+	for i := range checks {
+		if checks[i].Name == "lint" {
+			lint = &checks[i]
+			break
+		}
+	}
+	if lint == nil || lint.Conclusion != "failure" || lint.ID != 42 || lint.AppID != 17 || lint.AppSlug != "github-actions" || lint.CheckSuiteID != 99 {
+		t.Fatalf("expected failed lint check from paginated output, got %+v", checks)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read gh args log: %v", err)
+	}
+	if !strings.Contains(string(logged), "--paginate") {
+		t.Fatalf("ListCheckRuns should call gh api with --paginate, got:\n%s", logged)
+	}
+	if strings.Contains(string(logged), "--slurp") {
+		t.Fatalf("ListCheckRuns should not combine gh api --slurp with --jq, got:\n%s", logged)
+	}
+}
+
+func TestGHClient_PRCommitDetailUsesExactSHAAndMergesPages(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh-args.log")
+	ghPath := filepath.Join(binDir, "gh")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$GH_ARGS_LOG"
+case "$*" in
+  *commits/*)
+    printf '%s\n' '[{"sha":"2222222222222222222222222222222222222222","commit":{"message":"remote detail","author":{"name":"Octo Cat","date":"2026-08-04T11:00:00Z"}},"author":{"login":"octocat"},"stats":{"additions":7,"deletions":3},"files":[{"filename":"one.txt","status":"modified","additions":4,"deletions":1,"patch":"@@ -1 +1 @@\\n-old\\n+new"}]},{"sha":"2222222222222222222222222222222222222222","commit":{"message":"ignored","author":{"name":"Other","date":"2026-08-05T11:00:00Z"}},"stats":{"additions":99,"deletions":99},"files":[{"filename":"two.txt","status":"removed","additions":0,"deletions":2,"patch":"@@ -1 +0,0 @@\\n-gone"}]}]'
+    ;;
+  *) printf '%s\n' '[]' ;;
+esac
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_ARGS_LOG", logPath)
+
+	detail, err := NewGHClient().GetPRCommitDetail(
+		context.Background(), "acme", "widget", "2222222222222222222222222222222222222222",
+	)
+	if err != nil {
+		t.Fatalf("GetPRCommitDetail: %v", err)
+	}
+	if detail.SHA != "2222222222222222222222222222222222222222" || detail.Additions != 7 || detail.Deletions != 3 {
+		t.Fatalf("detail = %#v", detail)
+	}
+	if len(detail.Files) != 2 {
+		t.Fatalf("files = %#v, want two merged files", detail.Files)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read gh args: %v", err)
+	}
+	command := string(args)
+	for _, want := range []string{
+		"api repos/acme/widget/commits/2222222222222222222222222222222222222222?per_page=100",
+		"--paginate",
+		"--slurp",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("gh args = %q, want %q", command, want)
+		}
+	}
+}
+
+func TestGHClient_RequestReviewers_UsesGitHubReviewRequestEndpoint(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh-args.log")
+	ghPath := filepath.Join(binDir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_ARGS_LOG\"\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_ARGS_LOG", logPath)
+
+	if err := NewGHClient().RequestReviewers(context.Background(), "acme", "widget", 42, []string{"octocat"}); err != nil {
+		t.Fatalf("RequestReviewers: %v", err)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	want := "api repos/acme/widget/pulls/42/requested_reviewers -X POST -f reviewers[]=octocat\n"
+	if string(args) != want {
+		t.Fatalf("gh args = %q, want %q", args, want)
+	}
+}
+
+func TestDecodeGHCheckRuns(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantNames []string
+		wantErr   bool
+	}{
+		{name: "empty", input: "", wantNames: nil},
+		{name: "single object", input: `{"name":"unit","status":"completed","conclusion":"success"}`, wantNames: []string{"unit"}},
+		{
+			name:      "multiple objects with whitespace",
+			input:     "\n  {\"name\":\"unit\",\"status\":\"completed\",\"conclusion\":\"success\"}\n{\"name\":\"lint\",\"status\":\"completed\",\"conclusion\":\"failure\"}\t",
+			wantNames: []string{"unit", "lint"},
+		},
+		{name: "invalid json", input: `{"name":"unit"`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decodeGHCheckRuns(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeGHCheckRuns: %v", err)
+			}
+			if len(got) != len(tt.wantNames) {
+				t.Fatalf("runs = %d, want %d: %+v", len(got), len(tt.wantNames), got)
+			}
+			for i, name := range tt.wantNames {
+				if got[i].Name != name {
+					t.Fatalf("run[%d].Name = %q, want %q", i, got[i].Name, name)
+				}
+			}
+		})
+	}
+}
+
+func TestParseRepoURL(t *testing.T) {
+	tests := []struct {
+		name      string
+		url       string
+		wantOwner string
+		wantRepo  string
+	}{
+		{
+			"standard API URL",
+			"https://api.github.com/repos/myorg/myrepo",
+			"myorg", "myrepo",
+		},
+		{
+			"short path",
+			"owner/repo",
+			"owner", "repo",
+		},
+		{
+			"single segment returns empty",
+			"onlyone",
+			"", "",
+		},
+		{
+			"empty",
+			"",
+			"", "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner, repo := parseRepoURL(tt.url)
+			if owner != tt.wantOwner {
+				t.Errorf("owner = %q, want %q", owner, tt.wantOwner)
+			}
+			if repo != tt.wantRepo {
+				t.Errorf("repo = %q, want %q", repo, tt.wantRepo)
+			}
+		})
+	}
+}
+
+func TestConvertGHPR(t *testing.T) {
+	raw := &ghPR{
+		Number:      42,
+		Title:       "Test PR",
+		URL:         "https://github.com/owner/repo/pull/42",
+		State:       "OPEN",
+		HeadRefName: "feature-branch",
+		HeadRefOid:  "abc123def456",
+		BaseRefName: "main",
+		IsDraft:     boolPtr(true),
+		Mergeable:   "MERGEABLE",
+		Additions:   100,
+		Deletions:   50,
+		CreatedAt:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
+		ReviewRequests: []ghRequestedReviewer{
+			{TypeName: "User", Login: "alice-reviewer"},
+			{TypeName: "Team", Slug: "core-platform"},
+		},
+		Author: struct {
+			Login string `json:"login"`
+		}{Login: "alice"},
+	}
+
+	pr := convertGHPR(raw, "owner", "repo")
+
+	if pr.Number != 42 {
+		t.Errorf("number = %d, want 42", pr.Number)
+	}
+	if pr.State != "open" {
+		t.Errorf("state = %q, want open", pr.State)
+	}
+	if pr.HeadBranch != "feature-branch" {
+		t.Errorf("head_branch = %q, want feature-branch", pr.HeadBranch)
+	}
+	if pr.HeadSHA != "abc123def456" {
+		t.Errorf("head_sha = %q, want abc123def456", pr.HeadSHA)
+	}
+	if !pr.Draft {
+		t.Error("expected draft = true")
+	}
+	if !pr.IsDraftObserved {
+		t.Error("expected IsDraftObserved = true when isDraft is present in the response")
+	}
+	if !pr.Mergeable {
+		t.Error("expected mergeable = true")
+	}
+	if pr.Additions != 100 {
+		t.Errorf("additions = %d, want 100", pr.Additions)
+	}
+	if len(pr.RequestedReviewers) != 2 {
+		t.Fatalf("requested reviewers = %d, want 2", len(pr.RequestedReviewers))
+	}
+	if pr.RequestedReviewers[0].Type != reviewerTypeUser {
+		t.Errorf("first reviewer type = %q, want %q", pr.RequestedReviewers[0].Type, reviewerTypeUser)
+	}
+	if pr.RequestedReviewers[1].Type != reviewerTypeTeam {
+		t.Errorf("second reviewer type = %q, want %q", pr.RequestedReviewers[1].Type, reviewerTypeTeam)
+	}
+	if pr.MergedAt != nil {
+		t.Error("expected nil MergedAt")
+	}
+}
+
+// TestConvertGHPR_MissingIsDraftAndChangedFilesLeavesUnobserved covers
+// AC-12a on the gh CLI decode path: a response that omits isDraft and
+// changedFiles must decode to unobserved (Observed=false), not a fabricated
+// false/0 masquerading as a real observation.
+func TestConvertGHPR_MissingIsDraftAndChangedFilesLeavesUnobserved(t *testing.T) {
+	raw := &ghPR{Number: 7, State: "OPEN"}
+	pr := convertGHPR(raw, "owner", "repo")
+	if pr.IsDraftObserved {
+		t.Error("IsDraftObserved = true, want false when isDraft is absent from the response")
+	}
+	if pr.ChangedFilesObserved {
+		t.Error("ChangedFilesObserved = true, want false when changedFiles is absent from the response")
+	}
+}
+
+// TestConvertGHPR_ExplicitFalseAndZeroAreObserved covers AC-12a's other
+// half: a response that genuinely reports isDraft=false and changedFiles=0
+// must be distinguishable from one that omits them — both mark Observed=true.
+func TestConvertGHPR_ExplicitFalseAndZeroAreObserved(t *testing.T) {
+	raw := &ghPR{Number: 7, State: "OPEN", IsDraft: boolPtr(false), ChangedFiles: intPtr(0)}
+	pr := convertGHPR(raw, "owner", "repo")
+	if !pr.IsDraftObserved {
+		t.Error("IsDraftObserved = false, want true for an explicit isDraft=false")
+	}
+	if pr.Draft {
+		t.Error("Draft = true, want false")
+	}
+	if !pr.ChangedFilesObserved {
+		t.Error("ChangedFilesObserved = false, want true for an explicit changedFiles=0")
+	}
+	if pr.ChangedFiles != 0 {
+		t.Errorf("ChangedFiles = %d, want 0", pr.ChangedFiles)
+	}
+}
+
+func TestConvertGHPR_Merged(t *testing.T) {
+	raw := &ghPR{
+		Number:   1,
+		State:    "CLOSED",
+		MergedAt: "2025-01-10T12:00:00Z",
+		Author: struct {
+			Login string `json:"login"`
+		}{Login: "bob"},
+	}
+
+	pr := convertGHPR(raw, "owner", "repo")
+
+	if pr.State != prStateMerged {
+		t.Errorf("state = %q, want merged", pr.State)
+	}
+	if pr.MergedAt == nil {
+		t.Error("expected non-nil MergedAt")
+	}
+}
+
+func TestConvertGHPR_NotMergeable(t *testing.T) {
+	raw := &ghPR{
+		Number:    1,
+		State:     "OPEN",
+		Mergeable: "CONFLICTING",
+		Author: struct {
+			Login string `json:"login"`
+		}{Login: "alice"},
+	}
+
+	pr := convertGHPR(raw, "owner", "repo")
+
+	if pr.Mergeable {
+		t.Error("expected mergeable = false for CONFLICTING")
+	}
+}
+
+func TestConvertGHPR_MergeStateStatus(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawEnum string
+		want    string
+	}{
+		{"clean", "CLEAN", "clean"},
+		{"blocked", "BLOCKED", "blocked"},
+		{"dirty", "DIRTY", "dirty"},
+		{"behind", "BEHIND", "behind"},
+		{"unknown", "UNKNOWN", "unknown"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := &ghPR{
+				Number:           1,
+				State:            "OPEN",
+				MergeStateStatus: tt.rawEnum,
+				Author: struct {
+					Login string `json:"login"`
+				}{Login: "alice"},
+			}
+			pr := convertGHPR(raw, "owner", "repo")
+			if pr.MergeableState != tt.want {
+				t.Errorf("MergeableState = %q, want %q", pr.MergeableState, tt.want)
+			}
+		})
+	}
+}
+
+func TestConvertGHRequestedReviewers(t *testing.T) {
+	raw := []ghRequestedReviewer{
+		{TypeName: "User", Login: "alice"},
+		{TypeName: "Team", Slug: "my-team"},
+		{TypeName: "Team", Name: "fallback-team-name"},
+		{TypeName: "User"},
+	}
+
+	got := convertGHRequestedReviewers(raw)
+	if len(got) != 3 {
+		t.Fatalf("requested reviewers = %d, want 3", len(got))
+	}
+	if got[0] != (RequestedReviewer{Login: "alice", Type: reviewerTypeUser}) {
+		t.Errorf("unexpected first reviewer: %#v", got[0])
+	}
+	if got[1] != (RequestedReviewer{Login: "my-team", Type: reviewerTypeTeam}) {
+		t.Errorf("unexpected second reviewer: %#v", got[1])
+	}
+	if got[2] != (RequestedReviewer{Login: "fallback-team-name", Type: reviewerTypeTeam}) {
+		t.Errorf("unexpected third reviewer: %#v", got[2])
+	}
+}
+
+func TestGHStderrIndicatesRateLimit(t *testing.T) {
+	cases := []struct {
+		stderr string
+		want   bool
+	}{
+		{"GraphQL: API rate limit already exceeded for user ID 12345.", true},
+		{"You have exceeded a secondary rate limit.", true},
+		{"abuse detection mechanism triggered", true},
+		{"network: connection refused", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := ghStderrIndicatesRateLimit(c.stderr); got != c.want {
+			t.Errorf("ghStderrIndicatesRateLimit(%q) = %v, want %v", c.stderr, got, c.want)
+		}
+	}
+}
+
+func TestGHClient_InspectRateStderr_MarksGraphQL(t *testing.T) {
+	tracker := NewRateTracker(nil, nil)
+	c := NewGHClient().WithRateTracker(tracker)
+	c.inspectRateStderr([]string{"pr", "view", "1"}, "GraphQL: API rate limit already exceeded")
+	if !tracker.IsExhausted(ResourceGraphQL) {
+		t.Errorf("expected graphql exhausted")
+	}
+}
+
+func TestGHClient_InspectRateStderr_MarksSearchForSearchEndpoints(t *testing.T) {
+	tracker := NewRateTracker(nil, nil)
+	c := NewGHClient().WithRateTracker(tracker)
+	c.inspectRateStderr([]string{"api", "search/issues"}, "API rate limit exceeded")
+	if !tracker.IsExhausted(ResourceSearch) {
+		t.Errorf("expected search exhausted")
+	}
+}
+
+func TestResourceForGHArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want Resource
+	}{
+		// REST endpoints under `gh api <path>` go to Core, not GraphQL.
+		// This is the regression: previously every gh api failure was
+		// attributed to GraphQL unless the path started with search/.
+		{"api repos REST", []string{"api", "repos/o/r/pulls/1"}, ResourceCore},
+		{"api user REST", []string{"api", "user"}, ResourceCore},
+		{"api rate_limit REST", []string{"api", "rate_limit"}, ResourceCore},
+
+		// Documented exceptions still resolve to their dedicated buckets.
+		{"api graphql", []string{"api", "graphql"}, ResourceGraphQL},
+		{"api search/issues", []string{"api", "search/issues"}, ResourceSearch},
+		{"api search/repositories", []string{"api", "search/repositories"}, ResourceSearch},
+
+		// Non-`api` subcommands are GraphQL — gh implements pr/issue/repo
+		// against the GraphQL API.
+		{"pr view", []string{"pr", "view", "1"}, ResourceGraphQL},
+		{"issue list", []string{"issue", "list"}, ResourceGraphQL},
+		{"repo view", []string{"repo", "view"}, ResourceGraphQL},
+
+		// Defensive defaults for malformed argv.
+		{"empty", nil, ResourceCore},
+		{"api only", []string{"api"}, ResourceCore},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resourceForGHArgs(tc.args); got != tc.want {
+				t.Errorf("resourceForGHArgs(%v) = %s, want %s", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildUserReposGHArgs(t *testing.T) {
+	cases := []struct {
+		name  string
+		login string
+		query string
+		limit int
+		wantQ string
+		wantP string
+	}{
+		{
+			name:  "empty query",
+			login: "alice",
+			query: "",
+			limit: 20,
+			wantQ: "q=user:alice",
+			wantP: "per_page=20",
+		},
+		{
+			name:  "with query",
+			login: "alice",
+			query: "language:go",
+			limit: 50,
+			wantQ: "q=user:alice language:go",
+			wantP: "per_page=50",
+		},
+		{
+			name:  "clamped limit at upper bound",
+			login: "bob",
+			query: "",
+			limit: 100,
+			wantQ: "q=user:bob",
+			wantP: "per_page=100",
+		},
+		{
+			name:  "default clamp value",
+			login: "bob",
+			query: "in:name foo",
+			limit: 20,
+			wantQ: "q=user:bob in:name foo",
+			wantP: "per_page=20",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildUserReposGHArgs(tc.login, tc.query, tc.limit)
+			// Sanity: first two args pin the gh subcommand to `api search/repositories`.
+			if len(args) < 2 || args[0] != "api" || args[1] != "search/repositories" {
+				t.Fatalf("args prefix = %v, want [api search/repositories ...]", args)
+			}
+			// Find -f q=... and -f per_page=... values without depending on
+			// exact positional layout (so future arg additions don't break the test).
+			gotQ, gotP := "", ""
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] != "-f" {
+					continue
+				}
+				switch {
+				case strings.HasPrefix(args[i+1], "q="):
+					gotQ = args[i+1]
+				case strings.HasPrefix(args[i+1], "per_page="):
+					gotP = args[i+1]
+				}
+			}
+			if gotQ != tc.wantQ {
+				t.Errorf("q flag = %q, want %q", gotQ, tc.wantQ)
+			}
+			if gotP != tc.wantP {
+				t.Errorf("per_page flag = %q, want %q", gotP, tc.wantP)
+			}
+		})
+	}
+}
+
+func TestParseGHSearchRepos(t *testing.T) {
+	// Mixed payload: one public repo with a description and a default branch
+	// other than "main", one private repo with a `null` description that must
+	// decode to an empty string, and one repo with no pushed_at to verify the
+	// nil-pointer branch.
+	data := `[
+		{"full_name":"octocat/hello","owner":{"login":"octocat"},"name":"hello","private":false,"default_branch":"trunk","description":"Hello world","pushed_at":"2025-03-01T10:00:00Z"},
+		{"full_name":"octocat/secret","owner":{"login":"octocat"},"name":"secret","private":true,"default_branch":"main","description":null,"pushed_at":"2025-02-01T10:00:00Z"},
+		{"full_name":"octocat/new","owner":{"login":"octocat"},"name":"new","private":false,"default_branch":"main"}
+	]`
+	repos, err := parseGHSearchRepos(data)
+	if err != nil {
+		t.Fatalf("parseGHSearchRepos: %v", err)
+	}
+	if len(repos) != 3 {
+		t.Fatalf("len = %d, want 3", len(repos))
+	}
+	if repos[0].FullName != "octocat/hello" || repos[0].DefaultBranch != "trunk" || repos[0].Description != "Hello world" {
+		t.Errorf("repo[0] unexpected: %#v", repos[0])
+	}
+	if repos[0].PushedAt == nil {
+		t.Errorf("repo[0] PushedAt nil, want non-nil")
+	}
+	if !repos[1].Private || repos[1].DefaultBranch != "main" || repos[1].Description != "" {
+		t.Errorf("repo[1] unexpected: %#v", repos[1])
+	}
+	if repos[2].DefaultBranch != "main" || repos[2].PushedAt != nil {
+		t.Errorf("repo[2] unexpected: %#v", repos[2])
+	}
+}
+
+func TestBuildUserReposGHArgs_LimitClamping(t *testing.T) {
+	// Mirrors the PAT client test: ListUserRepos must clamp before calling
+	// buildUserReposGHArgs, so verify a full round-trip via clampRepoSearchLimit.
+	cases := []struct {
+		name        string
+		inLimit     int
+		wantPerPage string
+	}{
+		{"zero defaults to 20", 0, "per_page=20"},
+		{"negative defaults to 20", -5, "per_page=20"},
+		{"in range passes through", 42, "per_page=42"},
+		{"exceeds cap clamps to 100", 500, "per_page=100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildUserReposGHArgs("alice", "", clampRepoSearchLimit(tc.inLimit))
+			gotP := ""
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "-f" && strings.HasPrefix(args[i+1], "per_page=") {
+					gotP = args[i+1]
+				}
+			}
+			if gotP != tc.wantPerPage {
+				t.Errorf("per_page flag = %q, want %q", gotP, tc.wantPerPage)
+			}
+		})
+	}
+}
+
+// Regression: a 429 on `gh api repos/...` (REST) must mark Core, not GraphQL.
+// Previously this would pause the GraphQL PR monitor incorrectly.
+func TestGHClient_InspectRateStderr_RestEndpointMarksCore(t *testing.T) {
+	tracker := NewRateTracker(nil, nil)
+	c := NewGHClient().WithRateTracker(tracker)
+	c.inspectRateStderr([]string{"api", "repos/o/r/pulls/1"}, "API rate limit exceeded")
+	if !tracker.IsExhausted(ResourceCore) {
+		t.Errorf("expected core bucket exhausted for REST endpoint")
+	}
+	if tracker.IsExhausted(ResourceGraphQL) {
+		t.Errorf("REST 429 must not pause graphql bucket")
+	}
+}
+
+func TestDecodeGHCheckRunsReadsPaginatedJSONStream(t *testing.T) {
+	got, err := decodeGHCheckRuns(`{"name":"page one","status":"completed","conclusion":"success"}
+{"name":"page two","status":"completed","conclusion":"failure"}`)
+	if err != nil {
+		t.Fatalf("decodeGHCheckRuns: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("check runs = %d, want 2", len(got))
+	}
+	if got[1].Name != "page two" || got[1].Conclusion == nil || *got[1].Conclusion != "failure" {
+		t.Fatalf("second check run not decoded: %#v", got[1])
+	}
+}
+
+func TestBuildAccessibleReposGHArgs(t *testing.T) {
+	cases := []struct {
+		name     string
+		inLimit  int
+		wantPath string
+	}{
+		{"in range", 50, "/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=50"},
+		{"cap clamps to 100", 100, "/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=100"},
+		{"small page", 5, "/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildAccessibleReposGHArgs(clampRepoSearchLimit(tc.inLimit))
+			if len(args) != 2 || args[0] != "api" {
+				t.Fatalf("args = %v, want [api <path>]", args)
+			}
+			if args[1] != tc.wantPath {
+				t.Errorf("path = %q, want %q", args[1], tc.wantPath)
+			}
+			// Must NOT include --paginate: the picker wants a single page.
+			for _, a := range args {
+				if a == "--paginate" {
+					t.Errorf("args must not contain --paginate, got %v", args)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildAccessibleReposGHArgs_ClampsPerPage(t *testing.T) {
+	cases := []struct {
+		name        string
+		inLimit     int
+		wantPerPage string
+	}{
+		{"zero defaults to 20", 0, "per_page=20"},
+		{"negative defaults to 20", -5, "per_page=20"},
+		{"exceeds cap clamps to 100", 500, "per_page=100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildAccessibleReposGHArgs(clampRepoSearchLimit(tc.inLimit))
+			if !strings.Contains(args[1], tc.wantPerPage) {
+				t.Errorf("path %q must contain %q", args[1], tc.wantPerPage)
+			}
+		})
+	}
+}
+
+// TestParseGHSearchRepos_FlatArray confirms the flat /user/repos array shape
+// (used by ListAccessibleRepos) decodes correctly: happy path, empty, and a
+// null description mapping to empty string.
+func TestParseGHSearchRepos_FlatArray(t *testing.T) {
+	t.Run("happy", func(t *testing.T) {
+		data := `[
+			{"full_name":"kdlbs/kandev","owner":{"login":"kdlbs"},"name":"kandev","private":false,"default_branch":"main","description":"the app","pushed_at":"2025-05-01T10:00:00Z"}
+		]`
+		repos, err := parseGHSearchRepos(data)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(repos) != 1 || repos[0].FullName != "kdlbs/kandev" || repos[0].Owner != "kdlbs" {
+			t.Fatalf("unexpected repos: %#v", repos)
+		}
+		if repos[0].PushedAt == nil {
+			t.Errorf("PushedAt nil, want non-nil")
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		repos, err := parseGHSearchRepos(`[]`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(repos) != 0 {
+			t.Errorf("len = %d, want 0", len(repos))
+		}
+	})
+	t.Run("null description", func(t *testing.T) {
+		data := `[{"full_name":"o/r","owner":{"login":"o"},"name":"r","private":true,"default_branch":"main","description":null}]`
+		repos, err := parseGHSearchRepos(data)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if repos[0].Description != "" {
+			t.Errorf("description = %q, want empty", repos[0].Description)
+		}
+		if repos[0].PushedAt != nil {
+			t.Errorf("PushedAt = %v, want nil", repos[0].PushedAt)
+		}
+	})
+}

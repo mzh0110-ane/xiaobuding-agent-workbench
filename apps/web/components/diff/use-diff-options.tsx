@@ -1,0 +1,237 @@
+import { useCallback, useMemo, type ReactNode } from "react";
+import { useTheme } from "@/components/theme/app-theme";
+import type { FileDiffOptions, SelectedLineRange, FileDiffMetadata } from "@pierre/diffs";
+import { IconPlus } from "@tabler/icons-react";
+import { FONT } from "@/lib/theme/colors";
+import { useGlobalViewMode } from "@/hooks/use-global-view-mode";
+import { useDiffHeaderToolbar } from "./diff-header-toolbar";
+import type { AnnotationMetadata } from "./use-diff-annotation-renderer";
+import { useTranslation } from "react-i18next";
+
+/** CSS overrides for the Pierre diff viewer, injected via unsafeCSS. */
+const DIFF_UNSAFE_CSS = `
+  :host {
+    --diffs-bg: var(--background) !important;
+    --diffs-bg-context: var(--background) !important;
+    --diffs-bg-buffer: var(--card) !important;
+    --diffs-bg-separator: var(--card) !important;
+    --diffs-bg-hover: var(--muted) !important;
+    --diffs-fg: var(--foreground) !important;
+    --diffs-fg-number: var(--muted-foreground) !important;
+    --diffs-addition-color-override: rgb(var(--git-addition)) !important;
+    --diffs-deletion-color-override: rgb(var(--git-deletion)) !important;
+    --diffs-bg-addition: rgb(var(--git-addition) / 0.1) !important;
+    --diffs-bg-deletion: rgb(var(--git-deletion) / 0.1) !important;
+    --diffs-bg-addition-number: rgb(var(--git-addition) / 0.15) !important;
+    --diffs-bg-deletion-number: rgb(var(--git-deletion) / 0.15) !important;
+    --diffs-bg-addition-emphasis: rgb(var(--git-addition) / 0.3) !important;
+    --diffs-bg-deletion-emphasis: rgb(var(--git-deletion) / 0.3) !important;
+    --diffs-bg-selection-override: color-mix(in lab, var(--background) 74%, var(--primary)) !important;
+    --diffs-bg-selection-number-override: color-mix(in lab, var(--background) 60%, var(--primary)) !important;
+    --diffs-line-height: 24px !important;
+    --diffs-font-size: ${FONT.size}px !important;
+    --diffs-font-family: ${FONT.mono} !important;
+    --diffs-gap-fallback: 0;
+    font-size: ${FONT.size}px !important;
+    font-family: ${FONT.mono} !important;
+  }
+  [data-line] {
+    min-height: 24px !important;
+    line-height: 24px !important;
+  }
+  [data-selected-line]:is([data-line], [data-line-annotation]) {
+    box-shadow: inset 2px 0 0 var(--primary) !important;
+  }
+  [data-separator='metadata'],
+  [data-separator]:empty {
+    height: 24px !important;
+    background-image: repeating-linear-gradient(-45deg, transparent, transparent calc(3px * 1.414), var(--diffs-bg-buffer) calc(3px * 1.414), var(--diffs-bg-buffer) calc(4px * 1.414));
+    background-color: transparent !important;
+    border-top: 1px solid var(--diffs-bg-separator) !important;
+    border-bottom: 1px solid var(--diffs-bg-separator) !important;
+  }
+  [data-change-icon] {
+    width: 12px !important;
+    height: 12px !important;
+  }
+  [data-diffs-header] {
+    padding-inline: 12px !important;
+    background: var(--card) !important;
+  }
+  [data-header-content] {
+    display: flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    min-width: 0 !important;
+  }
+  [data-title],
+  [data-prev-name] {
+    min-width: 0 !important;
+  }
+  [data-title] bdi,
+  [data-prev-name] bdi {
+    display: block !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+  /* Vertically center the "Add comment" hover button in the line gutter.
+     Pierre 1.1.22 declares the slot wrapper as display:flex with top:0/bottom:0
+     but no align-items, so our fixed-size button pins to the top of the line
+     cell instead of centering on the line number. */
+  [data-gutter-utility-slot] {
+    align-items: center !important;
+  }
+`;
+
+type UseDiffOptionsArgs = {
+  filePath: string;
+  diff?: string;
+  enableComments: boolean;
+  showHeader: boolean;
+  wordWrap: boolean;
+  setWordWrap: (fn: (v: boolean) => boolean) => void;
+  handleLineSelectionEnd: (range: SelectedLineRange | null) => void;
+  onLineEnter: (props: { lineType?: string; lineNumber?: number; annotationSide?: string }) => void;
+  onLineLeave: () => void;
+  onOpenFile?: (filePath: string, repo?: string) => void;
+  onPreviewMarkdown?: (filePath: string) => void;
+  onRevert?: (filePath: string) => void;
+  /** Multi-repo subpath (repository_name) so Edit opens under the right repo. */
+  repo?: string;
+  taskId?: string | null;
+  sessionId?: string | null;
+  repositoryId?: string | null;
+  status?: string | null;
+  previousPath?: string | null;
+  publishedBranch?: string | null;
+  baseBranch?: string | null;
+  /** Enable diff expansion (requires full deletionLines/additionLines in metadata) */
+  enableExpansion?: boolean;
+  /** Number of lines to expand per click (default: 20) */
+  expansionLineCount?: number;
+  /** When true, show all lines (no separators) */
+  expandUnchanged?: boolean;
+  /** Toggle callback for expand-all button */
+  onToggleExpandUnchanged?: () => void;
+};
+
+type UseDiffOptionsResult = {
+  globalViewMode: string;
+  options: FileDiffOptions<AnnotationMetadata>;
+  renderHeaderMetadata: ((fileDiff: FileDiffMetadata) => ReactNode) | undefined;
+  renderHoverUtility: () => ReactNode;
+};
+
+export function useDiffOptions(args: UseDiffOptionsArgs): UseDiffOptionsResult {
+  const { t } = useTranslation();
+  const {
+    filePath,
+    diff,
+    enableComments,
+    showHeader,
+    wordWrap,
+    setWordWrap,
+    handleLineSelectionEnd,
+    onLineEnter,
+    onLineLeave,
+    onOpenFile,
+    onPreviewMarkdown,
+    onRevert,
+    repo,
+    enableExpansion = false,
+    expansionLineCount = 20,
+    expandUnchanged,
+    onToggleExpandUnchanged,
+  } = args;
+
+  const { resolvedTheme } = useTheme();
+  const [globalViewMode, setGlobalViewMode] = useGlobalViewMode();
+
+  const toggleViewMode = useCallback(
+    () => setGlobalViewMode(globalViewMode === "split" ? "unified" : "split"),
+    [globalViewMode, setGlobalViewMode],
+  );
+
+  const toggleWordWrap = useCallback(() => setWordWrap((v: boolean) => !v), [setWordWrap]);
+
+  const renderHeaderMetadata = useDiffHeaderToolbar({
+    filePath,
+    diff,
+    wordWrap,
+    onToggleWordWrap: toggleWordWrap,
+    viewMode: globalViewMode,
+    onToggleViewMode: toggleViewMode,
+    onOpenFile,
+    onPreviewMarkdown,
+    onRevert,
+    repo,
+    taskId: args.taskId,
+    sessionId: args.sessionId,
+    repositoryId: args.repositoryId,
+    status: args.status,
+    previousPath: args.previousPath,
+    publishedBranch: args.publishedBranch,
+    baseBranch: args.baseBranch,
+    expandUnchanged,
+    onToggleExpandUnchanged,
+  });
+
+  const renderHoverUtility = useCallback((): ReactNode => {
+    if (!enableComments) return null;
+    return (
+      <div
+        // Negative margin mirrors pierre's default [data-utility-button] trick:
+        // the slot wrapper is right:0 of the line-number cell, so without this
+        // the button sits inside the cell and overlaps the number. Pulling
+        // right by (1ch - 1lh) extrudes the button past the gutter's right
+        // edge into the code area, same as pierre's built-in button does.
+        style={{ marginRight: "calc(1ch - 1lh)" }}
+        className="flex h-5 w-5 cursor-pointer items-center justify-center rounded border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+        title={t("diff:addComment")}
+      >
+        <IconPlus className="h-3 w-3" />
+      </div>
+    );
+  }, [enableComments]);
+
+  const options = useMemo<FileDiffOptions<AnnotationMetadata>>(() => {
+    return {
+      diffStyle: globalViewMode,
+      themeType: resolvedTheme === "dark" ? "dark" : "light",
+      enableLineSelection: enableComments,
+      // "line-info" shows expand buttons when full deletionLines/additionLines are on metadata;
+      // "simple" is a plain divider without expand controls.
+      hunkSeparators: enableExpansion ? "line-info" : "simple",
+      enableHoverUtility: enableComments,
+      diffIndicators: "none",
+      onLineSelectionEnd: handleLineSelectionEnd,
+      onLineEnter,
+      onLineLeave,
+      disableFileHeader: !showHeader,
+      overflow: wordWrap ? "wrap" : "scroll",
+      unsafeCSS: DIFF_UNSAFE_CSS,
+      expansionLineCount,
+      expandUnchanged,
+    };
+  }, [
+    globalViewMode,
+    resolvedTheme,
+    enableComments,
+    showHeader,
+    handleLineSelectionEnd,
+    wordWrap,
+    onLineEnter,
+    onLineLeave,
+    enableExpansion,
+    expansionLineCount,
+    expandUnchanged,
+  ]);
+
+  return {
+    globalViewMode,
+    options,
+    renderHeaderMetadata: showHeader ? renderHeaderMetadata : undefined,
+    renderHoverUtility,
+  };
+}

@@ -1,0 +1,758 @@
+// Package models defines data types for the office domain.
+package models
+
+import (
+	"encoding/json"
+	"time"
+
+	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
+)
+
+// AgentRole and AgentStatus are aliases for the canonical types declared
+// in internal/agent/settings/models. ADR 0005 Wave D moved the typed
+// constants to the settings package because the agent_profiles row owns
+// these attributes after the unification; the aliases here keep ~270
+// office callsites compiling without an import-flag-day rename.
+//
+// New code should import settingsmodels directly. Office-only callers
+// reading models.AgentRoleCEO etc. continue to work via the const
+// re-exports below.
+type (
+	AgentRole   = settingsmodels.AgentRole
+	AgentStatus = settingsmodels.AgentStatus
+)
+
+// Re-exported AgentRole values. These are package-level constant aliases —
+// `models.AgentRoleCEO` evaluates to the same untyped string as
+// `settingsmodels.AgentRoleCEO`, so callers can mix references across
+// packages freely.
+const (
+	AgentRoleCEO        = settingsmodels.AgentRoleCEO
+	AgentRoleWorker     = settingsmodels.AgentRoleWorker
+	AgentRoleSpecialist = settingsmodels.AgentRoleSpecialist
+	AgentRoleAssistant  = settingsmodels.AgentRoleAssistant
+	AgentRoleSecurity   = settingsmodels.AgentRoleSecurity
+	AgentRoleQA         = settingsmodels.AgentRoleQA
+	AgentRoleDevOps     = settingsmodels.AgentRoleDevOps
+)
+
+// Re-exported AgentStatus values.
+const (
+	AgentStatusIdle            = settingsmodels.AgentStatusIdle
+	AgentStatusWorking         = settingsmodels.AgentStatusWorking
+	AgentStatusPaused          = settingsmodels.AgentStatusPaused
+	AgentStatusStopped         = settingsmodels.AgentStatusStopped
+	AgentStatusPendingApproval = settingsmodels.AgentStatusPendingApproval
+)
+
+// AgentInstance is an alias for settings.AgentProfile. ADR 0005 Wave G
+// collapsed the two structs into one row representation: every office
+// agent is an agent_profiles row with workspace_id != ”. Office code
+// continues to import models.AgentInstance for ergonomic naming, but the
+// underlying type is identical to settingsmodels.AgentProfile.
+//
+// The legacy AgentProfileID field is gone — under the unified model the
+// row's ID is the profile id. Callsites that previously read .AgentProfileID
+// have been migrated to .ID.
+type AgentInstance = settingsmodels.AgentProfile
+
+// Skill represents a reusable skill definition.
+//
+// System skills (is_system = true) are kandev-owned: they are
+// bundled with the binary, upserted into office_skills at startup,
+// and refreshed in place on every kandev release. Per-agent
+// `desired_skills` references are preserved across updates because
+// the row id stays stable. User skills (is_system = false) are
+// imported by users (`source_type = git | inline | local_path |
+// skills_sh | user_home`) and are never touched by the startup sync.
+//
+// `default_for_roles` is a JSON-encoded `[]string` of agent roles
+// that should receive this system skill auto-attached on agent
+// create (e.g. ["ceo"]). Empty array for "no auto-attach". Ignored
+// for is_system = false.
+type Skill struct {
+	ID                      string             `json:"id" db:"id"`
+	WorkspaceID             string             `json:"workspace_id" db:"workspace_id"`
+	Name                    string             `json:"name" db:"name"`
+	Slug                    string             `json:"slug" db:"slug"`
+	Description             string             `json:"description" db:"description"`
+	SourceType              SkillSourceType    `json:"source_type" db:"source_type"`
+	SourceLocator           string             `json:"source_locator" db:"source_locator"`
+	Content                 string             `json:"content" db:"content"`
+	FileInventory           string             `json:"file_inventory" db:"file_inventory"`
+	Version                 string             `json:"version" db:"version"`
+	ContentHash             string             `json:"content_hash" db:"content_hash"`
+	ApprovalState           SkillApprovalState `json:"approval_state" db:"approval_state"`
+	CreatedByAgentProfileID string             `json:"created_by_agent_profile_id" db:"created_by_agent_profile_id"`
+	IsSystem                bool               `json:"is_system" db:"is_system"`
+	SystemVersion           string             `json:"system_version" db:"system_version"`
+	DefaultForRoles         string             `json:"default_for_roles" db:"default_for_roles"`
+	CreatedAt               time.Time          `json:"created_at" db:"created_at"`
+	UpdatedAt               time.Time          `json:"updated_at" db:"updated_at"`
+}
+
+// RunSkillSnapshot records the exact skill package attached to a run.
+type RunSkillSnapshot struct {
+	RunID            string `json:"run_id" db:"run_id"`
+	SkillID          string `json:"skill_id" db:"skill_id"`
+	DisplayName      string `json:"display_name" db:"display_name"`
+	Slug             string `json:"slug" db:"slug"`
+	LabelSource      string `json:"label_source" db:"label_source"`
+	Version          string `json:"version" db:"version"`
+	ContentHash      string `json:"content_hash" db:"content_hash"`
+	MaterializedPath string `json:"materialized_path" db:"materialized_path"`
+}
+
+// RunSessionState is the durable lifecycle state of an Office execution that
+// is owned by a run rather than by a task session.
+type RunSessionState string
+
+const (
+	RunSessionStatePreparing   RunSessionState = "preparing"
+	RunSessionStateRunning     RunSessionState = "running"
+	RunSessionStateFinished    RunSessionState = "finished"
+	RunSessionStateFailed      RunSessionState = "failed"
+	RunSessionStateCancelled   RunSessionState = "cancelled"
+	RunSessionStateInterrupted RunSessionState = "interrupted"
+)
+
+// RunSession records one immutable attempt to execute an Office run. A retry
+// receives a new ID and attempt number, so delayed predecessor events cannot
+// be accepted as updates to the successor.
+type RunSession struct {
+	ID                 string          `json:"id" db:"id"`
+	WorkspaceID        string          `json:"workspace_id" db:"workspace_id"`
+	AgentProfileID     string          `json:"agent_profile_id" db:"agent_profile_id"`
+	RunID              string          `json:"run_id" db:"run_id"`
+	Attempt            int             `json:"attempt" db:"attempt"`
+	State              RunSessionState `json:"state" db:"state"`
+	ExecutionID        string          `json:"execution_id" db:"execution_id"`
+	ExecutionProfileID string          `json:"execution_profile_id" db:"execution_profile_id"`
+	Adapter            string          `json:"adapter" db:"adapter"`
+	Model              string          `json:"model" db:"model"`
+	ACPSessionID       string          `json:"acp_session_id" db:"acp_session_id"`
+	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
+	StartedAt          *time.Time      `json:"started_at,omitempty" db:"started_at"`
+	FinishedAt         *time.Time      `json:"finished_at,omitempty" db:"finished_at"`
+	CancelRequestedAt  *time.Time      `json:"cancel_requested_at,omitempty" db:"cancel_requested_at"`
+	ErrorMessage       string          `json:"error_message,omitempty" db:"error_message"`
+	Version            int64           `json:"version" db:"version"`
+}
+
+// ProjectStatus represents the status of a project.
+type ProjectStatus string
+
+const (
+	ProjectStatusActive    ProjectStatus = "active"
+	ProjectStatusCompleted ProjectStatus = "completed"
+	ProjectStatusOnHold    ProjectStatus = "on_hold"
+	ProjectStatusArchived  ProjectStatus = "archived"
+)
+
+// Project represents an office project.
+//
+// Repositories is stored in the DB and YAML as a JSON-encoded array
+// string (e.g. `["github.com/foo/bar"]`). MarshalJSON/UnmarshalJSON
+// convert it to/from a real `[]string` on the API wire so the
+// frontend (and any other JSON consumer) sees an array.
+type Project struct {
+	ID                 string        `json:"id" db:"id"`
+	WorkspaceID        string        `json:"workspace_id" db:"workspace_id"`
+	Name               string        `json:"name" db:"name"`
+	Description        string        `json:"description" db:"description"`
+	Status             ProjectStatus `json:"status" db:"status"`
+	LeadAgentProfileID string        `json:"lead_agent_profile_id" db:"lead_agent_profile_id"`
+	Color              string        `json:"color" db:"color"`
+	BudgetCents        int           `json:"budget_cents" db:"budget_cents"`
+	Repositories       string        `json:"-" db:"repositories"`
+	ExecutorConfig     string        `json:"executor_config" db:"executor_config"`
+	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at" db:"updated_at"`
+}
+
+// projectWire is the on-the-wire JSON representation of Project. It
+// matches Project field-for-field except `repositories` is a real
+// []string instead of a JSON-encoded string. Kept private so callers
+// only ever construct Project directly.
+type projectWire struct {
+	ID                 string        `json:"id"`
+	WorkspaceID        string        `json:"workspace_id"`
+	Name               string        `json:"name"`
+	Description        string        `json:"description"`
+	Status             ProjectStatus `json:"status"`
+	LeadAgentProfileID string        `json:"lead_agent_profile_id"`
+	Color              string        `json:"color"`
+	BudgetCents        int           `json:"budget_cents"`
+	Repositories       []string      `json:"repositories"`
+	ExecutorConfig     string        `json:"executor_config"`
+	CreatedAt          time.Time     `json:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+}
+
+// MarshalJSON emits Project with `repositories` as a []string. The
+// stored value is a JSON-encoded array string; empty values normalise
+// to an empty array so the frontend never has to guard against null.
+func (p Project) MarshalJSON() ([]byte, error) {
+	repos, err := DecodeRepositories(p.Repositories)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(projectWire{
+		ID:                 p.ID,
+		WorkspaceID:        p.WorkspaceID,
+		Name:               p.Name,
+		Description:        p.Description,
+		Status:             p.Status,
+		LeadAgentProfileID: p.LeadAgentProfileID,
+		Color:              p.Color,
+		BudgetCents:        p.BudgetCents,
+		Repositories:       repos,
+		ExecutorConfig:     p.ExecutorConfig,
+		CreatedAt:          p.CreatedAt,
+		UpdatedAt:          p.UpdatedAt,
+	})
+}
+
+// UnmarshalJSON accepts `repositories` as a []string and stores it
+// back as the canonical JSON-encoded string. Other consumers
+// (config sync, YAML) treat the field as a string so we preserve the
+// internal shape.
+func (p *Project) UnmarshalJSON(data []byte) error {
+	var w projectWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	encoded, err := EncodeRepositories(w.Repositories)
+	if err != nil {
+		return err
+	}
+	p.ID = w.ID
+	p.WorkspaceID = w.WorkspaceID
+	p.Name = w.Name
+	p.Description = w.Description
+	p.Status = w.Status
+	p.LeadAgentProfileID = w.LeadAgentProfileID
+	p.Color = w.Color
+	p.BudgetCents = w.BudgetCents
+	p.Repositories = encoded
+	p.ExecutorConfig = w.ExecutorConfig
+	p.CreatedAt = w.CreatedAt
+	p.UpdatedAt = w.UpdatedAt
+	return nil
+}
+
+// DecodeRepositories parses the stored JSON-encoded array string into
+// a []string. Empty input returns an empty (non-nil) slice so callers
+// never serialise `null`.
+func DecodeRepositories(raw string) ([]string, error) {
+	if raw == "" || raw == "[]" {
+		return []string{}, nil
+	}
+	var repos []string
+	if err := json.Unmarshal([]byte(raw), &repos); err != nil {
+		return nil, err
+	}
+	if repos == nil {
+		return []string{}, nil
+	}
+	return repos, nil
+}
+
+// EncodeRepositories renders a []string as the canonical JSON-encoded
+// array string used by the DB and YAML layers. A nil/empty slice
+// becomes "[]" so the validator's empty-check stays consistent.
+func EncodeRepositories(repos []string) (string, error) {
+	if len(repos) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(repos)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// TaskCounts holds aggregated task status counts for a project.
+type TaskCounts struct {
+	Total      int `json:"total" db:"total"`
+	InProgress int `json:"in_progress" db:"in_progress"`
+	Done       int `json:"done" db:"done"`
+	Blocked    int `json:"blocked" db:"blocked"`
+}
+
+// ProjectWithCounts is a project with aggregated task counts.
+type ProjectWithCounts struct {
+	Project
+	TaskCounts TaskCounts `json:"task_counts"`
+}
+
+// MarshalJSON inlines the embedded Project alongside `task_counts`.
+// Required because Project has a custom MarshalJSON and Go would
+// otherwise use it for the whole struct, dropping TaskCounts.
+func (p ProjectWithCounts) MarshalJSON() ([]byte, error) {
+	repos, err := DecodeRepositories(p.Repositories)
+	if err != nil {
+		return nil, err
+	}
+	type wire struct {
+		projectWire
+		TaskCounts TaskCounts `json:"task_counts"`
+	}
+	return json.Marshal(wire{
+		projectWire: projectWire{
+			ID:                 p.ID,
+			WorkspaceID:        p.WorkspaceID,
+			Name:               p.Name,
+			Description:        p.Description,
+			Status:             p.Status,
+			LeadAgentProfileID: p.LeadAgentProfileID,
+			Color:              p.Color,
+			BudgetCents:        p.BudgetCents,
+			Repositories:       repos,
+			ExecutorConfig:     p.ExecutorConfig,
+			CreatedAt:          p.CreatedAt,
+			UpdatedAt:          p.UpdatedAt,
+		},
+		TaskCounts: p.TaskCounts,
+	})
+}
+
+// ValidProjectStatuses contains valid project status values.
+var ValidProjectStatuses = map[ProjectStatus]bool{
+	ProjectStatusActive:    true,
+	ProjectStatusCompleted: true,
+	ProjectStatusOnHold:    true,
+	ProjectStatusArchived:  true,
+}
+
+// CostContractVersion is the in-band activation point for the cache-split /
+// cost-provenance / turn-attribution columns (docs/specs/office/requirements/costs.md).
+// The Rill cost extract has no schema versioning of its own, so a row
+// written under a prior contract is distinguished by comparing
+// cost_contract_version, not by a date an analyst has to be told out of
+// band. Both production writers (the prompt-usage subscriber's buildCostEvent
+// and the manual-entry RecordCostEvent) use this value. The test harness uses
+// it too. Thus, the writers cannot disagree about which contract applies to a
+// row. Bump only if the contract's meaning changes again.
+//
+// v1 → v2: on the CostSourceUnpriced path, v1 forced Estimated=true
+// regardless of the caller's own Estimated flag, conflating "we could not
+// resolve a price" with "the token counts themselves were synthesised" —
+// two different signals this same contract introduced CostSource
+// specifically to keep separate. v2 preserves the caller's Estimated value
+// verbatim on every path; cost_source=unpriced alone now carries the
+// pricing-failure signal.
+//
+// v2 → v3: v2 wrote TokensOut = OutputTokens unconditionally, so a
+// synthesised-usage turn (Estimated=true) with no observed output token
+// count stored a plain 0 — indistinguishable from a genuine zero-output
+// turn, and a row with real dollars attached to it. v3 makes TokensOut
+// nullable and uses the normalized output-token presence signal to leave it
+// NULL when no output count was observed, so "never measured" is
+// unrepresentable as a number.
+const CostContractVersion int64 = 3
+
+// CostEvent represents a cost tracking event.
+//
+// CostSubcents is stored as hundredths of a cent (int64) to keep token-rate
+// math integer-only. UI divides by 10000 when rendering dollars. Estimated
+// is true when token counts are not authoritative for a complete turn, such
+// as adapter synthesis or a provider frame that covers only part of a turn;
+// the row still counts toward budget totals at face value.
+//
+// TokensCachedRead / TokensCachedWrite / TokensOut / TurnID / UsageEventID /
+// CostSource / the Rate*PerMillion columns / PricingCatalogVersion /
+// CostContractVersion are all nullable (pointer fields): NULL means "not
+// recorded" — a legacy row written before the column existed, or (for the
+// cache split specifically) an adapter that did not report cache data.
+// TokensOut is NULL specifically when no output count was observed: a 0
+// would assert a measurement that was never taken, and a downstream
+// per-output-token measure must see "unknown" rather than a fake zero-output
+// turn. The JSON cost-list representation includes this field as null so API
+// consumers can make the same distinction. NULL is never backfilled to 0;
+// TokensCachedIn keeps its original read+write sum semantics on every row so
+// existing consumers of that column are unaffected. See docs/specs/office/requirements/costs.md.
+type CostEvent struct {
+	ID                        string      `json:"id" db:"id"`
+	SessionID                 string      `json:"session_id" db:"session_id"`
+	TaskID                    string      `json:"task_id" db:"task_id"`
+	AgentProfileID            string      `json:"agent_profile_id" db:"agent_profile_id"`
+	ProjectID                 string      `json:"project_id" db:"project_id"`
+	Model                     string      `json:"model" db:"model"`
+	Provider                  string      `json:"provider" db:"provider"`
+	TokensIn                  int64       `json:"tokens_in" db:"tokens_in"`
+	TokensCachedIn            int64       `json:"tokens_cached_in" db:"tokens_cached_in"`
+	TokensCachedRead          *int64      `json:"tokens_cached_read,omitempty" db:"tokens_cached_read"`
+	TokensCachedWrite         *int64      `json:"tokens_cached_write,omitempty" db:"tokens_cached_write"`
+	TokensOut                 *int64      `json:"tokens_out" db:"tokens_out"`
+	CostSubcents              int64       `json:"cost_subcents" db:"cost_subcents"`
+	Estimated                 bool        `json:"estimated" db:"estimated"`
+	TurnID                    *string     `json:"turn_id,omitempty" db:"turn_id"`
+	UsageEventID              *string     `json:"usage_event_id,omitempty" db:"usage_event_id"`
+	CostSource                *CostSource `json:"cost_source,omitempty" db:"cost_source"`
+	RateInputPerMillion       *int64      `json:"rate_input_per_million,omitempty" db:"rate_input_per_million"`
+	RateCachedReadPerMillion  *int64      `json:"rate_cached_read_per_million,omitempty" db:"rate_cached_read_per_million"`
+	RateCachedWritePerMillion *int64      `json:"rate_cached_write_per_million,omitempty" db:"rate_cached_write_per_million"`
+	RateOutputPerMillion      *int64      `json:"rate_output_per_million,omitempty" db:"rate_output_per_million"`
+	PricingCatalogVersion     *string     `json:"pricing_catalog_version,omitempty" db:"pricing_catalog_version"`
+	CostContractVersion       *int64      `json:"cost_contract_version,omitempty" db:"cost_contract_version"`
+	OccurredAt                time.Time   `json:"occurred_at" db:"occurred_at"`
+	CreatedAt                 time.Time   `json:"created_at" db:"created_at"`
+}
+
+// BudgetPolicy represents a budget limit policy. LimitSubcents is
+// hundredths of a cent (matches CostEvent.CostSubcents); the UI divides
+// by 10000 to render dollars via apps/web/lib/utils.ts:formatDollars.
+type BudgetPolicy struct {
+	ID                string               `json:"id" db:"id"`
+	WorkspaceID       string               `json:"workspace_id" db:"workspace_id"`
+	ScopeType         BudgetScopeType      `json:"scope_type" db:"scope_type"`
+	ScopeID           string               `json:"scope_id" db:"scope_id"`
+	LimitSubcents     int64                `json:"limit_subcents" db:"limit_subcents"`
+	Period            BudgetPeriod         `json:"period" db:"period"`
+	AlertThresholdPct int                  `json:"alert_threshold_pct" db:"alert_threshold_pct"`
+	ActionOnExceed    BudgetActionOnExceed `json:"action_on_exceed" db:"action_on_exceed"`
+	CreatedAt         time.Time            `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time            `json:"updated_at" db:"updated_at"`
+	// Revision identifies which immutable set of the fields above a budget
+	// claim was evaluated against (REQ-OFFICE-COSTS-003). Server-assigned:
+	// starts at 1 and increases by exactly 1 on each successful update.
+	Revision int64 `json:"revision" db:"revision"`
+}
+
+// SpendWindow reports one scope's priced spend and degradation state for a
+// single [start, before) window, in one query round-trip. Shared between
+// internal/office/repository/sqlite (the query implementations) and
+// internal/office/costs (the Repository interface and EvaluatePreLaunch),
+// so neither package needs to import the other's package for this one
+// return type. AC-OFFICE-BUDGET-002.10/.15, REQ-OFFICE-BUDGET-004.
+type SpendWindow struct {
+	// PricedSubcents excludes any event whose cost_source is 'unpriced'
+	// (AC-OFFICE-BUDGET-004.1); a NULL cost_source is treated as priced.
+	PricedSubcents int64
+	// Degraded is true when the window contains at least one unpriced
+	// event, determined from cost_source, never from estimated.
+	Degraded bool
+}
+
+// RouteAttempt records one provider attempt inside a Run. Each fallback
+// (resolver candidate tried) appends a new row keyed by (run_id, seq).
+// Persisted by the routing scheduler dispatcher in
+// internal/office/scheduler/dispatch_routing.go.
+type RouteAttempt struct {
+	RunID              string `json:"run_id" db:"run_id"`
+	Seq                int    `json:"seq" db:"seq"`
+	ExecutionProfileID string `json:"execution_profile_id" db:"execution_profile_id"`
+	ProviderID         string `json:"provider_id" db:"provider_id"`
+	Model              string `json:"model" db:"model"`
+	Tier               string `json:"tier" db:"tier"`
+	// TierSource names the precedence level that supplied Tier: one of
+	// "wake_reason", "override", "role", "workspace". Empty means "not
+	// recorded" — either a pre-migration row (Tier non-empty) or an
+	// attempt that never resolved a tier (both empty, e.g. a
+	// max-attempts-exceeded row) — never interpreted as "workspace".
+	TierSource      string              `json:"tier_source,omitempty" db:"tier_source"`
+	Outcome         RouteAttemptOutcome `json:"outcome" db:"outcome"`
+	ErrorCode       string              `json:"error_code,omitempty" db:"error_code"`
+	ErrorConfidence ErrorConfidence     `json:"error_confidence,omitempty" db:"error_confidence"`
+	AdapterPhase    AdapterPhase        `json:"adapter_phase,omitempty" db:"adapter_phase"`
+	ClassifierRule  string              `json:"classifier_rule,omitempty" db:"classifier_rule"`
+	ExitCode        *int                `json:"exit_code,omitempty" db:"exit_code"`
+	RawExcerpt      string              `json:"raw_excerpt,omitempty" db:"raw_excerpt"`
+	ResetHint       *time.Time          `json:"reset_hint,omitempty" db:"reset_hint"`
+	StartedAt       time.Time           `json:"started_at" db:"started_at"`
+	FinishedAt      *time.Time          `json:"finished_at,omitempty" db:"finished_at"`
+}
+
+// ProviderHealth records the health state of one (workspace, provider,
+// scope) tuple. Scope is one of 'provider' (whole provider), 'model'
+// (a specific model on this provider), or 'tier' (a specific workspace
+// tier mapping on this provider). The resolver checks scopes in order
+// provider → tier → model before considering a candidate eligible.
+type ProviderHealth struct {
+	WorkspaceID string              `json:"workspace_id" db:"workspace_id"`
+	ProviderID  string              `json:"provider_id" db:"provider_id"`
+	Scope       ProviderHealthScope `json:"scope" db:"scope"`
+	ScopeValue  string              `json:"scope_value" db:"scope_value"`
+	State       ProviderHealthState `json:"state" db:"state"`
+	ErrorCode   string              `json:"error_code,omitempty" db:"error_code"`
+	RetryAt     *time.Time          `json:"retry_at,omitempty" db:"retry_at"`
+	BackoffStep int                 `json:"backoff_step" db:"backoff_step"`
+	LastFailure *time.Time          `json:"last_failure,omitempty" db:"last_failure"`
+	LastSuccess *time.Time          `json:"last_success,omitempty" db:"last_success"`
+	RawExcerpt  string              `json:"raw_excerpt,omitempty" db:"raw_excerpt"`
+	UpdatedAt   time.Time           `json:"updated_at" db:"updated_at"`
+}
+
+// Routine represents a recurring task definition.
+type Routine struct {
+	ID                     string                   `json:"id" db:"id"`
+	WorkspaceID            string                   `json:"workspace_id" db:"workspace_id"`
+	Name                   string                   `json:"name" db:"name"`
+	Description            string                   `json:"description" db:"description"`
+	TaskTemplate           string                   `json:"task_template" db:"task_template"`
+	AssigneeAgentProfileID string                   `json:"assignee_agent_profile_id" db:"assignee_agent_profile_id"`
+	Status                 string                   `json:"status" db:"status"`
+	ConcurrencyPolicy      RoutineConcurrencyPolicy `json:"concurrency_policy" db:"concurrency_policy"`
+	CatchUpPolicy          RoutineCatchUpPolicy     `json:"catch_up_policy" db:"catch_up_policy"`
+	CatchUpMax             int                      `json:"catch_up_max" db:"catch_up_max"`
+	Variables              string                   `json:"variables" db:"variables"`
+	LastRunAt              *time.Time               `json:"last_run_at" db:"last_run_at"`
+	CreatedAt              time.Time                `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time                `json:"updated_at" db:"updated_at"`
+}
+
+// RoutineTrigger represents a trigger for a routine.
+type RoutineTrigger struct {
+	ID             string     `json:"id" db:"id"`
+	RoutineID      string     `json:"routine_id" db:"routine_id"`
+	Kind           string     `json:"kind" db:"kind"`
+	CronExpression string     `json:"cron_expression" db:"cron_expression"`
+	Timezone       string     `json:"timezone" db:"timezone"`
+	PublicID       string     `json:"public_id" db:"public_id"`
+	SigningMode    string     `json:"signing_mode" db:"signing_mode"`
+	Secret         string     `json:"secret" db:"secret"`
+	NextRunAt      *time.Time `json:"next_run_at" db:"next_run_at"`
+	LastFiredAt    *time.Time `json:"last_fired_at" db:"last_fired_at"`
+	Enabled        bool       `json:"enabled" db:"enabled"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// RoutineRun represents a single run of a routine.
+//
+// CatchUpMissedTicks/CatchUpFirstMissedAt/CatchUpTruncated are the gap
+// summary measured for the claim that created this run — written once
+// at creation and never modified afterward (AC-OFFICE-ROUTINE-CATCHUP-002.10).
+// CatchUpMissedTicks is nil when no gap summary was recorded; per
+// AC-002.3, absence is never represented as a stored zero, so a nil
+// check (not a zero check) is the presence test.
+type RoutineRun struct {
+	ID                   string           `json:"id" db:"id"`
+	RoutineID            string           `json:"routine_id" db:"routine_id"`
+	TriggerID            string           `json:"trigger_id" db:"trigger_id"`
+	Source               string           `json:"source" db:"source"`
+	Status               RoutineRunStatus `json:"status" db:"status"`
+	TriggerPayload       string           `json:"trigger_payload" db:"trigger_payload"`
+	LinkedTaskID         string           `json:"linked_task_id" db:"linked_task_id"`
+	CoalescedIntoRunID   string           `json:"coalesced_into_run_id" db:"coalesced_into_run_id"`
+	DispatchFingerprint  string           `json:"dispatch_fingerprint" db:"dispatch_fingerprint"`
+	CatchUpMissedTicks   *int             `json:"catch_up_missed_ticks,omitempty" db:"catch_up_missed_ticks"`
+	CatchUpFirstMissedAt *time.Time       `json:"catch_up_first_missed_at,omitempty" db:"catch_up_first_missed_at"`
+	CatchUpTruncated     bool             `json:"catch_up_truncated" db:"catch_up_truncated"`
+	StartedAt            *time.Time       `json:"started_at" db:"started_at"`
+	CompletedAt          *time.Time       `json:"completed_at" db:"completed_at"`
+	CreatedAt            time.Time        `json:"created_at" db:"created_at"`
+	// SkipReason carries exactly one value today, "workspace_paused",
+	// distinguishing a workspace-pause skip from every other skip cause
+	// (e.g. skip_if_active concurrency). Empty for a run not skipped by a
+	// pause.
+	SkipReason string `json:"skip_reason" db:"skip_reason"`
+	// PauseID names the office_workspace_pauses row that blocked this
+	// fire. Empty when SkipReason is empty.
+	PauseID string `json:"pause_id" db:"pause_id"`
+	// CausationID is minted once per fire in dispatchRoutineRun
+	// (REQ-OFFICE-LOOP-LIVENESS-002) — the origin id every wakeup
+	// request and run this fire produces carries forward. "" only for
+	// rows written before this feature.
+	CausationID string `json:"causation_id,omitempty" db:"causation_id"`
+}
+
+// ApprovalType constants for approval request types.
+const (
+	ApprovalTypeHireAgent      = "hire_agent"
+	ApprovalTypeBudgetIncrease = "budget_increase"
+	ApprovalTypeBoardApproval  = "board_approval"
+	ApprovalTypeTaskReview     = "task_review"
+	ApprovalTypeSkillCreation  = "skill_creation"
+)
+
+// Approval represents a pending or resolved approval request.
+type Approval struct {
+	ID                        string         `json:"id" db:"id"`
+	WorkspaceID               string         `json:"workspace_id" db:"workspace_id"`
+	Type                      string         `json:"type" db:"type"`
+	RequestedByAgentProfileID string         `json:"requested_by_agent_profile_id" db:"requested_by_agent_profile_id"`
+	Status                    ApprovalStatus `json:"status" db:"status"`
+	Payload                   string         `json:"payload" db:"payload"`
+	DecisionNote              string         `json:"decision_note" db:"decision_note"`
+	DecidedBy                 string         `json:"decided_by" db:"decided_by"`
+	DecidedAt                 *time.Time     `json:"decided_at" db:"decided_at"`
+	CreatedAt                 time.Time      `json:"created_at" db:"created_at"`
+	UpdatedAt                 time.Time      `json:"updated_at" db:"updated_at"`
+}
+
+// ActivityEntry represents an entry in the activity log.
+type ActivityEntry struct {
+	ID               string             `json:"id" db:"id"`
+	WorkspaceID      string             `json:"workspace_id" db:"workspace_id"`
+	ActorType        ActivityActorType  `json:"actor_type" db:"actor_type"`
+	ActorID          string             `json:"actor_id" db:"actor_id"`
+	Action           ActivityAction     `json:"action" db:"action"`
+	TargetType       ActivityTargetType `json:"target_type" db:"target_type"`
+	TargetID         string             `json:"target_id" db:"target_id"`
+	ActorName        string             `json:"actor_name,omitempty" db:"-"`
+	TargetName       string             `json:"target_name,omitempty" db:"-"`
+	TargetIdentifier string             `json:"target_identifier,omitempty" db:"-"`
+	Details          string             `json:"details" db:"details"`
+	// RunID + SessionID let the run detail page join activity rows
+	// back to the originating run for the "Tasks Touched" surface.
+	// Empty string for activity not produced under a run (manual
+	// user actions, etc.).
+	RunID     string    `json:"run_id,omitempty" db:"run_id"`
+	SessionID string    `json:"session_id,omitempty" db:"session_id"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+// AgentMemory represents a memory entry for an agent.
+type AgentMemory struct {
+	ID             string    `json:"id" db:"id"`
+	AgentProfileID string    `json:"agent_profile_id" db:"agent_profile_id"`
+	Layer          string    `json:"layer" db:"layer"`
+	Key            string    `json:"key" db:"key"`
+	Content        string    `json:"content" db:"content"`
+	Metadata       string    `json:"metadata" db:"metadata"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// Channel represents a communication channel for an agent.
+type Channel struct {
+	ID             string          `json:"id" db:"id"`
+	WorkspaceID    string          `json:"workspace_id" db:"workspace_id"`
+	AgentProfileID string          `json:"agent_profile_id" db:"agent_profile_id"`
+	Platform       ChannelPlatform `json:"platform" db:"platform"`
+	Config         string          `json:"config" db:"config"`
+	WebhookSecret  string          `json:"webhook_secret,omitempty" db:"webhook_secret"`
+	Status         ChannelStatus   `json:"status" db:"status"`
+	TaskID         string          `json:"task_id" db:"task_id"`
+	CreatedAt      time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at" db:"updated_at"`
+}
+
+// TaskBlocker represents a blocker relationship between tasks.
+type TaskBlocker struct {
+	TaskID        string    `json:"task_id" db:"task_id"`
+	BlockerTaskID string    `json:"blocker_task_id" db:"blocker_task_id"`
+	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+}
+
+// Participant role values for the office_task_participants table.
+// The DB has a CHECK constraint that pins these to two literals.
+const (
+	ParticipantRoleReviewer = "reviewer"
+	ParticipantRoleApprover = "approver"
+)
+
+// Decision values recorded by the office approval flow. ADR 0005 Wave E
+// moved storage from the legacy office_task_approval_decisions table to
+// workflow_step_decisions; the literals below are still the canonical
+// values office writes for `decision` and `decider_type`.
+const (
+	DecisionApproved         = "approved"
+	DecisionChangesRequested = "changes_requested"
+	// DecisionRejected is the agent-path verdict literal
+	// (engine.DecisionRejected) for the same semantic as
+	// DecisionChangesRequested — the quorum engine already treats them as
+	// synonyms (isRejectionVerdict in internal/workflow/engine/quorum.go).
+	DecisionRejected = "rejected"
+
+	DeciderTypeUser  = "user"
+	DeciderTypeAgent = "agent"
+)
+
+// TaskComment represents an asynchronous comment on a task.
+type TaskComment struct {
+	ID             string    `json:"id" db:"id"`
+	TaskID         string    `json:"task_id" db:"task_id"`
+	AuthorType     string    `json:"author_type" db:"author_type"`
+	AuthorID       string    `json:"author_id" db:"author_id"`
+	Body           string    `json:"body" db:"body"`
+	Source         string    `json:"source" db:"source"`
+	ReplyChannelID string    `json:"reply_channel_id" db:"reply_channel_id"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+}
+
+// InboxItem represents a computed inbox entry for the user.
+type InboxItem struct {
+	ID          string                 `json:"id"`
+	Type        string                 `json:"type"`
+	Title       string                 `json:"title"`
+	Description string                 `json:"description,omitempty"`
+	Status      string                 `json:"status"`
+	EntityID    string                 `json:"entity_id,omitempty"`
+	EntityType  string                 `json:"entity_type,omitempty"`
+	Payload     map[string]interface{} `json:"payload,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+}
+
+// RunActivityDay holds aggregated run outcome counts for a single calendar day.
+type RunActivityDay struct {
+	Date      string
+	Succeeded int
+	Failed    int
+	Other     int
+}
+
+// TaskBreakdown holds task counts bucketed by status category.
+type TaskBreakdown struct {
+	Open       int
+	InProgress int
+	Blocked    int
+	Done       int
+}
+
+// RecentTask holds minimal fields for a recently-updated task.
+type RecentTask struct {
+	ID                     string
+	Identifier             string
+	Title                  string
+	Status                 string
+	AssigneeAgentProfileID string
+	UpdatedAt              string
+}
+
+// DashboardData represents aggregated dashboard information.
+type DashboardData struct {
+	AgentCount         int              `json:"agent_count"`
+	RunningCount       int              `json:"running_count"`
+	PausedCount        int              `json:"paused_count"`
+	ErrorCount         int              `json:"error_count"`
+	TasksInProgress    int              `json:"tasks_in_progress"`
+	OpenTasks          int              `json:"open_tasks"`
+	BlockedTasks       int              `json:"blocked_tasks"`
+	MonthSpendSubcents int64            `json:"month_spend_subcents"`
+	PendingApprovals   int              `json:"pending_approvals"`
+	RecentActivity     []*ActivityEntry `json:"recent_activity"`
+	RecentIssues       []interface{}    `json:"recent_issues,omitempty"`
+	TaskCount          int              `json:"task_count"`
+	SkillCount         int              `json:"skill_count"`
+	RoutineCount       int              `json:"routine_count"`
+	RunActivity        []RunActivityDay
+	TaskBreakdown      TaskBreakdown
+	RecentTasks        []RecentTask
+}
+
+// InstructionFile represents an instruction file for an agent instance.
+type InstructionFile struct {
+	ID             string `json:"id" db:"id"`
+	AgentProfileID string `json:"agent_profile_id" db:"agent_profile_id"`
+	Filename       string `json:"filename" db:"filename"`
+	Content        string `json:"content" db:"content"`
+	IsEntry        bool   `json:"is_entry" db:"is_entry"`
+	CreatedAt      string `json:"created_at" db:"created_at"`
+	UpdatedAt      string `json:"updated_at" db:"updated_at"`
+}
+
+// CostBreakdown represents an aggregated cost entry. TotalSubcents stores
+// hundredths of a cent (UI divides by 10000 for dollars). GroupKey is the
+// stable id used by the breakdown grouping (agent_profile_id, project_id,
+// or model). GroupLabel is the human-readable label resolved by the query
+// (e.g. agent profile name, project name); empty when no lookup applies
+// or when the id has no row in the source table.
+type CostBreakdown struct {
+	GroupKey      string `json:"group_key" db:"group_key"`
+	GroupLabel    string `json:"group_label" db:"group_label"`
+	TotalSubcents int64  `json:"total_subcents" db:"total_subcents"`
+	Count         int    `json:"count" db:"count"`
+}

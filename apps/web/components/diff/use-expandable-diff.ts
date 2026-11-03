@@ -1,0 +1,274 @@
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { processFile, type FileDiffMetadata } from "@pierre/diffs";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import { requestFileContent, requestFileContentAtRef } from "@/lib/ws/workspace-files";
+import { t } from "@/lib/i18n";
+
+type UseExpandableDiffOptions = {
+  sessionId: string | undefined;
+  filePath: string;
+  baseRef: string | undefined;
+  fileDiffMetadata: FileDiffMetadata | null;
+  /** Original patch string used to build fileDiffMetadata. Required for
+   *  re-parsing via processFile with the loaded full content. */
+  diff: string | undefined;
+  enableExpansion?: boolean;
+  /** Multi-repo subpath for the file (e.g. "kandev"); empty for single-repo. */
+  repo?: string;
+};
+
+type UseExpandableDiffResult = {
+  metadata: FileDiffMetadata | null;
+  isContentLoaded: boolean;
+  isLoading: boolean;
+  error: string | null;
+  loadContent: () => Promise<void>;
+  canExpand: boolean;
+};
+
+type WsClient = NonNullable<ReturnType<typeof getWebSocketClient>>;
+
+/** Check if an error indicates file not found (various formats from backend). */
+function isFileNotFoundError(error: string): boolean {
+  return /file not found|not found|no such file|does not exist/i.test(error);
+}
+
+/**
+ * Number of extra attempts for a transient content-load failure and the base
+ * backoff between them. The two file reads go over the WebSocket, which rejects
+ * with a 5s timeout and no retry of its own; when the backend is briefly slow
+ * (loaded CI runner, reconnect in flight) a single timeout would otherwise set
+ * a terminal error and permanently disable expansion for this mount, since the
+ * auto-load effect only fires while there is no error. Retrying transient
+ * failures here keeps that from happening.
+ */
+const CONTENT_LOAD_MAX_RETRIES = 3;
+const CONTENT_LOAD_RETRY_BASE_MS = 300;
+
+/**
+ * A transient failure is one worth retrying: the WebSocket client not being
+ * ready yet, or a request that timed out. Permanent failures (binary file,
+ * genuine backend rejections) are surfaced immediately so we fall back to the
+ * partial metadata without spinning.
+ */
+function isTransientLoadError(error: string): boolean {
+  return /timed out|websocket client not available|not connected|connection (closed|lost)/i.test(
+    error,
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Validate that a reparsed metadata won't trip @pierre/diffs' iterateOverDiff
+ * trailing-context check (which throws and tears down the renderer). When
+ * fetched contents are out of sync with the patch, processFile still produces
+ * a metadata object whose final-hunk indices leave a different number of
+ * trailing addition vs deletion lines — the exact condition iterateOverDiff
+ * asserts on. Detecting it here lets the caller fall back to the partial
+ * metadata instead of crashing.
+ */
+function isReparseConsistent(meta: FileDiffMetadata): boolean {
+  const lastHunk = meta.hunks?.[meta.hunks.length - 1];
+  if (!lastHunk) return true;
+  const addRemain =
+    meta.additionLines.length - (lastHunk.additionLineIndex + lastHunk.additionCount);
+  const delRemain =
+    meta.deletionLines.length - (lastHunk.deletionLineIndex + lastHunk.deletionCount);
+  return addRemain === delRemain;
+}
+
+/** Fetch old file content at a git ref. Returns empty string for new files. */
+async function fetchOldContent(
+  client: WsClient,
+  sessionId: string,
+  filePath: string,
+  baseRef: string,
+  repo?: string,
+): Promise<string> {
+  try {
+    const res = await requestFileContentAtRef(client, sessionId, filePath, baseRef, repo);
+    if (res.is_binary) throw new Error("Cannot expand binary files");
+    if (!res.error) return res.content;
+    // File not found at ref is expected for new files - return empty string
+    if (isFileNotFoundError(res.error)) return "";
+    throw new Error(res.error);
+  } catch (err) {
+    // WebSocket client throws errors for backend error responses
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isFileNotFoundError(msg)) return "";
+    throw err;
+  }
+}
+
+/** Fetch new file content from the working tree. Returns empty string for deleted files. */
+async function fetchNewContent(
+  client: WsClient,
+  sessionId: string,
+  filePath: string,
+  repo?: string,
+): Promise<string> {
+  try {
+    // Fetch from working tree (current file on disk), not HEAD.
+    // The diff shows working tree changes, so additionLines must match.
+    const res = await requestFileContent(client, sessionId, filePath, repo);
+    if (res.is_binary) throw new Error("Cannot expand binary files");
+    if (!res.error) return res.content;
+    // File not found is expected for deleted files - return empty string
+    if (isFileNotFoundError(res.error)) return "";
+    throw new Error(res.error);
+  } catch (err) {
+    // WebSocket client throws errors for backend error responses
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isFileNotFoundError(msg)) return "";
+    throw err;
+  }
+}
+
+/** Fetch both old and new content as raw strings for @pierre/diffs expansion. */
+async function fetchExpansionContent(
+  sessionId: string,
+  filePath: string,
+  baseRef: string | undefined,
+  repo: string | undefined,
+) {
+  const client = getWebSocketClient();
+  if (!client) throw new Error("WebSocket client not available");
+  const newContent = await fetchNewContent(client, sessionId, filePath, repo);
+  const oldContent = baseRef
+    ? await fetchOldContent(client, sessionId, filePath, baseRef, repo)
+    : "";
+  return { oldContent, newContent };
+}
+
+/**
+ * Fetch expansion content, retrying transient failures with linear backoff.
+ * `isCurrent` lets the caller abort the retry loop when the hook's inputs have
+ * changed (a newer request superseded this one); permanent failures rethrow on
+ * the first attempt so we don't spin on a binary file or a real backend error.
+ */
+async function fetchExpansionContentWithRetry(
+  sessionId: string,
+  filePath: string,
+  baseRef: string | undefined,
+  repo: string | undefined,
+  isCurrent: () => boolean,
+) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= CONTENT_LOAD_MAX_RETRIES; attempt++) {
+    try {
+      return await fetchExpansionContent(sessionId, filePath, baseRef, repo);
+    } catch (err) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!isTransientLoadError(msg) || attempt === CONTENT_LOAD_MAX_RETRIES) throw err;
+      await delay(CONTENT_LOAD_RETRY_BASE_MS * (attempt + 1));
+      if (!isCurrent()) throw err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Hook for managing expandable diffs with lazy-loaded file content.
+ *
+ * @pierre/diffs needs the patch *and* the full file contents (with
+ * isPartial=false and hunk indices addressed against the full arrays) to
+ * render expand controls. We get there by re-parsing via `processFile`
+ * once the content arrives — it's the only API that produces a metadata
+ * shape internally consistent enough for the library's expansion path.
+ */
+export function useExpandableDiff({
+  sessionId,
+  filePath,
+  baseRef,
+  fileDiffMetadata,
+  diff,
+  enableExpansion = false,
+  repo,
+}: UseExpandableDiffOptions): UseExpandableDiffResult {
+  const requestVersionRef = useRef(0);
+  const [loadedContent, setLoadedContent] = useState<{
+    oldContent: string;
+    newContent: string;
+  } | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset cached content when inputs change so stale data is never rendered.
+  // Including fileDiffMetadata ensures expansion content is invalidated when
+  // the diff changes (e.g., file modified while Diff panel is open).
+  useEffect(() => {
+    requestVersionRef.current += 1;
+    setLoadedContent(null);
+    setError(null);
+  }, [sessionId, filePath, baseRef, repo, fileDiffMetadata]);
+
+  const loadContent = useCallback(async () => {
+    if (!sessionId || !enableExpansion || loadedContent || isLoading) return;
+
+    const version = ++requestVersionRef.current;
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const content = await fetchExpansionContentWithRetry(
+        sessionId,
+        filePath,
+        baseRef,
+        repo,
+        () => version === requestVersionRef.current,
+      );
+      if (version === requestVersionRef.current) setLoadedContent(content);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : t("task:failedToLoadFileContent");
+      console.error("[useExpandableDiff]", msg);
+      if (version === requestVersionRef.current) setError(msg);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [sessionId, filePath, baseRef, repo, enableExpansion, loadedContent, isLoading]);
+
+  const { metadata, reparseAccepted } = useMemo<{
+    metadata: FileDiffMetadata | null;
+    reparseAccepted: boolean;
+  }>(() => {
+    if (!fileDiffMetadata) return { metadata: null, reparseAccepted: false };
+    if (!loadedContent || !diff) return { metadata: fileDiffMetadata, reparseAccepted: false };
+    const reparsed = processFile(diff, {
+      oldFile: { name: filePath, contents: loadedContent.oldContent },
+      newFile: { name: filePath, contents: loadedContent.newContent },
+    });
+    if (!reparsed) return { metadata: fileDiffMetadata, reparseAccepted: false };
+    // Reject a reparse whose trailing-context lengths don't match: when the
+    // fetched contents are out of sync with the patch (stale snapshot, wrong
+    // base ref for a committed diff, file edited mid-flight), processFile
+    // still returns a metadata object, but @pierre/diffs' iterateOverDiff
+    // will throw "trailing context mismatch" the moment it tries to render.
+    // Falling back to the original partial metadata loses expansion controls
+    // but renders the patch correctly — same as the dedicated Diff tab.
+    if (!isReparseConsistent(reparsed))
+      return { metadata: fileDiffMetadata, reparseAccepted: false };
+    // Preserve the lang override that useDiffMetadata sets (e.g. lang:'text'
+    // for Go files that hit the Shiki backtracking guard). processFile would
+    // otherwise infer "go" from the filename and silently re-enable Shiki.
+    const final = fileDiffMetadata.lang ? { ...reparsed, lang: fileDiffMetadata.lang } : reparsed;
+    return { metadata: final, reparseAccepted: true };
+  }, [fileDiffMetadata, loadedContent, diff, filePath]);
+
+  const isContentLoaded = loadedContent !== null;
+
+  return {
+    metadata,
+    isContentLoaded,
+    isLoading,
+    error,
+    loadContent,
+    // Gate canExpand on a successful reparse so the toolbar button doesn't
+    // appear when we fell back to the partial metadata — clicking it would
+    // be a silent no-op since the metadata can't drive iterateOverDiff.
+    canExpand: enableExpansion && isContentLoaded && !error && reparseAccepted,
+  };
+}

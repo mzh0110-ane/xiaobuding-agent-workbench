@@ -1,0 +1,94 @@
+package webapp
+
+const BootPayloadVersion = 1
+
+// BootPayload is the JSON-safe data blob the Go server will embed in the SPA
+// shell before React hydrates.
+type BootPayload struct {
+	Version      int                 `json:"version"`
+	Route        RouteClassification `json:"route"`
+	Runtime      RuntimeConfig       `json:"runtime"`
+	InitialState map[string]any      `json:"initialState"`
+	RouteData    map[string]any      `json:"routeData,omitempty"`
+	Errors       []BootError         `json:"errors,omitempty"`
+	// InterimSettingsInterlockToken is a replayable per-boot SPA CSRF and
+	// accidental-mutation interlock. It is not an authentication credential.
+	InterimSettingsInterlockToken string `json:"interimSettingsInterlockToken,omitempty"`
+	// Plugins lists every active, UI-bundle-declaring plugin, per
+	// docs/plans/plugins/PLUGIN-API.md ("Loading model"). Empty when the
+	// plugin service failed to initialize or nothing active declares a
+	// bundle; the frontend boots whatever it finds here unconditionally.
+	Plugins []ActivePluginPayload `json:"plugins,omitempty"`
+}
+
+// ActivePluginPayload is one entry of BootPayload.Plugins: the browser-facing
+// shape the SPA's plugin host (apps/web/lib/plugins/host.ts) iterates to
+// inject styles and dynamically import() each plugin's bundle.
+type ActivePluginPayload struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	BundleURL string   `json:"bundleUrl"`
+	StyleURLs []string `json:"styleUrls,omitempty"`
+	// RepositoryProviderIDs is nil only for legacy manifests that omit
+	// repository_providers. A non-nil empty slice is an explicit declaration
+	// that must reach the browser as [] so the plugin registry can deny every
+	// undeclared provider claim.
+	RepositoryProviderIDs *[]string `json:"repositoryProviderIds,omitempty"`
+}
+
+// RuntimeConfig contains browser-facing runtime endpoints for the SPA.
+type RuntimeConfig struct {
+	APIPrefix                         string   `json:"apiPrefix"`
+	WebSocketPath                     string   `json:"webSocketPath"`
+	BootID                            string   `json:"bootId,omitempty"`
+	LSPAutoInstallPreferenceLanguages []string `json:"lspAutoInstallPreferenceLanguages,omitempty"`
+	Debug                             bool     `json:"debug,omitempty"`
+	// NonProduction marks a dev or e2e build. Distinct from Debug (which the SPA
+	// uses for verbose logging): this gates QA-only UI such as the pseudo-locale
+	// option, which the e2e harness needs even though it serves a PRODUCTION
+	// frontend bundle — so `import.meta.env.PROD` cannot answer this question.
+	NonProduction bool `json:"nonProduction,omitempty"`
+	// Locale is the active UI locale (BCP-47-ish tag) the SPA should activate
+	// before first paint. Sourced from the kandev_locale cookie; defaults to
+	// "en". Also drives the shell's <html lang> so first paint matches.
+	Locale string `json:"locale,omitempty"`
+	// TitlePrefix distinguishes Kandev instances in adjacent browser tabs. It
+	// carries the operator-configured prefix (KANDEV_WEB_TITLE_PREFIX) with
+	// surrounding whitespace trimmed, not the composed title: the shell
+	// rewrites <title> server-side for first paint, and the SPA composes the
+	// same "<prefix> Kandev" for the
+	// /api/v1/app-state boot path, which never renders through the shell.
+	TitlePrefix string `json:"titlePrefix,omitempty"`
+	// NativeFolderPickerAvailable is true only when the desktop shell launched
+	// this backend and can service the narrow native folder-picker command.
+	// Browsers must continue to use the HTTP directory picker.
+	NativeFolderPickerAvailable bool `json:"nativeFolderPickerAvailable,omitempty"`
+	// DesktopRuntime identifies the launch policy selected by the backend
+	// process marker. It is separate from the native picker capability so an
+	// ordinary browser connected to a desktop backend keeps desktop discovery
+	// policy while using the HTTP picker.
+	DesktopRuntime bool `json:"desktopRuntime,omitempty"`
+}
+
+// BootError is a serializable non-fatal boot-data error for partial hydration.
+type BootError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func NewBootPayload(
+	route RouteClassification,
+	runtime RuntimeConfig,
+	initialState map[string]any,
+) BootPayload {
+	if initialState == nil {
+		initialState = map[string]any{}
+	}
+
+	return BootPayload{
+		Version:      BootPayloadVersion,
+		Route:        route,
+		Runtime:      runtime,
+		InitialState: initialState,
+	}
+}

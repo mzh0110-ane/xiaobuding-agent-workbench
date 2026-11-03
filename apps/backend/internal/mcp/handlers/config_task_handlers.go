@@ -1,0 +1,723 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/kandev/kandev/internal/authz"
+	"github.com/kandev/kandev/internal/automation"
+	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
+	"github.com/kandev/kandev/internal/steptelemetry"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/task/service"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	workflowmove "github.com/kandev/kandev/internal/workflow/move"
+	workflowservice "github.com/kandev/kandev/internal/workflow/service"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+// moveTaskRequest is the parsed move_task_kandev payload. Prompt is a legacy
+// alias for entry_options.instructions: it is folded into EntryOptions during
+// normalization and never used directly by the move paths afterward.
+type moveTaskRequest struct {
+	TaskID          string                     `json:"task_id"`
+	WorkflowID      string                     `json:"workflow_id"`
+	WorkflowStepID  string                     `json:"workflow_step_id"`
+	Position        int                        `json:"position"`
+	Prompt          string                     `json:"prompt"`
+	SenderSessionID string                     `json:"sender_session_id"`
+	EntryOptions    *workflowmove.EntryOptions `json:"entry_options,omitempty"`
+}
+
+const (
+	// moveDispositionApplied marks an MCP move that committed immediately.
+	moveDispositionApplied = "applied"
+	// moveDispositionDeferred marks an MCP move recorded to run at the source
+	// session's turn-end.
+	moveDispositionDeferred = "deferred"
+)
+
+func (h *Handlers) handleMoveTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req moveTaskRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	if req.WorkflowID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workflow_id is required", nil)
+	}
+	if req.WorkflowStepID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "workflow_step_id is required", nil)
+	}
+
+	// Fold the legacy top-level prompt into entry_options.instructions and trim
+	// all fields. Supplying both a legacy prompt and a nested instructions value
+	// is rejected. The normalized options are the single request shape used by
+	// both the deferred and immediate paths below.
+	entryOptions, err := workflowmove.NormalizeEntryOptions(req.EntryOptions, req.Prompt)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+	req.EntryOptions = entryOptions
+	req.Prompt = ""
+	if response, handled, err := h.completeSameStepMove(ctx, msg, req); handled || err != nil {
+		return response, err
+	}
+
+	// entry_options are OPTIONAL — config-mode/admin moves don't always have an
+	// agent to hand off to. When supplied, one-shot instructions/reset/profile
+	// are applied when the task enters the target step. When omitted, we just
+	// move the task and return.
+	session, lookupErr := h.lookupSession(ctx, req.TaskID)
+	if lookupErr != nil {
+		// Backend lookup failure is an internal error, not validation — don't
+		// collapse it into "you have no session" downstream.
+		h.logger.Error("move_task: failed to look up primary session",
+			zap.String("task_id", req.TaskID), zap.Error(lookupErr))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"failed to look up task's primary session", nil)
+	}
+
+	// Active source session → deferred path. Running MoveTask immediately would
+	// fail validateMoveSessions ("task has an active session (RUNNING)") and,
+	// if it somehow succeeded, would race on_enter processing against the
+	// agent's still-active turn. Defer until handleAgentReady fires
+	// applyPendingMove on turn-end. Prompt is optional: omit it for simple
+	// self-moves (e.g. Work → Done); include it for cross-agent hand-offs.
+	if session != nil &&
+		(session.State == models.TaskSessionStateRunning || session.State == models.TaskSessionStateStarting) {
+		return h.deferMoveTask(ctx, msg, req, session)
+	}
+
+	// Idle path — apply immediately. If a prompt was supplied, queue it on the
+	// session so the receiving agent's next turn picks it up; if not, just move.
+	return h.applyMoveTaskImmediate(ctx, msg, req, session)
+}
+
+func (h *Handlers) completeSameStepMove(ctx context.Context, msg *ws.Message, req moveTaskRequest) (*ws.Message, bool, error) {
+	if h.taskSvc == nil {
+		return moveTaskErrorResponse(msg, ws.ErrorCodeInternalError, "task service is not configured")
+	}
+	task, err := h.taskSvc.GetTask(ctx, req.TaskID)
+	if err != nil || task == nil {
+		h.logger.Error("move_task: failed to load task for destination classification",
+			zap.String("task_id", req.TaskID), zap.Error(err))
+		return moveTaskErrorResponse(msg, ws.ErrorCodeInternalError, "failed to load task for move validation")
+	}
+	if task.WorkflowID != req.WorkflowID || task.WorkflowStepID != req.WorkflowStepID {
+		return nil, false, nil
+	}
+	if code, message := h.validateSameStepMove(ctx, req, task); code != "" {
+		return moveTaskErrorResponse(msg, code, message)
+	}
+	response, err := ws.NewResponse(msg.ID, msg.Action, dto.MoveTaskResponse{
+		Task:        dto.FromTask(task),
+		Disposition: moveDispositionApplied,
+	})
+	return response, true, err
+}
+
+func (h *Handlers) validateSameStepMove(ctx context.Context, req moveTaskRequest, task *models.Task) (string, string) {
+	if err := h.taskSvc.AuthorizeWorkspaceScope(ctx, task.WorkspaceID, authz.ScopeTaskWrite); err != nil {
+		if service.IsForbidden(err) {
+			return ws.ErrorCodeForbidden, "task is not writable"
+		}
+		h.logger.Error("move_task: failed to authorize task for same-step completion",
+			zap.String("task_id", req.TaskID), zap.Error(err))
+		return ws.ErrorCodeInternalError, "failed to authorize task for move"
+	}
+	if task.ArchivedAt != nil {
+		return ws.ErrorCodeConflict, "archived tasks cannot be moved"
+	}
+	if code, message := h.validateSameStepMoveTargets(ctx, req, task); code != "" {
+		return code, message
+	}
+	if err := workflowmove.ValidateEntryOptions(req.EntryOptions, workflowmove.MoveChangePositionOnly); err != nil {
+		return ws.ErrorCodeValidation, err.Error()
+	}
+	return "", ""
+}
+
+func (h *Handlers) validateSameStepMoveTargets(
+	ctx context.Context,
+	req moveTaskRequest,
+	task *models.Task,
+) (string, string) {
+	if code, message := h.validateSameStepTargetWorkflow(ctx, req, task); code != "" {
+		return code, message
+	}
+	return h.validateSameStepTargetStep(ctx, req)
+}
+
+func (h *Handlers) validateSameStepTargetWorkflow(
+	ctx context.Context,
+	req moveTaskRequest,
+	task *models.Task,
+) (string, string) {
+	targetWorkflow, err := h.taskSvc.GetWorkflow(ctx, req.WorkflowID)
+	if err != nil {
+		h.logger.Error("move_task: failed to look up target workflow",
+			zap.String("task_id", req.TaskID), zap.String("workflow_id", req.WorkflowID), zap.Error(err))
+		if errors.Is(err, repoerrors.ErrWorkflowNotFound) || errors.Is(err, workflowservice.ErrNotVisible) {
+			return ws.ErrorCodeValidation, "target workflow_id does not exist"
+		}
+		return ws.ErrorCodeInternalError, "failed to validate target workflow"
+	}
+	if targetWorkflow == nil {
+		return ws.ErrorCodeValidation, "target workflow_id does not exist"
+	}
+	if targetWorkflow.WorkspaceID != task.WorkspaceID {
+		return ws.ErrorCodeValidation, "target workflow is in a different workspace"
+	}
+	return "", ""
+}
+
+func (h *Handlers) validateSameStepTargetStep(ctx context.Context, req moveTaskRequest) (string, string) {
+	if h.workflowCtrl == nil {
+		return ws.ErrorCodeInternalError, "workflow validation is not configured"
+	}
+	stepResponse, err := h.workflowCtrl.GetStep(ctx, req.WorkflowStepID)
+	if err != nil {
+		h.logger.Error("move_task: failed to look up target workflow step",
+			zap.String("task_id", req.TaskID), zap.String("workflow_step_id", req.WorkflowStepID), zap.Error(err))
+		if errors.Is(err, workflowservice.ErrNotVisible) || errors.Is(err, wfmodels.ErrWorkflowStepNotFound) {
+			return ws.ErrorCodeValidation, "target workflow_step_id does not exist"
+		}
+		return ws.ErrorCodeInternalError, "failed to validate target workflow step"
+	}
+	if stepResponse == nil || stepResponse.Step == nil {
+		return ws.ErrorCodeValidation, "target workflow_step_id does not exist"
+	}
+	if stepResponse.Step.WorkflowID != req.WorkflowID {
+		return ws.ErrorCodeValidation, "target workflow_step_id does not belong to the requested workflow_id"
+	}
+	return "", ""
+}
+
+func moveTaskErrorResponse(msg *ws.Message, code, message string) (*ws.Message, bool, error) {
+	response, err := ws.NewError(msg.ID, msg.Action, code, message, nil)
+	return response, true, err
+}
+
+// deferMoveTask records a PendingMove for the agent's turn-end handler to
+// apply. Optionally queues a hand-off prompt when the caller supplied one.
+// Returns a synthetic moved-task DTO so the agent's tool call resolves
+// successfully and ends the turn cleanly.
+func (h *Handlers) deferMoveTask(
+	ctx context.Context,
+	msg *ws.Message,
+	req moveTaskRequest,
+	session *models.TaskSession,
+) (*ws.Message, error) {
+	if h.messageQueue == nil {
+		h.logger.Error("move_task: message queue not configured; cannot defer move from active session",
+			zap.String("task_id", req.TaskID), zap.String("session_id", session.ID))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"move_task requires message queue support while the source session is active", nil)
+	}
+
+	// Validate the target step exists and belongs to the requested workflow
+	// before committing the deferred move. Without this check a stale or
+	// foreign step_id would be stored and silently fail at turn-end, leaving
+	// the task orphaned on the board.
+	if h.workflowCtrl != nil {
+		stepResp, err := h.workflowCtrl.GetStep(ctx, req.WorkflowStepID)
+		if err != nil || stepResp == nil || stepResp.Step == nil {
+			h.logger.Error("move_task: target step not found",
+				zap.String("task_id", req.TaskID),
+				zap.String("workflow_step_id", req.WorkflowStepID),
+				zap.Error(err))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+				"target workflow_step_id does not exist", nil)
+		}
+		if stepResp.Step.WorkflowID != req.WorkflowID {
+			h.logger.Error("move_task: target step belongs to a different workflow",
+				zap.String("task_id", req.TaskID),
+				zap.String("workflow_step_id", req.WorkflowStepID),
+				zap.String("step_workflow_id", stepResp.Step.WorkflowID),
+				zap.String("requested_workflow_id", req.WorkflowID))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+				"target workflow_step_id does not belong to the requested workflow_id", nil)
+		}
+	}
+
+	// Validate the target workflow lives in the same workspace as the task.
+	// The immediate-apply path (task.Service.MoveTask) already enforces this
+	// via validateTaskMove; the deferred path bypasses that service entirely
+	// (see applyPendingMove's doc comment), so it must check independently or
+	// a cross-workspace move_task_kandev call would silently succeed.
+	if h.taskSvc != nil {
+		task, err := h.taskSvc.GetTask(ctx, req.TaskID)
+		if err != nil {
+			h.logger.Error("move_task: failed to load task for workspace validation",
+				zap.String("task_id", req.TaskID), zap.Error(err))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+				"failed to load task for move validation", nil)
+		}
+		targetWorkflow, err := h.taskSvc.GetWorkflow(ctx, req.WorkflowID)
+		if err != nil {
+			h.logger.Error("move_task: target workflow not found",
+				zap.String("task_id", req.TaskID),
+				zap.String("workflow_id", req.WorkflowID),
+				zap.Error(err))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+				"target workflow_id does not exist", nil)
+		}
+		if targetWorkflow.WorkspaceID != task.WorkspaceID {
+			h.logger.Error("move_task: target workflow is in a different workspace",
+				zap.String("task_id", req.TaskID),
+				zap.String("workflow_id", req.WorkflowID),
+				zap.String("task_workspace_id", task.WorkspaceID),
+				zap.String("target_workspace_id", targetWorkflow.WorkspaceID))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation,
+				"target workflow is in a different workspace", nil)
+		}
+		// One-shot entry options require an actual workflow step change; the
+		// deferred path bypasses the service that otherwise enforces this.
+		if err := workflowmove.ValidateEntryOptions(req.EntryOptions, moveChange(task.WorkflowStepID, req.WorkflowStepID)); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		}
+	}
+
+	// The one-shot options travel on the PendingMove and are applied when the
+	// target step is entered at turn-end (appended to an auto-start prompt or
+	// queued once for an existing session). No hand-off message is pre-queued
+	// here; instructions ride the entry overlay.
+	moveID := uuid.NewString()
+	if err := h.messageQueue.SetPendingMove(ctx, session.ID, &messagequeue.PendingMove{
+		MoveID:               moveID,
+		SessionIncarnationID: session.QueueIncarnationID,
+		TaskID:               req.TaskID,
+		WorkflowID:           req.WorkflowID,
+		WorkflowStepID:       req.WorkflowStepID,
+		Position:             req.Position,
+		Actor:                string(wfmodels.StepTransitionActorAgent),
+		SenderSessionID:      req.SenderSessionID,
+		EntryOptions:         req.EntryOptions,
+	}); err != nil {
+		h.logger.Error("move_task: failed to persist deferred move",
+			zap.String("task_id", req.TaskID), zap.String("session_id", session.ID), zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
+			"failed to persist deferred move", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.MoveTaskResponse{
+		Task:         h.synthesizeMovedTaskDTO(ctx, req.TaskID, req.WorkflowID, req.WorkflowStepID, req.Position),
+		MoveID:       moveID,
+		EntryOptions: req.EntryOptions,
+		Disposition:  moveDispositionDeferred,
+	})
+}
+
+// moveChange classifies a move as a workflow step change or position-only based
+// on the task's current and target step IDs.
+func moveChange(fromStepID, toStepID string) workflowmove.MoveChange {
+	if fromStepID != toStepID {
+		return workflowmove.MoveChangeStep
+	}
+	return workflowmove.MoveChangePositionOnly
+}
+
+// applyMoveTaskImmediate runs the move now, optionally queueing a hand-off
+// prompt on the (idle) primary session beforehand. Used when the source
+// session is idle, when there's no source session at all, or when no prompt
+// was supplied (config-mode/admin moves).
+func (h *Handlers) applyMoveTaskImmediate(
+	ctx context.Context,
+	msg *ws.Message,
+	req moveTaskRequest,
+	session *models.TaskSession,
+) (*ws.Message, error) {
+	// Attribution uses the CALLING session (req.SenderSessionID, injected
+	// server-side by the MCP server from its own bound session — see
+	// moveTaskHandler), never the target task's session captured above:
+	// move_task_kandev routinely moves a task the caller doesn't run a
+	// session on, so the target's session is not who caused this move.
+	// SenderSessionID is empty for a config-mode/admin MCP server with no
+	// bound session, which correctly falls back to ActorSystem.
+	attribution := steptelemetry.Attribution{Trigger: steptelemetry.TriggerMCPMove, ActorKind: steptelemetry.ActorSystem}
+	if req.SenderSessionID != "" {
+		attribution.ActorKind = steptelemetry.ActorAgent
+		attribution.ActorID = req.SenderSessionID
+		attribution.SessionID = req.SenderSessionID
+	}
+	moveCtx := steptelemetry.WithAttribution(ctx, attribution)
+	// One-shot options are validated (normalization, step-change requirement,
+	// profile preflight, recipient availability) inside MoveTaskWithOptions and
+	// applied when the task enters the target step. No hand-off message is
+	// pre-queued here; instructions ride the entry overlay.
+	result, err := h.taskSvc.MoveTaskWithOptions(moveCtx, req.TaskID, req.WorkflowID, req.WorkflowStepID, req.Position,
+		service.MoveTaskOptions{StepHistoryActor: wfmodels.StepTransitionActorAgent, EntryOptions: req.EntryOptions})
+	if err != nil {
+		h.logger.Error("failed to move task", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, classifyMoveTaskError(err), moveTaskErrorMessage(err), nil)
+	}
+	response := dto.MoveTaskResponse{
+		Task:                  dto.FromTask(result.Task),
+		WorkflowEntryIdentity: result.WorkflowEntryIdentity,
+		MoveID:                result.MoveID,
+		EntryOptions:          result.EntryOptions,
+		Disposition:           moveDispositionApplied,
+	}
+	if result.WorkflowStep != nil {
+		response.WorkflowStep = dto.FromWorkflowStep(result.WorkflowStep)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, response)
+}
+
+func classifyMoveTaskError(err error) string {
+	if err == nil {
+		return ws.ErrorCodeInternalError
+	}
+	if errors.Is(err, workflowmove.ErrMoveConflict) {
+		return ws.ErrorCodeConflict
+	}
+	if errors.Is(err, workflowmove.ErrConflictingInstructions) ||
+		errors.Is(err, workflowmove.ErrEntryOptionsRequireStepChange) ||
+		errors.Is(err, workflowmove.ErrEntryOptionsUnsupported) ||
+		errors.Is(err, workflowmove.ErrEntryTargetUnavailable) {
+		return ws.ErrorCodeValidation
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "wip limit exceeded"),
+		strings.Contains(msg, "active session"),
+		strings.Contains(msg, "archived tasks cannot be moved"),
+		strings.Contains(msg, "different workspace"),
+		strings.Contains(msg, "does not belong to target workflow"):
+		return ws.ErrorCodeConflict
+	case strings.Contains(msg, "invalid"),
+		strings.Contains(msg, "required"):
+		return ws.ErrorCodeValidation
+	default:
+		return ws.ErrorCodeInternalError
+	}
+}
+
+func moveTaskErrorMessage(err error) string {
+	switch classifyMoveTaskError(err) {
+	case ws.ErrorCodeConflict:
+		return "Move task conflicts with the current task or workflow state"
+	case ws.ErrorCodeValidation:
+		return "Invalid move_task request"
+	default:
+		return "Failed to move task"
+	}
+}
+
+// synthesizeMovedTaskDTO returns a task DTO with the post-move step/workflow
+// values filled in. Used by the deferred-move path so the agent's tool call
+// sees a "successful move" response shape, freeing it to end the turn (which
+// is what triggers applyPendingMove). If we can't load the task, fall back to
+// a minimal map so the call still resolves.
+func (h *Handlers) synthesizeMovedTaskDTO(ctx context.Context, taskID, workflowID, workflowStepID string, position int) dto.TaskDTO {
+	task, err := h.taskSvc.GetTask(ctx, taskID)
+	if err != nil || task == nil {
+		h.logger.Warn("failed to load task for synthetic move response",
+			zap.String("task_id", taskID),
+			zap.Error(err))
+		return dto.TaskDTO{
+			ID:             taskID,
+			WorkflowID:     workflowID,
+			WorkflowStepID: workflowStepID,
+			Position:       position,
+		}
+	}
+	clone := *task
+	clone.WorkflowID = workflowID
+	clone.WorkflowStepID = workflowStepID
+	clone.Position = position
+	return dto.FromTask(&clone)
+}
+
+// lookupSession returns the task's primary session.
+//   - (session, nil) — task has a primary session.
+//   - (nil, nil)     — task has no primary session yet (legitimate "empty"
+//     state — task was created but no agent has been launched). The
+//     repository signals this with the taskrepo.ErrNoPrimarySession sentinel;
+//     we treat it as a not-found rather than a failure so the caller can fall
+//     through to the idle-move path instead of rejecting the request.
+//   - (nil, err)     — real backend lookup failure (DB error, etc.). The
+//     caller should map this to an internal error rather than collapsing it
+//     into "no session" downstream.
+func (h *Handlers) lookupSession(ctx context.Context, taskID string) (*models.TaskSession, error) {
+	session, err := h.taskSvc.GetPrimarySession(ctx, taskID)
+	if err != nil {
+		// Classify the repo's not-found signal via the typed sentinel rather
+		// than substring-matching the formatted message, which is brittle.
+		if errors.Is(err, taskrepo.ErrNoPrimarySession) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return session, nil
+}
+
+type queuedMoveTaskPrompt struct {
+	identity messagequeue.QueueSessionIdentity
+	entryID  string
+}
+
+// queueMoveTaskPrompt enqueues a handoff for one exact session incarnation and
+// returns the entry identity needed to undo only that handoff.
+func (h *Handlers) queueMoveTaskPrompt(
+	ctx context.Context,
+	identity messagequeue.QueueSessionIdentity,
+	prompt string,
+) (*queuedMoveTaskPrompt, error) {
+	return h.queueMoveTaskPromptWithMoveID(ctx, identity, prompt, "")
+}
+
+func (h *Handlers) queueMoveTaskPromptWithMoveID(
+	ctx context.Context,
+	identity messagequeue.QueueSessionIdentity,
+	prompt string,
+	moveID string,
+) (*queuedMoveTaskPrompt, error) {
+	if h.messageQueue == nil {
+		return nil, fmt.Errorf("message queue is unavailable")
+	}
+	if identity.SessionID == "" {
+		return nil, fmt.Errorf("task has no primary session")
+	}
+	metadata := map[string]interface{}(nil)
+	if moveID != "" {
+		metadata = map[string]interface{}{messagequeue.MetadataDeferredMoveID: moveID}
+	}
+	var (
+		entry *messagequeue.QueuedMessage
+		err   error
+	)
+	if queue, ok := h.messageQueue.(*messagequeue.Service); ok {
+		entry, err = queue.QueueMessageWithMetadataForSession(
+			ctx, identity, prompt, "", messagequeue.QueuedByMoveTask, false, nil, metadata,
+		)
+		if err == nil {
+			h.publishQueueStatusEvent(ctx, identity, queue)
+		}
+	} else if queueWithMetadata, ok := h.messageQueue.(messageMetadataQueuer); ok {
+		entry, err = queueWithMetadata.QueueMessageWithMetadata(
+			ctx, identity.SessionID, identity.TaskID, prompt, "", messagequeue.QueuedByMoveTask, false, nil, metadata,
+		)
+	} else {
+		entry, err = h.messageQueue.QueueMessage(
+			ctx, identity.SessionID, identity.TaskID, prompt, "", messagequeue.QueuedByMoveTask, false, nil,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("queue message: %w", err)
+	}
+	if entry == nil || entry.ID == "" {
+		return nil, fmt.Errorf("queue message returned no entry identity")
+	}
+	return &queuedMoveTaskPrompt{identity: identity, entryID: entry.ID}, nil
+}
+
+func (h *Handlers) handleDeleteTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	taskID, err := unmarshalStringField(msg.Payload, "task_id")
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if taskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+
+	// Keep MCP task lifecycle mutations on the same HandoffService path as
+	// HTTP/WS when it is wired. This releases workspace-group membership and
+	// preserves shared-environment ownership before the task row is removed.
+	if h.handoffSvc != nil {
+		if _, err := h.handoffSvc.DeleteTaskTree(ctx, taskID, false); err != nil {
+			var postCommitErr *service.CascadePostCommitError
+			if !errors.As(err, &postCommitErr) {
+				h.logger.Error("failed to delete task", zap.Error(err))
+				return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete task", nil)
+			}
+			h.logger.Warn("task deleted but post-commit housekeeping failed",
+				zap.String("task_id", taskID), zap.Error(err))
+			return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+				keySuccess: false,
+				keyPending: true,
+				keyTaskID:  taskID,
+			})
+		}
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{keySuccess: true})
+	}
+	if err := h.taskSvc.DeleteTaskWithLifecycle(ctx, taskID); err != nil {
+		h.logger.Error("failed to delete task", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete task", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{keySuccess: true})
+}
+
+func (h *Handlers) handleArchiveTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	taskID, err := unmarshalStringField(msg.Payload, "task_id")
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if taskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	callerTaskID, err := unmarshalStringField(msg.Payload, "caller_task_id")
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if err := h.validateAutomationArchiveTarget(ctx, callerTaskID, taskID); err != nil {
+		h.logger.Warn("rejected archive target", zap.String("task_id", taskID), zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+
+	if h.handoffSvc != nil {
+		out, err := h.handoffSvc.ArchiveTaskTree(ctx, taskID, false)
+		if err != nil {
+			var postCommitErr *service.CascadePostCommitError
+			if !errors.As(err, &postCommitErr) {
+				h.logger.Error("failed to archive task", zap.Error(err))
+				return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to archive task", nil)
+			}
+			h.logger.Warn("task archived but post-commit housekeeping failed",
+				zap.String("task_id", taskID), zap.Error(err))
+			return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+				keySuccess: false,
+				keyPending: true,
+				keyTaskID:  taskID,
+			})
+		}
+		response := map[string]interface{}{keySuccess: true}
+		if out != nil && len(out.ArchivedTaskIDs) == 0 && len(out.SkippedTaskIDs) > 0 {
+			response["already_archived"] = true
+		}
+		return ws.NewResponse(msg.ID, msg.Action, response)
+	}
+	if err := h.taskSvc.ArchiveTask(ctx, taskID); err != nil {
+		// Archiving is a goal-state operation: a task that is already archived
+		// is in the requested state, so report success instead of an opaque
+		// internal error. The flag lets the caller tell a no-op from a real
+		// state change.
+		if errors.Is(err, service.ErrTaskAlreadyArchived) {
+			return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+				keySuccess:         true,
+				"already_archived": true,
+			})
+		}
+		var postCommitErr *service.CascadePostCommitError
+		if errors.As(err, &postCommitErr) {
+			h.logger.Warn("task archived but post-commit task projection failed",
+				zap.String("task_id", taskID), zap.Error(err))
+			return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+				keySuccess: false,
+				keyPending: true,
+				keyTaskID:  taskID,
+			})
+		}
+		h.logger.Error("failed to archive task", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to archive task", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{keySuccess: true})
+}
+
+func (h *Handlers) validateAutomationArchiveTarget(ctx context.Context, callerTaskID, targetTaskID string) error {
+	if callerTaskID == "" {
+		return nil
+	}
+	if h.taskSvc == nil {
+		return errors.New("archive caller task is unavailable")
+	}
+	caller, err := h.taskSvc.GetTask(ctx, callerTaskID)
+	if err != nil || caller == nil {
+		return errors.New("archive caller task cannot be resolved")
+	}
+	if caller.Origin != models.TaskOriginAutomationRun ||
+		models.StringFromAny(caller.Metadata["trigger_type"]) != string(automation.TriggerTypeGitHubPRMerged) {
+		return nil
+	}
+	expectedTarget := models.StringFromAny(caller.Metadata[models.MetaKeyAutomationTargetTaskID])
+	if expectedTarget == "" || expectedTarget != targetTaskID {
+		return errors.New("archive target is not bound to this automation run")
+	}
+	return nil
+}
+
+func (h *Handlers) handleUpdateTaskState(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID string `json:"task_id"`
+		State  string `json:"state"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
+	}
+	if req.State == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "state is required", nil)
+	}
+	state := normalizeTaskState(req.State)
+	if !isValidTaskState(state) {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "invalid task state: "+req.State, nil)
+	}
+
+	task, err := h.taskSvc.UpdateTaskState(ctx, req.TaskID, state)
+	if err != nil {
+		h.logger.Error("failed to update task state", zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to update task state", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, dto.FromTask(task))
+}
+
+func isValidTaskState(state v1.TaskState) bool {
+	switch state {
+	case v1.TaskStateTODO, v1.TaskStateCreated, v1.TaskStateScheduling,
+		v1.TaskStateInProgress, v1.TaskStateReview, v1.TaskStateBlocked,
+		v1.TaskStateWaitingForInput, v1.TaskStateCompleted,
+		v1.TaskStateFailed, v1.TaskStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeTaskState maps common agent-supplied aliases to canonical TaskState
+// values. Agents often send lowercase or shorthand strings (e.g. "complete",
+// "done") that are not valid v1.TaskState constants.
+func normalizeTaskState(raw string) v1.TaskState {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return v1.TaskState("")
+	}
+	upper := strings.ToUpper(trimmed)
+	switch upper {
+	case "OPEN", "TODO":
+		return v1.TaskStateTODO
+	case "IN_PROGRESS", "INPROGRESS", "ACTIVE":
+		return v1.TaskStateInProgress
+	case "COMPLETE", "COMPLETED", "DONE":
+		return v1.TaskStateCompleted
+	case "BLOCKED":
+		return v1.TaskStateBlocked
+	case "CANCELLED", "CANCELED":
+		return v1.TaskStateCancelled
+	case "REVIEW":
+		return v1.TaskStateReview
+	case "FAILED":
+		return v1.TaskStateFailed
+	case "CREATED":
+		return v1.TaskStateCreated
+	case "SCHEDULING":
+		return v1.TaskStateScheduling
+	case "WAITING_FOR_INPUT", "WAITING":
+		return v1.TaskStateWaitingForInput
+	default:
+		return v1.TaskState(trimmed)
+	}
+}

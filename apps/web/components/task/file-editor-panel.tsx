@@ -1,0 +1,604 @@
+"use client";
+
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
+import { PanelRoot, PanelBody } from "./panel-primitives";
+import { FileEditorContent, type FileEditorContentProps } from "./file-editor-content";
+import { FileImageViewer } from "./file-image-viewer";
+import { FileBinaryViewer } from "./file-binary-viewer";
+import { useAppStore } from "@/components/state-provider";
+import { useDockviewStore, type FileEditorState } from "@/lib/state/dockview-store";
+import { useFileEditors } from "@/hooks/use-file-editors";
+import { useSessionGitStatus } from "@/hooks/domains/session/use-session-git-status";
+import { getFileCategory, getFilePreviewKind } from "@/lib/utils/file-types";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import { requestFileContent } from "@/lib/ws/workspace-files";
+import { calculateHash } from "@/lib/utils/file-diff";
+import { panelPortalManager } from "@/lib/layout/panel-portal-manager";
+import { syncOpenFileFromWorkspace } from "@/hooks/file-editors-sync";
+import { buildRepoScopedItemId } from "@/lib/state/dockview-panel-actions";
+import { FileViewerDownloadButton, FileViewerExternalLink } from "./file-viewer-header";
+import { triggerFileDownload } from "@/lib/utils/file-download";
+import { getSessionWorkspacePath } from "@/lib/session-workspace-path";
+import { useTranslation } from "react-i18next";
+
+type FileCategory = "image" | "binary" | "text";
+
+function resolveFileCategory(isBinary: boolean, path: string): FileCategory {
+  if (!isBinary) return "text";
+  return getFileCategory(path) === "image" ? "image" : "binary";
+}
+
+function ImagePanel({
+  fileKey,
+  path,
+  worktreePath,
+  headerActions,
+}: {
+  fileKey: string;
+  path: string;
+  worktreePath: string | undefined;
+  headerActions?: React.ReactNode;
+}) {
+  const isSymlink = useDockviewStore((s) => !!s.openFiles.get(fileKey)?.resolvedPath);
+  const content = useDockviewStore((s) => s.openFiles.get(fileKey)?.content ?? "");
+  return (
+    <PanelRoot>
+      <PanelBody padding={false} scroll={false}>
+        <FileImageViewer
+          isSymlink={isSymlink}
+          path={path}
+          content={content}
+          worktreePath={worktreePath}
+          headerActions={headerActions}
+        />
+      </PanelBody>
+    </PanelRoot>
+  );
+}
+
+type StaticFilePanelProps = {
+  category: Exclude<FileCategory, "text">;
+  fileKey: string;
+  path: string;
+  worktreePath?: string;
+  sessionId: string | null;
+  taskId: string | null;
+  repositoryId?: string;
+  repositoryName?: string;
+};
+
+/**
+ * Download the open file from the copy already in the dockview store.
+ *
+ * The viewer only renders after `useFileLoader` resolves, so the bytes are
+ * always in hand here and no refetch is needed. Binary content is base64,
+ * matching the `workspace.file.get` contract `triggerFileDownload` expects.
+ */
+function useOpenFileDownload(fileKey: string, path: string): (() => void) | undefined {
+  const hasFile = useDockviewStore((s) => s.openFiles.has(fileKey));
+  const content = useDockviewStore((s) => s.openFiles.get(fileKey)?.content ?? "");
+  const isBinary = useDockviewStore((s) => s.openFiles.get(fileKey)?.isBinary ?? false);
+
+  return useMemo(() => {
+    if (!hasFile) return undefined;
+    return () => triggerFileDownload({ fileName: path, content, isBinary });
+  }, [hasFile, path, content, isBinary]);
+}
+
+function useLoadedFileDownload(
+  hasFile: boolean,
+  originalHash: string,
+  path: string,
+  content: string,
+  isBinary: boolean,
+): (() => void) | undefined {
+  return useMemo(
+    () =>
+      hasFile && originalHash
+        ? () => triggerFileDownload({ fileName: path, content, isBinary })
+        : undefined,
+    [hasFile, originalHash, path, content, isBinary],
+  );
+}
+
+function useLoadedFileDownloadForBuffer(
+  file: Pick<
+    ReturnType<typeof useFileEditorBuffer>,
+    "hasFile" | "originalHash" | "content" | "isBinary"
+  >,
+  path: string,
+) {
+  return useLoadedFileDownload(file.hasFile, file.originalHash, path, file.content, file.isBinary);
+}
+
+type FileEditorPanelActions = Pick<
+  ReturnType<typeof useFileEditors>,
+  "handleFileChange" | "saveFile" | "deleteFile" | "applyRemoteUpdate"
+>;
+
+function useFileEditorPanelActions({
+  path,
+  repo,
+  fileKey,
+  renderedPreview,
+  updateFileState,
+  actions,
+}: {
+  path: string;
+  repo: string | undefined;
+  fileKey: string;
+  renderedPreview: boolean;
+  updateFileState: (path: string, updates: Partial<FileEditorState>) => void;
+  actions: FileEditorPanelActions;
+}) {
+  const { handleFileChange, saveFile, deleteFile, applyRemoteUpdate } = actions;
+  const onChange = useCallback(
+    (newContent: string) => handleFileChange(path, newContent, repo),
+    [handleFileChange, path, repo],
+  );
+  const onSave = useCallback(() => saveFile(path, repo), [saveFile, path, repo]);
+  const onReloadFromAgent = useCallback(
+    () => applyRemoteUpdate(path, repo),
+    [applyRemoteUpdate, path, repo],
+  );
+  const onDelete = useCallback(() => deleteFile(path, repo), [deleteFile, path, repo]);
+  const onTogglePreview = useCallback(
+    () => updateFileState(fileKey, { renderedPreview: !renderedPreview }),
+    [updateFileState, fileKey, renderedPreview],
+  );
+  return { onChange, onSave, onReloadFromAgent, onDelete, onTogglePreview };
+}
+
+function StaticFilePanel({
+  category,
+  fileKey,
+  path,
+  worktreePath,
+  sessionId,
+  taskId,
+  repositoryId,
+  repositoryName,
+}: StaticFilePanelProps) {
+  const isSymlink = useDockviewStore((s) => !!s.openFiles.get(fileKey)?.resolvedPath);
+  const onDownload = useOpenFileDownload(fileKey, path);
+  const headerActions = (
+    <>
+      <FileViewerExternalLink
+        path={path}
+        sessionId={sessionId}
+        taskId={taskId}
+        repositoryId={repositoryId}
+        repositoryName={repositoryName}
+      />
+      <FileViewerDownloadButton onDownload={onDownload} />
+    </>
+  );
+  if (category === "image") {
+    return (
+      <ImagePanel
+        fileKey={fileKey}
+        path={path}
+        worktreePath={worktreePath}
+        headerActions={headerActions}
+      />
+    );
+  }
+  return (
+    <PanelRoot>
+      <PanelBody padding={false} scroll={false}>
+        <FileBinaryViewer
+          isSymlink={isSymlink}
+          path={path}
+          worktreePath={worktreePath}
+          headerActions={headerActions}
+        />
+      </PanelBody>
+    </PanelRoot>
+  );
+}
+
+type FileLoaderArgs = {
+  hasFile: boolean;
+  activeSessionId: string | null;
+  fileKey: string;
+  path: string;
+  setFileState: (path: string, state: FileEditorState) => void;
+  repo?: string;
+};
+
+function useFileLoader({
+  hasFile,
+  activeSessionId,
+  fileKey,
+  path,
+  setFileState,
+  repo,
+}: FileLoaderArgs) {
+  // Key the in-flight guard by session+path+repo. If any of them changes while
+  // a fetch is running, the new effect run starts a fresh fetch (rather than
+  // being silently blocked) and the stale response is dropped on arrival — so
+  // content from the wrong session/repo can never land in the buffer.
+  const inFlightKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (hasFile || !activeSessionId) return;
+    const key = `${activeSessionId}\0${path}\0${repo ?? ""}`;
+    if (inFlightKeyRef.current === key) return;
+    inFlightKeyRef.current = key;
+    const client = getWebSocketClient();
+    if (!client) {
+      inFlightKeyRef.current = null;
+      return;
+    }
+    requestFileContent(client, activeSessionId, path, repo)
+      .then(async (response) => {
+        if (inFlightKeyRef.current !== key) return;
+        const hash = await calculateHash(response.content);
+        const name = path.split("/").pop() || path;
+        const state: FileEditorState = {
+          path,
+          repo,
+          name,
+          content: response.content,
+          originalContent: response.content,
+          originalHash: hash,
+          isDirty: false,
+          isBinary: response.is_binary,
+          resolvedPath: response.resolved_path,
+        };
+        setFileState(fileKey, state);
+      })
+      .catch(() => {
+        /* stays on loading state */
+      })
+      .finally(() => {
+        if (inFlightKeyRef.current === key) inFlightKeyRef.current = null;
+      });
+  }, [hasFile, activeSessionId, fileKey, path, setFileState, repo]);
+}
+
+/**
+ * Force a workspace sync whenever the panel becomes the active dockview tab.
+ *
+ * Background: `useOpenFileWorkspaceSync` (mounted at the parent useFileEditors
+ * level) refetches file content when gitStatus signatures change. That signal
+ * arrives via the backend's workspace_tracker poll loop, which can be in
+ * `PollModeSlow` (30s interval) until the gateway's focus signal upgrades it
+ * to `PollModeFast` — there are two documented races in
+ * `manager_subscription.go:FlushSessionMode` where the focus signal can miss
+ * the mode upgrade for a brief window. When the missed window lines up with a
+ * file edit, the editor shows stale content until the next slow-poll cycle.
+ *
+ * Tab activation is a deterministic, user-driven signal that the editor's
+ * content is about to be looked at. Forcing a sync on activation closes the
+ * WS-event-miss gap without depending on git polling cadence.
+ *
+ * Safe by construction: syncOpenFileFromWorkspace is dirty-buffer aware —
+ * clean buffers get their content replaced, dirty buffers surface a Reload
+ * affordance via `hasRemoteUpdate` rather than clobbering edits.
+ */
+type ResyncOnTabActivateArgs = {
+  panelId: string;
+  hasFile: boolean;
+  activeSessionId: string | null;
+  fileKey: string;
+  path: string;
+  repo: string | undefined;
+  updateFileState: (path: string, updates: Partial<FileEditorState>) => void;
+};
+
+function useResyncOnTabActivate({
+  panelId,
+  hasFile,
+  activeSessionId,
+  fileKey,
+  path,
+  repo,
+  updateFileState,
+}: ResyncOnTabActivateArgs) {
+  useEffect(() => {
+    if (!hasFile || !activeSessionId) return;
+    // panelPortalManager.acquire() runs in usePortalSlot's mount effect (the
+    // dockview-side slot), which fires before child portals' effects, so the
+    // entry is virtually always present here. There is one acceptable miss:
+    // a fromJSON layout restore can swap `entry.api` for the same panelId
+    // without remounting this component, which would silently leave the
+    // subscription pointing at a disposed api. fromJSON is rare and
+    // `useOpenFileWorkspaceSync` still covers the common polling gap, so we
+    // accept that edge case rather than wiring a manager-level subscription.
+    const entry = panelPortalManager.get(panelId);
+    if (!entry?.api) return;
+    const syncNow = () => {
+      const client = getWebSocketClient();
+      if (!client) return;
+      void syncOpenFileFromWorkspace({
+        client,
+        sessionId: activeSessionId,
+        fileKey,
+        path,
+        repo,
+        updateFileState,
+      });
+    };
+    // If the panel is already the active tab when this effect first runs,
+    // onDidActiveChange won't fire (no transition), but the user is already
+    // looking at the editor — sync immediately so the initial open path
+    // benefits from the same WS-event-miss recovery as later activations.
+    if (entry.api.isActive) syncNow();
+    const disposable = entry.api.onDidActiveChange((event) => {
+      if (event.isActive) syncNow();
+    });
+    return () => disposable.dispose();
+  }, [panelId, hasFile, activeSessionId, fileKey, path, repo, updateFileState]);
+}
+
+type FileEditorPanelProps = {
+  panelId: string;
+  params: Record<string, unknown>;
+};
+
+function useFileEditorBuffer(fileKey: string) {
+  const hasFile = useDockviewStore((s) => s.openFiles.has(fileKey));
+  const isSymlink = useDockviewStore((s) => !!s.openFiles.get(fileKey)?.resolvedPath);
+  const content = useDockviewStore((s) => s.openFiles.get(fileKey)?.content ?? "");
+  const isDirty = useDockviewStore((s) => s.openFiles.get(fileKey)?.isDirty ?? false);
+  const hasRemoteUpdate = useDockviewStore(
+    (s) => s.openFiles.get(fileKey)?.hasRemoteUpdate ?? false,
+  );
+  const isBinary = useDockviewStore((s) => s.openFiles.get(fileKey)?.isBinary ?? false);
+  const originalContent = useDockviewStore((s) => s.openFiles.get(fileKey)?.originalContent ?? "");
+  const originalHash = useDockviewStore((s) => s.openFiles.get(fileKey)?.originalHash ?? "");
+  const renderedPreview = useDockviewStore(
+    (s) => s.openFiles.get(fileKey)?.renderedPreview ?? false,
+  );
+  return {
+    hasFile,
+    isSymlink,
+    content,
+    isDirty,
+    hasRemoteUpdate,
+    isBinary,
+    originalContent,
+    originalHash,
+    renderedPreview,
+  };
+}
+
+function LoadingFilePanel() {
+  const { t } = useTranslation();
+  return (
+    <PanelRoot>
+      <PanelBody
+        padding={false}
+        scroll={false}
+        className="flex items-center justify-center text-muted-foreground text-sm"
+      >
+        {t("task:loadingFile")}
+      </PanelBody>
+    </PanelRoot>
+  );
+}
+
+type LoadedFilePanelProps = {
+  category: FileCategory;
+  fileKey: string;
+  path: string;
+  worktreePath: string | undefined;
+  sessionId: string | null;
+  taskId: string | null;
+  repositoryId: string | undefined;
+  repositoryName: string | undefined;
+  editorProps: FileEditorContentProps;
+};
+
+function LoadedFilePanel({
+  category,
+  fileKey,
+  path,
+  worktreePath,
+  sessionId,
+  taskId,
+  repositoryId,
+  repositoryName,
+  editorProps,
+}: LoadedFilePanelProps) {
+  if (category !== "text") {
+    return (
+      <StaticFilePanel
+        category={category}
+        fileKey={fileKey}
+        path={path}
+        worktreePath={worktreePath}
+        sessionId={sessionId}
+        taskId={taskId}
+        repositoryId={repositoryId}
+        repositoryName={repositoryName}
+      />
+    );
+  }
+  return (
+    <PanelRoot>
+      <PanelBody padding={false} scroll={false}>
+        <FileEditorContent {...editorProps} />
+      </PanelBody>
+    </PanelRoot>
+  );
+}
+
+function resolveFileEditorPanelState({
+  path,
+  repo,
+  isBinary,
+  activeSession,
+  activeSessionId,
+  activeTaskId,
+}: {
+  path: string;
+  repo: string | undefined;
+  isBinary: boolean;
+  activeSession: {
+    workspace_path?: string | null;
+    worktree_path?: string | null;
+    repository_id?: string | null;
+  } | null;
+  activeSessionId: string | null;
+  activeTaskId: string | null;
+}) {
+  return {
+    category: resolveFileCategory(isBinary, path),
+    previewKind: getFilePreviewKind(path, isBinary),
+    panelProps: {
+      worktreePath: getSessionWorkspacePath(activeSession),
+      sessionId: activeSessionId,
+      taskId: activeTaskId,
+      repositoryId: activeSession?.repository_id ?? undefined,
+      repositoryName: repo,
+    },
+  };
+}
+
+type LoadedFileEditorPanelProps = {
+  category: FileCategory;
+  fileKey: string;
+  panelProps: Pick<
+    LoadedFilePanelProps,
+    "worktreePath" | "sessionId" | "taskId" | "repositoryId" | "repositoryName"
+  >;
+  buffer: Pick<
+    FileEditorContentProps,
+    "isSymlink" | "path" | "content" | "originalContent" | "isDirty" | "hasRemoteUpdate" | "vcsDiff"
+  >;
+  options: Pick<
+    FileEditorContentProps,
+    | "isSaving"
+    | "sessionId"
+    | "taskId"
+    | "repositoryId"
+    | "worktreePath"
+    | "repo"
+    | "enableComments"
+    | "previewKind"
+    | "renderedPreview"
+    | "onTogglePreview"
+  >;
+  actions: Pick<
+    FileEditorContentProps,
+    "onChange" | "onSave" | "onReloadFromAgent" | "onDelete" | "onDownload"
+  >;
+};
+
+function LoadedFileEditorPanel({
+  category,
+  fileKey,
+  panelProps,
+  buffer,
+  options,
+  actions,
+}: LoadedFileEditorPanelProps) {
+  return (
+    <LoadedFilePanel
+      category={category}
+      fileKey={fileKey}
+      path={buffer.path}
+      {...panelProps}
+      editorProps={{ ...buffer, ...options, ...actions }}
+    />
+  );
+}
+
+export const FileEditorPanel = memo(function FileEditorPanel({
+  panelId,
+  params,
+}: FileEditorPanelProps) {
+  const path = params.path as string;
+  const repo = params.repo as string | undefined;
+  const fileKey = buildRepoScopedItemId(path, repo);
+
+  const file = useFileEditorBuffer(fileKey);
+  const setFileState = useDockviewStore((s) => s.setFileState);
+  const updateFileState = useDockviewStore((s) => s.updateFileState);
+
+  const activeSessionId = useAppStore((state) => state.tasks.activeSessionId);
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const activeSession = useAppStore((state) =>
+    activeSessionId ? (state.taskSessions.items[activeSessionId] ?? null) : null,
+  );
+  const gitStatus = useSessionGitStatus(activeSessionId);
+  const vcsDiff = gitStatus?.files?.[path]?.diff;
+  const { savingFiles, handleFileChange, saveFile, deleteFile, applyRemoteUpdate } =
+    useFileEditors();
+  useFileLoader({ hasFile: file.hasFile, activeSessionId, fileKey, path, setFileState, repo });
+  useResyncOnTabActivate({
+    panelId,
+    hasFile: file.hasFile,
+    activeSessionId,
+    fileKey,
+    path,
+    repo,
+    updateFileState,
+  });
+
+  const { onChange, onSave, onReloadFromAgent, onDelete, onTogglePreview } =
+    useFileEditorPanelActions({
+      path,
+      repo,
+      fileKey,
+      renderedPreview: file.renderedPreview,
+      updateFileState,
+      actions: {
+        handleFileChange,
+        saveFile,
+        deleteFile,
+        applyRemoteUpdate,
+      },
+    });
+  const onDownload = useLoadedFileDownloadForBuffer(file, path);
+
+  if (!file.hasFile || !file.originalHash) {
+    return <LoadingFilePanel />;
+  }
+
+  const { category, previewKind, panelProps } = resolveFileEditorPanelState({
+    path,
+    repo,
+    isBinary: file.isBinary,
+    activeSession,
+    activeSessionId,
+    activeTaskId,
+  });
+
+  return (
+    <LoadedFileEditorPanel
+      category={category}
+      fileKey={fileKey}
+      panelProps={panelProps}
+      buffer={{
+        isSymlink: file.isSymlink,
+        path,
+        content: file.content,
+        originalContent: file.originalContent,
+        isDirty: file.isDirty,
+        hasRemoteUpdate: file.hasRemoteUpdate,
+        vcsDiff,
+      }}
+      options={{
+        isSaving: savingFiles.has(fileKey),
+        sessionId: activeSessionId || undefined,
+        taskId: activeTaskId,
+        repositoryId: panelProps.repositoryId,
+        worktreePath: panelProps.worktreePath,
+        repo,
+        enableComments: !!activeSessionId,
+        previewKind,
+        renderedPreview: previewKind !== "none" && file.renderedPreview,
+        onTogglePreview: previewKind === "markdown" ? onTogglePreview : undefined,
+      }}
+      actions={{
+        onChange,
+        onSave,
+        onReloadFromAgent,
+        onDelete,
+        onDownload,
+      }}
+    />
+  );
+});

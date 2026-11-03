@@ -1,0 +1,529 @@
+package linear
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+// workspaceDenied reports whether err is the per-user workspace access denial
+// surfaced by the workspace authorizer. Handlers map it to 404 so a workspace
+// the caller may not access is indistinguishable from a missing one.
+func workspaceDenied(err error) bool {
+	return errors.Is(err, repoerrors.ErrWorkspaceNotFound)
+}
+
+// RegisterRoutes wires the Linear HTTP and WebSocket handlers.
+func RegisterRoutes(router *gin.Engine, dispatcher *ws.Dispatcher, svc *Service, log *logger.Logger) {
+	ctrl := &Controller{service: svc, logger: log}
+	ctrl.RegisterHTTPRoutes(router)
+	registerWSHandlers(dispatcher, svc)
+}
+
+// Controller holds HTTP route handlers for the Linear integration.
+type Controller struct {
+	service *Service
+	logger  *logger.Logger
+}
+
+// RegisterHTTPRoutes attaches the Linear HTTP endpoints to router.
+func (c *Controller) RegisterHTTPRoutes(router *gin.Engine) {
+	api := router.Group("/api/v1/linear")
+	api.GET("/config", c.httpGetConfig)
+	api.POST("/config", c.httpSetConfig)
+	api.DELETE("/config", c.httpDeleteConfig)
+	api.POST("/config/test", c.httpTestConfig)
+	api.POST("/config/copy", c.httpCopyConfig)
+	api.GET("/teams", c.httpListTeams)
+	api.GET("/states", c.httpListStates)
+	api.GET("/labels", c.httpListLabels)
+	api.GET("/users", c.httpListUsers)
+	api.GET("/issues", c.httpSearchIssues)
+	api.GET("/issues/:id", c.httpGetIssue)
+	api.POST("/issues/:id/state", c.httpSetIssueState)
+
+	api.GET("/watches/issue", c.httpListIssueWatches)
+	api.POST("/watches/issue", c.httpCreateIssueWatch)
+	api.PATCH("/watches/issue/:id", c.httpUpdateIssueWatch)
+	api.DELETE("/watches/issue/:id", c.httpDeleteIssueWatch)
+	api.POST("/watches/issue/:id/trigger", c.httpTriggerIssueWatch)
+	api.GET("/watches/issue/:id/reset/preview", c.httpPreviewResetIssueWatch)
+	api.POST("/watches/issue/:id/reset", c.httpResetIssueWatch)
+}
+
+// --- HTTP handlers ---
+
+func (c *Controller) httpGetConfig(ctx *gin.Context) {
+	cfg, err := c.service.GetConfigForWorkspace(ctx.Request.Context(), c.workspaceID(ctx))
+	if err != nil {
+		if workspaceDenied(err) {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if cfg == nil {
+		ctx.Status(http.StatusNoContent)
+		return
+	}
+	ctx.JSON(http.StatusOK, cfg)
+}
+
+func (c *Controller) httpSetConfig(ctx *gin.Context) {
+	var req SetConfigRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+	cfg, err := c.service.SetConfigForWorkspace(ctx.Request.Context(), c.workspaceID(ctx), &req)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrInvalidConfig):
+			status = http.StatusBadRequest
+		case workspaceDenied(err):
+			status = http.StatusNotFound
+		}
+		ctx.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, cfg)
+}
+
+func (c *Controller) httpDeleteConfig(ctx *gin.Context) {
+	if err := c.service.DeleteConfigForWorkspace(ctx.Request.Context(), c.workspaceID(ctx)); err != nil {
+		if workspaceDenied(err) {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"deleted": true})
+}
+
+func (c *Controller) httpTestConfig(ctx *gin.Context) {
+	var req SetConfigRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+	result, err := c.service.TestConnectionForWorkspace(ctx.Request.Context(), c.workspaceID(ctx), &req)
+	if err != nil {
+		if workspaceDenied(err) {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, result)
+}
+
+func (c *Controller) httpListTeams(ctx *gin.Context) {
+	client, err := c.service.clientFor(ctx.Request.Context(), c.workspaceID(ctx))
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	teams, err := client.ListTeams(ctx.Request.Context())
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"teams": teams})
+}
+
+func (c *Controller) httpListStates(ctx *gin.Context) {
+	teamKey := ctx.Query(teamKeyParam)
+	if teamKey == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": teamKeyRequired})
+		return
+	}
+	client, err := c.service.clientFor(ctx.Request.Context(), c.workspaceID(ctx))
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	states, err := client.ListStates(ctx.Request.Context(), teamKey)
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"states": states})
+}
+
+func (c *Controller) httpListLabels(ctx *gin.Context) {
+	teamKey := ctx.Query(teamKeyParam)
+	if teamKey == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": teamKeyRequired})
+		return
+	}
+	client, err := c.service.clientFor(ctx.Request.Context(), c.workspaceID(ctx))
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	labels, err := client.ListLabels(ctx.Request.Context(), teamKey)
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"labels": labels})
+}
+
+func (c *Controller) httpListUsers(ctx *gin.Context) {
+	teamKey := ctx.Query(teamKeyParam)
+	if teamKey == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": teamKeyRequired})
+		return
+	}
+	client, err := c.service.clientFor(ctx.Request.Context(), c.workspaceID(ctx))
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	users, err := client.ListUsers(ctx.Request.Context(), teamKey)
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"users": users})
+}
+
+func (c *Controller) httpSearchIssues(ctx *gin.Context) {
+	filter := SearchFilter{
+		Query:     ctx.Query("query"),
+		TeamKey:   ctx.Query(teamKeyParam),
+		Assigned:  ctx.Query("assigned"),
+		CreatorID: ctx.Query("creator_id"),
+	}
+	if states := ctx.Query("state_ids"); states != "" {
+		filter.StateIDs = splitCSV(states)
+	}
+	if labels := ctx.Query("label_ids"); labels != "" {
+		filter.LabelIDs = splitCSV(labels)
+	}
+	if err := parseSearchNumericFilters(ctx, &filter); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	pageToken := ctx.Query("page_token")
+	maxResults, _ := strconv.Atoi(ctx.Query("max_results"))
+	result, err := c.service.SearchIssuesForWorkspace(ctx.Request.Context(), c.workspaceID(ctx), filter, pageToken, maxResults)
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, result)
+}
+
+func (c *Controller) workspaceID(ctx *gin.Context) string {
+	return strings.TrimSpace(ctx.Query("workspace_id"))
+}
+
+// copyConfigRequest is the payload for the copy-config endpoint. The source
+// workspace comes from the workspace_id query param; the body carries the
+// target.
+type copyConfigRequest struct {
+	TargetWorkspaceID string `json:"targetWorkspaceId"`
+}
+
+func (c *Controller) httpCopyConfig(ctx *gin.Context) {
+	sourceWorkspaceID := c.workspaceID(ctx)
+	if sourceWorkspaceID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id query parameter required"})
+		return
+	}
+	var req copyConfigRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+	targetWorkspaceID := strings.TrimSpace(req.TargetWorkspaceID)
+	if targetWorkspaceID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "targetWorkspaceId required"})
+		return
+	}
+	cfg, err := c.service.CopyConfigToWorkspace(ctx.Request.Context(), sourceWorkspaceID, targetWorkspaceID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrSameWorkspace), errors.Is(err, ErrNothingToCopy), errors.Is(err, ErrInvalidConfig):
+			status = http.StatusBadRequest
+		case workspaceDenied(err):
+			status = http.StatusNotFound
+		}
+		ctx.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, cfg)
+}
+
+// parseSearchNumericFilters parses priority + estimate query params onto the
+// filter and returns a 400-worthy error when any are malformed. Invalid input
+// is rejected rather than silently dropped so callers don't accidentally widen
+// the search by typoing a number.
+func parseSearchNumericFilters(ctx *gin.Context, filter *SearchFilter) error {
+	priorities, err := parseSearchPriorities(ctx.Query("priorities"))
+	if err != nil {
+		return err
+	}
+	filter.Priorities = priorities
+	if filter.EstimateMin, err = parseEstimateBound(ctx.Query("estimate_min"), "estimate_min"); err != nil {
+		return err
+	}
+	if filter.EstimateMax, err = parseEstimateBound(ctx.Query("estimate_max"), "estimate_max"); err != nil {
+		return err
+	}
+	if filter.EstimateMin != nil && filter.EstimateMax != nil && *filter.EstimateMin > *filter.EstimateMax {
+		return fmt.Errorf("estimate_min cannot be greater than estimate_max")
+	}
+	return nil
+}
+
+func parseSearchPriorities(raw string) ([]int, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := splitCSV(raw)
+	priorities := make([]int, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.Atoi(p)
+		if err != nil || v < 0 || v > 4 {
+			return nil, fmt.Errorf("priorities must be integers between 0 and 4")
+		}
+		priorities = append(priorities, v)
+	}
+	return priorities, nil
+}
+
+// parseEstimateBound parses a non-negative float query param. strconv.ParseFloat
+// accepts "NaN", "Inf", "-Inf" without error, but json.Marshal rejects them
+// later (turning a 400 into a 500), so we filter them out here.
+func parseEstimateBound(raw, name string) (*float64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return nil, fmt.Errorf("%s must be a non-negative number", name)
+	}
+	return &f, nil
+}
+
+func (c *Controller) httpGetIssue(ctx *gin.Context) {
+	id := ctx.Param("id")
+	issue, err := c.service.GetIssue(ctx.Request.Context(), id)
+	if err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, issue)
+}
+
+func (c *Controller) httpSetIssueState(ctx *gin.Context) {
+	id := ctx.Param("id")
+	var req struct {
+		StateID string `json:"stateId"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil || req.StateID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "stateId required"})
+		return
+	}
+	if err := c.service.SetIssueState(ctx.Request.Context(), id, req.StateID); err != nil {
+		c.writeClientError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"transitioned": true})
+}
+
+// errCodeLinearNotConfigured is the wire-level code surfaced to the UI when
+// Linear has no saved credentials.
+const errCodeLinearNotConfigured = "LINEAR_NOT_CONFIGURED"
+
+// Wire-format constants for the team_key query parameter that scopes
+// per-team endpoints (states / labels / users / search).
+const (
+	teamKeyParam    = "team_key"
+	teamKeyRequired = "team_key required"
+)
+
+// writeClientError maps service-level errors to HTTP responses.
+func (c *Controller) writeClientError(ctx *gin.Context, err error) {
+	if workspaceDenied(err) {
+		// A workspace the caller may not access is indistinguishable from a
+		// missing one — 404, not 403/500. Covers data-plane reads (via clientFor)
+		// and watch create/update (via writeIssueWatchError's fall-through).
+		ctx.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+		return
+	}
+	if errors.Is(err, ErrNotConfigured) {
+		ctx.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Linear is not configured",
+			"code":  errCodeLinearNotConfigured,
+		})
+		return
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		status := http.StatusInternalServerError
+		switch apiErr.StatusCode {
+		case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusBadRequest:
+			status = apiErr.StatusCode
+		}
+		ctx.JSON(status, gin.H{"error": apiErr.Error()})
+		return
+	}
+	c.logger.Warn("linear handler error", zap.Error(err))
+	ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// --- WebSocket handlers ---
+
+func registerWSHandlers(dispatcher *ws.Dispatcher, svc *Service) {
+	dispatcher.RegisterFunc(ws.ActionLinearConfigGet, wsGetConfig(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearConfigSet, wsSetConfig(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearConfigDelete, wsDeleteConfig(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearConfigTest, wsTestConfig(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearIssueGet, wsGetIssue(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearIssueTransition, wsSetIssueState(svc))
+	dispatcher.RegisterFunc(ws.ActionLinearTeamsList, wsListTeams(svc))
+}
+
+func wsReply(msg *ws.Message, payload interface{}) (*ws.Message, error) {
+	resp, err := ws.NewResponse(msg.ID, msg.Action, payload)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, err.Error(), nil)
+	}
+	return resp, nil
+}
+
+func wsFail(msg *ws.Message, err error) (*ws.Message, error) {
+	if errors.Is(err, ErrNotConfigured) {
+		return ws.NewError(msg.ID, msg.Action, errCodeLinearNotConfigured, err.Error(), nil)
+	}
+	return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, err.Error(), nil)
+}
+
+func wsGetConfig(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		cfg, err := svc.GetConfig(ctx)
+		if err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, gin.H{"config": cfg})
+	}
+}
+
+func wsSetConfig(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		var req SetConfigRequest
+		if err := msg.ParsePayload(&req); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "invalid payload", nil)
+		}
+		cfg, err := svc.SetConfig(ctx, &req)
+		if err != nil {
+			if errors.Is(err, ErrInvalidConfig) {
+				return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, err.Error(), nil)
+			}
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, gin.H{"config": cfg})
+	}
+}
+
+func wsDeleteConfig(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		if err := svc.DeleteConfig(ctx); err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, gin.H{"deleted": true})
+	}
+}
+
+func wsTestConfig(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		var req SetConfigRequest
+		if err := msg.ParsePayload(&req); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "invalid payload", nil)
+		}
+		result, err := svc.TestConnection(ctx, &req)
+		if err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, result)
+	}
+}
+
+func wsGetIssue(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		var p struct {
+			Identifier string `json:"identifier"`
+		}
+		if err := msg.ParsePayload(&p); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "invalid payload", nil)
+		}
+		if p.Identifier == "" {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "identifier required", nil)
+		}
+		issue, err := svc.GetIssue(ctx, p.Identifier)
+		if err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, issue)
+	}
+}
+
+func wsSetIssueState(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		var p struct {
+			IssueID string `json:"issueId"`
+			StateID string `json:"stateId"`
+		}
+		if err := msg.ParsePayload(&p); err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "invalid payload", nil)
+		}
+		if p.IssueID == "" || p.StateID == "" {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "issueId and stateId required", nil)
+		}
+		if err := svc.SetIssueState(ctx, p.IssueID, p.StateID); err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, gin.H{"transitioned": true})
+	}
+}
+
+func wsListTeams(svc *Service) func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	return func(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+		teams, err := svc.ListTeams(ctx)
+		if err != nil {
+			return wsFail(msg, err)
+		}
+		return wsReply(msg, gin.H{"teams": teams})
+	}
+}

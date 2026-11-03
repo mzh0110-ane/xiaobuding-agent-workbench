@@ -1,0 +1,193 @@
+/**
+ * Keyboard shortcut constants and key definitions
+ */
+
+// Modifier keys
+// i18n-exempt: DOM KeyboardEvent.key values, compared against real events.
+export const MODIFIER_KEYS = {
+  CTRL: "Control",
+  CMD: "Meta",
+  ALT: "Alt",
+  SHIFT: "Shift",
+} as const;
+
+// Common keys
+export const KEYS = {
+  ENTER: "Enter",
+  ESCAPE: "Escape",
+  SPACE: " ",
+  TAB: "Tab",
+  BACKSPACE: "Backspace",
+  DELETE: "Delete",
+  ARROW_UP: "ArrowUp",
+  ARROW_DOWN: "ArrowDown",
+  ARROW_LEFT: "ArrowLeft",
+  ARROW_RIGHT: "ArrowRight",
+  // Letters
+  A: "a",
+  B: "b",
+  C: "c",
+  D: "d",
+  E: "e",
+  F: "f",
+  G: "g",
+  H: "h",
+  I: "i",
+  J: "j",
+  K: "k",
+  L: "l",
+  M: "m",
+  N: "n",
+  O: "o",
+  P: "p",
+  Q: "q",
+  R: "r",
+  S: "s",
+  T: "t",
+  U: "u",
+  V: "v",
+  W: "w",
+  X: "x",
+  Y: "y",
+  Z: "z",
+  // Numbers
+  ZERO: "0",
+  ONE: "1",
+  TWO: "2",
+  THREE: "3",
+  FOUR: "4",
+  FIVE: "5",
+  SIX: "6",
+  SEVEN: "7",
+  EIGHT: "8",
+  NINE: "9",
+  // Symbols
+  SLASH: "/",
+} as const;
+
+// Platform types
+export type Platform = "mac" | "windows" | "linux" | "unknown";
+
+// Modifier key type
+export type ModifierKey = keyof typeof MODIFIER_KEYS;
+
+// Key type
+export type Key = (typeof KEYS)[keyof typeof KEYS];
+
+/**
+ * Keyboard shortcut definition
+ */
+export type KeyboardShortcut = {
+  key: Key;
+  modifiers?: {
+    ctrl?: boolean;
+    cmd?: boolean;
+    alt?: boolean;
+    shift?: boolean;
+    /** Use Cmd on Mac, Ctrl on Windows/Linux */
+    ctrlOrCmd?: boolean;
+  };
+};
+
+/**
+ * Common keyboard shortcuts used across the app
+ */
+export const SHORTCUTS = {
+  SUBMIT: {
+    key: KEYS.ENTER,
+    modifiers: { ctrlOrCmd: true },
+  },
+  SUBMIT_ENTER: {
+    key: KEYS.ENTER,
+  },
+  SAVE: {
+    key: KEYS.S,
+    modifiers: { ctrlOrCmd: true },
+  },
+  CANCEL: {
+    key: KEYS.ESCAPE,
+  },
+  SEARCH: {
+    key: KEYS.K,
+    modifiers: { ctrlOrCmd: true },
+  },
+  NEW_TASK: {
+    key: KEYS.N,
+    modifiers: { ctrlOrCmd: true },
+  },
+  TOGGLE_SIDEBAR: {
+    key: KEYS.B,
+    modifiers: { ctrlOrCmd: true },
+  },
+  FOCUS_INPUT: {
+    key: KEYS.SLASH,
+  },
+  FOCUS_PASSTHROUGH_INPUT: {
+    key: KEYS.Y,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  COMMAND_PANEL: {
+    key: KEYS.P,
+    modifiers: { ctrlOrCmd: true },
+  },
+  COMMAND_PANEL_SHIFT: {
+    key: KEYS.P,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  FILE_SEARCH: {
+    key: KEYS.K,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  CONTENT_SEARCH: {
+    key: KEYS.F,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  TOGGLE_PLAN_MODE: {
+    key: KEYS.TAB,
+    modifiers: { shift: true },
+  },
+  QUICK_CHAT: {
+    key: KEYS.Q,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  TASK_SWITCHER: {
+    key: KEYS.SPACE,
+    modifiers: { ctrlOrCmd: true },
+  },
+  // Cycle the recent-task switcher backward (oldest -> most-recent). Shift
+  // distinguishes it from TASK_SWITCHER so both can be held together.
+  TASK_SWITCHER_REVERSE: {
+    key: KEYS.SPACE,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  BOTTOM_TERMINAL: {
+    key: KEYS.J,
+    modifiers: { ctrlOrCmd: true },
+  },
+  FIND_IN_PANEL: {
+    key: KEYS.F,
+    modifiers: { ctrlOrCmd: true },
+  },
+  // Ctrl+R opens the bash-style reverse-i-search overlay on the chat composer.
+  // Defaults to plain Ctrl (not ctrlOrCmd) so the Mac browser refresh shortcut
+  // Cmd+R keeps working out of the box.
+  REVERSE_SEARCH: {
+    key: KEYS.R,
+    modifiers: { ctrl: true },
+  },
+  // Cmd+Shift+G on a task screen jumps straight to the task's GitHub PR
+  // (or opens a picker dialog when the task has several linked PRs).
+  OPEN_TASK_PR: {
+    key: KEYS.G,
+    modifiers: { ctrlOrCmd: true, shift: true },
+  },
+  // Cmd+E opens the sidebar-header workspace picker with focus inside the
+  // menu, so a workspace can be switched with arrows + Enter alone. Cmd+Shift+
+  // Space (the natural pairing with TASK_SWITCHER) is taken by
+  // TASK_SWITCHER_REVERSE; the browser defaults on Cmd/Ctrl+E (omnibox search,
+  // macOS find-selection) all yield to preventDefault.
+  WORKSPACE_PICKER: {
+    key: KEYS.E,
+    modifiers: { ctrlOrCmd: true },
+  },
+} as const;

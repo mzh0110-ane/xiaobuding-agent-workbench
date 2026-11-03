@@ -1,0 +1,139 @@
+package lifecycle
+
+import (
+	"testing"
+
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+func TestLaunchRequest_RepoSpecs_ReturnsExplicitListWhenSet(t *testing.T) {
+	req := &LaunchRequest{
+		// Single-repo top-level fields are populated from Repositories[0] for
+		// backwards compat by callers, but RepoSpecs() must always prefer the
+		// explicit list when present.
+		RepositoryID:   "legacy-repo",
+		RepositoryPath: "/legacy",
+		Repositories: []RepoLaunchSpec{
+			{RepositoryID: "repo-a", RepositoryPath: "/a", BaseBranch: "main"},
+			{RepositoryID: "repo-b", RepositoryPath: "/b", BaseBranch: "develop"},
+		},
+	}
+	specs := req.RepoSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 specs, got %d", len(specs))
+	}
+	if specs[0].RepositoryID != "repo-a" || specs[1].RepositoryID != "repo-b" {
+		t.Errorf("unexpected order: %+v", specs)
+	}
+}
+
+func TestQualifiedPRBase_LaunchRepoSpecsSynthesizesFromLegacyFields(t *testing.T) {
+	binding := models.RemoteContribution{CanonicalURL: "https://github.com/acme/widget/pull/7"}
+	destination := models.ContributionDestination{Provider: "github"}
+	qualifiedBase := lifecycleTestQualifiedPRBase()
+	req := &LaunchRequest{
+		RepositoryID:            "repo-x",
+		RepositoryPath:          "/x",
+		BaseBranch:              "main",
+		CheckoutBranch:          "feature/y",
+		WorktreeID:              "wt-1",
+		WorktreeBranchPrefix:    "feat/",
+		PullBeforeWorktree:      true,
+		RepoName:                "x",
+		BranchSlug:              "feature-y",
+		BranchIdentitySlug:      "feature-y",
+		RemoteContribution:      &binding,
+		ContributionDestination: &destination,
+		QualifiedPRBase:         &qualifiedBase,
+		PRNumber:                qualifiedBase.Target.Number,
+	}
+	specs := req.RepoSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("expected length-1 list synthesized, got %d", len(specs))
+	}
+	got := specs[0]
+	if got.RepositoryID != "repo-x" || got.RepositoryPath != "/x" ||
+		got.BaseBranch != "main" || got.CheckoutBranch != "feature/y" ||
+		got.WorktreeID != "wt-1" || got.WorktreeBranchPrefix != "feat/" ||
+		!got.PullBeforeWorktree || got.RepoName != "x" ||
+		got.BranchSlug != "feature-y" || got.BranchIdentitySlug != "feature-y" {
+		t.Errorf("synthesized spec mismatch: %+v", got)
+	}
+	if got.RemoteContribution != &binding {
+		t.Errorf("remote contribution = %#v, want %#v", got.RemoteContribution, &binding)
+	}
+	if got.ContributionDestination != &destination {
+		t.Errorf("contribution destination = %#v, want %#v", got.ContributionDestination, &destination)
+	}
+	if got.QualifiedPRBase != &qualifiedBase || got.PRNumber != qualifiedBase.Target.Number {
+		t.Errorf("qualified base = %#v, PR number = %d", got.QualifiedPRBase, got.PRNumber)
+	}
+}
+
+func TestLaunchRequest_RepoSpecs_NilForRepoLessLaunch(t *testing.T) {
+	req := &LaunchRequest{TaskID: "t1", SessionID: "s1"}
+	if specs := req.RepoSpecs(); specs != nil {
+		t.Errorf("expected nil for repo-less launch, got %v", specs)
+	}
+}
+
+func TestEnvPrepareRequest_RepoSpecs_ExplicitWins(t *testing.T) {
+	req := &EnvPrepareRequest{
+		RepositoryID:   "legacy",
+		RepositoryPath: "/legacy",
+		Repositories: []RepoPrepareSpec{
+			{RepositoryID: "a", RepositoryPath: "/a"},
+		},
+	}
+	specs := req.RepoSpecs()
+	if len(specs) != 1 || specs[0].RepositoryID != "a" {
+		t.Fatalf("expected explicit list to win; got %+v", specs)
+	}
+}
+
+func TestQualifiedPRBase_EnvPrepareRepoSpecsCarryRepoSetupScript(t *testing.T) {
+	qualifiedBase := lifecycleTestQualifiedPRBase()
+	req := &EnvPrepareRequest{
+		RepositoryID:       "r1",
+		RepositoryPath:     "/r1",
+		BaseBranch:         "main",
+		RepoSetupScript:    "make install",
+		BranchSlug:         "feature-y",
+		BranchIdentitySlug: "feature-y",
+		PRNumber:           qualifiedBase.Target.Number, QualifiedPRBase: &qualifiedBase,
+	}
+	specs := req.RepoSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("expected 1 spec, got %d", len(specs))
+	}
+	if specs[0].RepoSetupScript != "make install" {
+		t.Errorf("repo setup script not propagated: %+v", specs[0])
+	}
+	if specs[0].BranchSlug != "feature-y" || specs[0].BranchIdentitySlug != "feature-y" {
+		t.Errorf("branch identity not propagated: %+v", specs[0])
+	}
+	if specs[0].QualifiedPRBase != &qualifiedBase || specs[0].PRNumber != qualifiedBase.Target.Number {
+		t.Errorf("qualified base = %#v, PR number = %d", specs[0].QualifiedPRBase, specs[0].PRNumber)
+	}
+}
+
+func lifecycleTestQualifiedPRBase() models.PRBase {
+	return models.PRBase{Target: models.ComparisonTarget{
+		Version: models.ComparisonTargetVersion, Provider: models.ComparisonTargetProviderGitHub,
+		Kind: models.ComparisonTargetKindPullRequest, Number: 42,
+		HeadBranch: "feature/work", TargetBranch: "release/next",
+		HeadRepository: models.ComparisonTargetRepository{
+			Host: "github.com", Path: "fork/widget", ProviderID: "fork-id", RemoteURL: "https://github.com/fork/widget.git",
+		},
+		TargetRepository: models.ComparisonTargetRepository{
+			Host: "github.com", Path: "upstream/widget", ProviderID: "base-id", RemoteURL: "https://github.com/upstream/widget.git",
+		},
+	}}
+}
+
+func TestEnvPrepareRequest_RepoSpecs_NilForRepoLess(t *testing.T) {
+	req := &EnvPrepareRequest{}
+	if specs := req.RepoSpecs(); specs != nil {
+		t.Errorf("expected nil, got %+v", specs)
+	}
+}

@@ -1,0 +1,581 @@
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestGitHubCredentialBrokerConfigValidation(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.GitHubCredentialBroker.PublicBaseURL = "https://kandev.example.com"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("validate broker-only config: %v", err)
+	}
+	cfg.GitHubCredentialBroker.PublicBaseURL = "http://kandev.example.com"
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "githubCredentialBroker.publicBaseUrl") {
+		t.Fatalf("validate insecure broker URL error = %v", err)
+	}
+}
+
+func TestGitHubCredentialBrokerConfigEnvironmentBinding(t *testing.T) {
+	t.Setenv("KANDEV_GITHUB_CREDENTIAL_BROKER_PUBLIC_BASE_URL", "https://kandev.example.com")
+	t.Setenv("KANDEV_GITHUB_CREDENTIAL_BROKER_REISSUE_SIGNING_KEY", "test-signing-key")
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.GitHubCredentialBroker.PublicBaseURL; got != "https://kandev.example.com" {
+		t.Fatalf("broker public base URL = %q", got)
+	}
+	if got := cfg.GitHubCredentialBroker.ReissueSigningKey; got != "test-signing-key" {
+		t.Fatalf("broker reissue signing key was not bound")
+	}
+}
+
+func TestWebTitlePrefixEnvironmentBinding(t *testing.T) {
+	t.Setenv("KANDEV_WEB_TITLE_PREFIX", "TEST")
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Server.WebTitlePrefix; got != "TEST" {
+		t.Fatalf("web title prefix = %q, want %q", got, "TEST")
+	}
+}
+
+func TestWebTitlePrefixDefaultsEmpty(t *testing.T) {
+	t.Setenv("KANDEV_WEB_TITLE_PREFIX", "")
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Server.WebTitlePrefix; got != "" {
+		t.Fatalf("web title prefix = %q, want empty", got)
+	}
+}
+
+// minimalValidConfig returns a Config that passes validate() out of the box.
+// Tests modify a copy to exercise individual validation branches.
+func minimalValidConfig() *Config {
+	return &Config{
+		Server:   ServerConfig{Port: 38429},
+		Database: DatabaseConfig{Driver: "sqlite"},
+		Auth:     AuthConfig{TokenDuration: 3600},
+		Logging:  LoggingConfig{Level: "info", Format: "text"},
+		RepositoryDiscovery: RepositoryDiscoveryConfig{
+			MaxDepth: 5,
+		},
+	}
+}
+
+func TestLoggingConfigExposesOnlyLevelAndFormat(t *testing.T) {
+	cfgType := reflect.TypeOf(LoggingConfig{})
+	for _, field := range []string{"OutputPath", "MaxSizeMB", "MaxBackups", "MaxAgeDays", "Compress"} {
+		if _, exists := cfgType.FieldByName(field); exists {
+			t.Errorf("LoggingConfig still exposes legacy destination field %s", field)
+		}
+	}
+}
+
+func TestResolvedHomeDir_Default(t *testing.T) {
+	cfg := &Config{}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot determine home directory")
+	}
+	want := filepath.Join(home, ".kandev")
+	if got := cfg.ResolvedHomeDir(); got != want {
+		t.Errorf("ResolvedHomeDir() = %q, want %q", got, want)
+	}
+}
+
+func TestResolvedHomeDir_WithHomeDir(t *testing.T) {
+	cfg := &Config{HomeDir: "/custom/kandev"}
+	if got := cfg.ResolvedHomeDir(); got != "/custom/kandev" {
+		t.Errorf("ResolvedHomeDir() = %q, want %q", got, "/custom/kandev")
+	}
+}
+
+func TestResolvedHomeDir_TildeExpansion(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot determine home directory")
+	}
+	cfg := &Config{HomeDir: "~/.kandev-dev"}
+	want := filepath.Join(home, ".kandev-dev")
+	if got := cfg.ResolvedHomeDir(); got != want {
+		t.Errorf("ResolvedHomeDir() = %q, want %q", got, want)
+	}
+}
+
+func TestResolvedDataDir_Default(t *testing.T) {
+	cfg := &Config{}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot determine home directory")
+	}
+	want := filepath.Join(home, ".kandev", "data")
+	if got := cfg.ResolvedDataDir(); got != want {
+		t.Errorf("ResolvedDataDir() = %q, want %q", got, want)
+	}
+}
+
+func TestResolvedDataDir_DerivedFromHomeDir(t *testing.T) {
+	// Data always lives under <HomeDir>/data. No independent override.
+	cfg := &Config{HomeDir: "/custom/kandev"}
+	want := filepath.Join("/custom/kandev", "data")
+	if got := cfg.ResolvedDataDir(); got != want {
+		t.Errorf("ResolvedDataDir() = %q, want %q", got, want)
+	}
+}
+
+func TestValidate_DatabaseDriver(t *testing.T) {
+	t.Run("sqlite_ok", func(t *testing.T) {
+		cfg := minimalValidConfig()
+		if err := validate(cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("mixed_case_postgres_normalized", func(t *testing.T) {
+		cfg := minimalValidConfig()
+		cfg.Database.Driver = "Postgres"
+		cfg.Database.Port = 5432
+		cfg.Database.User = "u"
+		cfg.Database.DBName = "db"
+		cfg.Database.SSLMode = "disable"
+		if err := validate(cfg); err != nil {
+			t.Fatalf("expected mixed-case 'Postgres' to normalize, got %v", err)
+		}
+		if cfg.Database.Driver != "postgres" {
+			t.Errorf("driver not normalized: got %q, want %q", cfg.Database.Driver, "postgres")
+		}
+	})
+
+	t.Run("unknown_driver_rejected", func(t *testing.T) {
+		cfg := minimalValidConfig()
+		cfg.Database.Driver = "mysql"
+		err := validate(cfg)
+		if err == nil || !strings.Contains(err.Error(), "database.driver") {
+			t.Fatalf("expected database.driver error, got %v", err)
+		}
+	})
+}
+
+func TestValidate_PostgresSSLMode(t *testing.T) {
+	for _, mode := range []string{"disable", "require", "verify-ca", "verify-full"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			cfg.Database.Driver = "postgres"
+			cfg.Database.Port = 5432
+			cfg.Database.User = "u"
+			cfg.Database.DBName = "db"
+			cfg.Database.SSLMode = mode
+			if err := validate(cfg); err != nil && strings.Contains(err.Error(), "sslMode") {
+				t.Errorf("sslMode %q rejected unexpectedly: %v", mode, err)
+			}
+		})
+	}
+
+	t.Run("invalid_rejected", func(t *testing.T) {
+		cfg := minimalValidConfig()
+		cfg.Database.Driver = "postgres"
+		cfg.Database.Port = 5432
+		cfg.Database.User = "u"
+		cfg.Database.DBName = "db"
+		cfg.Database.SSLMode = "bogus"
+		err := validate(cfg)
+		if err == nil || !strings.Contains(err.Error(), "sslMode") {
+			t.Fatalf("expected sslMode error, got %v", err)
+		}
+	})
+
+	t.Run("sqlite_ignores_sslmode", func(t *testing.T) {
+		cfg := minimalValidConfig()
+		cfg.Database.SSLMode = "bogus"
+		if err := validate(cfg); err != nil {
+			t.Errorf("sqlite should ignore sslMode, got %v", err)
+		}
+	})
+}
+
+// TestFeatures_ProductionDefaults pins the production policy: new and
+// in-progress features remain off until a deployment explicitly opts in.
+func TestFeatures_ProductionDefaults(t *testing.T) {
+	// Force a clean env so KANDEV_FEATURES_* and profile-selector vars from the
+	// host shell cannot change the production-profile defaults under test.
+	t.Setenv("KANDEV_FEATURES_OFFICE", "")
+	unsetEnv(t, "KANDEV_FEATURES_AUTH")
+	unsetEnv(t, "KANDEV_FEATURES_CANVASES")
+	unsetEnv(t, "KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF")
+	t.Setenv("KANDEV_DEBUG_DEV_MODE", "")
+	t.Setenv("KANDEV_DEBUG_PPROF_ENABLED", "")
+	t.Setenv("KANDEV_E2E_MOCK", "")
+
+	dir := t.TempDir()
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if cfg.Features.Office {
+		t.Errorf("Features.Office = true, want false (production default must be off)")
+	}
+	if cfg.Features.Auth {
+		t.Error("Features.Auth = true, want false (authentication must remain opt-in by default)")
+	}
+	if cfg.Features.ClaudeBackgroundPromptHandoff {
+		t.Error("Features.ClaudeBackgroundPromptHandoff = true, want false (experiment must remain opt-in by default)")
+	}
+}
+
+// TestFeatures_OfficeEnabledByEnv proves the documented opt-in path:
+// setting KANDEV_FEATURES_OFFICE=true flips Features.Office to true. This
+// is what `apps/cli/src/dev.ts` relies on for dev mode and what release
+// deployments would set if they ever wanted Office on.
+func TestFeatures_OfficeEnabledByEnv(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_OFFICE", "true")
+
+	dir := t.TempDir()
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if !cfg.Features.Office {
+		t.Errorf("Features.Office = false, want true (KANDEV_FEATURES_OFFICE=true must flip the flag)")
+	}
+}
+
+func TestFeatures_ClaudeBackgroundPromptHandoffEnabledByEnv(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF", "true")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if !cfg.Features.ClaudeBackgroundPromptHandoff {
+		t.Error("Features.ClaudeBackgroundPromptHandoff = false, want true")
+	}
+}
+
+func TestFeaturesConfigIgnoresRetiredAppStatusBarEnv(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_APP_STATUS_BAR", "true")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	raw, err := json.Marshal(cfg.Features)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var response map[string]bool
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if _, ok := response["appStatusBar"]; ok {
+		t.Fatal("retired KANDEV_FEATURES_APP_STATUS_BAR still affects the feature response")
+	}
+}
+
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	value, set := os.LookupEnv(name)
+	_ = os.Unsetenv(name)
+	t.Cleanup(func() {
+		if set {
+			_ = os.Setenv(name, value)
+			return
+		}
+		_ = os.Unsetenv(name)
+	})
+}
+
+func TestServerHostFromEnv(t *testing.T) {
+	t.Setenv("KANDEV_SERVER_HOST", "127.0.0.1")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Fatalf("Server.Host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
+}
+
+func TestResolvedBinds(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		hosts   []string
+		want    []string
+		wantErr bool
+	}{
+		{name: "single host", host: "127.0.0.1", want: []string{"127.0.0.1"}},
+		{name: "empty falls back to wildcard default", host: "", want: []string{"0.0.0.0"}},
+		{name: "comma separated list", host: "127.0.0.1,100.64.0.1", want: []string{"127.0.0.1", "100.64.0.1"}},
+		{name: "whitespace trimmed", host: " 127.0.0.1 , 100.64.0.1 ", want: []string{"127.0.0.1", "100.64.0.1"}},
+		{name: "duplicates dropped", host: "127.0.0.1,127.0.0.1,::1", want: []string{"127.0.0.1", "::1"}},
+		{name: "wildcard collapses set", host: "127.0.0.1,0.0.0.0", want: []string{"0.0.0.0"}},
+		{name: "ipv6 wildcard collapses set", host: "::,127.0.0.1", want: []string{"::"}},
+		{name: "hostname allowed", host: "my-tailnet-host", want: []string{"my-tailnet-host"}},
+		{name: "hosts array used when host unset", host: "", hosts: []string{"127.0.0.1", "100.64.0.1"}, want: []string{"127.0.0.1", "100.64.0.1"}},
+		{name: "explicit host wins over hosts array", host: "127.0.0.1", hosts: []string{"0.0.0.0"}, want: []string{"127.0.0.1"}},
+		{name: "hosts array as comma string", hosts: []string{"127.0.0.1,100.64.0.1"}, want: []string{"127.0.0.1", "100.64.0.1"}},
+		{name: "equivalent ipv6 forms dedupe", host: "::1,0:0:0:0:0:0:0:1", want: []string{"::1"}},
+		{name: "longhand unspecified ipv6 is wildcard", host: "0:0:0:0:0:0:0:0,127.0.0.1", want: []string{"::"}},
+		{name: "invalid entry errors", host: "127.0.0.1,not a host!!", wantErr: true},
+		{name: "invalid entry after wildcard still errors", host: "0.0.0.0,not a host!!", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := ServerConfig{Host: tt.host, Hosts: tt.hosts}
+			got, err := sc.ResolvedBinds()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ResolvedBinds() expected error, got %v", got)
+				}
+				if !strings.Contains(err.Error(), "not a host!!") {
+					t.Fatalf("ResolvedBinds() error = %q, want it to name the bad entry", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolvedBinds() unexpected error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("ResolvedBinds() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("ResolvedBinds() = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"127.0.0.53", true},
+		{"::1", true},
+		{"localhost", true},
+		{"LocalHost", true},
+		{"0.0.0.0", false},
+		{"::", false},
+		{"", false},
+		{"100.64.0.1", false},
+		{"my-tailnet-host", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := IsLoopbackHost(tt.host); got != tt.want {
+				t.Fatalf("IsLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNonLoopbackBinds(t *testing.T) {
+	sc := ServerConfig{Host: "127.0.0.1,100.64.0.1,::1"}
+	got, err := sc.NonLoopbackBinds()
+	if err != nil {
+		t.Fatalf("NonLoopbackBinds() error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "100.64.0.1" {
+		t.Fatalf("NonLoopbackBinds() = %v, want [100.64.0.1]", got)
+	}
+
+	loopOnly := ServerConfig{Host: "127.0.0.1"}
+	if got, err := loopOnly.NonLoopbackBinds(); err != nil || len(got) != 0 {
+		t.Fatalf("NonLoopbackBinds() = %v (err %v), want empty", got, err)
+	}
+
+	wildcard := ServerConfig{Host: "0.0.0.0"}
+	if got, err := wildcard.NonLoopbackBinds(); err != nil || len(got) != 1 || got[0] != "0.0.0.0" {
+		t.Fatalf("NonLoopbackBinds() = %v (err %v), want [0.0.0.0]", got, err)
+	}
+}
+
+// TestServerHostEnvOverridesConfigHosts verifies env-over-file precedence: a
+// KANDEV_SERVER_HOST env override must win over a config-file server.hosts
+// array, so launching with a loopback host binds only loopback even if the
+// config file left non-loopback addresses in server.hosts. Regression for the
+// desktop/headless loopback contract.
+func TestServerHostEnvOverridesConfigHosts(t *testing.T) {
+	dir := t.TempDir()
+	cfgYAML := "server:\n  hosts:\n    - 0.0.0.0\n    - 100.64.0.1\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	t.Setenv("KANDEV_SERVER_HOST", "127.0.0.1")
+
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	binds, err := cfg.Server.ResolvedBinds()
+	if err != nil {
+		t.Fatalf("ResolvedBinds: %v", err)
+	}
+	if len(binds) != 1 || binds[0] != "127.0.0.1" {
+		t.Fatalf("ResolvedBinds() = %v, want [127.0.0.1] (env host must override config server.hosts)", binds)
+	}
+}
+
+// TestServerHostsFromConfigWhenHostUnset confirms server.hosts is honored when
+// no host/env override is present.
+func TestServerHostsFromConfigWhenHostUnset(t *testing.T) {
+	dir := t.TempDir()
+	cfgYAML := "server:\n  hosts:\n    - 127.0.0.1\n    - 100.64.0.1\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	// Ensure no ambient KANDEV_SERVER_HOST override leaks into the test.
+	t.Setenv("KANDEV_SERVER_HOST", "")
+
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	binds, err := cfg.Server.ResolvedBinds()
+	if err != nil {
+		t.Fatalf("ResolvedBinds: %v", err)
+	}
+	want := []string{"127.0.0.1", "100.64.0.1"}
+	if len(binds) != len(want) || binds[0] != want[0] || binds[1] != want[1] {
+		t.Fatalf("ResolvedBinds() = %v, want %v", binds, want)
+	}
+}
+
+// TestFeaturesConfig_JSONShape pins the wire format of GET /api/v1/features.
+// The handler in helpers.go serializes FeaturesConfig directly so new fields
+// flow through without an extra edit. Every feature field must remain a bool
+// with explicit JSON and profile/mapstructure names so the runtime flag
+// registry and frontend contract can derive from the same declaration.
+func TestFeaturesConfig_JSONShape(t *testing.T) {
+	typeOfFeatures := reflect.TypeOf(FeaturesConfig{})
+	cfgValue := reflect.New(typeOfFeatures).Elem()
+	seenJSONNames := make(map[string]struct{}, typeOfFeatures.NumField())
+	seenMapstructureNames := make(map[string]struct{}, typeOfFeatures.NumField())
+	for i := 0; i < typeOfFeatures.NumField(); i++ {
+		field := typeOfFeatures.Field(i)
+		if field.Type.Kind() != reflect.Bool {
+			t.Fatalf("FeaturesConfig.%s has type %s; want bool", field.Name, field.Type)
+		}
+		jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonName == "" || jsonName == "-" || jsonName == field.Name {
+			t.Fatalf("FeaturesConfig.%s has invalid json tag %q", field.Name, field.Tag.Get("json"))
+		}
+		if _, exists := seenJSONNames[jsonName]; exists {
+			t.Fatalf("FeaturesConfig has duplicate json tag %q", jsonName)
+		}
+		seenJSONNames[jsonName] = struct{}{}
+		mapstructureName := strings.Split(field.Tag.Get("mapstructure"), ",")[0]
+		if mapstructureName == "" || mapstructureName == "-" || mapstructureName == field.Name {
+			t.Fatalf("FeaturesConfig.%s has invalid mapstructure tag %q", field.Name, field.Tag.Get("mapstructure"))
+		}
+		if _, exists := seenMapstructureNames[mapstructureName]; exists {
+			t.Fatalf("FeaturesConfig has duplicate mapstructure tag %q", mapstructureName)
+		}
+		seenMapstructureNames[mapstructureName] = struct{}{}
+		cfgValue.Field(i).SetBool(true)
+	}
+	cfg := cfgValue.Interface().(FeaturesConfig)
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var decoded map[string]bool
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if len(decoded) != typeOfFeatures.NumField() {
+		t.Fatalf("FeaturesConfig JSON has %d fields; want %d", len(decoded), typeOfFeatures.NumField())
+	}
+	for i := 0; i < typeOfFeatures.NumField(); i++ {
+		jsonName := strings.Split(typeOfFeatures.Field(i).Tag.Get("json"), ",")[0]
+		if got, ok := decoded[jsonName]; !ok || !got {
+			t.Errorf("FeaturesConfig JSON missing true field %q: %#v", jsonName, decoded)
+		}
+	}
+	if _, ok := decoded["appStatusBar"]; ok {
+		t.Fatal("retired appStatusBar remains in FeaturesConfig JSON")
+	}
+}
+
+// TestAuthCookieNameDefaultsEmpty pins the config-default contract: the
+// seeded default is EMPTY so the auth service port-scopes its internal
+// "kandev_session" base from the request host; a seeded non-empty default
+// would suppress suffixing in production.
+func TestAuthCookieNameDefaultsEmpty(t *testing.T) {
+	t.Setenv("KANDEV_AUTH_COOKIE_NAME", "")
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Auth.CookieName; got != "" {
+		t.Fatalf("default auth.cookieName = %q, want empty", got)
+	}
+}
+
+// TestAuthCookieNameFromConfigFile pins config.yaml precedence for
+// auth.cookieName.
+func TestAuthCookieNameFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgYAML := "auth:\n  cookieName: my_session\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	t.Setenv("KANDEV_AUTH_COOKIE_NAME", "")
+
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Auth.CookieName; got != "my_session" {
+		t.Fatalf("auth.cookieName from config = %q, want %q", got, "my_session")
+	}
+}
+
+// TestAuthCookieNameFromEnv pins the canonical environment override
+// KANDEV_AUTH_COOKIE_NAME (explicit BindEnv — the automatic camelCase
+// mapping would expose the undocumented KANDEV_AUTH_COOKIENAME instead).
+func TestAuthCookieNameFromEnv(t *testing.T) {
+	t.Setenv("KANDEV_AUTH_COOKIE_NAME", "env_session")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Auth.CookieName; got != "env_session" {
+		t.Fatalf("auth.cookieName from env = %q, want %q", got, "env_session")
+	}
+}
+
+// TestAuthCookieNameEnvOverridesFile pins precedence: environment wins over
+// config.yaml for auth.cookieName.
+func TestAuthCookieNameEnvOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgYAML := "auth:\n  cookieName: file_session\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	t.Setenv("KANDEV_AUTH_COOKIE_NAME", "env_session")
+
+	cfg, err := LoadWithPath(dir)
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.Auth.CookieName; got != "env_session" {
+		t.Fatalf("auth.cookieName = %q, want env override %q", got, "env_session")
+	}
+}

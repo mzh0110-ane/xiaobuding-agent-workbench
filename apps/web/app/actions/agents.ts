@@ -1,0 +1,342 @@
+"use client";
+
+import { getBackendConfig } from "@/lib/config";
+import { ApiError, fetchJson } from "@/lib/api/client";
+import type {
+  Agent,
+  AgentProfile,
+  AgentProfileMcpConfig,
+  CLIFlag,
+  ProfileEnvVar,
+  McpServerDef,
+  ListAgentsResponse,
+  ListAgentDiscoveryResponse,
+} from "@/lib/types/http";
+import type { PermissionKey } from "@/lib/agent-permissions";
+import { normalizeAgentProfile } from "@/lib/api/domains/agent-profile-normalize";
+import type { AgentProfileKind } from "@/lib/types/agent-profile";
+import type { AgentMcpDiscoveryResponse } from "@/lib/types/agent-mcp-discovery";
+import type { MCPSelectionMode } from "@/lib/types/agent-profile";
+
+type ProfilePermissions = Record<PermissionKey, boolean>;
+
+const { apiBaseUrl } = getBackendConfig();
+
+type DynamicProfilePayload = {
+  version: number;
+  candidates: Array<{
+    position: number;
+    execution_profile_id: string;
+    enabled: boolean;
+    rules?: Record<string, string>;
+  }>;
+};
+
+function normalizeAgentInPlace(agent: Agent): Agent {
+  return {
+    ...agent,
+    profiles: (agent.profiles ?? []).map((profile) => normalizeAgentProfile(profile)),
+  };
+}
+
+function agentSettingsRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  // Pin the URL origin to the configured backend so a tainted path segment
+  // (agent ID from a form, profile ID from a route param) cannot redirect
+  // the request to a different host. Closes the CodeQL SSRF finding.
+  const parsed = new URL(url);
+  const allowed = new URL(apiBaseUrl);
+  if (parsed.origin !== allowed.origin) {
+    throw new Error(`Refusing to fetch outside configured backend origin: ${parsed.origin}`);
+  }
+  return fetchJson<T>(parsed.toString(), { cache: "no-store", init });
+}
+
+export async function listAgentDiscoveryAction(): Promise<ListAgentDiscoveryResponse> {
+  return agentSettingsRequest<ListAgentDiscoveryResponse>(`${apiBaseUrl}/api/v1/agents/discovery`);
+}
+
+export async function getAgentMcpDiscoveryAction(
+  agentId: string,
+): Promise<AgentMcpDiscoveryResponse> {
+  return agentSettingsRequest<AgentMcpDiscoveryResponse>(
+    `${apiBaseUrl}/api/v1/agents/${encodeURIComponent(agentId)}/mcp-discovery`,
+  );
+}
+
+export async function listAgentsAction(): Promise<ListAgentsResponse> {
+  const res = await agentSettingsRequest<ListAgentsResponse>(`${apiBaseUrl}/api/v1/agents`);
+  return { ...res, agents: (res.agents ?? []).map(normalizeAgentInPlace) };
+}
+
+export async function createAgentAction(payload: {
+  name: string;
+  workspace_id?: string | null;
+  profiles?: Array<
+    {
+      name: string;
+      model: string;
+      kind?: AgentProfileKind;
+      mode?: string;
+      cli_passthrough: boolean;
+      cursor_mcp_auth_enabled?: boolean;
+      cursor_plugins_mcp_enabled?: boolean;
+      mcp_selection_mode?: MCPSelectionMode;
+      mcp_selected_servers?: string[];
+      cli_flags?: CLIFlag[];
+      command_prefix?: string;
+      env_vars?: ProfileEnvVar[];
+      dynamic?: DynamicProfilePayload;
+    } & ProfilePermissions
+  >;
+}): Promise<Agent> {
+  const res = await agentSettingsRequest<Agent>(`${apiBaseUrl}/api/v1/agents`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  return normalizeAgentInPlace(res);
+}
+
+export async function updateAgentAction(
+  id: string,
+  payload: {
+    workspace_id?: string | null;
+    supports_mcp?: boolean;
+    mcp_config_path?: string | null;
+  },
+): Promise<Agent> {
+  const res = await agentSettingsRequest<Agent>(`${apiBaseUrl}/api/v1/agents/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  return normalizeAgentInPlace(res);
+}
+
+export async function deleteAgentAction(id: string) {
+  await agentSettingsRequest<void>(`${apiBaseUrl}/api/v1/agents/${id}`, { method: "DELETE" });
+}
+
+export async function createAgentProfileAction(
+  agentId: string,
+  payload: {
+    name: string;
+    model: string;
+    kind?: AgentProfileKind;
+    fallback_model?: string;
+    auto_fallback?: boolean;
+    require_exact_model?: boolean;
+    mode?: string;
+    config_options?: Record<string, string>;
+    cli_passthrough: boolean;
+    cursor_mcp_auth_enabled?: boolean;
+    cursor_plugins_mcp_enabled?: boolean;
+    mcp_selection_mode?: MCPSelectionMode;
+    mcp_selected_servers?: string[];
+    cli_flags?: CLIFlag[];
+    command_prefix?: string;
+    provider_kind?: string;
+    provider_base_url?: string;
+    provider_api_key_secret_id?: string;
+    env_vars?: ProfileEnvVar[];
+    dynamic?: DynamicProfilePayload;
+  } & ProfilePermissions,
+): Promise<AgentProfile> {
+  const raw = await agentSettingsRequest<unknown>(
+    `${apiBaseUrl}/api/v1/agents/${agentId}/profiles`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+  return normalizeAgentProfile(raw);
+}
+
+export async function updateAgentProfileAction(
+  id: string,
+  payload: {
+    name?: string;
+    model?: string;
+    kind?: AgentProfileKind;
+    fallback_model?: string;
+    auto_fallback?: boolean;
+    require_exact_model?: boolean;
+    mode?: string;
+    config_options?: Record<string, string>;
+    allow_indexing?: boolean;
+    auto_approve?: boolean;
+    cli_passthrough?: boolean;
+    cursor_mcp_auth_enabled?: boolean;
+    cursor_plugins_mcp_enabled?: boolean;
+    mcp_selection_mode?: MCPSelectionMode;
+    mcp_selected_servers?: string[];
+    enabled?: boolean;
+    cli_flags?: CLIFlag[];
+    command_prefix?: string;
+    provider_kind?: string;
+    provider_base_url?: string;
+    provider_api_key_secret_id?: string;
+    env_vars?: ProfileEnvVar[];
+    dynamic?: DynamicProfilePayload;
+  },
+  force = false,
+): Promise<AgentProfile> {
+  const raw = await agentSettingsRequest<unknown>(
+    `${apiBaseUrl}/api/v1/agent-profiles/${id}${force ? "?force=true" : ""}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+  return normalizeAgentProfile(raw);
+}
+
+/**
+ * Duplicate a profile: the backend copies the source's full configuration
+ * into a new row named "<source> copy" and returns the new profile. The
+ * existing `agent.profile.created` WS notification also picks the copy up in
+ * every open settings surface.
+ */
+export async function duplicateAgentProfileAction(id: string): Promise<AgentProfile> {
+  const raw = await agentSettingsRequest<unknown>(
+    `${apiBaseUrl}/api/v1/agent-profiles/${id}/duplicate`,
+    { method: "POST" },
+  );
+  return normalizeAgentProfile(raw);
+}
+
+import type {
+  ActiveSessionInfo,
+  AutomationReference,
+  RoutingTierReference,
+  WatcherReference,
+  UtilityAgentReference,
+} from "@/lib/types/agent-profile-errors";
+
+export type DeleteProfileResult =
+  | { status: "ok" }
+  | {
+      status: "conflict";
+      activeSessions: ActiveSessionInfo[];
+      watchers: WatcherReference[];
+      routingTiers: RoutingTierReference[];
+      automations: AutomationReference[];
+      utilityAgents: UtilityAgentReference[];
+    }
+  | { status: "error"; message: string; handled?: boolean };
+
+export async function deleteAgentProfileAction(
+  id: string,
+  force?: boolean,
+): Promise<DeleteProfileResult> {
+  const url = `${apiBaseUrl}/api/v1/agent-profiles/${id}${force ? "?force=true" : ""}`;
+  try {
+    await agentSettingsRequest<void>(url, { method: "DELETE" });
+    return { status: "ok" };
+  } catch (error) {
+    return deleteAgentProfileError(error);
+  }
+}
+
+type DeleteProfileErrorBody = {
+  error?: string;
+  active_sessions?: ActiveSessionInfo[];
+  watchers?: WatcherReference[];
+  routing_tiers?: RoutingTierReference[];
+  automations?: AutomationReference[];
+  utility_agents?: UtilityAgentReference[];
+};
+
+function readDeleteProfileErrorBody(value: unknown): DeleteProfileErrorBody {
+  return value && typeof value === "object" ? (value as DeleteProfileErrorBody) : {};
+}
+
+function hasDeleteProfileConflict(body: DeleteProfileErrorBody): boolean {
+  return Boolean(
+    body.active_sessions ||
+    body.watchers ||
+    body.routing_tiers ||
+    body.automations ||
+    body.utility_agents,
+  );
+}
+
+function deleteAgentProfileError(error: unknown): DeleteProfileResult {
+  const apiError = error instanceof ApiError ? error : undefined;
+  const body = apiError ? readDeleteProfileErrorBody(apiError.body) : {};
+  // A 409 is active sessions, referencing watchers, routing tier mappings, or a mix.
+  // Treat any non-empty list as the conflict signal — a watcher-only
+  // conflict (the new self-heal path) must still pop the dialog.
+  if (apiError?.status === 409 && hasDeleteProfileConflict(body)) {
+    return {
+      status: "conflict",
+      activeSessions: body.active_sessions ?? [],
+      watchers: body.watchers ?? [],
+      routingTiers: body.routing_tiers ?? [],
+      automations: body.automations ?? [],
+      utilityAgents: body.utility_agents ?? [],
+    };
+  }
+  // i18n-exempt: server-provided error text, or an HTTP status diagnostic when
+  // the server sent none. The toast title around it is translated.
+  return {
+    status: "error",
+    message: error instanceof Error ? error.message : "Request failed",
+    ...(apiError?.handled ? { handled: true } : {}),
+  };
+}
+
+export async function getAgentProfileMcpConfigAction(
+  profileId: string,
+): Promise<AgentProfileMcpConfig> {
+  return agentSettingsRequest<AgentProfileMcpConfig>(
+    `${apiBaseUrl}/api/v1/agent-profiles/${profileId}/mcp-config`,
+  );
+}
+
+export async function updateAgentProfileMcpConfigAction(
+  profileId: string,
+  payload: {
+    enabled: boolean;
+    mcpServers: Record<string, McpServerDef>;
+    meta?: Record<string, unknown>;
+  },
+): Promise<AgentProfileMcpConfig> {
+  return agentSettingsRequest<AgentProfileMcpConfig>(
+    `${apiBaseUrl}/api/v1/agent-profiles/${profileId}/mcp-config`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export type CommandPreviewRequest = {
+  model: string;
+  permission_settings: Record<string, boolean>;
+  cli_passthrough: boolean;
+  cli_flags: CLIFlag[];
+  command_prefix?: string;
+};
+
+export type CommandPreviewResponse = {
+  supported: boolean;
+  command: string[];
+  command_string: string;
+  /**
+   * Which process the profile's CLI flags are appended to. Over ACP that is the
+   * bridge, not the agent CLI it wraps.
+   */
+  flag_destination?: "agent_cli" | "acp_bridge";
+};
+
+export async function previewAgentCommandAction(
+  agentName: string,
+  payload: CommandPreviewRequest,
+): Promise<CommandPreviewResponse> {
+  return agentSettingsRequest<CommandPreviewResponse>(
+    `${apiBaseUrl}/api/v1/agent-command-preview/${agentName}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}

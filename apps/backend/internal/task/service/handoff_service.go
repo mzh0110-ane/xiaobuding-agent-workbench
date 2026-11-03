@@ -1,0 +1,872 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"sync"
+	"time"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/taskdependencies"
+	orchmodels "github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// Workspace-mode and ordering constants used across handoff plumbing.
+// Mirror the string values agents send via the MCP tool surface — keep
+// in sync with internal/mcp/handlers/workspace_policy.go.
+const (
+	workspaceModeInheritParent = "inherit_parent"
+	workspaceModeNewWorkspace  = "new_workspace"
+	workspaceModeSharedGroup   = "shared_group"
+	orderingSequential         = "sequential"
+)
+
+// WorkspaceGroupRepo is the slim repository surface HandoffService uses
+// to record workspace-group membership for office task handoffs. The
+// office sqlite Repository (Phase 1) implements this; tests can supply
+// fakes.
+type WorkspaceGroupRepo interface {
+	CreateWorkspaceGroup(ctx context.Context, g *orchmodels.WorkspaceGroup) error
+	GetWorkspaceGroup(ctx context.Context, id string) (*orchmodels.WorkspaceGroup, error)
+	ListWorkspaceGroupsByWorkspace(ctx context.Context, workspaceID string) ([]*orchmodels.WorkspaceGroup, error)
+	GetWorkspaceGroupForTask(ctx context.Context, taskID string) (*orchmodels.WorkspaceGroup, error)
+	AddWorkspaceGroupMember(ctx context.Context, groupID, taskID, role string) error
+	// Phase 6 surface — cascade release / restore + cleanup status updates.
+	ReleaseWorkspaceGroupMember(ctx context.Context, groupID, taskID, reason, cascadeID string) error
+	// Restore is idempotent and CAS-guarded by cascadeID; repeated restores
+	// for the same task and cascade must not create duplicate active members.
+	RestoreWorkspaceGroupMemberByCascade(ctx context.Context, taskID, cascadeID string) error
+	ListActiveWorkspaceGroupMembers(ctx context.Context, groupID string) ([]orchmodels.WorkspaceGroupMember, error)
+	// ListWorkspaceGroupMembers returns ALL members (including
+	// released ones). Cleanup uses this to scan every task that ever
+	// belonged to the group for lingering executor_running rows.
+	ListWorkspaceGroupMembers(ctx context.Context, groupID string) ([]orchmodels.WorkspaceGroupMember, error)
+	UpdateWorkspaceGroupCleanupStatus(ctx context.Context, id, status, errStr string, cleanedAt *time.Time) error
+	// Materializer hook — flips owned_by_kandev / cleanup_policy
+	// atomically on a workspace group when the owner's session
+	// produces a worktree on disk.
+	MarkWorkspaceMaterialized(ctx context.Context, id string, m orchmodels.MaterializedWorkspace) error
+	UpdateWorkspaceGroupRestoreStatus(ctx context.Context, id, status, errStr string) error
+}
+
+type workspaceGroupCleanupGenerationRepository interface {
+	ClaimWorkspaceGroupCleanup(ctx context.Context, id string, generation int64) (bool, error)
+	CompleteWorkspaceGroupCleanup(
+		ctx context.Context,
+		id string,
+		generation int64,
+		status, errStr string,
+		cleanedAt *time.Time,
+	) (bool, error)
+}
+
+func claimWorkspaceGroupCleanup(
+	ctx context.Context,
+	repo WorkspaceGroupRepo,
+	group *orchmodels.WorkspaceGroup,
+) (bool, error) {
+	if guarded, ok := repo.(workspaceGroupCleanupGenerationRepository); ok {
+		return guarded.ClaimWorkspaceGroupCleanup(ctx, group.ID, group.OwnershipGeneration)
+	}
+	err := repo.UpdateWorkspaceGroupCleanupStatus(
+		ctx, group.ID, orchmodels.WorkspaceCleanupStatusPending, "", nil,
+	)
+	return err == nil, err
+}
+
+func completeWorkspaceGroupCleanup(
+	ctx context.Context,
+	repo WorkspaceGroupRepo,
+	group *orchmodels.WorkspaceGroup,
+	status, errStr string,
+	cleanedAt *time.Time,
+) error {
+	if guarded, ok := repo.(workspaceGroupCleanupGenerationRepository); ok {
+		_, err := guarded.CompleteWorkspaceGroupCleanup(
+			ctx, group.ID, group.OwnershipGeneration, status, errStr, cleanedAt,
+		)
+		return err
+	}
+	return repo.UpdateWorkspaceGroupCleanupStatus(ctx, group.ID, status, errStr, cleanedAt)
+}
+
+// SessionWorktreeReader is the slim repository surface HandoffService
+// uses to discover a task's primary session + worktree details when
+// recording materialization state on a workspace group. Implemented by
+// the sqlite task repository.
+type SessionWorktreeReader interface {
+	ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error)
+	ListTaskSessionWorktrees(ctx context.Context, sessionID string) ([]*models.TaskEnvironmentRepo, error)
+	GetTask(ctx context.Context, id string) (*models.Task, error)
+	// HasExecutorRunningRow tells cleanup whether a session still has
+	// an executors_running row. Cleanup must refuse to delete a
+	// materialized workspace while any member session remains active,
+	// otherwise the agent's writes could be destroyed.
+	HasExecutorRunningRow(ctx context.Context, sessionID string) (bool, error)
+}
+
+// RunCanceller stops active sessions / runs for a task before a
+// cascade archive / delete touches the task row. Implemented by
+// orchestrator.Service.CancelTaskExecution. Optional — when nil the
+// cascade proceeds without cancellation (legacy / tests).
+type RunCanceller interface {
+	CancelTaskExecution(ctx context.Context, taskID, reason string, force bool) error
+}
+
+// SynchronousRunCanceller is an optional archive/delete cascade extension.
+// Unlike the interactive cancellation contract, it waits for runtime teardown
+// before the lifecycle mutation can be undone by an unarchive.
+type SynchronousRunCanceller interface {
+	CancelTaskExecutionSynchronously(ctx context.Context, taskID, reason string, force bool) error
+}
+
+// activeTaskSessionCanceller finalizes active task sessions independently of
+// runtime teardown. The sqlite task repository implements this surface; it is
+// intentionally optional so handoff tests and legacy wiring do not need the
+// full session repository.
+type activeTaskSessionCanceller interface {
+	CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) ([]*models.TaskSession, error)
+}
+
+// activeTaskSessionReader lists sessions that still own live runtime state.
+// The concrete task repository implements this optional surface.
+type activeTaskSessionReader interface {
+	ListActiveTaskSessionsByTaskID(ctx context.Context, taskID string) ([]*models.TaskSession, error)
+}
+
+// SetGitArchiveCapture wires the repository snapshotter used by ArchiveTaskTree.
+func (s *HandoffService) SetGitArchiveCapture(capture GitArchiveCapture) {
+	s.gitArchiveCapture = capture
+}
+
+// SetRunCanceller wires the run-canceller used by ArchiveTaskTree /
+// DeleteTaskTree to terminate active descendants before archive.
+func (s *HandoffService) SetRunCanceller(c RunCanceller) {
+	s.runCanceller = c
+}
+
+// WorkspacePolicy bundles the workspace-mode fields a coordinator
+// supplies (or that get inherited from the parent) when creating a new
+// office task. AttachWorkspacePolicy is the consumer.
+type WorkspacePolicy struct {
+	Mode                  string // inherit_parent | new_workspace | shared_group
+	GroupID               string // when Mode == shared_group
+	DefaultChildWorkspace string // parent-only: applied to children created later
+	DefaultChildOrdering  string // parent-only: sequential | parallel
+	// ParentOrdering is the ordering policy resolved from the parent
+	// task's metadata. Drives whether AttachWorkspacePolicy adds a
+	// blocker chain on the new task. Empty means parallel (no chain).
+	// Note: the resulting blocker edges gate execution only in office
+	// workflows (released via the on_blocker_resolved trigger). In plain
+	// kanban nothing consults them at auto-start time — they drive the
+	// subtask-stepper UI / ordering display, not execution order.
+	ParentOrdering string
+}
+
+// MetadataBlock returns the metadata map to persist on the new task. The
+// "workspace" sub-map captures the effective mode so launch-time logic
+// can read it back without re-deriving from parent state. Returns nil
+// when no fields are set so callers don't accidentally overwrite a
+// task's existing metadata with an empty workspace block.
+func (p WorkspacePolicy) MetadataBlock() map[string]interface{} {
+	ws := map[string]interface{}{}
+	if p.Mode != "" {
+		ws["mode"] = p.Mode
+	}
+	if p.GroupID != "" {
+		ws["group_id"] = p.GroupID
+	}
+	if p.DefaultChildWorkspace != "" {
+		ws["default_child_workspace"] = p.DefaultChildWorkspace
+	}
+	if p.DefaultChildOrdering != "" {
+		ws["default_child_ordering"] = p.DefaultChildOrdering
+	}
+	if len(ws) == 0 {
+		return nil
+	}
+	return map[string]interface{}{"workspace": ws}
+}
+
+// MergeMetadataBlock folds MetadataBlock into caller-supplied task metadata,
+// allocating base only when there is something to write. The policy block wins
+// for the keys it owns, so a caller cannot inject conflicting policy through
+// raw metadata. Both task-create surfaces (HTTP and MCP) go through here, which
+// is what keeps their metadata precedence identical.
+func (p WorkspacePolicy) MergeMetadataBlock(base map[string]interface{}) map[string]interface{} {
+	block := p.MetadataBlock()
+	if len(block) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]interface{}{}
+	}
+	maps.Copy(base, block)
+	return base
+}
+
+// NeedsAttachment returns true when AttachWorkspacePolicy has work to do
+// (group membership recording or sequential blocker chaining).
+func (p WorkspacePolicy) NeedsAttachment() bool {
+	if p.Mode == workspaceModeInheritParent || p.Mode == workspaceModeSharedGroup {
+		return true
+	}
+	if p.ParentOrdering == orderingSequential {
+		return true
+	}
+	return false
+}
+
+// RelatedTask is the lightweight projection of a task surfaced through the
+// list_related_tasks_kandev MCP tool. Document keys are precomputed so an
+// agent can decide what to fetch without a follow-up list call. Description
+// is included so a coordinating agent can read dependency metadata (e.g. a
+// "Depends on:" line) from a related task — including a CREATED sibling that
+// has no session yet — without an unbounded list_tasks call. The relation
+// graph itself is the bound: only parent/children/siblings/blockers are ever
+// projected, so descriptions never leak from unrelated tasks.
+type RelatedTask struct {
+	ID             string                        `json:"id"`
+	Identifier     string                        `json:"identifier,omitempty"`
+	Title          string                        `json:"title"`
+	Description    string                        `json:"description,omitempty"`
+	State          string                        `json:"state"`
+	WorkspaceID    string                        `json:"workspace_id"`
+	ParentID       string                        `json:"parent_id,omitempty"`
+	AssigneeLabel  string                        `json:"assignee_label,omitempty"`
+	DocumentKeys   []string                      `json:"document_keys,omitempty"`
+	PRs            []v1.TaskPRSummary            `json:"prs,omitempty"`
+	ChangeRequests []v1.TaskChangeRequestSummary `json:"change_requests,omitempty"`
+}
+
+// RelatedTasks bundles every relation surface for a single task.
+type RelatedTasks struct {
+	Task      RelatedTask    `json:"task"`
+	Parent    *RelatedTask   `json:"parent,omitempty"`
+	Children  []*RelatedTask `json:"children"`
+	Siblings  []*RelatedTask `json:"siblings"`
+	Blockers  []*RelatedTask `json:"blockers"`
+	BlockedBy []*RelatedTask `json:"blocked_by"`
+}
+
+// HandoffService implements the cross-task context surface (related-task
+// listing + document access guards) used by the new MCP tools introduced
+// for office task handoffs. It deliberately wraps existing services rather
+// than reaching into the repos directly so document writes still go
+// through DocumentService and emit the same revision/event side effects.
+type HandoffService struct {
+	tasks                  repository.TaskRepository
+	docs                   *DocumentService
+	docsRepo               repository.DocumentRepository
+	blockers               BlockerRepository
+	wsGroups               WorkspaceGroupRepo
+	sessions               SessionWorktreeReader
+	cleaner                WorkspaceCleaner
+	runCanceller           RunCanceller
+	gitArchiveCapture      GitArchiveCapture
+	eventPublisher         TaskEventPublisher
+	vacancyReconciler      VacatedStepReconciler
+	resourceCleaner        TaskResourceCleaner
+	taskAccessCheck        func(ctx context.Context, taskID string) error
+	comments               CommentReader
+	sessionCeilingReleaser SessionCeilingReleaser
+	logger                 *logger.Logger
+	parentLock             parentMutex
+	archiveCascadeLock     parentMutex
+	partialArchiveMu       sync.Mutex
+	partialArchiveIDs      map[string]string
+	workspaceGroupLock     parentMutex
+}
+
+// TaskEventPublisher abstracts the side-effect of broadcasting task
+// lifecycle events. The cascade paths (ArchiveTaskTree, DeleteTaskTree)
+// bypass Service.ArchiveTask / Service.DeleteTask — which means they
+// also bypass the publishTaskEvent call those wrappers perform. Without
+// re-publishing here, the gateway never forwards task.updated /
+// task.deleted to WebSocket clients and the kanban board does not
+// reflect cascade-archive or cascade-delete operations until a reload.
+//
+// Implemented by *Service via PublishTaskUpdated / PublishTaskDeleted.
+// Optional — when nil the cascade still completes, it just won't emit
+// WS events (matches the pre-handoff fallback in the HTTP handler).
+type TaskEventPublisher interface {
+	PublishTaskUpdated(ctx context.Context, task *models.Task, oldWorkflowIDs ...string)
+	PublishTaskDeleted(ctx context.Context, task *models.Task)
+}
+type dependencyChangePublisher interface {
+	PublishDependencyChange(context.Context, ...string)
+}
+
+type TaskDeletedEventPublisherWithExtra interface {
+	PublishTaskDeletedWithExtra(ctx context.Context, task *models.Task, extra map[string]interface{})
+}
+
+// VacatedStepReconciler backfills capacity in a workflow step after admitted
+// work leaves it.
+type VacatedStepReconciler interface {
+	ReconcileVacatedStep(ctx context.Context, vacatedStepID string)
+}
+
+type cascadeArchiveTaskRepository interface {
+	ArchiveTaskIfActiveWithVacatedStep(ctx context.Context, id, cascadeID string) (string, bool, error)
+}
+
+type cascadeDeleteTaskRepository interface {
+	DeleteTaskWithVacatedStep(ctx context.Context, id string) (string, error)
+}
+
+// taskSessionCancellationPublisher is the optional event side effect paired
+// with activeTaskSessionCanceller. Cascade archive/delete paths do not call
+// Service.ArchiveTask, so they must publish the session transition themselves
+// when a DB-only cancellation is needed.
+type taskSessionCancellationPublisher interface {
+	PublishTaskSessionsCancelled(ctx context.Context, taskID string, cancelledSessions []*models.TaskSession, reason string)
+}
+
+// SetSessionReader wires the session/worktree lookup used by the
+// materializer hook (MarkOwnerSessionMaterialized). Optional — when
+// nil the materializer is a no-op so legacy / test wiring still works.
+func (s *HandoffService) SetSessionReader(r SessionWorktreeReader) {
+	s.sessions = r
+}
+
+// SetWorkspaceCleaner wires the disk-cleanup surface invoked by
+// evaluateWorkspaceGroupCleanup when a Kandev-owned group's last active
+// member leaves. Optional — when nil the cleanup state machine still
+// transitions to cleanup_pending but no disk work is performed.
+func (s *HandoffService) SetWorkspaceCleaner(c WorkspaceCleaner) {
+	s.cleaner = c
+}
+
+// SetTaskEventPublisher wires the publisher used by cascade
+// archive/delete to broadcast task.updated / task.deleted events.
+// Optional — when nil the cascade silently skips event publishing
+// (legacy and test wiring).
+func (s *HandoffService) SetTaskEventPublisher(p TaskEventPublisher) {
+	s.eventPublisher = p
+}
+
+// SetVacatedStepReconciler wires post-mutation WIP capacity reconciliation.
+// Archive and delete remain committed if reconciliation cannot fill a slot.
+func (s *HandoffService) SetVacatedStepReconciler(r VacatedStepReconciler) {
+	s.vacancyReconciler = r
+}
+
+// SetSessionCeilingReleaser wires session-ceiling release (orchestrator) for
+// finalizeActiveSessions' bulk cancellation, which never passes through the
+// orchestrator's own persistence funnels.
+func (s *HandoffService) SetSessionCeilingReleaser(releaser SessionCeilingReleaser) {
+	s.sessionCeilingReleaser = releaser
+}
+
+// TaskResourceCleaner tears down a task's runtime resources (container,
+// sandbox, worktree, executor_running rows, quick-chat dir, task_environment
+// row) AFTER the cascade has stamped the task's DB row. The cascade paths
+// (ArchiveTaskTree, DeleteTaskTree) bypass Service.ArchiveTask /
+// Service.DeleteTask — which means they also bypass the env-cleanup branch
+// those wrappers run via runAsyncTaskCleanup. Without this wiring the agent
+// gets stopped (its container exits) but the container itself is never
+// removed and leaks indefinitely.
+//
+// Implemented by *Service via CleanupTaskResources. Optional — when nil the
+// cascade still completes, it just leaks runtime resources (matches the
+// pre-fix behaviour). deleteEnvRow is true for delete cascades and false for
+// archive (archive preserves the env row for later inspection).
+type TaskResourceCleaner interface {
+	CleanupTaskResources(ctx context.Context, taskID string, deleteEnvRow bool)
+}
+
+type archiveTaskResourceCleanupCanceller interface {
+	CancelArchiveTaskResourceCleanup(ctx context.Context, taskID string) error
+}
+
+type archiveTaskResourceCleanupOperationsCanceller interface {
+	CancelArchiveTaskResourceCleanupWithOperations(ctx context.Context, taskID string) ([]string, error)
+}
+
+type taskResourceCleanupCoordinator interface {
+	PrepareTaskResourceCleanup(ctx context.Context, taskID string, trigger models.TaskResourceCleanupTrigger, operationID string, deleteEnvironmentRow bool) error
+	StartPreparedTaskResourceCleanup(ctx context.Context, operationID string) error
+	CancelPreparedTaskResourceCleanup(ctx context.Context, operationID string) error
+}
+
+type taskResourceCleanupRestorer interface {
+	RestoreCancelledTaskResourceCleanup(ctx context.Context, operationID string) error
+}
+
+type taskResourceCleanupCoordinatorWithOptions interface {
+	PrepareTaskResourceCleanupWithOptions(
+		ctx context.Context,
+		taskID string,
+		trigger models.TaskResourceCleanupTrigger,
+		operationID string,
+		deleteEnvironmentRow bool,
+		discardWorktreeChanges bool,
+	) error
+}
+
+type taskDeleteWorktreeAdmissionChecker interface {
+	ValidateTaskDeleteWorktrees(ctx context.Context, taskIDs []string, discardWorktreeChanges bool) error
+}
+
+// SetTaskResourceCleaner wires the resource teardown surface invoked by
+// cascade archive/delete to release containers / sandboxes / worktrees.
+// Optional — when nil the cascade does not tear down runtime resources.
+func (s *HandoffService) SetTaskResourceCleaner(c TaskResourceCleaner) {
+	s.resourceCleaner = c
+}
+
+// SetTaskAccessChecker installs the per-user task check applied by the cascade
+// entry points. Same contract as orchestrator.Service.SetTaskAccessChecker: the
+// checker returns nil for contexts without a request identity, so internal
+// callers (event bus, schedulers, workflow engine) stay unscoped, and leaving it
+// unwired keeps the pre-auth see-everything behavior.
+//
+// The cascade methods walk the task repository directly and never reach
+// Service.DeleteTask / Service.ArchiveTask, so they inherit nothing from the
+// task service's authorize* helpers — without this they are the unguarded half
+// of every archive and delete route.
+func (s *HandoffService) SetTaskAccessChecker(check func(ctx context.Context, taskID string) error) {
+	s.taskAccessCheck = check
+}
+
+// SetCommentReader wires the read-only comment store queried by
+// ListCommentsForCaller. Optional — when nil, ListCommentsForCaller reports
+// an internal error rather than falling back to an empty list (AC-005.2:
+// an unconfigured dependency must never look like "the task has no
+// comments").
+func (s *HandoffService) SetCommentReader(r CommentReader) {
+	s.comments = r
+}
+
+// authorizeTask applies the configured per-user task check. No-op when unwired.
+func (s *HandoffService) authorizeTask(ctx context.Context, taskID string) error {
+	if s.taskAccessCheck == nil || taskID == "" {
+		return nil
+	}
+	return s.taskAccessCheck(ctx, taskID)
+}
+
+// NewHandoffService creates a HandoffService. blockers and wsGroups may be
+// nil — when nil the corresponding methods return empty results /
+// no-ops, mirroring the optional wiring used by Service.SetBlockerRepository.
+func NewHandoffService(
+	tasks repository.TaskRepository,
+	docsRepo repository.DocumentRepository,
+	docs *DocumentService,
+	blockers BlockerRepository,
+	wsGroups WorkspaceGroupRepo,
+	log *logger.Logger,
+) *HandoffService {
+	return &HandoffService{
+		tasks:    tasks,
+		docs:     docs,
+		docsRepo: docsRepo,
+		blockers: blockers,
+		wsGroups: wsGroups,
+		parentLock: parentMutex{
+			locks: make(map[string]*sync.Mutex),
+		},
+		archiveCascadeLock: parentMutex{locks: make(map[string]*sync.Mutex)},
+		partialArchiveIDs:  make(map[string]string),
+		workspaceGroupLock: parentMutex{locks: make(map[string]*sync.Mutex)},
+	}
+}
+
+// parentMutex serialises sequential-child creation per parent. A naive
+// "previous sibling = most recent non-archived" lookup races when two
+// create_task_kandev calls arrive concurrently — both could pick the
+// same previous sibling and the resulting blocker chain would skip a
+// task. Per-parent locking keeps the chain deterministic without a
+// schema change.
+type parentMutex struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func (p *parentMutex) lockFor(parentID string) *sync.Mutex {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m, ok := p.locks[parentID]
+	if !ok {
+		m = &sync.Mutex{}
+		p.locks[parentID] = m
+	}
+	return m
+}
+
+// AttachWorkspacePolicy records workspace-group membership and adds a
+// sequential blocker edge to the previous non-archived sibling when the
+// parent's ordering policy is "sequential". Safe to call multiple times
+// for the same task — group membership inserts use INSERT OR IGNORE and
+// blocker creation is wrapped in a per-parent mutex to keep the chain
+// deterministic under concurrent task creation.
+func (s *HandoffService) AttachWorkspacePolicy(ctx context.Context, taskID, parentID string, pol WorkspacePolicy) error {
+	if !pol.NeedsAttachment() {
+		return nil
+	}
+	if pol.ParentOrdering == orderingSequential && parentID != "" {
+		if err := s.attachSequentialBlocker(ctx, taskID, parentID); err != nil {
+			return err
+		}
+	}
+	return s.attachWorkspaceGroup(ctx, taskID, parentID, pol)
+}
+
+// ReleaseWorkspacePolicy removes the task's active workspace-group
+// membership after a create rollback. The membership audit row is retained,
+// and normal group cleanup evaluation runs so a group created solely for the
+// failed task cannot remain active forever.
+func (s *HandoffService) ReleaseWorkspacePolicy(ctx context.Context, taskID, reason string) error {
+	if s.wsGroups == nil || taskID == "" {
+		return nil
+	}
+	group, err := s.wsGroups.GetWorkspaceGroupForTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if group == nil {
+		return nil
+	}
+	if err := s.wsGroups.ReleaseWorkspaceGroupMember(ctx, group.ID, taskID, reason, ""); err != nil {
+		return err
+	}
+	return s.evaluateWorkspaceGroupCleanup(ctx, group.ID)
+}
+
+func (s *HandoffService) attachWorkspaceGroup(ctx context.Context, taskID, parentID string, pol WorkspacePolicy) error {
+	if s.wsGroups == nil {
+		return nil
+	}
+	switch pol.Mode {
+	case workspaceModeInheritParent:
+		if parentID == "" {
+			return errors.New("workspace_mode=" + workspaceModeInheritParent + " requires a parent task")
+		}
+		group, err := s.lookupOrCreateParentGroup(ctx, parentID)
+		if err != nil {
+			return err
+		}
+		if group == nil {
+			return nil
+		}
+		return s.wsGroups.AddWorkspaceGroupMember(ctx, group.ID, taskID, orchmodels.WorkspaceMemberRoleMember)
+
+	case workspaceModeSharedGroup:
+		if pol.GroupID == "" {
+			return errors.New("workspace_mode=shared_group requires workspace_group_id")
+		}
+		g, err := s.wsGroups.GetWorkspaceGroup(ctx, pol.GroupID)
+		if err != nil {
+			return err
+		}
+		if g == nil {
+			return fmt.Errorf("workspace group %s not found", pol.GroupID)
+		}
+		if g.CleanupStatus != orchmodels.WorkspaceCleanupStatusActive {
+			return fmt.Errorf("workspace group %s is not active (cleanup_status=%s)", pol.GroupID, g.CleanupStatus)
+		}
+		return s.wsGroups.AddWorkspaceGroupMember(ctx, g.ID, taskID, orchmodels.WorkspaceMemberRoleMember)
+	}
+	return nil
+}
+
+// lookupOrCreateParentGroup returns the parent task's existing active
+// workspace group or creates a fresh one with the parent as owner. The
+// MaterializedKind is provisional (single_repo by default) — the
+// materializer flips it via MarkWorkspaceMaterialized at launch time.
+//
+// The archived check runs first and unconditionally, before the
+// existing-group lookup: a parent that already has other children almost
+// always already has a group, so gating only the create-new-group branch
+// would let a new inherit_parent child attach to an archived parent's group
+// silently — a task that is dead workspace-wise the moment it is created
+// ("born stranded"), indistinguishable on the board from a normal
+// launchable CREATED card until someone tries to launch it.
+func (s *HandoffService) lookupOrCreateParentGroup(ctx context.Context, parentID string) (*orchmodels.WorkspaceGroup, error) {
+	parent, err := s.tasks.GetTask(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("parent task %s not found", parentID)
+	}
+	if parent.ArchivedAt != nil {
+		return nil, fmt.Errorf("workspace_mode=%s requires a non-archived parent task; parent task %s is archived", workspaceModeInheritParent, parentID)
+	}
+
+	g, err := s.wsGroups.GetWorkspaceGroupForTask(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	if g != nil {
+		return g, nil
+	}
+	g = &orchmodels.WorkspaceGroup{
+		WorkspaceID:      parent.WorkspaceID,
+		OwnerTaskID:      parentID,
+		MaterializedKind: orchmodels.WorkspaceGroupKindSingleRepo,
+	}
+	if err := s.wsGroups.CreateWorkspaceGroup(ctx, g); err != nil {
+		return nil, err
+	}
+	if err := s.wsGroups.AddWorkspaceGroupMember(ctx, g.ID, parentID, orchmodels.WorkspaceMemberRoleOwner); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// attachSequentialBlocker links the new child to the previous non-archived
+// sibling under parentID. Held inside a per-parent mutex so concurrent
+// creates produce a deterministic chain rather than a tangle.
+func (s *HandoffService) attachSequentialBlocker(ctx context.Context, taskID, parentID string) error {
+	if s.blockers == nil {
+		return nil
+	}
+	mu := s.parentLock.lockFor(parentID)
+	mu.Lock()
+	defer mu.Unlock()
+	edgesUnlock := taskdependencies.AcquireMutationLock()
+	defer edgesUnlock()
+
+	siblings, err := s.tasks.ListChildren(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	// Pick the most recently created sibling that is not the new task itself.
+	// ListChildren already filters archived/ephemeral.
+	var prev string
+	for i := len(siblings) - 1; i >= 0; i-- {
+		if siblings[i].ID == taskID {
+			continue
+		}
+		prev = siblings[i].ID
+		break
+	}
+	if prev == "" {
+		return nil
+	}
+	return s.blockers.CreateTaskBlocker(ctx, &orchmodels.TaskBlocker{
+		TaskID:        taskID,
+		BlockerTaskID: prev,
+	})
+}
+
+// ListRelatedForCaller is the access-checked entry point behind the
+// list_related_tasks_kandev MCP tool. When the caller inspects a task other
+// than itself, the target must be readable under the same relation/workspace
+// guard the document tools use (self / ancestor / descendant / sibling /
+// blocker, same workspace). Without this gate a caller that learns an
+// unrelated or cross-workspace task ID could read that task's description and
+// its relatives' descriptions. Returns ErrAccessDenied for inaccessible
+// targets.
+//
+// The un-gated ListRelated remains for trusted internal callers (e.g.
+// GetTaskContext renders the context panel for a task the user already owns).
+func (s *HandoffService) ListRelatedForCaller(ctx context.Context, callerTaskID, targetTaskID string) (*RelatedTasks, error) {
+	if targetTaskID == "" {
+		return nil, ErrDocumentTaskRequired
+	}
+	// Any target other than the caller itself must pass the read guard. An
+	// empty caller has no identity to authorize against, so canReadDocuments
+	// denies it (rather than silently delegating to the ungated ListRelated).
+	if callerTaskID != targetTaskID {
+		ok, err := canReadDocuments(ctx,
+			repoTaskLookupAdapter{r: s.tasks},
+			blockerLookupAdapter{repo: s.blockers},
+			callerTaskID, targetTaskID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrAccessDenied
+		}
+	}
+	return s.ListRelated(ctx, targetTaskID)
+}
+
+// ListRelated returns the parent, children, siblings, blockers, and
+// blocked-by tasks for taskID. Document keys are populated for the task
+// itself plus every related task so an agent can shop for documents in
+// one call.
+func (s *HandoffService) ListRelated(ctx context.Context, taskID string) (*RelatedTasks, error) {
+	if taskID == "" {
+		return nil, ErrDocumentTaskRequired
+	}
+	self, err := s.tasks.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if self == nil {
+		return nil, errors.New("task not found")
+	}
+
+	out := &RelatedTasks{
+		Task:      s.toRelated(ctx, self),
+		Children:  []*RelatedTask{},
+		Siblings:  []*RelatedTask{},
+		Blockers:  []*RelatedTask{},
+		BlockedBy: []*RelatedTask{},
+	}
+
+	if self.ParentID != "" {
+		parent, err := s.tasks.GetTask(ctx, self.ParentID)
+		if err == nil && parent != nil {
+			ref := s.toRelated(ctx, parent)
+			out.Parent = &ref
+		}
+	}
+
+	children, err := s.tasks.ListChildren(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	out.Children = s.toRelatedSlice(ctx, children)
+
+	siblings, err := s.tasks.ListSiblings(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	out.Siblings = s.toRelatedSlice(ctx, siblings)
+
+	if s.blockers != nil {
+		bs, err := s.blockers.ListTaskBlockers(ctx, taskID)
+		if err == nil {
+			ids := make([]string, 0, len(bs))
+			for _, b := range bs {
+				ids = append(ids, b.BlockerTaskID)
+			}
+			out.Blockers = s.toRelatedByIDs(ctx, ids)
+		}
+		bbIDs, err := s.blockers.ListTasksBlockedBy(ctx, taskID)
+		if err == nil {
+			out.BlockedBy = s.toRelatedByIDs(ctx, bbIDs)
+		}
+	}
+
+	return out, nil
+}
+
+// GetDocumentForCaller fetches a document on targetTaskID after enforcing
+// the read access rule for currentTaskID. Returns ErrAccessDenied when
+// the rule fails.
+func (s *HandoffService) GetDocumentForCaller(ctx context.Context, currentTaskID, targetTaskID, key string) (*models.TaskDocument, error) {
+	if key == "" {
+		return nil, ErrDocumentKeyRequired
+	}
+	if targetTaskID == "" {
+		return nil, ErrDocumentTaskRequired
+	}
+	ok, err := canReadDocuments(ctx, repoTaskLookupAdapter{r: s.tasks}, blockerLookupAdapter{repo: s.blockers}, currentTaskID, targetTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrAccessDenied
+	}
+	return s.docs.GetDocument(ctx, targetTaskID, key)
+}
+
+// ListDocumentsForCaller returns the document HEADs (no content) for
+// targetTaskID after the read-access guard.
+func (s *HandoffService) ListDocumentsForCaller(ctx context.Context, currentTaskID, targetTaskID string) ([]*models.TaskDocument, error) {
+	if targetTaskID == "" {
+		return nil, ErrDocumentTaskRequired
+	}
+	ok, err := canReadDocuments(ctx, repoTaskLookupAdapter{r: s.tasks}, blockerLookupAdapter{repo: s.blockers}, currentTaskID, targetTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrAccessDenied
+	}
+	docs, err := s.docs.ListDocuments(ctx, targetTaskID)
+	if err != nil {
+		return nil, err
+	}
+	// Strip Content from the projection so callers cannot accidentally
+	// surface bodies through the listing tool. The MCP layer should treat
+	// the listing as metadata-only.
+	out := make([]*models.TaskDocument, 0, len(docs))
+	for _, d := range docs {
+		copy := *d
+		copy.Content = ""
+		out = append(out, &copy)
+	}
+	return out, nil
+}
+
+// WriteDocumentForCaller upserts a document on targetTaskID through
+// DocumentService after the write-access guard. authorKind/authorName
+// follow DocumentService defaults when empty.
+func (s *HandoffService) WriteDocumentForCaller(
+	ctx context.Context,
+	currentTaskID, targetTaskID, key, docType, title, content, authorKind, authorName string,
+) (*models.TaskDocument, error) {
+	if key == "" {
+		return nil, ErrDocumentKeyRequired
+	}
+	if targetTaskID == "" {
+		return nil, ErrDocumentTaskRequired
+	}
+	ok, err := canWriteDocuments(ctx, repoTaskLookupAdapter{r: s.tasks}, currentTaskID, targetTaskID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrAccessDenied
+	}
+	return s.docs.CreateOrUpdateDocument(ctx, targetTaskID, key, docType, title, content, authorKind, authorName)
+}
+
+// toRelated converts a Task into the RelatedTask projection, populating
+// document keys when the task has any. Errors fetching documents are
+// logged and the keys list is left empty.
+func (s *HandoffService) toRelated(ctx context.Context, t *models.Task) RelatedTask {
+	rt := RelatedTask{
+		ID:            t.ID,
+		Identifier:    t.Identifier,
+		Title:         t.Title,
+		Description:   t.Description,
+		State:         string(t.State),
+		WorkspaceID:   t.WorkspaceID,
+		ParentID:      t.ParentID,
+		AssigneeLabel: t.AssigneeAgentProfileID,
+	}
+	if s.docsRepo != nil {
+		docs, err := s.docsRepo.ListDocuments(ctx, t.ID)
+		if err == nil {
+			for _, d := range docs {
+				rt.DocumentKeys = append(rt.DocumentKeys, d.Key)
+			}
+		}
+	}
+	return rt
+}
+
+func (s *HandoffService) toRelatedSlice(ctx context.Context, tasks []*models.Task) []*RelatedTask {
+	out := make([]*RelatedTask, 0, len(tasks))
+	for _, t := range tasks {
+		rt := s.toRelated(ctx, t)
+		out = append(out, &rt)
+	}
+	return out
+}
+
+func (s *HandoffService) toRelatedByIDs(ctx context.Context, ids []string) []*RelatedTask {
+	out := make([]*RelatedTask, 0, len(ids))
+	for _, id := range ids {
+		t, err := s.tasks.GetTask(ctx, id)
+		if err != nil || t == nil {
+			continue
+		}
+		rt := s.toRelated(ctx, t)
+		out = append(out, &rt)
+	}
+	return out
+}

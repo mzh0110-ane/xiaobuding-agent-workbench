@@ -1,0 +1,306 @@
+import type { Route } from "@playwright/test";
+import { test, expect } from "../../fixtures/test-base";
+import { KanbanPage } from "../../pages/kanban-page";
+
+const VISIBLE_TIMEOUT = 10_000;
+
+// E2E coverage for the no-cascade-by-default archive / delete behaviour:
+// the confirmation dialog must expose an opt-in checkbox when the task
+// has live subtasks, default to unchecked (subtasks preserved), and
+// propagate the choice to the backend.
+test.describe("Kanban card archive — cascade subtasks toggle", () => {
+  // @covers AC-TASKS-CONFIRMATION-SURFACE-002.4
+  test("keeps pending classification hidden and dismissible before the cascade dialog", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    const parent = await apiClient.createTask(seedData.workspaceId, "Stable Archive Parent", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Stable Archive Child", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCard(parent.id)).toBeVisible({ timeout: VISIBLE_TIMEOUT });
+
+    let releaseResponse: () => void = () => {};
+    const responseHeld = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    let markRequestObserved: () => void = () => {};
+    const requestObserved = new Promise<void>((resolve) => {
+      markRequestObserved = resolve;
+    });
+    let requestStarted = false;
+    let markHandlerSettled: () => void = () => {};
+    const handlerSettled = new Promise<void>((resolve) => {
+      markHandlerSettled = resolve;
+    });
+    const routePattern = `**/api/v1/tasks/${parent.id}/subtask-count`;
+    const holdSubtaskCount = async (route: Route) => {
+      requestStarted = true;
+      markRequestObserved();
+      await responseHeld;
+      try {
+        await route.continue();
+      } finally {
+        markHandlerSettled();
+      }
+    };
+
+    await testPage.route(routePattern, holdSubtaskCount);
+    try {
+      await kanban.openTaskActionsMenu(parent.id);
+      await testPage.getByRole("menuitem", { name: "Archive" }).click();
+      await requestObserved;
+
+      const popover = testPage.getByTestId("task-archive-confirm-popover");
+      const dialog = testPage.getByRole("alertdialog", { name: "Archive task" });
+      await expect(popover).toHaveCount(0);
+      await expect(dialog).toHaveCount(0);
+
+      await testPage.keyboard.press("Escape");
+      await expect(kanban.taskCard(parent.id).getByLabel("More options")).toBeFocused();
+
+      releaseResponse();
+      await handlerSettled;
+      await testPage.unroute(routePattern, holdSubtaskCount);
+
+      await expect(dialog).toHaveCount(0);
+      await expect(popover).toHaveCount(0);
+
+      await kanban.openTaskActionsMenu(parent.id);
+      await testPage.getByRole("menuitem", { name: "Archive" }).click();
+
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByTestId("archive-cascade-checkbox")).toBeVisible();
+      await expect(popover).toHaveCount(0);
+      await prCapture.screenshot("stable-archive-cascade-dialog", {
+        caption: "A parent task opens only the final cascade archive dialog.",
+      });
+    } finally {
+      releaseResponse();
+      if (requestStarted) await handlerSettled;
+      await testPage.unroute(routePattern, holdSubtaskCount);
+    }
+  });
+
+  test("renders the cascade checkbox only when the task has subtasks", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const lonely = await apiClient.createTask(seedData.workspaceId, "No-Subtasks Parent", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCard(lonely.id)).toBeVisible({ timeout: VISIBLE_TIMEOUT });
+
+    await kanban.openTaskActionsMenu(lonely.id);
+    await testPage.getByRole("menuitem", { name: "Archive" }).click();
+
+    const confirmation = testPage.getByTestId("task-archive-confirm-popover");
+    await expect(confirmation).toBeVisible();
+    // No subtasks → no checkbox.
+    await expect(testPage.getByTestId("archive-cascade-checkbox")).toHaveCount(0);
+  });
+
+  test("archiving the parent without ticking the box leaves subtasks on the board", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const parent = await apiClient.createTask(seedData.workspaceId, "Parent Keep Subs", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Survivor Subtask A", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Survivor Subtask B", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCardByTitle("Parent Keep Subs")).toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+
+    await kanban.openTaskActionsMenu(parent.id);
+    await testPage.getByRole("menuitem", { name: "Archive" }).click();
+
+    const dialog = testPage.getByRole("alertdialog");
+    await expect(dialog).toBeVisible();
+    // Checkbox is present, displays the count, and is unchecked by default.
+    const cascade = testPage.getByTestId("archive-cascade-checkbox");
+    await expect(cascade).toBeVisible();
+    await expect(dialog).toContainText("Also archive 2 subtasks");
+    await expect(cascade).not.toBeChecked();
+
+    await dialog.getByRole("button", { name: "Archive" }).click();
+
+    // Parent leaves the board, subtasks stay.
+    await expect(kanban.taskCardByTitle("Parent Keep Subs")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle("Survivor Subtask A")).toBeVisible();
+    await expect(kanban.taskCardByTitle("Survivor Subtask B")).toBeVisible();
+  });
+
+  test("ticking the cascade checkbox archives subtasks too", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const parent = await apiClient.createTask(seedData.workspaceId, "Parent Cascade Subs", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Doomed Subtask A", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Doomed Subtask B", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCardByTitle("Parent Cascade Subs")).toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+
+    await kanban.openTaskActionsMenu(parent.id);
+    await testPage.getByRole("menuitem", { name: "Archive" }).click();
+
+    const dialog = testPage.getByRole("alertdialog");
+    await expect(dialog).toBeVisible();
+    const cascade = testPage.getByTestId("archive-cascade-checkbox");
+    await expect(cascade).toBeVisible();
+    await cascade.click();
+    await expect(cascade).toBeChecked();
+
+    await dialog.getByRole("button", { name: "Archive" }).click();
+
+    await expect(kanban.taskCardByTitle("Parent Cascade Subs")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle("Doomed Subtask A")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle("Doomed Subtask B")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+  });
+});
+
+test.describe("Kanban card delete — cascade subtasks toggle", () => {
+  test("deleting the parent without ticking the box reparents subtasks to root", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const parent = await apiClient.createTask(seedData.workspaceId, "Parent Delete Keep", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Orphaned Subtask", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCardByTitle("Parent Delete Keep")).toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+
+    await kanban.openTaskActionsMenu(parent.id);
+    await testPage.getByRole("menuitem", { name: "Delete" }).click();
+
+    const dialog = testPage.getByRole("alertdialog");
+    await expect(dialog).toBeVisible();
+    const cascade = testPage.getByTestId("delete-cascade-checkbox");
+    await expect(cascade).toBeVisible();
+    await expect(dialog).toContainText("Also delete 1 subtask");
+    await expect(cascade).not.toBeChecked();
+
+    const discard = testPage.getByTestId("delete-discard-worktree-checkbox");
+    const deleteAction = dialog.getByRole("button", { name: "Delete", exact: true });
+    await expect(deleteAction).toBeEnabled();
+    await expect(discard).toHaveCount(0);
+
+    await deleteAction.click();
+
+    // Parent is gone, child survives (now reparented to root with no
+    // subtask badge — the badge requires a live parent on the board).
+    await expect(kanban.taskCardByTitle("Parent Delete Keep")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+    const survivor = kanban.taskCardByTitle("Orphaned Subtask");
+    await expect(survivor).toBeVisible();
+    await expect(survivor.getByText("Parent Delete Keep")).not.toBeVisible();
+  });
+
+  test("ticking the cascade checkbox deletes subtasks too", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const parent = await apiClient.createTask(seedData.workspaceId, "Parent Delete Cascade", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+    });
+    await apiClient.createTask(seedData.workspaceId, "Cascaded Doomed Subtask", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      parent_id: parent.id,
+    });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await expect(kanban.taskCardByTitle("Parent Delete Cascade")).toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+
+    await kanban.openTaskActionsMenu(parent.id);
+    await testPage.getByRole("menuitem", { name: "Delete" }).click();
+
+    const dialog = testPage.getByRole("alertdialog");
+    const cascade = testPage.getByTestId("delete-cascade-checkbox");
+    await expect(cascade).toBeVisible();
+    const discard = testPage.getByTestId("delete-discard-worktree-checkbox");
+    const deleteAction = dialog.getByRole("button", { name: "Delete", exact: true });
+    await expect(deleteAction).toBeEnabled();
+    await expect(discard).toHaveCount(0);
+    await cascade.click();
+    await expect(cascade).toBeChecked();
+    await deleteAction.click();
+
+    await expect(kanban.taskCardByTitle("Parent Delete Cascade")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle("Cascaded Doomed Subtask")).not.toBeVisible({
+      timeout: VISIBLE_TIMEOUT,
+    });
+  });
+});

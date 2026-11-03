@@ -1,0 +1,315 @@
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/worktree"
+)
+
+// WorkspaceRepositoryMaterialization is one durable repository projection
+// prepared for a running remote workspace. It deliberately carries only a
+// credential-free locator; executor launch environments provide Git auth.
+type WorkspaceRepositoryMaterialization struct {
+	CheckoutOptions         *models.RepositoryCheckoutOptions
+	RepositoryURL           string
+	Destination             string
+	BaseBranch              string
+	CheckoutBranch          string
+	PRNumber                int
+	QualifiedPRBase         *models.PRBase
+	RemoteContribution      *models.RemoteContribution
+	ContributionDestination *models.ContributionDestination
+}
+
+const workspaceMaterializationRollbackTimeout = 10 * time.Second
+
+// remoteWorkspaceProjectionFromLaunch returns the repositories agentctl must
+// materialize. Executors with a prepare script establish the first repository at
+// the workspace root themselves; includePrimary asks for it too, for executors
+// that have none.
+func remoteWorkspaceProjectionFromLaunch(req *LaunchRequest, includePrimary bool) ([]WorkspaceRepositoryMaterialization, error) {
+	if req == nil {
+		return nil, fmt.Errorf("launch request is required")
+	}
+	specs := req.RepoSpecs()
+	projection := make([]WorkspaceRepositoryMaterialization, 0, len(specs))
+	for index, spec := range specs {
+		if index == 0 && !includePrimary {
+			continue
+		}
+		if index == 0 && spec.RepositoryURL == "" && len(req.Repositories) == 0 {
+			spec.RepositoryURL = getMetadataString(req.Metadata, "repository_clone_url")
+		}
+		if spec.RepositoryURL == "" {
+			return nil, fmt.Errorf("remote repository %q has no clone URL", spec.RepoName)
+		}
+		destination, err := remoteWorkspaceRepositoryDestination(spec)
+		if err != nil {
+			return nil, fmt.Errorf("remote repository %q has unsafe runtime name", spec.RepoName)
+		}
+		projection = append(projection, WorkspaceRepositoryMaterialization{
+			RepositoryURL: spec.RepositoryURL, Destination: destination,
+			BaseBranch: spec.BaseBranch, CheckoutBranch: spec.CheckoutBranch,
+			PRNumber: spec.PRNumber, QualifiedPRBase: spec.QualifiedPRBase,
+			RemoteContribution: spec.RemoteContribution, CheckoutOptions: spec.CheckoutOptions,
+			ContributionDestination: spec.ContributionDestination,
+		})
+	}
+	return projection, nil
+}
+
+func remoteWorkspaceRepositoryDirectory(spec RepoLaunchSpec) string {
+	branch := spec.CheckoutBranch
+	if branch == "" {
+		branch = spec.BaseBranch
+	}
+	name, branchSlug := worktree.SanitizeRepoDirName(spec.RepoName), worktree.SanitizeBranchSlug(branch)
+	if name == "" || branchSlug == "" {
+		return ""
+	}
+	return name + "-" + branchSlug
+}
+
+func remoteWorkspaceRepositoryDestination(spec RepoLaunchSpec) (string, error) {
+	if destination := remoteWorkspaceRepositoryDirectory(spec); destination != "" {
+		return destination, nil
+	}
+	return "", fmt.Errorf("repository %q has no safe branch-scoped workspace directory", spec.RepoName)
+}
+
+func usesRemoteWorkspaceMaterialization(req *LaunchRequest) bool {
+	return req != nil && models.IsRemoteExecutorType(models.ExecutorType(req.ExecutorType))
+}
+
+// launchRepositoryProjectionKey returns the workspace key used by agentctl
+// for a repository in this launch. Remote executors materialize secondary
+// repositories in branch-scoped directories. Plugin executors also materialize
+// the primary repository there, while other remote executors keep the primary
+// checkout at the workspace root.
+func launchRepositoryProjectionKey(req *LaunchRequest, spec RepoLaunchSpec, index int) (string, error) {
+	if usesRemoteWorkspaceMaterialization(req) {
+		if req.ExecutorType == string(models.ExecutorTypePluginRemote) || index > 0 {
+			return remoteWorkspaceRepositoryDestination(spec)
+		}
+		return "", nil
+	}
+	if index == 0 {
+		return "", nil
+	}
+	return baseBranchMetadataKey(spec), nil
+}
+
+type workspaceRepositoryClient interface {
+	MaterializeRepository(context.Context, agentctl.MaterializeRepositoryRequest) (*agentctl.MaterializeRepositoryResponse, error)
+	RemoveMaterializedRepository(context.Context, agentctl.RemoveMaterializedRepositoryRequest) error
+	RescanWorkspace(context.Context, string, ...[]string) error
+	ReconcileWorkspace(context.Context, ...[]string) error
+}
+
+// MaterializeRepositoriesForEnvironment reconciles the complete durable
+// repository projection against the live agentctl workspace. It is intentionally
+// environment-scoped so callers attach to the existing task/session execution.
+func (m *Manager) MaterializeRepositoriesForEnvironment(ctx context.Context, taskEnvironmentID string, repositories []WorkspaceRepositoryMaterialization) ([]string, error) {
+	executions, err := m.liveWorkspaceExecutionsForEnvironment(ctx, taskEnvironmentID)
+	if err != nil {
+		return nil, err
+	}
+	clients := distinctWorkspaceRepositoryClients(executions)
+	defer releaseWorkspaceRepositoryClients(clients)
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("workspace execution has no agentctl client")
+	}
+	created, err := materializeWorkspaceRepositoriesWithoutRescan(ctx, clients[0].client, repositories)
+	if err != nil {
+		return nil, err
+	}
+	rescanned := make([]workspaceRepositoryExecution, 0, len(clients))
+	for _, execution := range clients {
+		if err := execution.client.RescanWorkspace(ctx, "", execution.sourceRoots); err != nil {
+			cleanupErr := rollbackMaterializedWorkspaceRepositories(ctx, clients[0].client, created)
+			var reconcileErr error
+			if cleanupErr == nil {
+				reconcileErr = rollbackWorkspaceRepositoryRescans(ctx, rescanned)
+			}
+			return nil, fmt.Errorf("rescan materialized workspace for session %s: %w", execution.sessionID, errors.Join(err, cleanupErr, reconcileErr))
+		}
+		rescanned = append(rescanned, execution)
+	}
+	return workspaceRepositorySessionIDs(executions), nil
+}
+
+func materializeWorkspaceRepositories(ctx context.Context, client workspaceRepositoryClient, repositories []WorkspaceRepositoryMaterialization) error {
+	created, err := materializeWorkspaceRepositoriesWithoutRescan(ctx, client, repositories)
+	if err != nil {
+		return err
+	}
+	if err := client.RescanWorkspace(ctx, ""); err != nil {
+		cleanupErr := rollbackMaterializedWorkspaceRepositories(ctx, client, created)
+		var reconcileErr error
+		if cleanupErr == nil {
+			reconcileErr = reconcileWorkspaceRepositoryClient(ctx, client, nil)
+		}
+		return fmt.Errorf("rescan materialized workspace: %w", errors.Join(err, cleanupErr, reconcileErr))
+	}
+	return nil
+}
+
+type workspaceRepositoryExecution struct {
+	sessionID   string
+	client      workspaceRepositoryClient
+	release     func()
+	sourceRoots []string
+}
+
+func (m *Manager) liveWorkspaceExecutionsForEnvironment(ctx context.Context, taskEnvironmentID string) ([]*AgentExecution, error) {
+	if taskEnvironmentID == "" {
+		return nil, fmt.Errorf("task_environment_id is required")
+	}
+	executions := make([]*AgentExecution, 0)
+	for _, execution := range m.executionStore.List() {
+		if execution == nil || execution.TaskEnvironmentID != taskEnvironmentID {
+			continue
+		}
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		releaseClient()
+		if client != nil {
+			executions = append(executions, execution)
+		}
+	}
+	if len(executions) == 0 {
+		execution, err := m.GetOrEnsureExecutionForEnvironment(ctx, taskEnvironmentID)
+		if err != nil {
+			return nil, fmt.Errorf("ensure workspace execution: %w", err)
+		}
+		if execution == nil {
+			return nil, fmt.Errorf("workspace execution has no agentctl client")
+		}
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		releaseClient()
+		if client == nil {
+			return nil, fmt.Errorf("workspace execution has no agentctl client")
+		}
+		executions = append(executions, execution)
+	}
+	sort.Slice(executions, func(i, j int) bool { return executions[i].ID < executions[j].ID })
+	return executions, nil
+}
+
+func distinctWorkspaceRepositoryClients(executions []*AgentExecution) []workspaceRepositoryExecution {
+	clients := make([]workspaceRepositoryExecution, 0, len(executions))
+	seen := make(map[*agentctl.Client]struct{}, len(executions))
+	for _, execution := range executions {
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		if client == nil {
+			continue
+		}
+		if _, exists := seen[client]; exists {
+			releaseClient()
+			continue
+		}
+		seen[client] = struct{}{}
+		clients = append(clients, workspaceRepositoryExecution{
+			sessionID:   execution.SessionID,
+			client:      client,
+			release:     releaseClient,
+			sourceRoots: append([]string(nil), execution.WorkspaceSourceRoots...),
+		})
+	}
+	return clients
+}
+
+func releaseWorkspaceRepositoryClients(executions []workspaceRepositoryExecution) {
+	for _, execution := range executions {
+		if execution.release != nil {
+			execution.release()
+		}
+	}
+}
+
+func workspaceRepositorySessionIDs(executions []*AgentExecution) []string {
+	ids := make([]string, 0, len(executions))
+	seen := make(map[string]struct{}, len(executions))
+	for _, execution := range executions {
+		if execution.SessionID == "" {
+			continue
+		}
+		if _, exists := seen[execution.SessionID]; !exists {
+			seen[execution.SessionID] = struct{}{}
+			ids = append(ids, execution.SessionID)
+		}
+	}
+	return ids
+}
+
+func materializeWorkspaceRepositoriesWithoutRescan(ctx context.Context, client workspaceRepositoryClient, repositories []WorkspaceRepositoryMaterialization) ([]WorkspaceRepositoryMaterialization, error) {
+	if client == nil {
+		return nil, fmt.Errorf("agentctl client is required")
+	}
+	created := make([]WorkspaceRepositoryMaterialization, 0, len(repositories))
+	for _, repository := range repositories {
+		response, err := client.MaterializeRepository(ctx, agentctl.MaterializeRepositoryRequest{
+			RepositoryURL:           repository.RepositoryURL,
+			Destination:             repository.Destination,
+			BaseBranch:              repository.BaseBranch,
+			CheckoutBranch:          repository.CheckoutBranch,
+			PRNumber:                repository.PRNumber,
+			QualifiedPRBase:         repository.QualifiedPRBase,
+			RemoteContribution:      repository.RemoteContribution,
+			CheckoutOptions:         repository.CheckoutOptions,
+			ContributionDestination: repository.ContributionDestination,
+		})
+		if err != nil {
+			rollbackErr := rollbackMaterializedWorkspaceRepositories(ctx, client, created)
+			return nil, fmt.Errorf("materialize workspace repository %q: %w", repository.Destination, errors.Join(err, rollbackErr))
+		}
+		if response == nil {
+			rollbackErr := rollbackMaterializedWorkspaceRepositories(ctx, client, created)
+			return nil, fmt.Errorf("materialize workspace repository %q: %w", repository.Destination, errors.Join(errors.New("empty response"), rollbackErr))
+		}
+		if !response.Reused {
+			created = append(created, repository)
+		}
+	}
+	return created, nil
+}
+
+func rollbackWorkspaceRepositoryRescans(ctx context.Context, executions []workspaceRepositoryExecution) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceMaterializationRollbackTimeout)
+	defer cancel()
+	var errs []error
+	for index := len(executions) - 1; index >= 0; index-- {
+		execution := executions[index]
+		if err := execution.client.ReconcileWorkspace(rollbackCtx, execution.sourceRoots); err != nil {
+			errs = append(errs, fmt.Errorf("reconcile workspace for session %s: %w", execution.sessionID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func reconcileWorkspaceRepositoryClient(ctx context.Context, client workspaceRepositoryClient, sourceRoots []string) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceMaterializationRollbackTimeout)
+	defer cancel()
+	return client.ReconcileWorkspace(rollbackCtx, sourceRoots)
+}
+
+func rollbackMaterializedWorkspaceRepositories(ctx context.Context, client workspaceRepositoryClient, created []WorkspaceRepositoryMaterialization) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workspaceMaterializationRollbackTimeout)
+	defer cancel()
+	var errs []error
+	for i := len(created) - 1; i >= 0; i-- {
+		repository := created[i]
+		if err := client.RemoveMaterializedRepository(cleanupCtx, agentctl.RemoveMaterializedRepositoryRequest{
+			RepositoryURL: repository.RepositoryURL,
+			Destination:   repository.Destination,
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("remove materialized workspace repository %q: %w", repository.Destination, err))
+		}
+	}
+	return errors.Join(errs...)
+}

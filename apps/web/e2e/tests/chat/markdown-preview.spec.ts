@@ -1,0 +1,556 @@
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { type Page } from "@playwright/test";
+import { expect, resetSeedRepositoryCheckout, test } from "../../fixtures/test-base";
+import { watchWs } from "../../helpers/causal-waits";
+import type { SeedData } from "../../fixtures/test-base";
+import type { ApiClient } from "../../helpers/api-client";
+import {
+  selectMarkdownPreviewRange,
+  selectMarkdownPreviewText,
+} from "../../helpers/markdown-preview";
+import { makeGitEnv } from "../../helpers/git-helper";
+import { SessionPage } from "../../pages/session-page";
+
+const MARKDOWN_CONTENT = `# Hello World
+
+This is a **markdown** file with some content.
+
+- Item 1
+- Item 2
+- Item 3
+
+\`\`\`js
+console.log("hello");
+\`\`\`
+`;
+
+const HTML_MARKDOWN_CONTENT = `<div align="center">
+  <a href="https://github.com/kdlbs/kandev">
+    <img width="120" height="80" src="./logo.svg" alt="Kandev logo" onerror="alert('xss')">
+  </a>
+  <br>
+  <h1>Embedded HTML</h1>
+  <p>Rendered from a README.</p>
+  <details open>
+    <summary>More information</summary>
+    <p>Collapsible README content.</p>
+  </details>
+  <a href="javascript:alert('xss')">Unsafe link</a>
+  <script>window.markdownXss = true</script>
+</div>`;
+
+async function seedTaskWithSession(
+  testPage: Page,
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+  repositoryId = seedData.repositoryId,
+): Promise<{ session: SessionPage; sessionId: string }> {
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description: "/e2e:simple-message",
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: [repositoryId],
+    },
+  );
+  await testPage.goto(`/t/${task.id}`);
+  const session = new SessionPage(testPage);
+  await session.waitForLoad();
+  await session.waitForChatIdle({ timeout: 30_000 });
+  return { session, sessionId: task.session_id };
+}
+
+/** Open a markdown file from the Files panel and enable preview mode. */
+async function openFileInPreview(
+  testPage: Page,
+  session: SessionPage,
+  fileName: string,
+): Promise<void> {
+  await session.clickTab("Files");
+  await expect(session.files).toBeVisible({ timeout: 5_000 });
+  const fileRow = session.files.getByText(fileName);
+  await expect(fileRow).toBeVisible({ timeout: 10_000 });
+  await fileRow.click();
+
+  const editorTab = testPage.locator(`.dv-default-tab:has-text('${fileName}')`);
+  await expect(editorTab).toBeVisible({ timeout: 10_000 });
+
+  const previewToggle = testPage.getByTestId("markdown-preview-toggle").first();
+  await expect(previewToggle).toBeVisible({ timeout: 10_000 });
+  await previewToggle.click();
+
+  await expect(testPage.getByTestId("markdown-preview")).toBeVisible({ timeout: 5_000 });
+}
+
+/** Open a markdown file from the Files panel and leave it in code mode. */
+async function openFileInCode(
+  testPage: Page,
+  session: SessionPage,
+  fileName: string,
+): Promise<void> {
+  await session.clickTab("Files");
+  await expect(session.files).toBeVisible({ timeout: 5_000 });
+  const fileRow = await session.fileTree.waitForFileTreeNode(fileName, 30_000);
+  await fileRow.click();
+
+  const editorTab = testPage.locator(`.dv-default-tab:has-text('${fileName}')`);
+  await expect(editorTab).toBeVisible({ timeout: 10_000 });
+  await expect(testPage.locator(".monaco-editor").first()).toBeVisible({ timeout: 10_000 });
+}
+
+test.describe("Markdown preview", () => {
+  test.describe.configure({ retries: 0, timeout: 120_000 });
+
+  test.beforeEach(({ backend, seedData }) => {
+    resetSeedRepositoryCheckout(seedData, backend.tmpDir);
+  });
+
+  test("toggle markdown preview in file editor", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+    prCapture,
+  }) => {
+    // Create a markdown file in the workspace repo before navigating
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    const filePath = path.join(repoDir, "readme.md");
+    fs.writeFileSync(filePath, MARKDOWN_CONTENT);
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Preview Test",
+    );
+
+    // Open the Files panel and click on the markdown file
+    await session.clickTab("Files");
+    await expect(session.files).toBeVisible({ timeout: 5_000 });
+    const fileRow = session.files.getByText("readme.md");
+    await expect(fileRow).toBeVisible({ timeout: 10_000 });
+    await fileRow.click();
+
+    // Wait for the file editor tab to appear
+    const editorTab = testPage.locator(".dv-default-tab:has-text('readme.md')");
+    await expect(editorTab).toBeVisible({ timeout: 10_000 });
+
+    // The preview toggle button should be visible (only for markdown files)
+    const previewToggle = testPage.getByTestId("markdown-preview-toggle").first();
+    await expect(previewToggle).toBeVisible({ timeout: 10_000 });
+
+    // Click to enable markdown preview
+    await previewToggle.click();
+
+    // The markdown preview should be visible with rendered content
+    const preview = testPage.getByTestId("markdown-preview");
+    await expect(preview).toBeVisible({ timeout: 5_000 });
+    // Check that markdown is rendered (heading should be an <h1>)
+    await expect(preview.locator("h1")).toContainText("Hello World");
+    // Check that list items are rendered
+    await expect(preview.locator("li")).toHaveCount(3);
+
+    // Capture screenshot for PR description (only when CAPTURE_PR_ASSETS=true)
+    await prCapture.screenshot("markdown-preview-on", {
+      caption: "Markdown file rendered in preview mode",
+    });
+
+    // Toggle back to code view
+    const codeToggle = testPage.getByTestId("markdown-preview-toggle").first();
+    await codeToggle.click();
+
+    // Preview should be gone
+    await expect(preview).not.toBeVisible({ timeout: 5_000 });
+  });
+
+  test("renders safe embedded HTML and strips executable content", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    fs.writeFileSync(path.join(repoDir, "html-readme.md"), HTML_MARKDOWN_CONTENT);
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Embedded HTML Test",
+    );
+    await openFileInPreview(testPage, session, "html-readme.md");
+
+    const preview = testPage.getByTestId("markdown-preview");
+    const centeredContent = preview.locator('div[align="center"]');
+    await expect(centeredContent).toBeVisible();
+    await expect(centeredContent.getByRole("heading", { name: "Embedded HTML" })).toBeVisible();
+
+    const image = centeredContent.getByRole("img", { name: "Kandev logo" });
+    await expect(image).toHaveAttribute("src", "./logo.svg");
+    await expect(image).toHaveAttribute("width", "120");
+    await expect(image).not.toHaveAttribute("onerror");
+    await expect(centeredContent.locator("p").first()).toHaveAttribute("data-md-source-start", "7");
+    await expect(centeredContent.locator("details")).toContainText("Collapsible README content.");
+    await expect(centeredContent.locator("summary")).toHaveText("More information");
+    await expect(centeredContent.locator("a", { hasText: "Unsafe link" })).not.toHaveAttribute(
+      "href",
+    );
+    await expect(preview.locator("script")).toHaveCount(0);
+    expect(await testPage.evaluate(() => "markdownXss" in window)).toBe(false);
+  });
+
+  test("resizes adjacent columns in a rendered Markdown file preview", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    // Covers AC-UI-RESIZABLE-MARKDOWN-TABLES-001.1, .3, and .9.
+    const fileName = "resizable-table.md";
+    const marker = "Preview table resize marker";
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    fs.writeFileSync(
+      path.join(repoDir, fileName),
+      [
+        "| Setting | Effect | Notes |",
+        "| --- | --- | --- |",
+        `| strictDepBuilds | Blocks unapproved scripts | ${marker} |`,
+        "| allowBuilds | Allows approved scripts | Ephemeral width |",
+      ].join("\n"),
+    );
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Preview Table Resize Test",
+    );
+    await openFileInPreview(testPage, session, fileName);
+
+    const preview = testPage.getByTestId("markdown-preview");
+    const table = preview.locator("table", { hasText: marker });
+    const wrapper = table.locator("xpath=..");
+    const cells = table.locator("tbody tr").first().locator("td");
+    const separator = preview.getByTestId("markdown-table-resizer-0");
+    await expect(table).toBeVisible();
+    await expect(separator).toBeVisible();
+    await expect(separator).toHaveAccessibleName("Resize table columns 1 and 2");
+    await expect(wrapper).toHaveAttribute("data-md-source-start", "1");
+    await expect(wrapper).toHaveClass(/markdown-table-scroll/);
+
+    const initialWidths = await cells.evaluateAll((elements) =>
+      elements.map((element) => element.getBoundingClientRect().width),
+    );
+    const initialTableWidth = await table.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    );
+    const [separatorBox, cellBox] = await Promise.all([
+      separator.boundingBox(),
+      cells.first().boundingBox(),
+    ]);
+    expect(separatorBox).not.toBeNull();
+    expect(cellBox).not.toBeNull();
+
+    const boundaryX = separatorBox!.x + separatorBox!.width / 2;
+    const rowY = cellBox!.y + cellBox!.height / 2;
+    await testPage.mouse.move(boundaryX, rowY);
+    await testPage.mouse.down();
+    await testPage.mouse.move(boundaryX + 40, rowY);
+    await testPage.mouse.up();
+
+    const resizedWidths = await cells.evaluateAll((elements) =>
+      elements.map((element) => element.getBoundingClientRect().width),
+    );
+    expect(resizedWidths[0] - initialWidths[0]).toBeCloseTo(40, 0);
+    expect(initialWidths[1] - resizedWidths[1]).toBeCloseTo(40, 0);
+    expect(resizedWidths[2]).toBeCloseTo(initialWidths[2], 0);
+    expect(await table.evaluate((element) => element.getBoundingClientRect().width)).toBeCloseTo(
+      initialTableWidth,
+      0,
+    );
+    expect(
+      await preview.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
+    ).toBe(true);
+  });
+
+  test("markdown preview persists across page refresh", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    // Create a markdown file
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    const filePath = path.join(repoDir, "persist-test.md");
+    fs.writeFileSync(filePath, "# Persist Test\n\nSome content here.");
+
+    const { session, sessionId } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Persist Test",
+    );
+
+    // Open file and enable preview
+    await openFileInPreview(testPage, session, "persist-test.md");
+    await expect(testPage.getByTestId("markdown-preview").locator("h1")).toContainText(
+      "Persist Test",
+    );
+
+    // Verify the renderedPreview flag is in sessionStorage
+    const storedTabs = await testPage.evaluate((sid) => {
+      const raw = window.sessionStorage.getItem(`kandev.openFiles.${sid}`);
+      return raw ? JSON.parse(raw) : null;
+    }, sessionId);
+    expect(storedTabs).not.toBeNull();
+    const mdTab = storedTabs.find((t: { path: string }) => t.path.endsWith("persist-test.md"));
+    expect(mdTab).toBeTruthy();
+    expect(mdTab.renderedPreview).toBe(true);
+
+    // No settle needed before the reload: the assertions above already read
+    // the flag back out of sessionStorage, so the write has demonstrably
+    // landed by the time we get here.
+
+    // Reload the page — sessionStorage survives same-URL reload.
+    // After reload, the restored file tab becomes active (not the chat),
+    // so we wait for the sidebar instead of the chat panel.
+    await testPage.reload();
+    const sessionAfter = new SessionPage(testPage);
+    await expect(sessionAfter.sidebar).toBeVisible({ timeout: 30_000 });
+
+    // The file tab should be restored with preview still active
+    const editorTabAfter = testPage.locator(".dv-default-tab:has-text('persist-test.md')");
+    await expect(editorTabAfter).toBeVisible({ timeout: 15_000 });
+    await editorTabAfter.click();
+
+    const previewAfter = testPage.getByTestId("markdown-preview");
+    await expect(previewAfter).toBeVisible({ timeout: 10_000 });
+    await expect(previewAfter.locator("h1")).toContainText("Persist Test");
+  });
+
+  test("open markdown preview from diff toolbar", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    // Keep this diff fixture separate from files left by earlier tests in the worker repo.
+    const repoDir = fs.mkdtempSync(path.join(backend.tmpDir, "repos", "markdown-diff-preview-"));
+    const gitEnv = makeGitEnv(backend.tmpDir);
+    execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, env: gitEnv });
+    fs.writeFileSync(path.join(repoDir, "README.md"), "Markdown diff preview fixture\n");
+    execFileSync("git", ["add", "README.md"], { cwd: repoDir, env: gitEnv });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir, env: gitEnv });
+    const repository = await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "Markdown Diff Preview E2E",
+    });
+
+    // Create a markdown file as an untracked file — it will show in Changes.
+    const filePath = path.join(repoDir, "preview-from-diff.md");
+    fs.writeFileSync(filePath, "# Preview From Diff\n\nThis file was created for the diff test.");
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Diff Preview Test",
+      repository.id,
+    );
+
+    // Open Changes panel — the untracked .md file should appear in the file list.
+    // Click "Changes" tab first, then click the file to open its diff.
+    await session.clickTab("Changes");
+    await expect(session.changes).toBeVisible({ timeout: 5_000 });
+
+    // Wait for git status to detect the file and show it in the changes list
+    const fileEntry = session.changes.getByText("preview-from-diff.md");
+    await expect(fileEntry).toBeVisible({ timeout: 15_000 });
+    await fileEntry.click();
+
+    // The diff opens as a center panel tab "Diff [preview-from-diff.md]".
+    // Wait for the diff tab and its content to render.
+    const diffTab = testPage.locator(".dv-default-tab:has-text('preview-from-diff.md')");
+    await expect(diffTab).toBeVisible({ timeout: 10_000 });
+
+    // The diff content should show our markdown text
+    await expect(testPage.getByText("# Preview From Diff")).toBeVisible({ timeout: 15_000 });
+
+    // Click the "Preview markdown" button (eye icon) in the diff header toolbar.
+    // The button is in the center diff panel, not the right-side changes panel.
+    const previewBtn = testPage.getByRole("button", { name: "Preview markdown" }).first();
+    await expect(previewBtn).toBeVisible({ timeout: 10_000 });
+    await previewBtn.click();
+
+    // The file editor should open in preview mode (not code mode).
+    // The markdown preview should be active immediately (no need to toggle).
+    const preview = testPage.getByTestId("markdown-preview");
+    await expect(preview).toBeVisible({ timeout: 10_000 });
+    await expect(preview.locator("h1")).toContainText("Preview From Diff");
+  });
+
+  test("can add a pending comment from markdown preview selection", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    const filePath = path.join(repoDir, "comment-preview.md");
+    fs.writeFileSync(filePath, MARKDOWN_CONTENT);
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Preview Comment Test",
+    );
+
+    await openFileInPreview(testPage, session, "comment-preview.md");
+    const preview = testPage.getByTestId("markdown-preview");
+    await selectMarkdownPreviewText(preview.locator("p").first());
+
+    const commentButton = testPage.getByTestId("markdown-preview-comment-button");
+    await expect(commentButton).toBeVisible({ timeout: 5_000 });
+    await commentButton.click();
+
+    await expect(testPage.getByRole("button", { name: "Run" })).toBeVisible();
+    await testPage
+      .locator('textarea[placeholder="Add your comment or instruction..."]')
+      .fill("Please tighten this paragraph.");
+    await testPage.getByRole("button", { name: "Add", exact: true }).click();
+
+    await expect(testPage.getByTestId("markdown-preview-commented-range").first()).toBeVisible({
+      timeout: 5_000,
+    });
+
+    await session.clickSessionChatTab();
+    await expect(session.activeChat().getByText("comment-preview.md (1)")).toBeVisible({
+      timeout: 5_000,
+    });
+  });
+
+  test("shows one editable badge for a multiline markdown preview comment", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    const filePath = path.join(repoDir, "multiline-preview-comment.md");
+    fs.writeFileSync(
+      filePath,
+      [
+        "# Multiline Preview Comment",
+        "",
+        "First paragraph for the preview selection.",
+        "",
+        "Second paragraph for the preview selection.",
+        "",
+        "Third paragraph for the preview selection.",
+        "",
+      ].join("\n"),
+    );
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Preview Multiline Comment Test",
+    );
+
+    await openFileInPreview(testPage, session, "multiline-preview-comment.md");
+    const preview = testPage.getByTestId("markdown-preview");
+    await selectMarkdownPreviewRange(preview.locator("p").nth(0), preview.locator("p").nth(2));
+
+    const commentButton = testPage.getByTestId("markdown-preview-comment-button");
+    await expect(commentButton).toBeVisible({ timeout: 5_000 });
+    await commentButton.click();
+
+    await testPage
+      .locator('textarea[placeholder="Add your comment or instruction..."]')
+      .fill("Please revise these paragraphs.");
+    await testPage.getByRole("button", { name: "Add", exact: true }).click();
+
+    const badges = preview.getByTestId("markdown-preview-comment-badge");
+    await expect(badges).toHaveCount(1);
+    await badges.first().click();
+
+    await testPage.getByText("Please revise these paragraphs.").hover();
+    await testPage.getByRole("button", { name: "Edit comment" }).click();
+    const editTextarea = testPage.locator('textarea[placeholder="Add a comment..."]').last();
+    await editTextarea.fill("Please tighten these paragraphs.");
+    await testPage.getByRole("button", { name: "Update", exact: true }).click();
+
+    await expect(testPage.getByText("Please tighten these paragraphs.")).toBeVisible({
+      timeout: 5_000,
+    });
+  });
+
+  test("shows one code comment marker on the first visual row of a wrapped line", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    const fileName = "wrapped-code-comment.md";
+    const wrappedLine = Array.from(
+      { length: 80 },
+      (_, i) => `wrapped-word-${i.toString().padStart(2, "0")}`,
+    ).join(" ");
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-repo");
+    fs.writeFileSync(path.join(repoDir, fileName), `${wrappedLine}\n`);
+
+    const gateway = watchWs(testPage);
+    const treeResponse = gateway.waitForResponse("workspace.tree.get");
+    const { session, sessionId } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Markdown Code Wrapped Comment Test",
+    );
+    await treeResponse;
+    await testPage.evaluate(
+      ({ sid, pathName, codeContent }) => {
+        window.sessionStorage.setItem(
+          `kandev.comments.${sid}`,
+          JSON.stringify([
+            {
+              id: "wrapped-code-comment",
+              source: "diff",
+              sessionId: sid,
+              filePath: pathName,
+              startLine: 1,
+              endLine: 1,
+              side: "additions",
+              codeContent,
+              text: "Review this wrapped line.",
+              createdAt: new Date().toISOString(),
+              status: "pending",
+            },
+          ]),
+        );
+      },
+      { sid: sessionId, pathName: fileName, codeContent: wrappedLine },
+    );
+
+    await openFileInCode(testPage, session, fileName);
+    await expect(testPage.locator(".view-line").first()).toContainText("wrapped-word-00", {
+      timeout: 10_000,
+    });
+    await expect
+      .poll(() => testPage.locator(".view-line").count(), { timeout: 10_000 })
+      .toBeGreaterThan(1);
+
+    await expect
+      .poll(() => testPage.locator(".monaco-comment-bar-icon").count(), {
+        timeout: 10_000,
+      })
+      .toBe(1);
+  });
+});

@@ -1,0 +1,274 @@
+package agents
+
+import (
+	"context"
+	_ "embed"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/internal/agentruntime"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+//go:embed logos/mock_light.svg
+var mockLogoLight []byte
+
+//go:embed logos/mock_dark.svg
+var mockLogoDark []byte
+
+var (
+	_ Agent                         = (*MockAgent)(nil)
+	_ PassthroughAgent              = (*MockAgent)(nil)
+	_ InferenceAgent                = (*MockAgent)(nil)
+	_ OpenAICompatibleProviderAgent = (*MockAgent)(nil)
+)
+
+const (
+	mockTUIReadyPromptPattern = "\x1b\\[1;32m❯\x1b\\[0m $"
+	// mockAgentDefaultID is the canonical ID for the default MockAgent
+	// instance. When NewMockAgentWithID() supplies a non-empty override
+	// the override wins; otherwise this is returned by ID() and used as
+	// the default binary basename across BuildCommand/Runtime/Inference.
+	mockAgentDefaultID = "mock-agent"
+)
+
+type MockAgent struct {
+	StandardPassthrough
+	// id/name/displayName are per-instance overrides so the same mock
+	// binary can be registered under multiple canonical routing provider
+	// IDs (e.g. "claude-acp", "codex-acp") in E2E mode. When empty the
+	// defaults ("mock-agent", "Mock Agent", "Mock") are returned.
+	id          string
+	name        string
+	displayName string
+	enabled     bool
+	binaryPath  string
+	supportsMCP bool
+}
+
+func NewMockAgent() *MockAgent {
+	return &MockAgent{
+		StandardPassthrough: StandardPassthrough{
+			Cfg: PassthroughConfig{
+				Supported:         true,
+				Label:             "TUI Passthrough",
+				Description:       "Terminal UI mode for testing",
+				PassthroughCmd:    NewCommand(mockAgentDefaultID, "--tui"),
+				ModelFlag:         NewParam("--model", "{model}"),
+				PromptFlag:        NewParam("--prompt", "{prompt}"),
+				SessionResumeFlag: NewParam("--resume"),
+				ResumeFlag:        NewParam("-c"),
+				PromptPattern:     mockTUIReadyPromptPattern,
+				IdleTimeout:       2 * time.Second,
+				BufferMaxBytes:    DefaultBufferMaxBytes,
+			},
+		},
+		supportsMCP: true,
+	}
+}
+
+// NewMockAgentWithID returns a MockAgent identical to NewMockAgent but
+// with its ID, Name and DisplayName pre-set to the supplied values.
+// Used in E2E mode (KANDEV_MOCK_PROVIDERS) to register the same mock
+// binary under multiple canonical routing provider IDs so routing
+// validation accepts real-looking provider_order lists while every
+// launch still routes through the mock binary.
+func NewMockAgentWithID(id, name, displayName string) *MockAgent {
+	a := NewMockAgent()
+	a.id = id
+	a.name = name
+	a.displayName = displayName
+	return a
+}
+
+// SetEnabled enables or disables the mock agent at runtime.
+func (a *MockAgent) SetEnabled(enabled bool) { a.enabled = enabled }
+
+// SetBinaryPath overrides the mock-agent binary path.
+// Also updates the passthrough command to use the same binary.
+func (a *MockAgent) SetBinaryPath(path string) {
+	a.binaryPath = path
+	a.Cfg.PassthroughCmd = NewCommand(path, "--tui")
+}
+
+// SetSupportsMCP controls whether the mock agent reports MCP support.
+// Defaults to true so plan mode workflow events work in E2E tests.
+func (a *MockAgent) SetSupportsMCP(v bool) { a.supportsMCP = v }
+
+// SupportsMCPEnabled reports the current MCP support setting.
+func (a *MockAgent) SupportsMCPEnabled() bool { return a.supportsMCP }
+
+func (a *MockAgent) ID() string {
+	if a.id != "" {
+		return a.id
+	}
+	return mockAgentDefaultID
+}
+func (a *MockAgent) Name() string {
+	if a.name != "" {
+		return a.name
+	}
+	return "Mock Agent"
+}
+func (a *MockAgent) DisplayName() string {
+	if a.displayName != "" {
+		return a.displayName
+	}
+	return "Mock"
+}
+func (a *MockAgent) Description() string {
+	return "Mock agent for testing. Generates simulated responses with all message types."
+}
+func (a *MockAgent) Enabled() bool     { return a.enabled }
+func (a *MockAgent) DisplayOrder() int { return 99 }
+
+func (a *MockAgent) Logo(v LogoVariant) []byte {
+	if v == LogoDark {
+		return mockLogoDark
+	}
+	return mockLogoLight
+}
+
+func (a *MockAgent) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+	// Mock agent is always "available" when enabled (forced by settings controller).
+	return &DiscoveryResult{Available: true, SupportsMCP: a.supportsMCP}, nil
+}
+
+func (a *MockAgent) BuildCommand(opts CommandOptions) Command {
+	// For container-bound runtimes (Docker, Sprites, remote Docker) the
+	// agent process exec's inside a Linux container, where the host path
+	// computed by configureMockAgent doesn't exist. The container's image
+	// has /usr/local/bin on PATH and container.go bind-mounts the
+	// linux/amd64 mock-agent there, so the bare name resolves correctly.
+	//
+	// SSH is the same shape: the agent runs on a remote host whose
+	// filesystem doesn't share paths with the kandev backend's, so the
+	// host-absolute binary path can't apply. The SSH e2e image bakes
+	// mock-agent at /usr/local/bin/mock-agent; production SSH expects
+	// users to install agents into the remote's $PATH (real agents like
+	// Claude use `npx` and never hit this branch).
+	//
+	// For host runtimes (standalone) we prefer the absolute host path
+	// that configureMockAgent computed via os.Executable() — that's the
+	// only way the host path works in dev mode (where the shell's $PATH
+	// doesn't include apps/backend/bin). Fall back to the bare name when
+	// no path is set: e2e fixtures prepend the kandev bin dir to PATH.
+	if opts.Runtime.IsContainerized() || opts.Runtime == agentruntime.RuntimeSSH {
+		return Cmd(mockAgentDefaultID).Build()
+	}
+	binary := mockAgentDefaultID
+	if a.binaryPath != "" {
+		binary = a.binaryPath
+	}
+	return Cmd(binary).Build()
+}
+
+func (a *MockAgent) Runtime() *RuntimeConfig {
+	canRecover := true
+	return &RuntimeConfig{
+		Cmd:             Cmd(mockAgentDefaultID).Build(),
+		WorkingDir:      "{workspace}",
+		Env:             map[string]string{},
+		ResourceLimits:  ResourceLimits{MemoryMB: 512, CPUCores: 0.5, Timeout: time.Hour},
+		Protocol:        agent.ProtocolACP,
+		ProjectSkillDir: DefaultProjectSkillDir,
+		UserSkillDir:    ".mock-agent/skills",
+		SessionConfig: SessionConfig{
+			NativeSessionResume: true,
+			CanRecover:          &canRecover,
+			SessionDirTemplate:  "{home}/.mock-agent",
+			SessionDirTarget:    "/root/.mock-agent",
+		},
+	}
+}
+
+// RemoteAuth returns a Codex-shaped auth spec for the mock Codex alias so the
+// settings E2E can prove auth and configuration remain independent. The base
+// mock agent still requires no credentials.
+func (a *MockAgent) RemoteAuth() *RemoteAuth {
+	if a.ID() != "codex-acp" {
+		return &RemoteAuth{}
+	}
+	return &RemoteAuth{Methods: []RemoteAuthMethod{
+		{
+			Type:  remoteAuthMethodTypeFiles,
+			Label: remoteAuthLabelCopyFiles,
+			SourceFiles: map[string][]string{
+				"darwin": {".codex/auth.json"},
+				"linux":  {".codex/auth.json"},
+			},
+			TargetRelDir: ".codex",
+		},
+		{Type: "env", EnvVar: "OPENAI_API_KEY"},
+	}}
+}
+
+// PortableConfig exposes one disposable settings file so the Docker E2E
+// agent can exercise the same isolated-home transfer path as a real ACP
+// provider without requiring provider credentials.
+func (a *MockAgent) PortableConfig() *PortableConfig {
+	bundleID := "mock.settings"
+	if a.ID() != mockAgentDefaultID {
+		bundleID = a.ID() + ".settings"
+	}
+	return &PortableConfig{Bundles: []PortableConfigBundle{
+		{
+			ID:    bundleID,
+			Label: "Copy mock-agent settings",
+			Files: []PortableConfigFile{
+				{
+					SourcePaths: map[string]string{"": ".mock-agent/settings.json"},
+					TargetPath:  ".mock-agent/settings.json",
+				},
+			},
+		},
+	}}
+}
+
+// InstallScript returns a deterministic short-lived shell script so e2e tests
+// can exercise the install streaming endpoint without depending on npm.
+func (a *MockAgent) InstallScript() string {
+	return "echo mock-install: step 1 && echo mock-install: step 2 && echo mock-install: done"
+}
+
+// LoginCommand exposes a deterministic interactive command for e2e PTY tests.
+// `cat` echoes any input back to the user; tests send "exit\n" or kill the
+// session to terminate.
+func (a *MockAgent) LoginCommand() *LoginCommand {
+	return &LoginCommand{
+		Cmd:         []string{"cat"},
+		Description: "Mock login (echoes input).",
+	}
+}
+
+func (a *MockAgent) BillingType() usage.BillingType { return defaultBillingType() }
+
+func (a *MockAgent) PermissionSettings() map[string]PermissionSetting {
+	return emptyPermSettings
+}
+
+// InferenceConfig enables one-shot inference via ACP. The mock-agent binary
+// advertises its available models in the session/new response, so the host
+// utility capability probe populates them into the cache without any static
+// model list here.
+func (a *MockAgent) InferenceConfig() *InferenceConfig {
+	binary := mockAgentDefaultID
+	if a.binaryPath != "" {
+		binary = a.binaryPath
+	}
+	return &InferenceConfig{
+		Supported: true,
+		Command:   NewCommand(binary),
+	}
+}
+
+// OpenAICompatibleProvider lets a mock-agent profile exercise the
+// OpenAI-compatible provider primitive end to end in tests and e2e. It reuses
+// the same ACP gateway auth method shape as codex-acp.
+func (a *MockAgent) OpenAICompatibleProvider() *OpenAICompatibleProviderSpec {
+	return &OpenAICompatibleProviderSpec{
+		AuthMethodID: "gateway",
+		ProviderName: "Kandev",
+		KeyEnvVar:    "OPENAI_API_KEY",
+	}
+}

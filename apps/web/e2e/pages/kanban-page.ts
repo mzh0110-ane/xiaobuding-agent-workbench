@@ -1,0 +1,352 @@
+import { expect, type Locator, type Page } from "@playwright/test";
+import { ChangeWorkflowPage } from "./change-workflow-page";
+
+export class KanbanPage {
+  readonly board: Locator;
+  readonly createTaskButton: Locator;
+  readonly multiSelectToolbar: Locator;
+  readonly bulkDeleteButton: Locator;
+  readonly bulkArchiveButton: Locator;
+  readonly bulkMoveButton: Locator;
+  readonly bulkClearButton: Locator;
+  readonly bulkDeleteConfirm: Locator;
+  readonly bulkArchiveConfirm: Locator;
+
+  readonly multiSelectToggle: Locator;
+
+  readonly viewTogglePipeline: Locator;
+  readonly viewToggleKanban: Locator;
+
+  constructor(private page: Page) {
+    this.board = page.getByTestId("kanban-board");
+    this.createTaskButton = page.getByTestId("create-task-button");
+    this.multiSelectToolbar = page.getByTestId("multi-select-toolbar");
+    this.multiSelectToggle = page.getByTestId("multi-select-toggle");
+    this.bulkDeleteButton = page.getByTestId("bulk-delete-button");
+    this.bulkArchiveButton = page.getByTestId("bulk-archive-button");
+    this.bulkMoveButton = page.getByTestId("bulk-move-button");
+    this.bulkClearButton = page.getByTestId("bulk-clear-selection");
+    this.bulkDeleteConfirm = page.getByTestId("bulk-delete-confirm");
+    this.bulkArchiveConfirm = page.getByTestId("bulk-archive-confirm");
+    this.viewTogglePipeline = page.getByTestId("view-toggle-pipeline");
+    this.viewToggleKanban = page.getByTestId("view-toggle-kanban");
+  }
+
+  async goto(workflowId?: string) {
+    const path = workflowId ? `/?workflowId=${encodeURIComponent(workflowId)}` : "/";
+    await this.page.goto(path);
+    await this.board.waitFor({ state: "visible" });
+  }
+
+  taskCard(taskId: string): Locator {
+    return this.page.getByTestId(`task-card-${taskId}`);
+  }
+
+  taskCardByTitle(title: string): Locator {
+    return this.board.locator(`[data-testid^="task-card-"]`, {
+      has: this.page.locator('[data-testid="task-card-title"]', { hasText: title }),
+    });
+  }
+
+  taskSelectCheckbox(taskId: string): Locator {
+    return this.page.getByTestId(`task-select-checkbox-${taskId}`);
+  }
+
+  bulkMoveStepOption(stepId: string): Locator {
+    return this.page.getByTestId(`bulk-move-step-${stepId}`);
+  }
+
+  columnByStepId(stepId: string): Locator {
+    return this.page.getByTestId(`kanban-column-${stepId}`);
+  }
+
+  taskCardInColumn(title: string, stepId: string): Locator {
+    return this.columnByStepId(stepId).locator('[data-testid^="task-card-"]', {
+      has: this.page.locator('[data-testid="task-card-title"]', { hasText: title }),
+    });
+  }
+
+  contextMoveTo(): Locator {
+    return this.page.getByTestId("task-context-move-to");
+  }
+
+  contextChangeWorkflow(): Locator {
+    return this.page.getByTestId("task-context-change-workflow");
+  }
+
+  contextChangeWorkflowSelection(): Locator {
+    return this.page.getByTestId("task-context-change-workflow-selection");
+  }
+
+  contextWorkflow(workflowId: string): Locator {
+    return this.page.getByTestId(`task-context-workflow-${workflowId}`);
+  }
+
+  contextStep(stepId: string): Locator {
+    return this.page.getByTestId(`task-context-step-${stepId}`);
+  }
+
+  contextAutoStartStep(stepId: string): Locator {
+    return this.page.getByTestId(`task-context-step-autostart-${stepId}`);
+  }
+
+  contextPriority(): Locator {
+    return this.page.getByTestId("task-context-priority");
+  }
+
+  contextPriorityOption(priority: string): Locator {
+    return this.page.getByTestId(`task-context-priority-${priority}`);
+  }
+
+  contextPriorityCurrent(priority: string): Locator {
+    return this.page.getByTestId(`task-context-priority-current-${priority}`);
+  }
+
+  /** Opens the Priority submenu on whichever card menu is currently open, without selecting anything. */
+  async openPrioritySubmenu() {
+    await this.openSubmenu(this.contextPriority(), this.contextPriorityOption("medium"));
+  }
+
+  async setPriorityFromContextMenu(taskId: string, priority: string) {
+    await this.selectFromTaskContextMenu(taskId, async () => {
+      const option = this.contextPriorityOption(priority);
+      await this.openSubmenu(this.contextPriority(), option);
+      await this.selectMenuItem(option);
+    });
+  }
+
+  async setPriorityFromActionsMenu(taskId: string, priority: string) {
+    await this.selectFromTaskActionsMenu(taskId, async () => {
+      const option = this.contextPriorityOption(priority);
+      await this.openSubmenu(this.contextPriority(), option);
+      await this.selectMenuItem(option);
+    });
+  }
+
+  async openTaskContextMenu(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await card.click({ button: "right" });
+  }
+
+  async openTaskActionsMenu(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await card.getByLabel("More options").click();
+  }
+
+  async moveTaskWithinWorkflow(taskId: string, stepId: string) {
+    await this.selectFromTaskContextMenu(taskId, async () => {
+      const step = this.contextStep(stepId);
+      await this.openSubmenu(this.contextMoveTo(), step);
+      await this.selectMenuItem(step);
+    });
+  }
+
+  async sendTaskToWorkflow(taskId: string, workflowId: string, stepId: string) {
+    await this.selectFromTaskContextMenu(taskId, async () => {
+      await expect(
+        this.contextChangeWorkflow().or(this.contextChangeWorkflowSelection()),
+      ).toBeVisible();
+      if (await this.contextChangeWorkflowSelection().isVisible()) {
+        await this.selectBulkWorkflowStep(workflowId, stepId);
+        return;
+      }
+      await this.selectChangeWorkflowForm(workflowId, stepId);
+    });
+  }
+
+  async sendTaskToWorkflowFromActions(taskId: string, workflowId: string, stepId: string) {
+    await this.selectFromTaskActionsMenu(taskId, () =>
+      this.selectChangeWorkflowForm(workflowId, stepId),
+    );
+  }
+
+  async openSendToWorkflowTargets(workflowId: string) {
+    await this.openChangeWorkflowForm();
+    await this.changeWorkflowPage().chooseWorkflow(workflowId);
+  }
+
+  async openSendToWorkflowStep(workflowId: string, stepId: string) {
+    await this.openChangeWorkflowForm();
+    await this.changeWorkflowPage().chooseWorkflow(workflowId);
+    await this.changeWorkflowPage().chooseStep(stepId);
+  }
+
+  async openChangeWorkflowForm() {
+    await this.contextChangeWorkflow().click();
+    await expect(this.page.getByTestId("change-workflow-form")).toBeVisible();
+  }
+
+  private async selectFromTaskContextMenu(taskId: string, select: () => Promise<void>) {
+    await this.selectFromTaskMenu(() => this.openTaskContextMenu(taskId), select);
+  }
+
+  private async selectFromTaskActionsMenu(taskId: string, select: () => Promise<void>) {
+    await this.selectFromTaskMenu(() => this.openTaskActionsMenu(taskId), select);
+  }
+
+  private async selectFromTaskMenu(openMenu: () => Promise<void>, select: () => Promise<void>) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await openMenu();
+      try {
+        await select();
+        return;
+      } catch (error) {
+        lastError = error;
+        await this.page.keyboard.press("Escape").catch(() => {});
+      }
+    }
+    throw lastError;
+  }
+
+  private async selectChangeWorkflowForm(workflowId: string, stepId: string) {
+    await this.openChangeWorkflowForm();
+    const form = this.changeWorkflowPage();
+    await form.chooseWorkflow(workflowId);
+    await form.chooseStep(stepId);
+    await form.submit();
+  }
+
+  private async selectBulkWorkflowStep(workflowId: string, stepId: string) {
+    const workflow = this.contextWorkflow(workflowId);
+    const step = this.contextStep(stepId);
+    await this.openSubmenu(this.contextChangeWorkflowSelection(), workflow);
+    await this.openSubmenu(workflow, step);
+    await this.selectMenuItem(step);
+  }
+
+  private changeWorkflowPage() {
+    return new ChangeWorkflowPage(this.page);
+  }
+
+  private async openSubmenu(trigger: Locator, child: Locator) {
+    await expect(trigger).toBeVisible({ timeout: 2_000 });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await trigger.focus({ timeout: 2_000 });
+      await this.page.keyboard.press("ArrowRight");
+      try {
+        await child.waitFor({ state: "visible", timeout: 1_000 });
+        return;
+      } catch {
+        // The submenu can miss focus under CI load; refocus the trigger.
+      }
+    }
+    await expect(child).toBeVisible({ timeout: 2_000 });
+  }
+
+  private async selectMenuItem(item: Locator) {
+    await expect(item).toBeVisible({ timeout: 2_000 });
+    await item.focus({ timeout: 2_000 });
+    await this.page.keyboard.press("Enter");
+  }
+
+  async enableMultiSelect() {
+    await this.multiSelectToggle.first().waitFor({ state: "visible" });
+    const isEnabled = await this.page
+      .locator('[data-multi-select-active="true"]')
+      .first()
+      .isVisible();
+    if (!isEnabled) {
+      await this.multiSelectToggle.first().click();
+    }
+  }
+
+  async selectTask(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await this.enableMultiSelect();
+    await this.taskSelectCheckbox(taskId).click();
+  }
+
+  /** Cmd/Ctrl-click a card body — toggles it into the selection without the toggle button. */
+  async cmdClickCard(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await card.click({ modifiers: ["ControlOrMeta"] });
+  }
+
+  /** Shift-click a card body — range-selects within the column. */
+  async shiftClickCard(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await card.click({ modifiers: ["Shift"] });
+  }
+
+  /** Plain click a card body (no modifier). */
+  async plainClickCard(taskId: string) {
+    const card = this.taskCard(taskId);
+    await card.waitFor({ state: "visible" });
+    await card.click();
+  }
+
+  /** A card is part of the selection when it renders the primary ring. */
+  async expectCardSelected(taskId: string, selected = true) {
+    const card = this.taskCard(taskId);
+    if (selected) {
+      await expect(card).toHaveClass(/ring-primary/, { timeout: 5_000 });
+    } else {
+      await expect(card).not.toHaveClass(/ring-primary/, { timeout: 5_000 });
+    }
+  }
+
+  pipelineTask(taskId: string): Locator {
+    return this.page.getByTestId(`pipeline-task-${taskId}`);
+  }
+
+  pipelineTaskRepoName(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("task-repo-chip");
+  }
+
+  pipelineTaskTitle(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-row-title");
+  }
+
+  pipelineTaskInfo(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-row-info");
+  }
+
+  pipelineOverflowRegion(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-row-overflow-region");
+  }
+
+  pipelineStatusStrip(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-row-status-strip");
+  }
+
+  pipelineStepRunScroll(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-step-run-scroll");
+  }
+
+  pipelinePositionSummary(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByTestId("pipeline-row-position-summary");
+  }
+
+  pipelineTaskMenuTrigger(taskId: string): Locator {
+    return this.pipelineTask(taskId).getByLabel("More options");
+  }
+
+  async switchToPipelineView() {
+    await this.viewTogglePipeline.first().click();
+    // Wait for a pipeline-specific element — swimlane-container is shared with the kanban view.
+    await this.page.locator('[data-testid^="pipeline-task-"]').first().waitFor();
+  }
+
+  async selectPipelineTask(taskId: string) {
+    const row = this.pipelineTask(taskId);
+    await row.waitFor({ state: "visible" });
+    await this.enableMultiSelect();
+    await this.taskSelectCheckbox(taskId).click();
+  }
+
+  async openPipelineTaskContextMenu(taskId: string) {
+    const row = this.pipelineTask(taskId);
+    await row.waitFor({ state: "visible" });
+    await row.click({ button: "right" });
+  }
+
+  async openPipelineTaskActionsMenu(taskId: string) {
+    await this.pipelineTaskMenuTrigger(taskId).click();
+  }
+}

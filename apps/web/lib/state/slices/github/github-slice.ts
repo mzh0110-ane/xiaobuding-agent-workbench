@@ -1,0 +1,484 @@
+import type { StateCreator } from "zustand";
+import type { GitHubSlice, GitHubSliceState, TaskPRScope } from "./types";
+import type { GitHubPRDiscoveryHealth, GitHubPRDiscoveryHealthUpdate } from "@/lib/types/github";
+
+export const defaultGitHubState: GitHubSliceState = {
+  githubStatus: { byWorkspaceId: {}, pendingPRDiscoveryHealthByWorkspaceId: {} },
+  githubAppRegistrations: { byWorkspaceId: {} },
+  taskPRs: {
+    byTaskId: {},
+    workspaceId: null,
+    workspaceContextGeneration: 0,
+    deletedAssociationIdsByTaskId: {},
+  },
+  taskIssues: { workspaceId: null, byTaskId: {} },
+  pendingPrUrlByTaskId: { byTaskId: {} },
+  prWatches: { items: [], loaded: false, loading: false },
+  reviewWatches: { items: [], loaded: false, loading: false },
+  issueWatches: { items: [], loaded: false, loading: false },
+  actionPresets: { byWorkspaceId: {}, loading: {} },
+  prFeedbackCache: { byKey: {} },
+  taskCIAutomation: { byTaskId: {}, loading: {}, saving: {}, errors: {} },
+};
+
+const PR_FEEDBACK_CACHE_LIMIT = 20;
+
+function shouldApplyTaskCIAutomationOptions(
+  current: GitHubSlice["taskCIAutomation"]["byTaskId"][string] | undefined,
+  incoming: GitHubSlice["taskCIAutomation"]["byTaskId"][string],
+) {
+  if (!current) return true;
+  const currentUpdatedAt = Date.parse(current.updated_at ?? "");
+  const incomingUpdatedAt = Date.parse(incoming.updated_at ?? "");
+  if (!Number.isFinite(incomingUpdatedAt)) return false;
+  if (!Number.isFinite(currentUpdatedAt)) return true;
+  // Equal versions are intentionally first-writer-wins so replay order cannot
+  // make two payloads carrying the same version produce different state.
+  return incomingUpdatedAt > currentUpdatedAt;
+}
+
+type ImmerSet = Parameters<
+  StateCreator<GitHubSlice, [["zustand/immer", never]], [], GitHubSlice>
+>[0];
+
+function createGitHubStatusActions(
+  set: ImmerSet,
+): Pick<GitHubSlice, "setGitHubStatus" | "setGitHubStatusLoading" | "resetGitHubStatus"> {
+  return {
+    setGitHubStatus: (workspaceId, status) =>
+      set((draft) => {
+        const entry = draft.githubStatus.byWorkspaceId[workspaceId];
+        if (!entry) return;
+        let nextStatus = status;
+        const currentHealth = entry.status?.pr_discovery_health;
+        const pending = draft.githubStatus.pendingPRDiscoveryHealthByWorkspaceId[workspaceId];
+        if (nextStatus?.authenticated) {
+          let selectedHealth = nextStatus.pr_discovery_health;
+          if (
+            currentHealth &&
+            (!selectedHealth || !shouldApplyDiscoveryHealth(selectedHealth, currentHealth))
+          ) {
+            selectedHealth = currentHealth;
+          }
+          if (
+            pending &&
+            (!selectedHealth || shouldApplyDiscoveryHealth(pending.health, selectedHealth))
+          ) {
+            selectedHealth = pending.health;
+          }
+          if (selectedHealth) {
+            nextStatus = { ...nextStatus, pr_discovery_health: selectedHealth };
+          }
+        }
+        delete draft.githubStatus.pendingPRDiscoveryHealthByWorkspaceId[workspaceId];
+        entry.status = nextStatus;
+        entry.loaded = true;
+      }),
+    setGitHubStatusLoading: (workspaceId, loading) =>
+      set((draft) => {
+        const entry = draft.githubStatus.byWorkspaceId[workspaceId];
+        if (!entry) return;
+        entry.loading = loading;
+      }),
+    resetGitHubStatus: (workspaceId) =>
+      set((draft) => {
+        draft.githubStatus.byWorkspaceId[workspaceId] = {
+          status: null,
+          loaded: false,
+          loading: false,
+        };
+        delete draft.githubStatus.pendingPRDiscoveryHealthByWorkspaceId[workspaceId];
+      }),
+  };
+}
+
+function shouldApplyDiscoveryHealth(
+  incoming: GitHubPRDiscoveryHealth,
+  current: GitHubPRDiscoveryHealth | undefined,
+): boolean {
+  if (!current) return true;
+  const incomingEpoch = incoming.runtime_epoch ?? 0;
+  const currentEpoch = current.runtime_epoch ?? 0;
+  if (incomingEpoch !== currentEpoch) return incomingEpoch > currentEpoch;
+  if (incoming.credential_generation !== current.credential_generation) {
+    return incoming.credential_generation > current.credential_generation;
+  }
+  return incoming.revision > current.revision;
+}
+
+function createGitHubAppRegistrationActions(
+  set: ImmerSet,
+): Pick<
+  GitHubSlice,
+  "setGitHubAppRegistrations" | "setGitHubAppRegistrationsLoading" | "resetGitHubAppRegistrations"
+> {
+  return {
+    setGitHubAppRegistrations: (workspaceId, catalog, error = null) =>
+      set((draft) => {
+        const entry = draft.githubAppRegistrations.byWorkspaceId[workspaceId];
+        if (!entry) return;
+        entry.catalog = catalog;
+        entry.error = error;
+        entry.loaded = true;
+      }),
+    setGitHubAppRegistrationsLoading: (workspaceId, loading) =>
+      set((draft) => {
+        const entry = draft.githubAppRegistrations.byWorkspaceId[workspaceId];
+        if (!entry) return;
+        entry.loading = loading;
+      }),
+    resetGitHubAppRegistrations: (workspaceId) =>
+      set((draft) => {
+        draft.githubAppRegistrations.byWorkspaceId[workspaceId] = {
+          catalog: null,
+          loaded: false,
+          loading: false,
+          error: null,
+        };
+      }),
+  };
+}
+
+function clearPendingPrUrlForRepo(draft: GitHubSlice, taskId: string, repoKey: string) {
+  const pending = draft.pendingPrUrlByTaskId.byTaskId[taskId];
+  if (!pending) return;
+  delete pending[repoKey];
+  if (Object.keys(pending).length === 0) {
+    delete draft.pendingPrUrlByTaskId.byTaskId[taskId];
+  }
+}
+
+/** Clear client-only pending URLs for the repo that just synced (not sibling repos). */
+function clearPendingForTaskPR(
+  draft: GitHubSlice,
+  taskId: string,
+  pr: { repository_id?: string; pr_url?: string },
+) {
+  clearPendingPrUrlForRepo(draft, taskId, pr.repository_id ?? "");
+  clearPendingPrUrlForRepo(draft, taskId, "");
+  const pending = draft.pendingPrUrlByTaskId.byTaskId[taskId];
+  if (!pending || !pr.pr_url) return;
+  for (const key of Object.keys(pending)) {
+    if (pending[key] === pr.pr_url) clearPendingPrUrlForRepo(draft, taskId, key);
+  }
+}
+
+function applyTaskPRScope(draft: GitHubSlice, scope?: TaskPRScope): void {
+  if (!scope) return;
+  const changed =
+    draft.taskPRs.workspaceId !== scope.workspaceId ||
+    draft.taskPRs.workspaceContextGeneration !== scope.workspaceContextGeneration;
+  if (changed) {
+    draft.taskPRs.byTaskId = {};
+    draft.taskPRs.deletedAssociationIdsByTaskId = {};
+  }
+  draft.taskPRs.workspaceId = scope.workspaceId;
+  draft.taskPRs.workspaceContextGeneration = scope.workspaceContextGeneration;
+}
+
+function clearTaskPRDeletionTombstone(draft: GitHubSlice, taskId: string, associationId: string) {
+  const deletedByTask = draft.taskPRs.deletedAssociationIdsByTaskId;
+  if (!deletedByTask) return;
+  const deleted = deletedByTask[taskId];
+  if (!deleted) return;
+  delete deleted[associationId];
+  if (Object.keys(deleted).length === 0) {
+    delete deletedByTask[taskId];
+  }
+}
+
+function createTaskPRActions(
+  set: ImmerSet,
+): Pick<
+  GitHubSlice,
+  | "setTaskPRs"
+  | "removeTaskPR"
+  | "setTaskPR"
+  | "setPendingPrUrlForTask"
+  | "setTaskIssues"
+  | "upsertTaskIssue"
+> {
+  return {
+    setTaskPRs: (prs, scope) =>
+      set((draft) => {
+        applyTaskPRScope(draft, scope);
+        draft.taskPRs.byTaskId = prs;
+        draft.taskPRs.deletedAssociationIdsByTaskId = {};
+      }),
+    removeTaskPR: (taskId, associationId, scope) =>
+      set((draft) => {
+        applyTaskPRScope(draft, scope);
+        const deletedByTask = (draft.taskPRs.deletedAssociationIdsByTaskId ??= {});
+        const deleted = deletedByTask[taskId] ?? {};
+        deleted[associationId] = true;
+        deletedByTask[taskId] = deleted;
+        const current = draft.taskPRs.byTaskId[taskId];
+        if (!Array.isArray(current)) return;
+        const remaining = current.filter((pr) => pr.id !== associationId);
+        if (remaining.length === 0) delete draft.taskPRs.byTaskId[taskId];
+        else draft.taskPRs.byTaskId[taskId] = remaining;
+      }),
+    setTaskIssues: (workspaceId, issues) =>
+      set((draft) => {
+        draft.taskIssues.workspaceId = workspaceId;
+        draft.taskIssues.byTaskId = issues;
+      }),
+    upsertTaskIssue: (workspaceId, issue) =>
+      set((draft) => {
+        if (draft.taskIssues.workspaceId && draft.taskIssues.workspaceId !== workspaceId) return;
+        draft.taskIssues.workspaceId = workspaceId;
+        draft.taskIssues.byTaskId[issue.task_id] = issue;
+      }),
+    setTaskPR: (taskId, pr, scope) =>
+      set((draft) => {
+        applyTaskPRScope(draft, scope);
+        clearTaskPRDeletionTombstone(draft, taskId, pr.id);
+        // Upsert by (repository_id, pr_number) so multi-branch tasks can
+        // hold N PRs on the same repo as siblings. Keying on
+        // repository_id alone collapses every PR for that repo onto one
+        // slot — the second WS event silently overwrites the first and
+        // the UI shows only the most-recent PR. Legacy rows without a
+        // repository_id match on the empty key + pr_number, preserving
+        // prior single-PR semantics for single-repo tasks.
+        const current = draft.taskPRs.byTaskId[taskId];
+        const existing = Array.isArray(current) ? current : [];
+        const repoKey = pr.repository_id ?? "";
+        const idx = existing.findIndex(
+          (p) => (p.repository_id ?? "") === repoKey && p.pr_number === pr.pr_number,
+        );
+        if (idx >= 0) existing[idx] = pr;
+        else existing.push(pr);
+        draft.taskPRs.byTaskId[taskId] = existing;
+        clearPendingForTaskPR(draft, taskId, pr);
+      }),
+    setPendingPrUrlForTask: (taskId, repoKey, prUrl) =>
+      set((draft) => {
+        const trimmed = prUrl.trim();
+        if (!trimmed) {
+          clearPendingPrUrlForRepo(draft, taskId, repoKey);
+          return;
+        }
+        if (!draft.pendingPrUrlByTaskId.byTaskId[taskId]) {
+          draft.pendingPrUrlByTaskId.byTaskId[taskId] = {};
+        }
+        draft.pendingPrUrlByTaskId.byTaskId[taskId][repoKey] = trimmed;
+      }),
+  };
+}
+
+function createWatchActions(
+  set: ImmerSet,
+): Pick<
+  GitHubSlice,
+  | "setPRWatches"
+  | "setPRWatchesLoading"
+  | "removePRWatch"
+  | "setReviewWatches"
+  | "setReviewWatchesLoading"
+  | "addReviewWatch"
+  | "updateReviewWatch"
+  | "removeReviewWatch"
+  | "setIssueWatches"
+  | "setIssueWatchesLoading"
+  | "addIssueWatch"
+  | "updateIssueWatch"
+  | "removeIssueWatch"
+> {
+  return {
+    setPRWatches: (watches) =>
+      set((draft) => {
+        draft.prWatches.items = watches;
+        draft.prWatches.loaded = true;
+      }),
+    setPRWatchesLoading: (loading) =>
+      set((draft) => {
+        draft.prWatches.loading = loading;
+      }),
+    removePRWatch: (id) =>
+      set((draft) => {
+        draft.prWatches.items = draft.prWatches.items.filter((w) => w.id !== id);
+      }),
+    setReviewWatches: (watches) =>
+      set((draft) => {
+        draft.reviewWatches.items = watches;
+        draft.reviewWatches.loaded = true;
+      }),
+    setReviewWatchesLoading: (loading) =>
+      set((draft) => {
+        draft.reviewWatches.loading = loading;
+      }),
+    addReviewWatch: (watch) =>
+      set((draft) => {
+        draft.reviewWatches.items = [
+          ...draft.reviewWatches.items.filter((w) => w.id !== watch.id),
+          watch,
+        ];
+        draft.reviewWatches.loaded = true;
+      }),
+    updateReviewWatch: (watch) =>
+      set((draft) => {
+        const idx = draft.reviewWatches.items.findIndex((w) => w.id === watch.id);
+        if (idx >= 0) {
+          draft.reviewWatches.items[idx] = watch;
+        }
+      }),
+    removeReviewWatch: (id) =>
+      set((draft) => {
+        draft.reviewWatches.items = draft.reviewWatches.items.filter((w) => w.id !== id);
+      }),
+    setIssueWatches: (watches) =>
+      set((draft) => {
+        draft.issueWatches.items = watches;
+        draft.issueWatches.loaded = true;
+      }),
+    setIssueWatchesLoading: (loading) =>
+      set((draft) => {
+        draft.issueWatches.loading = loading;
+      }),
+    addIssueWatch: (watch) =>
+      set((draft) => {
+        draft.issueWatches.items = [
+          ...draft.issueWatches.items.filter((w) => w.id !== watch.id),
+          watch,
+        ];
+        draft.issueWatches.loaded = true;
+      }),
+    updateIssueWatch: (watch) =>
+      set((draft) => {
+        const idx = draft.issueWatches.items.findIndex((w) => w.id === watch.id);
+        if (idx >= 0) {
+          draft.issueWatches.items[idx] = watch;
+        }
+      }),
+    removeIssueWatch: (id) =>
+      set((draft) => {
+        draft.issueWatches.items = draft.issueWatches.items.filter((w) => w.id !== id);
+      }),
+  };
+}
+
+function createActionPresetActions(
+  set: ImmerSet,
+): Pick<GitHubSlice, "setActionPresets" | "setActionPresetsLoading"> {
+  return {
+    setActionPresets: (workspaceId, presets) =>
+      set((draft) => {
+        draft.actionPresets.byWorkspaceId[workspaceId] = presets;
+      }),
+    setActionPresetsLoading: (workspaceId, loading) =>
+      set((draft) => {
+        draft.actionPresets.loading[workspaceId] = loading;
+      }),
+  };
+}
+
+function createPRFeedbackCacheActions(
+  set: ImmerSet,
+): Pick<GitHubSlice, "setPRFeedbackCacheEntry" | "removePRFeedbackCacheEntry"> {
+  return {
+    setPRFeedbackCacheEntry: (key, feedback) =>
+      set((draft) => {
+        draft.prFeedbackCache.byKey[key] = { feedback, lastUpdatedAt: Date.now() };
+        // Bound cache size: drop the oldest entries when over the limit so a
+        // user opening many PRs doesn't grow the slice unboundedly.
+        const entries = Object.entries(draft.prFeedbackCache.byKey);
+        if (entries.length > PR_FEEDBACK_CACHE_LIMIT) {
+          entries.sort((a, b) => a[1].lastUpdatedAt - b[1].lastUpdatedAt);
+          const drop = entries.length - PR_FEEDBACK_CACHE_LIMIT;
+          for (let i = 0; i < drop; i++) {
+            delete draft.prFeedbackCache.byKey[entries[i][0]];
+          }
+        }
+      }),
+    removePRFeedbackCacheEntry: (key) =>
+      set((draft) => {
+        delete draft.prFeedbackCache.byKey[key];
+      }),
+  };
+}
+
+function createTaskCIAutomationActions(
+  set: ImmerSet,
+): Pick<
+  GitHubSlice,
+  | "setTaskCIAutomationOptions"
+  | "setTaskCIAutomationLoading"
+  | "setTaskCIAutomationSaving"
+  | "setTaskCIAutomationError"
+> {
+  return {
+    setTaskCIAutomationOptions: (taskId, options) =>
+      set((draft) => {
+        const current = draft.taskCIAutomation.byTaskId[taskId];
+        if (!shouldApplyTaskCIAutomationOptions(current, options)) return;
+        draft.taskCIAutomation.byTaskId[taskId] = options;
+      }),
+    setTaskCIAutomationLoading: (taskId, loading) =>
+      set((draft) => {
+        draft.taskCIAutomation.loading[taskId] = loading;
+      }),
+    setTaskCIAutomationSaving: (taskId, saving) =>
+      set((draft) => {
+        draft.taskCIAutomation.saving[taskId] = saving;
+      }),
+    setTaskCIAutomationError: (taskId, error) =>
+      set((draft) => {
+        draft.taskCIAutomation.errors[taskId] = error;
+      }),
+  };
+}
+
+function createRateLimitActions(
+  set: ImmerSet,
+): Pick<GitHubSlice, "applyGitHubRateLimitUpdate" | "applyGitHubPRDiscoveryHealthUpdate"> {
+  return {
+    applyGitHubRateLimitUpdate: (update) =>
+      set((draft) => {
+        for (const entry of Object.values(draft.githubStatus.byWorkspaceId)) {
+          const existing = entry.status;
+          if (!existing || existing.automation?.source !== "legacy_shared") continue;
+          const rateLimit = { ...(existing.rate_limit ?? {}) };
+          for (const snap of update.snapshots) {
+            rateLimit[snap.resource] = snap;
+          }
+          entry.status = { ...existing, rate_limit: rateLimit };
+        }
+      }),
+    applyGitHubPRDiscoveryHealthUpdate: (update: GitHubPRDiscoveryHealthUpdate) =>
+      set((draft) => {
+        if (!update?.workspace_id || !update.health) return;
+        const entry = draft.githubStatus.byWorkspaceId[update.workspace_id];
+        if (!entry?.status) {
+          const pending =
+            draft.githubStatus.pendingPRDiscoveryHealthByWorkspaceId[update.workspace_id];
+          if (!pending || shouldApplyDiscoveryHealth(update.health, pending.health)) {
+            draft.githubStatus.pendingPRDiscoveryHealthByWorkspaceId[update.workspace_id] = update;
+          }
+          return;
+        }
+        if (!shouldApplyDiscoveryHealth(update.health, entry.status.pr_discovery_health)) return;
+        entry.status = {
+          ...entry.status,
+          workspace_id: update.workspace_id,
+          pr_discovery_health: update.health,
+        };
+      }),
+  };
+}
+
+export const createGitHubSlice: StateCreator<
+  GitHubSlice,
+  [["zustand/immer", never]],
+  [],
+  GitHubSlice
+> = (set) => ({
+  ...defaultGitHubState,
+  ...createGitHubStatusActions(set),
+  ...createGitHubAppRegistrationActions(set),
+  ...createTaskPRActions(set),
+  ...createWatchActions(set),
+  ...createActionPresetActions(set),
+  ...createRateLimitActions(set),
+  ...createPRFeedbackCacheActions(set),
+  ...createTaskCIAutomationActions(set),
+});

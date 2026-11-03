@@ -1,0 +1,252 @@
+import { cn } from "@kandev/ui/lib/utils";
+import { Button } from "@kandev/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@kandev/ui/tooltip";
+import {
+  IconCopy,
+  IconTextWrap,
+  IconLayoutRows,
+  IconLayoutColumns,
+  IconPencil,
+  IconArrowBackUp,
+  IconFoldDown,
+  IconFold,
+} from "@tabler/icons-react";
+import type { FileDiffData } from "@/lib/diff/types";
+import type { ViewMode } from "@/hooks/use-global-view-mode";
+import { ExternalVcsFileLink } from "@/components/editors/external-vcs-file-link";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import { useTranslation } from "react-i18next";
+
+interface DiffViewerToolbarProps {
+  data: FileDiffData;
+  foldUnchanged: boolean;
+  setFoldUnchanged: (v: boolean) => void;
+  wordWrap: boolean;
+  setWordWrap: (v: boolean) => void;
+  globalViewMode: ViewMode;
+  setGlobalViewMode: (v: ViewMode) => void;
+  onCopyDiff: () => void;
+  onOpenFile?: (filePath: string) => void;
+  onRevert?: (filePath: string) => void;
+  sessionId?: string;
+  taskId?: string | null;
+  repositoryId?: string | null;
+  repositoryName?: string;
+  status?: string | null;
+  previousPath?: string | null;
+  publishedBranch?: string | null;
+  baseBranch?: string | null;
+}
+
+const iconBtn = "h-6 w-6 p-0 cursor-pointer opacity-60 hover:opacity-100";
+
+type DiffViewerActionsProps = Omit<DiffViewerToolbarProps, "data"> & { filePath: string };
+
+function DiffViewerToggleButtons({
+  foldUnchanged,
+  setFoldUnchanged,
+  wordWrap,
+  setWordWrap,
+  globalViewMode,
+  setGlobalViewMode,
+}: Pick<
+  DiffViewerActionsProps,
+  | "foldUnchanged"
+  | "setFoldUnchanged"
+  | "wordWrap"
+  | "setWordWrap"
+  | "globalViewMode"
+  | "setGlobalViewMode"
+>) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={cn(iconBtn, foldUnchanged && "opacity-100 bg-muted")}
+            onClick={() => setFoldUnchanged(!foldUnchanged)}
+          >
+            {foldUnchanged ? (
+              <IconFoldDown className="h-3.5 w-3.5" />
+            ) : (
+              <IconFold className="h-3.5 w-3.5" />
+            )}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {foldUnchanged ? t("editors:showAllLines") : t("editors:foldUnchangedLines")}
+        </TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={cn(iconBtn, wordWrap && "opacity-100 bg-muted")}
+            onClick={() => setWordWrap(!wordWrap)}
+          >
+            <IconTextWrap className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("editors:toggleWordWrap")}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={cn(iconBtn)}
+            onClick={() => setGlobalViewMode(globalViewMode === "split" ? "unified" : "split")}
+          >
+            {globalViewMode === "split" ? (
+              <IconLayoutRows className="h-3.5 w-3.5" />
+            ) : (
+              <IconLayoutColumns className="h-3.5 w-3.5" />
+            )}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {globalViewMode === "split"
+            ? t("editors:switchToUnifiedView")
+            : t("editors:switchToSplitView")}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  );
+}
+
+function DiffViewerActions({
+  filePath,
+  foldUnchanged,
+  setFoldUnchanged,
+  wordWrap,
+  setWordWrap,
+  globalViewMode,
+  setGlobalViewMode,
+  onCopyDiff,
+  onOpenFile,
+  onRevert,
+  sessionId,
+  taskId,
+  repositoryId,
+  repositoryName,
+  status,
+  previousPath,
+  publishedBranch,
+  baseBranch,
+}: DiffViewerActionsProps) {
+  const { t } = useTranslation();
+  const { isMobile } = useResponsiveBreakpoint();
+  return (
+    <div className="flex items-center gap-1">
+      <ExternalVcsFileLink
+        filePath={filePath}
+        previousPath={previousPath}
+        status={status}
+        taskId={taskId}
+        sessionId={sessionId}
+        repositoryId={repositoryId}
+        repositoryName={repositoryName}
+        publishedBranch={publishedBranch}
+        baseBranch={baseBranch}
+        size={isMobile ? "touch" : "xs"}
+      />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button variant="ghost" size="sm" className={iconBtn} onClick={onCopyDiff}>
+            <IconCopy className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("editors:copyDiff")}</TooltipContent>
+      </Tooltip>
+      <DiffViewerToggleButtons
+        foldUnchanged={foldUnchanged}
+        setFoldUnchanged={setFoldUnchanged}
+        wordWrap={wordWrap}
+        setWordWrap={setWordWrap}
+        globalViewMode={globalViewMode}
+        setGlobalViewMode={setGlobalViewMode}
+      />
+      {onRevert && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={iconBtn}
+              onClick={() => onRevert(filePath)}
+            >
+              <IconArrowBackUp className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{t("editors:revertChanges")}</TooltipContent>
+        </Tooltip>
+      )}
+      {onOpenFile && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={iconBtn}
+              onClick={() => onOpenFile(filePath)}
+            >
+              <IconPencil className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{t("common:edit")}</TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  );
+}
+
+export function DiffViewerToolbar({
+  data,
+  foldUnchanged,
+  setFoldUnchanged,
+  wordWrap,
+  setWordWrap,
+  globalViewMode,
+  setGlobalViewMode,
+  onCopyDiff,
+  onOpenFile,
+  onRevert,
+  sessionId,
+  taskId,
+  repositoryId,
+  repositoryName,
+  status,
+  previousPath,
+  publishedBranch,
+  baseBranch,
+}: DiffViewerToolbarProps) {
+  return (
+    <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 bg-card/50 rounded-t-md text-xs text-muted-foreground">
+      <span className="font-mono truncate">{data.filePath}</span>
+      <DiffViewerActions
+        filePath={data.filePath}
+        foldUnchanged={foldUnchanged}
+        setFoldUnchanged={setFoldUnchanged}
+        wordWrap={wordWrap}
+        setWordWrap={setWordWrap}
+        globalViewMode={globalViewMode}
+        setGlobalViewMode={setGlobalViewMode}
+        onCopyDiff={onCopyDiff}
+        onOpenFile={onOpenFile}
+        onRevert={onRevert}
+        sessionId={sessionId}
+        taskId={taskId}
+        repositoryId={repositoryId}
+        repositoryName={repositoryName}
+        status={status}
+        previousPath={previousPath}
+        publishedBranch={publishedBranch}
+        baseBranch={baseBranch}
+      />
+    </div>
+  );
+}

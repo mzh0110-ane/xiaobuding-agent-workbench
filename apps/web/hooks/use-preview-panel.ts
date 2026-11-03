@@ -1,0 +1,315 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getSessionProcess, listSessionProcesses, startProcess, stopProcess } from "@/lib/api";
+import { useAppStore } from "@/components/state-provider";
+import { useLayoutStore } from "@/lib/state/layout-store";
+import type { ProcessInfo } from "@/lib/types/http";
+import type { ProcessStatusEntry } from "@/lib/state/store";
+import { toProcessStatusEntry } from "@/lib/state/process-status";
+import type { PreviewStage, PreviewViewMode } from "@/lib/state/slices";
+import { getLocalStorage } from "@/lib/local-storage";
+import { detectPreviewUrlFromOutput, rewritePreviewUrlForProxy } from "@/lib/preview-url-detector";
+
+type UsePreviewPanelParams = {
+  sessionId: string | null;
+  hasDevScript?: boolean;
+};
+
+function sortProcesses(processes: ProcessInfo[]): ProcessInfo[] {
+  return processes.slice().sort((a, b) => {
+    if (a.kind === "dev" && b.kind !== "dev") return -1;
+    if (a.kind !== "dev" && b.kind === "dev") return 1;
+    return 0;
+  });
+}
+
+function useProcessLoader(
+  sessionId: string | null,
+  upsertProcessStatus: (s: ProcessStatusEntry) => void,
+) {
+  const [hasInitialized, setHasInitialized] = useState(false);
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    listSessionProcesses(sessionId)
+      .then((processes) => {
+        if (cancelled) return;
+        sortProcesses(processes).forEach((proc) => {
+          upsertProcessStatus(toProcessStatusEntry(proc));
+        });
+        setHasInitialized(true);
+      })
+      .catch(() => {
+        setHasInitialized(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, upsertProcessStatus]);
+  return hasInitialized;
+}
+
+function useDevOutputLoader(
+  sessionId: string | null,
+  devProcessId: string | undefined,
+  clearProcessOutput: (id: string) => void,
+  appendProcessOutput: (id: string, data: string) => void,
+) {
+  useEffect(() => {
+    if (!sessionId || !devProcessId) return;
+    let cancelled = false;
+    getSessionProcess(sessionId, devProcessId, true)
+      .then((proc) => {
+        if (cancelled) return;
+        clearProcessOutput(devProcessId);
+        if (proc.command) appendProcessOutput(devProcessId, `${proc.command}\n\n`);
+        proc.output?.forEach((chunk) => {
+          appendProcessOutput(devProcessId, chunk.data);
+        });
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, devProcessId, clearProcessOutput, appendProcessOutput]);
+}
+
+function resolveRestoreView(sessionId: string): "output" | "preview" {
+  const stored = getLocalStorage(`preview-view:${sessionId}`, null as string | null);
+  return stored === "output" || stored === "preview" ? stored : "output";
+}
+
+function usePreviewStore(sessionId: string | null) {
+  const previewOpen = useAppStore((s) =>
+    sessionId ? (s.previewPanel.openBySessionId[sessionId] ?? false) : false,
+  );
+  const previewStage = useAppStore((s) =>
+    sessionId ? (s.previewPanel.stageBySessionId[sessionId] ?? "closed") : "closed",
+  );
+  const previewUrl = useAppStore((s) =>
+    sessionId ? (s.previewPanel.urlBySessionId[sessionId] ?? "") : "",
+  );
+  const previewUrlDraft = useAppStore((s) =>
+    sessionId ? (s.previewPanel.urlDraftBySessionId[sessionId] ?? "") : "",
+  );
+  const setPreviewOpen = useAppStore((s) => s.setPreviewOpen);
+  const setPreviewStage = useAppStore((s) => s.setPreviewStage);
+  const setPreviewView = useAppStore((s) => s.setPreviewView);
+  const setPreviewUrl = useAppStore((s) => s.setPreviewUrl);
+  const setPreviewUrlDraft = useAppStore((s) => s.setPreviewUrlDraft);
+  return {
+    previewOpen,
+    previewStage,
+    previewUrl,
+    previewUrlDraft,
+    setPreviewOpen,
+    setPreviewStage,
+    setPreviewView,
+    setPreviewUrl,
+    setPreviewUrlDraft,
+  };
+}
+
+type PreviewRestoreOptions = {
+  sessionId: string | null;
+  hasDevScript: boolean;
+  hasInitialized: boolean;
+  layoutState: { preview?: boolean } | null;
+  devProcessId: string | undefined;
+  devProcess: { status: string; processId: string } | null;
+  previewOpen: boolean;
+  previewStage: PreviewStage;
+  setPreviewOpen: (sid: string, open: boolean) => void;
+  setPreviewView: (sid: string, view: PreviewViewMode) => void;
+  setPreviewStage: (sid: string, stage: PreviewStage) => void;
+  upsertProcessStatus: (s: ReturnType<typeof toProcessStatusEntry>) => void;
+  setActiveProcess: (sessionId: string, processId: string) => void;
+};
+
+function usePreviewStateRestore({
+  sessionId,
+  hasDevScript,
+  hasInitialized,
+  layoutState,
+  devProcessId,
+  devProcess,
+  previewOpen,
+  previewStage,
+  setPreviewOpen,
+  setPreviewView,
+  setPreviewStage,
+  upsertProcessStatus,
+  setActiveProcess,
+}: PreviewRestoreOptions) {
+  const hasRestoredRef = useRef(false);
+  const isStartingRef = useRef(false);
+
+  const restoreRunningPreview = useCallback(
+    (sid: string, view: "output" | "preview") => {
+      if (!previewOpen) setPreviewOpen(sid, true);
+      setPreviewView(sid, view);
+      if (previewStage === "closed") setPreviewStage(sid, "preview");
+      hasRestoredRef.current = true;
+    },
+    [previewOpen, previewStage, setPreviewOpen, setPreviewView, setPreviewStage],
+  );
+
+  const startDevAndRestore = useCallback(
+    (sid: string, view: "output" | "preview") => {
+      isStartingRef.current = true;
+      setPreviewOpen(sid, true);
+      setPreviewView(sid, view);
+      setPreviewStage(sid, "preview");
+      startProcess(sid, { kind: "dev" })
+        .then((resp) => {
+          if (!resp?.process) return;
+          const p = resp.process;
+          const status = toProcessStatusEntry(p);
+          upsertProcessStatus(status);
+          setActiveProcess(status.sessionId, status.processId);
+        })
+        .finally(() => {
+          isStartingRef.current = false;
+          hasRestoredRef.current = true;
+        });
+    },
+    [setPreviewOpen, setPreviewView, setPreviewStage, upsertProcessStatus, setActiveProcess],
+  );
+
+  useEffect(() => {
+    if (!sessionId || !hasInitialized || hasRestoredRef.current || isStartingRef.current) return;
+    if (!layoutState?.preview) {
+      hasRestoredRef.current = true;
+      return;
+    }
+    const restoredView = resolveRestoreView(sessionId);
+    const isDevRunning = devProcess?.status === "running" || devProcess?.status === "starting";
+    if (devProcessId !== undefined && isDevRunning) {
+      restoreRunningPreview(sessionId, restoredView);
+    } else if (devProcessId === undefined && hasDevScript) {
+      startDevAndRestore(sessionId, restoredView);
+    } else {
+      setPreviewView(sessionId, restoredView);
+      hasRestoredRef.current = true;
+    }
+  }, [
+    sessionId,
+    hasInitialized,
+    layoutState,
+    devProcessId,
+    devProcess,
+    hasDevScript,
+    restoreRunningPreview,
+    startDevAndRestore,
+    setPreviewView,
+  ]);
+}
+
+function usePreviewPanelStore(sessionId: string | null) {
+  const processState = useAppStore((state) => state.processes);
+  const upsertProcessStatus = useAppStore((state) => state.upsertProcessStatus);
+  const appendProcessOutput = useAppStore((state) => state.appendProcessOutput);
+  const clearProcessOutput = useAppStore((state) => state.clearProcessOutput);
+  const setActiveProcess = useAppStore((state) => state.setActiveProcess);
+  const applyLayoutPreset = useLayoutStore((state) => state.applyPreset);
+  const layoutState = useLayoutStore((state) =>
+    sessionId ? state.columnsBySessionId[sessionId] : null,
+  );
+  const previewStore = usePreviewStore(sessionId);
+  const devProcessId = useMemo(
+    () => (sessionId ? processState.devProcessBySessionId[sessionId] : undefined),
+    [processState.devProcessBySessionId, sessionId],
+  );
+  const devProcess = devProcessId ? (processState.processesById[devProcessId] ?? null) : null;
+  const devOutput = devProcessId ? (processState.outputsByProcessId[devProcessId] ?? "") : "";
+  const rawDetectedUrl = useMemo(() => detectPreviewUrlFromOutput(devOutput), [devOutput]);
+  const detectedUrl = useMemo(
+    () =>
+      rawDetectedUrl && sessionId ? rewritePreviewUrlForProxy(rawDetectedUrl, sessionId) : null,
+    [rawDetectedUrl, sessionId],
+  );
+  return {
+    ...previewStore,
+    processState,
+    upsertProcessStatus,
+    appendProcessOutput,
+    clearProcessOutput,
+    setActiveProcess,
+    applyLayoutPreset,
+    layoutState,
+    devProcessId,
+    devProcess,
+    devOutput,
+    detectedUrl,
+  };
+}
+
+export function usePreviewPanel({ sessionId, hasDevScript = false }: UsePreviewPanelParams) {
+  const [isStopping, setIsStopping] = useState(false);
+  const s = usePreviewPanelStore(sessionId);
+
+  const hasInitialized = useProcessLoader(sessionId, s.upsertProcessStatus);
+  useDevOutputLoader(sessionId, s.devProcessId, s.clearProcessOutput, s.appendProcessOutput);
+
+  useEffect(() => {
+    if (!sessionId || !s.previewOpen || s.previewStage !== "logs" || !s.detectedUrl) return;
+    s.setPreviewUrl(sessionId, s.detectedUrl);
+    s.setPreviewUrlDraft(sessionId, s.detectedUrl);
+    s.setPreviewView(sessionId, "preview");
+    s.setPreviewStage(sessionId, "preview");
+    s.applyLayoutPreset(sessionId, "preview");
+  }, [sessionId, s]);
+
+  usePreviewStateRestore({
+    sessionId,
+    hasDevScript,
+    hasInitialized,
+    layoutState: s.layoutState,
+    devProcessId: s.devProcessId,
+    devProcess: s.devProcess,
+    previewOpen: s.previewOpen,
+    previewStage: s.previewStage,
+    setPreviewOpen: s.setPreviewOpen,
+    setPreviewView: s.setPreviewView,
+    setPreviewStage: s.setPreviewStage,
+    upsertProcessStatus: s.upsertProcessStatus,
+    setActiveProcess: s.setActiveProcess,
+  });
+
+  useEffect(() => {
+    if (!sessionId || !s.detectedUrl) return;
+    if (!s.previewOpen && s.previewStage === "closed") return;
+    if (!s.previewOpen) s.setPreviewOpen(sessionId, true);
+    if (!s.previewUrl) {
+      s.setPreviewUrl(sessionId, s.detectedUrl);
+      s.setPreviewUrlDraft(sessionId, s.detectedUrl);
+    }
+  }, [sessionId, s]);
+
+  const handleStop = async () => {
+    if (!sessionId || !s.devProcess) return;
+    setIsStopping(true);
+    try {
+      await stopProcess(sessionId, { process_id: s.devProcess.processId });
+    } finally {
+      setIsStopping(false);
+    }
+  };
+
+  const isRunning = s.devProcess?.status === "running" || s.devProcess?.status === "starting";
+
+  return {
+    previewStage: s.previewStage,
+    previewUrl: s.previewUrl,
+    previewUrlDraft: s.previewUrlDraft,
+    setPreviewUrl: s.setPreviewUrl,
+    setPreviewUrlDraft: s.setPreviewUrlDraft,
+    detectedUrl: s.detectedUrl,
+    isRunning,
+    isStopping,
+    handleStop,
+  };
+}

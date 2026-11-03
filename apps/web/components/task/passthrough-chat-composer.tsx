@@ -1,0 +1,383 @@
+"use client";
+
+import { sanitizeSessionErrorDetails } from "@/lib/session-error-details";
+import { useCallback, type RefObject } from "react";
+import { useToast } from "@/components/toast-provider";
+import { useAppStoreApi } from "@/components/state-provider";
+import { useCommentsStore } from "@/lib/state/slices/comments/comments-store";
+import { formatReviewCommentsAsMarkdown } from "@/lib/state/slices/comments/format";
+import { buildSubmitMessage } from "./chat/chat-input-area";
+import {
+  ChatInputContainer,
+  type ChatInputContainerHandle,
+  type ChatSubmitPayload,
+  type MessageAttachment,
+} from "./chat/chat-input-container";
+import type { useChatPanelState } from "./chat/use-chat-panel-state";
+import type { ReviewComment } from "@/lib/state/slices/comments";
+import type { AgentMessageComment } from "@/lib/state/slices/comments";
+import type { ContextFile } from "@/lib/state/context-files-store";
+import type { TaskMentionData } from "@/hooks/use-inline-mention";
+import {
+  buildContextFilesContext,
+  buildTaskMentionsContext,
+  sendMessageRequest,
+} from "@/hooks/use-message-handler";
+import { getTaskPlan } from "@/lib/api/domains/plan-api";
+import type { AppState } from "@/lib/state/store";
+import { useComposerWorkspace } from "@/hooks/domains/task/use-composer-workspace";
+import { useTranslation } from "react-i18next";
+import { planCommentAdmissionConflict, toTaskPlanCommentRefs } from "@/lib/plan-comment-refs";
+import type { TaskPlanCommentRef } from "@/lib/types/http";
+import { isMessageSendError, MessageSendError } from "@/lib/chat/message-send-error";
+import { t as translate } from "@/lib/i18n";
+import { PlanCommentMigrationNotice } from "@/components/task/plan-comment-migration-notice";
+import { PreviewFeedbackCollectionSurface } from "@/components/task/inspector/preview-feedback-collection";
+
+const PLAN_CONTEXT_PATH = "plan:context";
+
+export type PassthroughSubmitHandler = (payload: ChatSubmitPayload) => Promise<void>;
+
+export function PassthroughComposerPanel({
+  refHandle,
+  onSubmit,
+  onCancel,
+  panelState,
+  taskId,
+  isMoving,
+  isSending,
+  onImplementPlan,
+}: {
+  refHandle: RefObject<ChatInputContainerHandle | null>;
+  onSubmit: PassthroughSubmitHandler;
+  onCancel: () => void;
+  panelState: ReturnType<typeof useChatPanelState>;
+  taskId: string | null;
+  isMoving: boolean;
+  isSending: boolean;
+  onImplementPlan?: (fresh: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const hasContextComments =
+    panelState.planComments.length > 0 ||
+    panelState.pendingPRFeedback.length > 0 ||
+    panelState.walkthroughComments.length > 0 ||
+    panelState.messageComments.length > 0;
+  const composerWorkspace = useComposerWorkspace(panelState.resolvedSessionId, taskId);
+  return (
+    <div
+      data-testid="passthrough-composer"
+      onKeyDownCapture={(event) => {
+        if (event.key === "Escape") onCancel();
+      }}
+    >
+      <PlanCommentMigrationNotice {...panelState.planCommentMigration} />
+      {panelState.previewFeedbackState && (
+        <PreviewFeedbackCollectionSurface
+          taskId={taskId}
+          collection={panelState.previewFeedbackState}
+          open={panelState.previewFeedbackOpen ?? false}
+          onOpenChange={panelState.setPreviewFeedbackOpen ?? (() => undefined)}
+          showTrigger={Boolean(
+            panelState.previewFeedback.length > 0 &&
+            (!panelState.resolvedSessionId || panelState.isCompleted),
+          )}
+        />
+      )}
+      <ChatInputContainer
+        ref={refHandle}
+        onSubmit={onSubmit}
+        sessionId={panelState.resolvedSessionId}
+        taskId={taskId}
+        workspaceId={composerWorkspace.workspaceId}
+        workspaceResolutionFailed={composerWorkspace.status === "failed"}
+        onRetryWorkspaceResolution={composerWorkspace.retry}
+        entityReferencesEnabled={false}
+        taskTitle={panelState.task?.title}
+        taskDescription={panelState.taskDescription ?? ""}
+        planModeEnabled={panelState.planModeEnabled}
+        planModeAvailable={panelState.planModeAvailable}
+        mcpServers={panelState.mcpServers}
+        mcpAttachmentHistory={panelState.mcpAttachmentHistory}
+        onPlanModeChange={panelState.handlePlanModeChange}
+        isAgentBusy={false}
+        isWorking={panelState.isWorking}
+        showCancelAgent={false}
+        isCompleted={panelState.isCompleted}
+        isStarting={panelState.isStarting}
+        isPreparingEnvironment={panelState.isPreparingEnvironment}
+        isMoving={isMoving}
+        isSending={isSending}
+        onCancel={onCancel}
+        placeholder={t("task:typeAMessageMentionFilesOr")}
+        pendingCommentsByFile={panelState.pendingCommentsByFile}
+        hasContextComments={hasContextComments}
+        submitKey={panelState.chatSubmitKey}
+        hasAgentCommands={false}
+        contextItems={panelState.contextItems}
+        planContextEnabled={panelState.planContextEnabled}
+        contextFiles={panelState.contextFiles}
+        onToggleContextFile={panelState.handleToggleContextFile}
+        onAddContextFile={panelState.handleAddContextFile}
+        onImplementPlan={onImplementPlan}
+        hideSessionsDropdown
+        hideAgentControls
+      />
+    </div>
+  );
+}
+
+type PassthroughFinalMessage = {
+  content: string;
+  commentsToSend: Array<ReviewComment | AgentMessageComment>;
+  contextFilesMeta?: Array<{ path: string; name: string }>;
+  planCommentRefs: TaskPlanCommentRef[];
+};
+
+export function formatPassthroughBaseMessage(
+  content: string,
+  reviewComments: ReviewComment[] | undefined,
+  pendingComments: ReviewComment[],
+  panelState: ReturnType<typeof useChatPanelState>,
+) {
+  const commentsToSend = reviewComments ?? pendingComments;
+  const messageComments = panelState.messageComments;
+  const hasStructuredComments =
+    !!reviewComments ||
+    panelState.pendingPRFeedback.length > 0 ||
+    panelState.planComments.length > 0 ||
+    panelState.walkthroughComments.length > 0 ||
+    messageComments.length > 0;
+  if (hasStructuredComments) {
+    return {
+      formatted: buildSubmitMessage({
+        message: content,
+        reviewComments: commentsToSend.length > 0 ? commentsToSend : undefined,
+        pendingPRFeedback: panelState.pendingPRFeedback,
+        planComments: panelState.planComments,
+        walkthroughComments: panelState.walkthroughComments,
+        messageComments,
+      }),
+      commentsToSend: [...commentsToSend, ...messageComments],
+    };
+  }
+  if (pendingComments.length > 0) {
+    return {
+      formatted: formatReviewCommentsAsMarkdown(pendingComments) + content,
+      commentsToSend,
+    };
+  }
+  return { formatted: content, commentsToSend };
+}
+
+function hasPlanContext(files: ContextFile[]) {
+  return files.some((file) => file.path === PLAN_CONTEXT_PATH);
+}
+
+function stripSelectedPlanMentions(content: string, files: ContextFile[]) {
+  if (!hasPlanContext(files)) return content;
+  return content.replace(/\s*@Plan(?=\s|$)/g, "").trim();
+}
+
+function sanitizeSystemBlockContent(content: string) {
+  return content.replace(/<\/kandev-system>/gi, "</ kandev-system>");
+}
+
+export function buildPassthroughPlanContext(planContent: string | undefined | null) {
+  const trimmed = planContent?.trim();
+  if (!trimmed) return "";
+  return (
+    `\n\n<kandev-system>\n` +
+    `CONTEXT PLAN: The user has attached the current task plan as context. ` +
+    `Use this plan content to understand what they mean by the plan:\n` +
+    `${sanitizeSystemBlockContent(trimmed)}\n` +
+    `</kandev-system>`
+  );
+}
+
+function cachedTaskPlanContent(taskId: string, state: AppState) {
+  return state.taskPlans.byTaskId[taskId]?.content;
+}
+
+async function loadTaskPlanContent(taskId: string | null, getState: () => AppState) {
+  if (!taskId) return "";
+  const cached = cachedTaskPlanContent(taskId, getState());
+  if (cached !== undefined) return cached;
+  const plan = await getTaskPlan(taskId);
+  return plan?.content ?? "";
+}
+
+export async function buildPassthroughFinalMessage({
+  taskId,
+  content,
+  reviewComments,
+  pendingComments,
+  panelState,
+  inlineMentions,
+  inlineTaskMentions,
+  getState,
+}: {
+  taskId: string | null;
+  content: string;
+  reviewComments?: ReviewComment[];
+  pendingComments: ReviewComment[];
+  panelState: ReturnType<typeof useChatPanelState>;
+  inlineMentions?: ContextFile[];
+  inlineTaskMentions?: TaskMentionData[];
+  getState: ReturnType<typeof useAppStoreApi>["getState"];
+}): Promise<PassthroughFinalMessage> {
+  const { formatted, commentsToSend } = formatPassthroughBaseMessage(
+    content,
+    reviewComments,
+    pendingComments,
+    panelState,
+  );
+  const allContextFiles = [...panelState.contextFiles, ...(inlineMentions ?? [])];
+  const visibleContent = stripSelectedPlanMentions(formatted, allContextFiles);
+  const contextFilesContext = buildContextFilesContext(allContextFiles, panelState.prompts);
+  const planContext = hasPlanContext(allContextFiles)
+    ? buildPassthroughPlanContext(await loadTaskPlanContent(taskId, getState))
+    : "";
+  const taskMentionsContext =
+    inlineTaskMentions && inlineTaskMentions.length > 0
+      ? buildTaskMentionsContext(inlineTaskMentions, getState())
+      : "";
+  return {
+    content: visibleContent + contextFilesContext + planContext + taskMentionsContext,
+    commentsToSend,
+    contextFilesMeta: buildContextFilesMeta(allContextFiles),
+    planCommentRefs: toTaskPlanCommentRefs(panelState.planComments),
+  };
+}
+
+export function buildContextFilesMeta(files: ContextFile[]) {
+  const realContextFiles = files.filter(
+    (f) => !f.path.startsWith("prompt:") && f.path !== PLAN_CONTEXT_PATH,
+  );
+  if (realContextFiles.length === 0) return undefined;
+  return realContextFiles.map((f) => ({ path: f.path, name: f.name }));
+}
+
+async function requestPassthroughMessage({
+  taskId,
+  sessionId,
+  message,
+  attachments,
+}: {
+  taskId: string;
+  sessionId: string;
+  message: PassthroughFinalMessage;
+  attachments?: MessageAttachment[];
+}) {
+  await sendMessageRequest({
+    taskId,
+    resolvedSessionId: sessionId,
+    finalMessage: message.content,
+    modelToSend: undefined,
+    planMode: false,
+    attachments,
+    contextFilesMeta: message.contextFilesMeta,
+    planCommentRefs: message.planCommentRefs,
+  });
+}
+
+export function clearPassthroughComposerContext(panelState: ReturnType<typeof useChatPanelState>) {
+  if (panelState.pendingPRFeedback.length > 0) {
+    panelState.handleClearPRFeedback();
+  }
+  if (panelState.walkthroughComments.length > 0) {
+    panelState.handleClearWalkthroughComments();
+  }
+  if (panelState.messageComments.length > 0) {
+    panelState.handleClearMessageComments();
+  }
+  if (!panelState.resolvedSessionId) return;
+  panelState.clearEphemeral(panelState.resolvedSessionId);
+  if (panelState.planModeEnabled) {
+    panelState.addContextFile(panelState.resolvedSessionId, {
+      path: "plan:context",
+      name: "Plan",
+    });
+  }
+}
+
+export function assertPlanCommentMigrationReady(panelState: ReturnType<typeof useChatPanelState>) {
+  if (!panelState.planCommentMigration?.isBlocking) return;
+  throw new MessageSendError(
+    "plan-comment-migration-pending",
+    translate("task:planCommentMigrationPending"),
+  );
+}
+
+export function useSendPassthroughMessage({
+  taskId,
+  sessionId,
+  pendingComments,
+  panelState,
+  onSent,
+}: {
+  taskId: string | null;
+  sessionId: string | null | undefined;
+  pendingComments: ReviewComment[];
+  panelState: ReturnType<typeof useChatPanelState>;
+  onSent: () => void;
+}) {
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const markCommentsSent = useCommentsStore((s) => s.markCommentsSent);
+  const storeApi = useAppStoreApi();
+
+  return useCallback(
+    async ({
+      message: content,
+      reviewComments,
+      attachments,
+      inlineMentions,
+      inlineTaskMentions,
+    }: ChatSubmitPayload) => {
+      if (!taskId || !sessionId) {
+        toast({ title: t("task:sessionNotReady"), variant: "error" });
+        throw new Error(t("task:sessionNotReady"));
+      }
+      try {
+        assertPlanCommentMigrationReady(panelState);
+        const message = await buildPassthroughFinalMessage({
+          taskId,
+          content,
+          reviewComments,
+          pendingComments,
+          panelState,
+          inlineMentions,
+          inlineTaskMentions,
+          getState: storeApi.getState,
+        });
+        await requestPassthroughMessage({ taskId, sessionId, message, attachments });
+        if (message.commentsToSend.length > 0) {
+          markCommentsSent(message.commentsToSend.map((c) => c.id));
+        }
+        clearPassthroughComposerContext(panelState);
+        onSent();
+      } catch (error) {
+        const conflict = planCommentAdmissionConflict(error);
+        if (conflict?.snapshot) {
+          storeApi.getState().setTaskPlanComments(taskId, conflict.snapshot);
+        }
+        console.error("Failed to send passthrough message:", sanitizeSessionErrorDetails(error));
+        let title = t("task:failedToSendMessage");
+        if (isMessageSendError(error)) title = t("task:messageNotSent");
+        else if (conflict?.code === "plan_comments_changed") {
+          title = t("task:planCommentsChangedRetry");
+        }
+        toast({
+          title,
+          ...(isMessageSendError(error)
+            ? { description: sanitizeSessionErrorDetails(error, 240) }
+            : {}),
+          variant: "error",
+        });
+        throw error;
+      }
+    },
+    [taskId, sessionId, toast, pendingComments, panelState, storeApi, markCommentsSent, onSent],
+  );
+}

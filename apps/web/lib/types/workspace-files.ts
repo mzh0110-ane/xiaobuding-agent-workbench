@@ -1,0 +1,101 @@
+export type FileTreeNode = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number;
+  is_symlink?: boolean;
+  children?: FileTreeNode[];
+};
+
+export type FileTreeResponse = {
+  request_id?: string;
+  root: FileTreeNode;
+  error?: string;
+};
+
+export type FileContentResponse = {
+  request_id?: string;
+  path: string;
+  content: string;
+  size: number;
+  is_binary?: boolean;
+  resolved_path?: string;
+  error?: string;
+};
+
+export type FileSearchResult = {
+  repository_name?: string;
+  /** Task-root-relative path accepted by the workspace file APIs. */
+  path: string;
+};
+
+export type FileSearchResponse = {
+  files: string[];
+  /** Structured results for repository-aware consumers. */
+  results?: FileSearchResult[];
+  error?: string;
+};
+
+export type ContentSearchMatchRange = {
+  /** Inclusive UTF-16 offset into `preview`. */
+  start: number;
+  /** Exclusive UTF-16 offset into `preview`. */
+  end: number;
+};
+
+export type WorkspaceContentSearchResult = {
+  repository_name: string;
+  path: string;
+  line: number;
+  column: number;
+  preview: string;
+  match_ranges: ContentSearchMatchRange[];
+};
+
+export type WorkspaceContentSearchResponse = {
+  results: WorkspaceContentSearchResult[];
+  error?: string;
+};
+
+export type FileChangeEvent = {
+  timestamp: string;
+  path: string;
+  operation: "create" | "write" | "remove" | "rename" | "chmod" | "refresh";
+  session_id: string;
+  task_id: string;
+  agent_id: string;
+  // Set for multi-repo task roots so the frontend can scope refreshes to the right repo branch.
+  repository_name?: string;
+};
+
+export type FileChangeNotificationPayload = {
+  session_id: string;
+  changes: FileChangeEvent[];
+};
+
+export type OpenFileTab = {
+  resolvedPath?: string;
+  path: string;
+  name: string;
+  repo?: string;
+  content: string;
+  originalContent: string;
+  originalHash: string;
+  isDirty: boolean;
+  isBinary?: boolean;
+  renderedPreview?: boolean;
+};
+
+export const FILE_EXTENSION_COLORS: Record<string, string> = {
+  ts: "bg-blue-500",
+  tsx: "bg-blue-400",
+  js: "bg-yellow-500",
+  jsx: "bg-yellow-400",
+  go: "bg-cyan-500",
+  py: "bg-green-500",
+  rs: "bg-orange-500",
+  json: "bg-amber-400",
+  css: "bg-purple-500",
+  html: "bg-red-500",
+  md: "bg-gray-400",
+};

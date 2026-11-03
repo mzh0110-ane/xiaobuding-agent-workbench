@@ -1,0 +1,241 @@
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ReviewFile } from "./types";
+
+const mocks = vi.hoisted(() => ({ isMobile: false }));
+
+vi.mock("./review-diff-toolbar", () => ({
+  FileDiffToolbar: (props: Record<string, unknown>) => (
+    <span data-testid="review-toolbar-props" data-props={JSON.stringify(props)} />
+  ),
+}));
+
+vi.mock("@/hooks/use-responsive-breakpoint", () => ({
+  useResponsiveBreakpoint: () => ({ isMobile: mocks.isMobile }),
+}));
+
+import { ReviewDiffHeader } from "./review-diff-header";
+
+afterEach(() => {
+  cleanup();
+  mocks.isMobile = false;
+});
+
+const SESSION_ID = "session-1";
+const TOOLBAR_PROPS_TEST_ID = "review-toolbar-props";
+
+const file: ReviewFile = {
+  path: "src/app.ts",
+  diff: "@@ -1 +1 @@",
+  status: "modified",
+  additions: 1,
+  deletions: 1,
+  staged: false,
+  source: "pr",
+  repository_id: "repo-2",
+  repository_name: "frontend",
+};
+
+describe("ReviewDiffHeader external context", () => {
+  it("keeps the exact repo base and rejects a published branch from another repo", () => {
+    render(
+      <ReviewDiffHeader
+        file={file}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "develop" }}
+        taskId="task-1"
+        publishedPRBranch="feature/other-repo"
+        publishedPRRepositoryId="repo-1"
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const props = JSON.parse(screen.getByTestId(TOOLBAR_PROPS_TEST_ID).dataset.props ?? "{}");
+    expect(props).toMatchObject({
+      filePath: "src/app.ts",
+      repositoryId: "repo-2",
+      repo: "frontend",
+      baseBranch: "develop",
+      taskId: "task-1",
+    });
+    expect(props).not.toHaveProperty("publishedBranch");
+  });
+
+  it("does not inherit a published PR without a matching published repository", () => {
+    render(
+      <ReviewDiffHeader
+        file={file}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "develop" }}
+        taskId="task-1"
+        publishedPRBranch="feature/unknown-repository"
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const props = JSON.parse(screen.getByTestId(TOOLBAR_PROPS_TEST_ID).dataset.props ?? "{}");
+    expect(props).not.toHaveProperty("publishedBranch");
+    expect(props).not.toHaveProperty("publishedPullRequestNumber");
+  });
+
+  it("forwards the published branch without guessing a fork PR ref", () => {
+    render(
+      <ReviewDiffHeader
+        file={{ ...file, repository_id: "repo-1" }}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "main" }}
+        taskId="task-1"
+        publishedPRBranch="contributor:feature/share"
+        publishedPRRepositoryId="repo-1"
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const props = JSON.parse(screen.getByTestId(TOOLBAR_PROPS_TEST_ID).dataset.props ?? "{}");
+    expect(props).toMatchObject({
+      publishedBranch: "contributor:feature/share",
+    });
+    expect(props).not.toHaveProperty("publishedPullRequestNumber");
+  });
+});
+
+describe("ReviewDiffHeader path direction", () => {
+  it.each([
+    { viewport: "desktop", isMobile: false },
+    { viewport: "mobile", isMobile: true },
+  ])("keeps dot-prefixed directories left-to-right on $viewport", ({ isMobile }) => {
+    mocks.isMobile = isMobile;
+    render(
+      <ReviewDiffHeader
+        file={{ ...file, path: ".agents/skills/pr-fixup/SKILL.md" }}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "main" }}
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const directory = document.querySelector("[data-review-file-directory]");
+    expect(directory).not.toBeNull();
+    expect(directory?.querySelector('bdi[dir="ltr"]')?.textContent).toBe(".agents/skills/pr-fixup");
+    expect(document.querySelector("[data-review-file-name]")?.textContent).toBe("SKILL.md");
+  });
+});
+
+describe("ReviewDiffHeader responsive composition", () => {
+  it("uses one compact mobile header with the toolbar embedded as the overflow trigger", () => {
+    mocks.isMobile = true;
+    render(
+      <ReviewDiffHeader
+        file={{
+          ...file,
+          path: "packages/frontend/review/deeply/nested/mobile-file-bar.tsx",
+        }}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "main" }}
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const identity = screen.getByTestId("review-file-identity");
+    const toolbar = screen.getByTestId(TOOLBAR_PROPS_TEST_ID);
+    expect(identity.contains(toolbar)).toBe(true);
+    expect(screen.queryByTestId("review-file-actions")).toBeNull();
+    expect(screen.getByText("mobile-file-bar.tsx")).toBeTruthy();
+    expect(document.querySelector("[data-review-file-directory]")?.textContent).toBe(
+      "packages/frontend/review/deeply/nested",
+    );
+  });
+
+  it("keeps the submodule scope visible in the mobile sticky identity", () => {
+    mocks.isMobile = true;
+    render(
+      <ReviewDiffHeader
+        file={{ ...file, repository_name: "vendor/outer/vendor/inner" }}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ "vendor/outer/vendor/inner": "abc123" }}
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("review-file-repository").textContent).toBe(
+      "vendor/outer/vendor/inner",
+    );
+  });
+
+  it("keeps the desktop toolbar in its existing inline actions slot", () => {
+    render(
+      <ReviewDiffHeader
+        file={file}
+        isReviewed={false}
+        isStale={false}
+        sessionId={SESSION_ID}
+        collapsed={false}
+        wordWrap={false}
+        expandUnchanged={false}
+        baseBranchByRepo={{ frontend: "main" }}
+        onCheckboxChange={vi.fn()}
+        onDiscard={vi.fn()}
+        onToggleCollapse={vi.fn()}
+        onToggleExpandUnchanged={vi.fn()}
+        onToggleWordWrap={vi.fn()}
+      />,
+    );
+
+    const actions = screen.getByTestId("review-file-actions");
+    expect(actions.contains(screen.getByTestId(TOOLBAR_PROPS_TEST_ID))).toBe(true);
+  });
+});

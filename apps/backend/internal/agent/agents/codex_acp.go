@@ -1,0 +1,220 @@
+package agents
+
+import (
+	"context"
+	_ "embed"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+//go:embed logos/codex_light.svg
+var codexACPLogoLight []byte
+
+//go:embed logos/codex_dark.svg
+var codexACPLogoDark []byte
+
+const codexACPPackage = "@agentclientprotocol/codex-acp"
+
+var (
+	_ Agent                         = (*CodexACP)(nil)
+	_ PassthroughAgent              = (*CodexACP)(nil)
+	_ InferenceAgent                = (*CodexACP)(nil)
+	_ ManagedNPMRuntimeAgent        = (*CodexACP)(nil)
+	_ OpenAICompatibleProviderAgent = (*CodexACP)(nil)
+)
+
+// codex-acp >= 1.7 advertises an ACP "gateway" auth method when the client
+// sends clientCapabilities.auth._meta.gateway=true, then applies the base URL
+// and Authorization header from authenticate({methodId:"gateway"}) live.
+const (
+	codexGatewayAuthMethodID = "gateway"
+	codexGatewayProviderName = "Kandev"
+)
+
+// CodexACP implements Agent for the Agent Client Protocol codex-acp package.
+// It speaks the ACP protocol (JSON-RPC 2.0 over stdin/stdout) through the npm
+// bridge for OpenAI Codex. Used for A/B comparison against the native Codex agent.
+type CodexACP struct {
+	StandardPassthrough
+}
+
+// codexPassthroughPermSettings maps passthrough-only toggles to @openai/codex CLI
+// flags. Not returned from PermissionSettings(): ACP auto-approve is handled by
+// agentctl's permission flow, not by a subprocess flag. The legacy --full-auto
+// flag was removed; auto_approve uses --ask-for-approval never.
+var codexPassthroughPermSettings = map[string]PermissionSetting{
+	PermissionKeyAutoApprove: {
+		Supported:    true,
+		Default:      true,
+		Label:        "Auto approve",
+		Description:  "Skip command approval prompts (--ask-for-approval never)",
+		ApplyMethod:  PermissionApplyMethodCLIFlag,
+		CLIFlag:      "--ask-for-approval",
+		CLIFlagValue: "never",
+	},
+}
+
+func NewCodexACP() *CodexACP {
+	return &CodexACP{
+		StandardPassthrough: StandardPassthrough{
+			PermSettings: codexPassthroughPermSettings,
+			Cfg: PassthroughConfig{
+				Supported:        true,
+				Label:            "CLI Passthrough",
+				Description:      "Show terminal directly instead of chat interface",
+				PassthroughCmd:   NewCommand("npx", "-y", "@openai/codex"),
+				ModelFlag:        NewParam("--model", "{model}"),
+				IdleTimeout:      3 * time.Second,
+				BufferMaxBytes:   DefaultBufferMaxBytes,
+				MCPStrategy:      mcpconfig.CodexStrategy{},
+				AutoInjectPrompt: true,
+				SubmitSequence:   "\r",
+			},
+		},
+	}
+}
+
+func (a *CodexACP) ID() string          { return "codex-acp" }
+func (a *CodexACP) Name() string        { return "Codex ACP Agent" }
+func (a *CodexACP) DisplayName() string { return "Codex" }
+func (a *CodexACP) Description() string {
+	return "OpenAI Codex coding agent using the Agent Client Protocol bridge."
+}
+func (a *CodexACP) Enabled() bool     { return true }
+func (a *CodexACP) DisplayOrder() int { return 2 }
+
+func (a *CodexACP) Logo(v LogoVariant) []byte {
+	if v == LogoDark {
+		return codexACPLogoDark
+	}
+	return codexACPLogoLight
+}
+
+func (a *CodexACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+	// Check for the CLI binary on PATH. Auth state is surfaced later by the
+	// ACP probe (session/new returns auth_required if the user hasn't logged in).
+	result, err := Detect(ctx, WithCommand("codex-acp"), WithCommand("codex"))
+	if err != nil {
+		return result, err
+	}
+	result.SupportsMCP = true
+	return result, nil
+}
+
+func (a *CodexACP) BuildCommand(opts CommandOptions) Command {
+	return a.ManagedNPMRuntime().ACPCommand(opts.ManagedRuntimeVersion)
+}
+
+func (a *CodexACP) ManagedNPMRuntime() ManagedNPMRuntimeSpec {
+	return newManagedNPMRuntimeSpec(codexACPPackage)
+}
+
+func (a *CodexACP) Runtime() *RuntimeConfig {
+	canRecover := true
+	return &RuntimeConfig{
+		Image:       "kandev/multi-agent",
+		Tag:         "latest",
+		Cmd:         a.ManagedNPMRuntime().CachedACPCommand(),
+		WorkingDir:  "{workspace}",
+		RequiredEnv: []string{"OPENAI_API_KEY"},
+		Env:         map[string]string{},
+		Mounts: []MountTemplate{
+			{Source: "{workspace}", Target: "/workspace"},
+		},
+		ResourceLimits:  ResourceLimits{MemoryMB: 4096, CPUCores: 2.0, Timeout: time.Hour},
+		Protocol:        agent.ProtocolACP,
+		ProjectSkillDir: ".agents/skills",
+		UserSkillDir:    ".codex/skills",
+		SessionConfig: SessionConfig{
+			NativeSessionResume: true,
+			CanRecover:          &canRecover,
+			// Use the same SessionDirTemplate pattern every other ACP agent
+			// uses; the docker container manager wires this into a kandev-owned
+			// per-container session dir, isolated from the host's ~/.codex
+			// (which carries host-absolute rollout paths in state.db that
+			// don't resolve inside the container).
+			SessionDirTemplate: "{home}/.codex",
+			SessionDirTarget:   "/root/.codex",
+		},
+	}
+}
+
+func (a *CodexACP) RemoteAuth() *RemoteAuth {
+	return &RemoteAuth{
+		Methods: []RemoteAuthMethod{
+			{
+				Type:  remoteAuthMethodTypeFiles,
+				Label: remoteAuthLabelCopyFiles,
+				SourceFiles: map[string][]string{
+					"darwin": {".codex/auth.json"},
+					"linux":  {".codex/auth.json"},
+				},
+				TargetRelDir: ".codex",
+			},
+			{
+				Type:   "env",
+				EnvVar: "OPENAI_API_KEY",
+			},
+		},
+	}
+}
+
+func (a *CodexACP) PortableConfig() *PortableConfig {
+	return &PortableConfig{Bundles: []PortableConfigBundle{
+		{
+			ID:    "codex.config",
+			Label: "Copy Codex configuration",
+			Files: []PortableConfigFile{
+				{SourcePaths: map[string]string{
+					"darwin":  ".codex/config.toml",
+					"linux":   ".codex/config.toml",
+					"windows": ".codex/config.toml",
+				}, TargetPath: ".codex/config.toml"},
+			},
+		},
+	}}
+}
+
+// Verified against `codex --help`: `codex login --device-auth` is the
+// dedicated sign-in subcommand. Device-auth prints a code + URL that works
+// even when the kandev process can't open a browser (containers, SSH,
+// headless dev boxes), and falls back to a local browser flow otherwise.
+func (a *CodexACP) LoginCommand() *LoginCommand {
+	return &LoginCommand{
+		Cmd:         []string{"codex", "login", "--device-auth"},
+		Description: "Sign in with your OpenAI account.",
+	}
+}
+
+// Install both the user-facing OpenAI codex CLI (which `codex login` runs
+// against) and the ACP bridge package used for chat sessions.
+func (a *CodexACP) InstallScript() string {
+	return "npm install -g @openai/codex " + codexACPPackage
+}
+
+func (a *CodexACP) BillingType() usage.BillingType { return codexBillingType() }
+
+func (a *CodexACP) PermissionSettings() map[string]PermissionSetting {
+	return emptyPermSettings
+}
+
+// OpenAICompatibleProvider lets a Codex profile point at a self-hosted
+// OpenAI-compatible router through codex-acp's ACP gateway auth method.
+func (a *CodexACP) OpenAICompatibleProvider() *OpenAICompatibleProviderSpec {
+	return &OpenAICompatibleProviderSpec{
+		AuthMethodID: codexGatewayAuthMethodID,
+		ProviderName: codexGatewayProviderName,
+		KeyEnvVar:    "OPENAI_API_KEY",
+	}
+}
+
+// InferenceConfig returns configuration for one-shot inference using ACP.
+func (a *CodexACP) InferenceConfig() *InferenceConfig {
+	return &InferenceConfig{
+		Supported: true,
+		Command:   a.ManagedNPMRuntime().CachedACPCommand(),
+	}
+}

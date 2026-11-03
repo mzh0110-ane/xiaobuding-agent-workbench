@@ -1,0 +1,504 @@
+package acp
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/coder/acp-go-sdk"
+	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+func TestEmitMCPAttachmentEvidenceUsesBackendOwnedAttempt(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+	a := &Adapter{updatesCh: make(chan AgentEvent, 1), logger: log}
+	ctx := streams.WithMCPAttachmentContext(context.Background(), streams.MCPAttachmentAttempt{
+		AttemptID: "attempt-1", TaskID: "task-1", SessionID: "session-1", ExecutionID: "execution-1",
+	})
+
+	a.emitMCPAttachmentEvidence(ctx, types.McpServer{
+		Name: "kandev", Type: "http", URL: "https://token@example.test/mcp",
+	}, streams.MCPAttachmentEvidenceDelivered, "", "")
+
+	select {
+	case event := <-a.updatesCh:
+		if event.Type != streams.EventTypeMCPAttachment || event.MCPAttachment == nil {
+			t.Fatalf("event = %+v, want MCP attachment", event)
+		}
+		if event.MCPAttachment.AttemptID != "attempt-1" || event.MCPAttachment.Target != "https://example.test" {
+			t.Fatalf("evidence = %+v", event.MCPAttachment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected attachment evidence")
+	}
+}
+
+func TestFilterMcpServersWithDecisionsReportsFilteredAndDuplicateServers(t *testing.T) {
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+	servers := []types.McpServer{
+		{Name: "kandev", Type: "http", URL: "https://kandev.example/mcp"},
+		{Name: "kandev", Type: "sse", URL: "https://kandev.example/sse"},
+		{Name: "stdio", Type: "stdio", Command: "mcp-server"},
+	}
+
+	selected, decisions := filterMcpServersWithDecisions(servers, acp.McpCapabilities{Sse: true}, log)
+	if len(selected) != 2 || selected[0].Type != "sse" || selected[1].Name != "stdio" {
+		t.Fatalf("selected = %+v, want SSE kandev and stdio", selected)
+	}
+	if len(decisions) != len(servers) {
+		t.Fatalf("decision count = %d, want %d", len(decisions), len(servers))
+	}
+	if decisions[0].Included || decisions[0].ReasonCode != mcpFilterReasonHTTPUnsupported {
+		t.Fatalf("HTTP decision = %+v", decisions[0])
+	}
+	if !decisions[1].Included || decisions[1].ReasonCode != "" {
+		t.Fatalf("SSE decision = %+v", decisions[1])
+	}
+	if !decisions[2].Included || decisions[2].ReasonCode != "" {
+		t.Fatalf("stdio decision = %+v", decisions[2])
+	}
+}
+
+func TestFilterMcpServersWithDecisionsMarksSupportedDuplicateAsFiltered(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "kandev", Type: "http", URL: "https://kandev.example/mcp"},
+		{Name: "kandev", Type: "sse", URL: "https://kandev.example/sse"},
+	}
+
+	selected, decisions := filterMcpServersWithDecisions(servers, acp.McpCapabilities{Http: true, Sse: true}, log)
+	if len(selected) != 1 || selected[0].Type != "http" {
+		t.Fatalf("selected = %+v, want one HTTP kandev server", selected)
+	}
+	if decisions[1].Included || decisions[1].ReasonCode != mcpFilterReasonDuplicateName {
+		t.Fatalf("duplicate decision = %+v", decisions[1])
+	}
+}
+
+// --- mapToEnvVars ---
+
+func TestMapToEnvVars_Empty(t *testing.T) {
+	result := mapToEnvVars(nil)
+	if result == nil {
+		t.Fatal("expected non-nil empty slice for nil input")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 vars, got %d", len(result))
+	}
+
+	result = mapToEnvVars(map[string]string{})
+	if result == nil {
+		t.Fatal("expected non-nil empty slice for empty input")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 vars, got %d", len(result))
+	}
+}
+
+func TestMapToEnvVars_WithValues(t *testing.T) {
+	env := map[string]string{
+		"GITHUB_TOKEN": "secret",
+		"API_KEY":      "key123",
+	}
+
+	result := mapToEnvVars(env)
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 vars, got %d", len(result))
+	}
+
+	found := map[string]string{}
+	for _, v := range result {
+		found[v.Name] = v.Value
+	}
+	if found["GITHUB_TOKEN"] != "secret" {
+		t.Errorf("GITHUB_TOKEN = %q, want %q", found["GITHUB_TOKEN"], "secret")
+	}
+	if found["API_KEY"] != "key123" {
+		t.Errorf("API_KEY = %q, want %q", found["API_KEY"], "key123")
+	}
+}
+
+// --- mapToHTTPHeaders ---
+
+func TestMapToHTTPHeaders_Empty(t *testing.T) {
+	result := mapToHTTPHeaders(nil)
+	if result == nil {
+		t.Fatal("expected non-nil empty slice for nil input")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 headers, got %d", len(result))
+	}
+}
+
+func TestMapToHTTPHeaders_WithValues(t *testing.T) {
+	headers := map[string]string{
+		"Authorization": "Bearer tok",
+		"X-Api-Key":     "key",
+	}
+
+	result := mapToHTTPHeaders(headers)
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 headers, got %d", len(result))
+	}
+
+	found := map[string]string{}
+	for _, h := range result {
+		found[h.Name] = h.Value
+	}
+	if found["Authorization"] != "Bearer tok" {
+		t.Errorf("Authorization = %q, want %q", found["Authorization"], "Bearer tok")
+	}
+	if found["X-Api-Key"] != "key" {
+		t.Errorf("X-Api-Key = %q, want %q", found["X-Api-Key"], "key")
+	}
+}
+
+// --- toACPMcpServers ---
+
+func TestToACPMcpServers_Empty(t *testing.T) {
+	result := toACPMcpServers(nil)
+	if result == nil {
+		t.Fatal("expected non-nil empty slice for nil input")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 servers, got %d", len(result))
+	}
+}
+
+func TestToACPMcpServers_Stdio(t *testing.T) {
+	servers := []types.McpServer{
+		{
+			Name:    "github",
+			Type:    "stdio",
+			Command: "npx",
+			Args:    []string{"-y", "@mcp/github"},
+			Env:     map[string]string{"TOKEN": "val"},
+		},
+	}
+
+	result := toACPMcpServers(servers)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(result))
+	}
+	if result[0].Stdio == nil {
+		t.Fatal("expected Stdio variant, got nil")
+	}
+	if result[0].Sse != nil || result[0].Http != nil {
+		t.Error("expected only Stdio variant to be set")
+	}
+	s := result[0].Stdio
+	if s.Name != "github" {
+		t.Errorf("Name = %q, want %q", s.Name, "github")
+	}
+	if s.Command != "npx" {
+		t.Errorf("Command = %q, want %q", s.Command, "npx")
+	}
+	if len(s.Args) != 2 || s.Args[0] != "-y" {
+		t.Errorf("Args = %v, want [-y @mcp/github]", s.Args)
+	}
+	if len(s.Env) != 1 || s.Env[0].Name != "TOKEN" || s.Env[0].Value != "val" {
+		t.Errorf("Env = %v, want [{TOKEN val}]", s.Env)
+	}
+}
+
+func TestToACPMcpServers_StdioEmptyEnv(t *testing.T) {
+	servers := []types.McpServer{
+		{Name: "srv", Type: "stdio", Command: "cmd"},
+	}
+
+	result := toACPMcpServers(servers)
+
+	s := result[0].Stdio
+	if s.Env == nil {
+		t.Fatal("Env should be empty slice, not nil (ACP SDK non-omitempty)")
+	}
+	if len(s.Env) != 0 {
+		t.Errorf("expected 0 env vars, got %d", len(s.Env))
+	}
+}
+
+func TestToACPMcpServers_SSE(t *testing.T) {
+	servers := []types.McpServer{
+		{
+			Name:    "remote",
+			Type:    "sse",
+			URL:     "https://mcp.example.com/sse",
+			Headers: map[string]string{"Authorization": "Bearer tok"},
+		},
+	}
+
+	result := toACPMcpServers(servers)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(result))
+	}
+	if result[0].Sse == nil {
+		t.Fatal("expected Sse variant, got nil")
+	}
+	s := result[0].Sse
+	if s.Name != "remote" {
+		t.Errorf("Name = %q, want %q", s.Name, "remote")
+	}
+	if s.Url != "https://mcp.example.com/sse" {
+		t.Errorf("Url = %q, want %q", s.Url, "https://mcp.example.com/sse")
+	}
+	if s.Type != "sse" {
+		t.Errorf("Type = %q, want %q", s.Type, "sse")
+	}
+	if len(s.Headers) != 1 || s.Headers[0].Name != "Authorization" {
+		t.Errorf("Headers = %v, want [{Authorization Bearer tok}]", s.Headers)
+	}
+}
+
+func TestToACPMcpServers_HTTP(t *testing.T) {
+	servers := []types.McpServer{
+		{
+			Name: "http-srv",
+			Type: "http",
+			URL:  "https://mcp.example.com/http",
+		},
+	}
+
+	result := toACPMcpServers(servers)
+
+	if result[0].Http == nil {
+		t.Fatal("expected Http variant for http type")
+	}
+	if result[0].Http.Type != "http" {
+		t.Errorf("Type = %q, want %q", result[0].Http.Type, "http")
+	}
+	if result[0].Http.Url != "https://mcp.example.com/http" {
+		t.Errorf("Url = %q, want %q", result[0].Http.Url, "https://mcp.example.com/http")
+	}
+}
+
+func TestToACPMcpServers_StreamableHTTP(t *testing.T) {
+	servers := []types.McpServer{
+		{
+			Name: "stream-srv",
+			Type: "streamable_http",
+			URL:  "https://mcp.example.com/stream",
+		},
+	}
+
+	result := toACPMcpServers(servers)
+
+	if result[0].Http == nil {
+		t.Fatal("expected Http variant for streamable_http type")
+	}
+	if result[0].Http.Type != "streamable_http" {
+		t.Errorf("Type = %q, want %q", result[0].Http.Type, "streamable_http")
+	}
+}
+
+func TestToACPMcpServers_Mixed(t *testing.T) {
+	servers := []types.McpServer{
+		{Name: "s1", Type: "stdio", Command: "cmd"},
+		{Name: "s2", Type: "sse", URL: "https://sse"},
+		{Name: "s3", Type: "http", URL: "https://http"},
+		{Name: "s4", Type: "streamable_http", URL: "https://stream"},
+	}
+
+	result := toACPMcpServers(servers)
+
+	if len(result) != 4 {
+		t.Fatalf("expected 4 servers, got %d", len(result))
+	}
+	if result[0].Stdio == nil {
+		t.Error("result[0] should be Stdio")
+	}
+	if result[1].Sse == nil {
+		t.Error("result[1] should be Sse")
+	}
+	if result[2].Http == nil {
+		t.Error("result[2] should be Http")
+	}
+	if result[3].Http == nil {
+		t.Error("result[3] should be Http (streamable_http)")
+	}
+}
+
+// --- filterMcpServersByCapabilities ---
+
+func TestFilterMcpServersByCapabilities_StdioAlwaysAllowed(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "s1", Type: "stdio", Command: "cmd"},
+	}
+	caps := acp.McpCapabilities{Sse: false, Http: false}
+
+	result := filterMcpServersByCapabilities(servers, caps, log)
+
+	if len(result) != 1 {
+		t.Fatalf("stdio should always pass, got %d servers", len(result))
+	}
+}
+
+func TestFilterMcpServersByCapabilities_SSEFiltered(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "s1", Type: "sse", URL: "https://sse"},
+	}
+
+	result := filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: false}, log)
+	if len(result) != 0 {
+		t.Error("SSE should be filtered when Sse=false")
+	}
+
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: true}, log)
+	if len(result) != 1 {
+		t.Error("SSE should pass when Sse=true")
+	}
+}
+
+func TestFilterMcpServersByCapabilities_HTTPFiltered(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "s1", Type: "http", URL: "https://http"},
+	}
+
+	result := filterMcpServersByCapabilities(servers, acp.McpCapabilities{Http: false}, log)
+	if len(result) != 0 {
+		t.Error("HTTP should be filtered when Http=false")
+	}
+
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Http: true}, log)
+	if len(result) != 1 {
+		t.Error("HTTP should pass when Http=true")
+	}
+}
+
+func TestFilterMcpServersByCapabilities_StreamableHTTPFiltered(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "s1", Type: "streamable_http", URL: "https://stream"},
+	}
+
+	result := filterMcpServersByCapabilities(servers, acp.McpCapabilities{Http: false}, log)
+	if len(result) != 0 {
+		t.Error("streamable_http should be filtered when Http=false")
+	}
+
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Http: true}, log)
+	if len(result) != 1 {
+		t.Error("streamable_http should pass when Http=true")
+	}
+}
+
+func TestFilterMcpServersByCapabilities_Mixed(t *testing.T) {
+	log := newTestLoggerForMcp()
+	servers := []types.McpServer{
+		{Name: "stdio", Type: "stdio", Command: "cmd"},
+		{Name: "sse", Type: "sse", URL: "https://sse"},
+		{Name: "http", Type: "http", URL: "https://http"},
+		{Name: "stream", Type: "streamable_http", URL: "https://stream"},
+	}
+
+	// Only SSE capability
+	result := filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: true, Http: false}, log)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 (stdio + sse), got %d", len(result))
+	}
+	if result[0].Name != "stdio" || result[1].Name != "sse" {
+		t.Errorf("expected [stdio, sse], got [%s, %s]", result[0].Name, result[1].Name)
+	}
+
+	// All capabilities
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: true, Http: true}, log)
+	if len(result) != 4 {
+		t.Errorf("expected 4 with all caps, got %d", len(result))
+	}
+}
+
+func TestFilterMcpServersByCapabilities_DeduplicatesSameName(t *testing.T) {
+	log := newTestLoggerForMcp()
+	// Simulate dual injection: same name "kandev" with different types
+	servers := []types.McpServer{
+		{Name: "kandev", Type: "sse", URL: "http://localhost:10005/sse"},
+		{Name: "kandev", Type: "http", URL: "http://localhost:10005/mcp"},
+		{Name: "other", Type: "stdio", Command: "cmd"},
+	}
+
+	// Agent supports both SSE and HTTP - should only get first kandev entry
+	result := filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: true, Http: true}, log)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 (first kandev + other), got %d", len(result))
+	}
+	if result[0].Name != "kandev" || result[0].Type != "sse" {
+		t.Errorf("expected first entry to be kandev/sse, got %s/%s", result[0].Name, result[0].Type)
+	}
+	if result[1].Name != "other" {
+		t.Errorf("expected second entry to be other, got %s", result[1].Name)
+	}
+
+	// Agent supports only HTTP - should get kandev/http (SSE filtered, then HTTP kept)
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: false, Http: true}, log)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 (kandev/http + other), got %d", len(result))
+	}
+	if result[0].Name != "kandev" || result[0].Type != "http" {
+		t.Errorf("expected first entry to be kandev/http, got %s/%s", result[0].Name, result[0].Type)
+	}
+
+	// Agent supports only SSE - should get kandev/sse (HTTP filtered)
+	result = filterMcpServersByCapabilities(servers, acp.McpCapabilities{Sse: true, Http: false}, log)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 (kandev/sse + other), got %d", len(result))
+	}
+	if result[0].Name != "kandev" || result[0].Type != "sse" {
+		t.Errorf("expected first entry to be kandev/sse, got %s/%s", result[0].Name, result[0].Type)
+	}
+}
+
+// newTestLoggerForMcp creates a logger for MCP tests.
+func newTestLoggerForMcp() *logger.Logger {
+	return newTestAdapter().logger
+}
+
+// --- effectiveMcpCapabilities ---
+
+func TestEffectiveMcpCapabilities_AssumeHTTPAndSSE(t *testing.T) {
+	// Agent advertises neither SSE nor HTTP.
+	base := acp.McpCapabilities{Sse: false, Http: false}
+
+	// Nil config leaves capabilities untouched.
+	if got := effectiveMcpCapabilities(base, nil); got.Sse || got.Http {
+		t.Errorf("nil cfg should not alter caps, got %+v", got)
+	}
+
+	// AssumeMcpHttp forces Http on (and an http server then survives the filter).
+	caps := effectiveMcpCapabilities(base, &shared.Config{AssumeMcpHttp: true})
+	if !caps.Http {
+		t.Fatal("AssumeMcpHttp should force caps.Http = true")
+	}
+	if caps.Sse {
+		t.Error("AssumeMcpHttp should not affect caps.Sse")
+	}
+
+	log := newTestLoggerForMcp()
+	httpServer := []types.McpServer{{Name: "remote", Type: "http", URL: "https://mcp.example.com/mcp"}}
+	if got := filterMcpServersByCapabilities(httpServer, caps, log); len(got) != 1 {
+		t.Fatalf("http server should survive when AssumeMcpHttp set, got %d servers", len(got))
+	}
+
+	// AssumeMcpSse forces Sse on independently.
+	caps = effectiveMcpCapabilities(base, &shared.Config{AssumeMcpSse: true})
+	if !caps.Sse {
+		t.Fatal("AssumeMcpSse should force caps.Sse = true")
+	}
+	if caps.Http {
+		t.Error("AssumeMcpSse should not affect caps.Http")
+	}
+}

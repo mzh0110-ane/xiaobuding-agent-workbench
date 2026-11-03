@@ -1,0 +1,425 @@
+"use client";
+
+import { memo, useState, useCallback, useMemo } from "react";
+import { IconWand, IconMessageDots, IconFile, IconFolder } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
+import type { Message } from "@/lib/types/http";
+import { TASK_DESCRIPTION_SYNTHETIC_ID } from "@/hooks/initial-prompt-preview";
+import { MessageActions } from "@/components/task/chat/messages/message-actions";
+import { useMessageFavorite } from "@/hooks/domains/session/use-message-favorite";
+import { useUserMessageNavigation } from "@/hooks/use-message-navigation";
+import { SenderTaskBadge } from "./sender-task-badge";
+import type { SenderTaskInfo } from "@/hooks/domains/session/use-sender-task-badge-model";
+import { ImagePreviewDialog } from "@/components/task/chat/image-preview-dialog";
+import {
+  WorkflowStepMessageBadge,
+  workflowMessageInfoFromMetadata,
+  type WorkflowMessageMetadata,
+  type WorkflowStepMessageInfo,
+} from "./workflow-step-message-badge";
+import { AgentMessageContent } from "./agent-message-content";
+import {
+  usePromptMentionMarkdownComponents,
+  usePromptMentionNames,
+} from "./prompt-mention-components";
+import { entityReferencesFromMetadata } from "@/lib/entity-references/message-references";
+import { attachmentContentUrl } from "@/lib/api/domains/attachment-api";
+import { formatBytes } from "@/lib/utils/format-bytes";
+import { renderUserMessageBody } from "./user-message-body";
+
+type ChatMessageProps = {
+  comment: Message;
+  label: string;
+  className: string;
+  showRichBlocks?: boolean;
+  sessionId?: string | null;
+  worktreePath?: string;
+  onOpenFile?: (path: string) => void;
+  onScrollToMessage?: (messageId: string) => void;
+  isTurnActive?: boolean;
+};
+
+// Regex to match @file references (file paths after @)
+// Matches @path/to/file.ext or @file.ext patterns
+const FILE_REF_REGEX = /@([\w./-]+\.[\w]+|[\w/-]+)/g;
+
+/**
+ * Renders content with file references highlighted in code style
+ */
+function renderContentWithFileRefs(content: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match;
+  let keyIndex = 0;
+
+  FILE_REF_REGEX.lastIndex = 0; // Reset regex state
+  while ((match = FILE_REF_REGEX.exec(content)) !== null) {
+    // Add text before the match
+    if (match.index > lastIndex) {
+      parts.push(content.slice(lastIndex, match.index));
+    }
+
+    // Add the file reference with code styling
+    const filePath = match[1];
+    parts.push(
+      <code
+        key={`file-ref-${keyIndex++}`}
+        className="px-1 py-0.5 bg-muted text-accent rounded font-mono text-[0.85em]"
+      >
+        @{filePath}
+      </code>,
+    );
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  // Add remaining text after last match
+  if (lastIndex < content.length) {
+    parts.push(content.slice(lastIndex));
+  }
+
+  return parts.length > 0 ? parts : [content];
+}
+
+// ── User message sub-component ──────────────────────────────────────
+
+type UserMessageProps = {
+  comment: Message;
+  showRaw: boolean;
+  onToggleRaw: () => void;
+  sessionId?: string | null;
+  worktreePath?: string;
+  onOpenFile?: (path: string) => void;
+  onScrollToMessage?: (messageId: string) => void;
+};
+
+type UserMessageMetadata = WorkflowMessageMetadata & {
+  attachments?: UserMessageAttachment[];
+  plan_mode?: boolean;
+  has_review_comments?: boolean;
+  has_hidden_prompts?: boolean;
+  context_files?: Array<{ path: string; name: string; is_directory?: boolean }>;
+  sender_task_id?: string;
+  sender_task_title?: string;
+  sender_session_id?: string;
+  sender_session_name?: string;
+};
+
+function parseUserMessageMetadata(comment: Message) {
+  const metadata = comment.metadata as UserMessageMetadata | undefined;
+  const imageAttachments = (metadata?.attachments || []).filter((att) => att.type === "image");
+  const fileAttachments = (metadata?.attachments || []).filter((att) => att.type === "resource");
+  const contextFiles = metadata?.context_files || [];
+  const hasPlanMode = !!metadata?.plan_mode;
+  const hasReviewComments = !!metadata?.has_review_comments;
+  const hasHiddenPrompts = !!metadata?.has_hidden_prompts;
+  const hasContent = !!(comment.content && comment.content.trim() !== "");
+  const hasAttachments = imageAttachments.length > 0 || fileAttachments.length > 0;
+  const senderTask: SenderTaskInfo | null = metadata?.sender_task_id
+    ? {
+        id: metadata.sender_task_id,
+        snapshotTitle: metadata.sender_task_title || "",
+        sessionId: metadata.sender_session_id,
+        sessionName: metadata.sender_session_name,
+      }
+    : null;
+  const workflowMessage = workflowMessageInfoFromMetadata(metadata);
+  return {
+    imageAttachments,
+    fileAttachments,
+    contextFiles,
+    hasPlanMode,
+    hasReviewComments,
+    hasHiddenPrompts,
+    hasContent,
+    hasAttachments,
+    senderTask,
+    workflowMessage,
+  };
+}
+
+function UserContextBadges({
+  destinationTaskId,
+  hasPlanMode,
+  hasReviewComments,
+  contextFiles,
+  senderTask,
+  workflowMessage,
+}: {
+  destinationTaskId: string;
+  hasPlanMode: boolean;
+  hasReviewComments: boolean;
+  contextFiles: Array<{ path: string; name: string; is_directory?: boolean }>;
+  senderTask: SenderTaskInfo | null;
+  workflowMessage: WorkflowStepMessageInfo | null;
+}) {
+  const { t } = useTranslation();
+  if (
+    !hasPlanMode &&
+    !hasReviewComments &&
+    contextFiles.length === 0 &&
+    !senderTask &&
+    !workflowMessage
+  )
+    return null;
+  return (
+    <div className="flex justify-end gap-1.5 mb-1 flex-wrap">
+      {workflowMessage && <WorkflowStepMessageBadge workflow={workflowMessage} />}
+      {senderTask && <SenderTaskBadge sender={senderTask} destinationTaskId={destinationTaskId} />}
+      {hasPlanMode && (
+        <span className="inline-flex items-center gap-1 rounded-full bg-slate-500/20 px-2 py-0.5 text-[10px] text-slate-400">
+          <IconWand size={10} /> {t("task:planMode")}
+        </span>
+      )}
+      {hasReviewComments && (
+        <span className="inline-flex items-center gap-1 rounded-full bg-blue-500/20 px-2 py-0.5 text-[10px] text-blue-400">
+          <IconMessageDots size={10} /> {t("task:reviewComments")}
+        </span>
+      )}
+      {contextFiles.map((f) => (
+        <span
+          key={f.path}
+          data-testid="message-context-file"
+          data-path={f.path}
+          className="inline-flex items-center gap-1 rounded-full bg-muted/50 px-2 py-0.5 text-[10px] text-muted-foreground"
+        >
+          {f.is_directory ? (
+            <IconFolder data-testid="message-context-directory-icon" size={10} />
+          ) : (
+            <IconFile data-testid="message-context-file-icon" size={10} />
+          )}{" "}
+          {f.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+type UserMessageAttachment = {
+  type: string;
+  data?: string;
+  attachment_id?: string;
+  mime_type: string;
+  name?: string;
+  size_bytes?: number;
+};
+
+/** Renders image previews and file chips attached to a user message. */
+function UserMessageAttachments({
+  imageAttachments,
+  fileAttachments,
+  hasContent,
+}: {
+  imageAttachments: UserMessageAttachment[];
+  fileAttachments: UserMessageAttachment[];
+  hasContent: boolean;
+}) {
+  const { t } = useTranslation("chat");
+  const sourceFor = (attachment: UserMessageAttachment) => {
+    if (attachment.attachment_id) {
+      return attachmentContentUrl(attachment.attachment_id);
+    }
+    if (attachment.data) {
+      return `data:${attachment.mime_type};base64,${attachment.data}`;
+    }
+    return null;
+  };
+  return (
+    <div className={cn("flex flex-wrap gap-2", hasContent && "mb-2")}>
+      {imageAttachments.map((att, index) => {
+        const src = sourceFor(att);
+        if (!src) {
+          return (
+            <span key={`image-${index}`} className="inline-flex items-center gap-1.5 text-xs">
+              <IconFile size={12} />
+              {att.name || t("chat:attachmentFallbackName")}
+            </span>
+          );
+        }
+        return (
+          <ImagePreviewDialog
+            key={index}
+            src={src}
+            alt={t("chat:attachmentMessageAlt", { index: index + 1 })}
+            thumbnailClassName="max-h-48 max-w-full rounded-lg object-contain transition-opacity hover:opacity-90"
+          />
+        );
+      })}
+      {fileAttachments.map((att, index) => (
+        <span
+          key={`file-${index}`}
+          data-testid="message-file-attachment"
+          className="inline-flex self-start items-center gap-1.5 rounded-full bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground"
+        >
+          <IconFile size={12} />
+          <span>{att.name || t("chat:attachmentFallbackName")}</span>
+          {typeof att.size_bytes === "number" && (
+            <span className="text-[10px]">({formatBytes(att.size_bytes)})</span>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function UserMessageContent({
+  comment,
+  showRaw,
+  onToggleRaw,
+  sessionId,
+  worktreePath,
+  onOpenFile,
+  onScrollToMessage,
+}: UserMessageProps) {
+  const userNavigation = useUserMessageNavigation(sessionId ?? null, comment.id);
+  const promptNames = usePromptMentionNames();
+  const { isFavorite, toggleFavorite } = useMessageFavorite(comment.session_id, comment.id);
+  const entityReferences = useMemo(
+    () => entityReferencesFromMetadata(comment.metadata),
+    [comment.metadata],
+  );
+  const promptMentionComponents = usePromptMentionMarkdownComponents(promptNames, entityReferences);
+  const {
+    imageAttachments,
+    fileAttachments,
+    contextFiles,
+    hasPlanMode,
+    hasReviewComments,
+    hasHiddenPrompts,
+    hasContent,
+    hasAttachments,
+    senderTask,
+    workflowMessage,
+  } = parseUserMessageMetadata(comment);
+
+  return (
+    <div className="flex justify-end w-full overflow-hidden">
+      <div className="max-w-[85%] sm:max-w-[75%] md:max-w-2xl overflow-hidden group">
+        <UserContextBadges
+          destinationTaskId={comment.task_id}
+          hasPlanMode={hasPlanMode}
+          hasReviewComments={hasReviewComments}
+          contextFiles={contextFiles}
+          senderTask={senderTask}
+          workflowMessage={workflowMessage}
+        />
+        <div
+          data-testid="user-message-bubble"
+          className={cn(
+            "rounded-2xl px-4 py-2.5 overflow-hidden",
+            isFavorite ? "bg-yellow-200/50 dark:bg-yellow-500/10" : "bg-primary/30",
+          )}
+        >
+          {hasAttachments && (
+            <UserMessageAttachments
+              imageAttachments={imageAttachments}
+              fileAttachments={fileAttachments}
+              hasContent={hasContent}
+            />
+          )}
+          {renderUserMessageBody({
+            hasContent,
+            showRaw,
+            hasAttachments,
+            content: comment.content,
+            rawContent: comment.raw_content,
+            promptMentionComponents,
+            taskId: comment.task_id,
+            worktreePath,
+            onOpenFile,
+          })}
+        </div>
+        <MessageActions
+          message={comment}
+          showCopy={true}
+          showTimestamp={true}
+          showRawToggle={true}
+          hasHiddenPrompts={hasHiddenPrompts}
+          showNavigation={userNavigation.hasPrevious || userNavigation.hasNext}
+          isRawView={showRaw}
+          onToggleRaw={onToggleRaw}
+          isFavorite={isFavorite}
+          onToggleFavorite={
+            comment.id === TASK_DESCRIPTION_SYNTHETIC_ID ? undefined : toggleFavorite
+          }
+          onNavigatePrev={() => {
+            if (userNavigation.previousId && onScrollToMessage)
+              onScrollToMessage(userNavigation.previousId);
+          }}
+          onNavigateNext={() => {
+            if (userNavigation.nextId && onScrollToMessage)
+              onScrollToMessage(userNavigation.nextId);
+          }}
+          hasPrev={userNavigation.hasPrevious}
+          hasNext={userNavigation.hasNext}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────────
+
+export const ChatMessage = memo(function ChatMessage({
+  comment,
+  label,
+  className,
+  showRichBlocks,
+  sessionId,
+  worktreePath,
+  onOpenFile,
+  onScrollToMessage,
+  isTurnActive = false,
+}: ChatMessageProps) {
+  const { t } = useTranslation();
+  const [showRaw, setShowRaw] = useState(false);
+  const toggleRaw = useCallback(() => setShowRaw((v) => !v), []);
+
+  // Keep the old card-based layout for task descriptions (amber banner)
+  if (label === "Task") {
+    return (
+      <div className={cn("w-full rounded-lg px-4 py-3", className)}>
+        <div className="flex items-center">
+          <p className="text-[11px] uppercase tracking-wide opacity-70">
+            {comment.requests_input ? (
+              <span className="ml-2 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] text-amber-300">
+                {t("task:needsInput")}
+              </span>
+            ) : null}
+          </p>
+        </div>
+        <p className="whitespace-pre-wrap">
+          {comment.content ? renderContentWithFileRefs(comment.content) : t("task:empty")}
+        </p>
+      </div>
+    );
+  }
+
+  if (comment.author_type === "user") {
+    return (
+      <UserMessageContent
+        comment={comment}
+        showRaw={showRaw}
+        onToggleRaw={toggleRaw}
+        sessionId={sessionId}
+        worktreePath={worktreePath}
+        onOpenFile={onOpenFile}
+        onScrollToMessage={onScrollToMessage}
+      />
+    );
+  }
+
+  return (
+    <AgentMessageContent
+      comment={comment}
+      showRaw={showRaw}
+      onToggleRaw={toggleRaw}
+      showRichBlocks={showRichBlocks}
+      sessionId={sessionId}
+      isTurnActive={isTurnActive}
+      worktreePath={worktreePath}
+      onOpenFile={onOpenFile}
+    />
+  );
+});

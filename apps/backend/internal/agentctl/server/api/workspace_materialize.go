@@ -1,0 +1,970 @@
+package api
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/gin-gonic/gin"
+	"github.com/kandev/kandev/internal/common/gitbase"
+	"github.com/kandev/kandev/internal/common/securityutil"
+	"github.com/kandev/kandev/internal/common/subproc"
+	"github.com/kandev/kandev/internal/gitcheckout"
+	"github.com/kandev/kandev/internal/task/models"
+	"go.uber.org/zap"
+)
+
+// MaterializeRepositoryRequest describes one repository checkout below the
+// agentctl workspace. RepositoryURL must be a credential-free Git locator;
+// destination is always a direct child of the current workspace root.
+type MaterializeRepositoryRequest struct {
+	CheckoutOptions         *models.RepositoryCheckoutOptions `json:"checkout_options,omitempty"`
+	RepositoryURL           string                            `json:"repository_url"`
+	Destination             string                            `json:"destination"`
+	BaseBranch              string                            `json:"base_branch"`
+	CheckoutBranch          string                            `json:"checkout_branch,omitempty"`
+	PRNumber                int                               `json:"pr_number,omitempty"`
+	QualifiedPRBase         *models.PRBase                    `json:"qualified_pr_base,omitempty"`
+	RemoteContribution      *models.RemoteContribution        `json:"remote_contribution,omitempty"`
+	ContributionDestination *models.ContributionDestination   `json:"contribution_destination,omitempty"`
+}
+
+// MaterializeRepositoryResponse deliberately contains no remote locator so a
+// credential accidentally supplied by an untrusted caller cannot be echoed.
+type MaterializeRepositoryResponse struct {
+	Destination string `json:"destination"`
+	Reused      bool   `json:"reused,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// RemoveMaterializedRepositoryRequest identifies a previously materialized,
+// credential-free checkout that may be removed during a failed batch rollback.
+type RemoveMaterializedRepositoryRequest struct {
+	RepositoryURL string `json:"repository_url"`
+	Destination   string `json:"destination"`
+}
+
+type removeMaterializedRepositoryResponse struct {
+	Removed bool   `json:"removed"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (s *Server) handleWorkspaceMaterializeRepository(c *gin.Context) {
+	var req MaterializeRepositoryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid request"})
+		return
+	}
+	destination, err := materializeDestination(s.procMgr.WorkDir(), req.Destination)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid destination"})
+		return
+	}
+	if err := validateRepositoryLocator(req.RepositoryURL); err != nil {
+		c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid repository locator"})
+		return
+	}
+	if !securityutil.IsValidBranchName(req.BaseBranch) || (req.CheckoutBranch != "" && !securityutil.IsValidBranchName(req.CheckoutBranch)) {
+		c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid repository branch"})
+		return
+	}
+	if err := validateQualifiedPRBaseRequest(&req); err != nil {
+		c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid qualified PR base"})
+		return
+	}
+	if req.RemoteContribution != nil {
+		if err := req.RemoteContribution.Validate(); err != nil {
+			c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid remote contribution"})
+			return
+		}
+		if req.BaseBranch != req.RemoteContribution.BaseBranch || req.CheckoutBranch != req.RemoteContribution.HeadBranch {
+			c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "remote contribution branch mismatch"})
+			return
+		}
+		if err := models.ValidatePRBaseContributionIdentity(req.QualifiedPRBase, req.RemoteContribution); err != nil {
+			c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "qualified PR base does not match remote contribution"})
+			return
+		}
+	}
+	if req.ContributionDestination != nil {
+		if err := req.ContributionDestination.Validate(); err != nil {
+			c.JSON(http.StatusBadRequest, MaterializeRepositoryResponse{Error: "invalid contribution destination"})
+			return
+		}
+	}
+
+	reused, err := materializeRepositoryWithQualifiedPRBase(
+		c.Request.Context(), req.RepositoryURL, destination, req.BaseBranch, req.CheckoutBranch,
+		req.PRNumber, req.QualifiedPRBase, req.RemoteContribution, req.ContributionDestination, req.CheckoutOptions,
+	)
+	if err != nil {
+		var directoryErr *gitcheckout.DirectoryError
+		if errors.As(err, &directoryErr) {
+			c.JSON(http.StatusUnprocessableEntity, MaterializeRepositoryResponse{Error: directoryErr.Error()})
+			return
+		}
+		if errors.Is(err, errMaterializeCollision) {
+			c.JSON(http.StatusConflict, MaterializeRepositoryResponse{Error: "destination already exists"})
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.JSON(http.StatusRequestTimeout, MaterializeRepositoryResponse{Error: "repository materialization cancelled"})
+			return
+		}
+		s.logger.Warn("workspace repository materialization failed", zap.String("destination", req.Destination), zap.Error(err))
+		c.JSON(http.StatusUnprocessableEntity, MaterializeRepositoryResponse{Error: "repository materialization failed"})
+		return
+	}
+	status := http.StatusCreated
+	if reused {
+		status = http.StatusOK
+	}
+	c.JSON(status, MaterializeRepositoryResponse{Destination: req.Destination, Reused: reused})
+}
+
+func (s *Server) handleWorkspaceRemoveMaterializedRepository(c *gin.Context) {
+	var req RemoveMaterializedRepositoryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, removeMaterializedRepositoryResponse{Error: "invalid request"})
+		return
+	}
+	destination, err := materializeDestination(s.procMgr.WorkDir(), req.Destination)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, removeMaterializedRepositoryResponse{Error: "invalid destination"})
+		return
+	}
+	if err := validateRemovalRepositoryLocator(req.RepositoryURL); err != nil {
+		c.JSON(http.StatusBadRequest, removeMaterializedRepositoryResponse{Error: "invalid repository locator"})
+		return
+	}
+	removed, err := removeMaterializedRepository(c.Request.Context(), s.procMgr.WorkDir(), destination, req.RepositoryURL)
+	if err != nil {
+		if errors.Is(err, errMaterializeCollision) {
+			c.JSON(http.StatusConflict, removeMaterializedRepositoryResponse{Error: "destination is not the requested checkout"})
+			return
+		}
+		s.logger.Warn("workspace repository cleanup failed", zap.String("destination", req.Destination), zap.Error(err))
+		c.JSON(http.StatusUnprocessableEntity, removeMaterializedRepositoryResponse{Error: "repository cleanup failed"})
+		return
+	}
+	c.JSON(http.StatusOK, removeMaterializedRepositoryResponse{Removed: removed})
+}
+
+var errMaterializeCollision = errors.New("materialize destination collision")
+
+type materializeGitCommandError struct {
+	exitCode int
+}
+
+func (e materializeGitCommandError) Error() string { return "git command failed" }
+
+func (e materializeGitCommandError) ExitCode() int { return e.exitCode }
+
+var beforeMaterializeQuarantineRename = func() {}
+
+var afterMaterializeQuarantineOpen = func(string) {}
+
+func materializeDestination(workDir, destination string) (string, error) {
+	if destination == "" || filepath.IsAbs(destination) || filepath.Base(destination) != destination || destination == "." || destination == ".." {
+		return "", errors.New("unsafe destination")
+	}
+	root, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	destination = filepath.Join(root, destination)
+	if filepath.Dir(destination) != root {
+		return "", errors.New("destination escapes workspace")
+	}
+	return destination, nil
+}
+
+func validateRepositoryLocator(locator string) error {
+	if malformedRepositoryLocator(locator) {
+		return errors.New("empty or malformed locator")
+	}
+	if filepath.IsAbs(locator) {
+		return errors.New("local locator is not allowed")
+	}
+	parsed, err := url.Parse(locator)
+	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("credentialed or malformed locator")
+	}
+	if isNetworkRepositoryScheme(parsed.Scheme) {
+		return validateNetworkRepositoryLocator(parsed)
+	}
+	// Git's SCP-like syntax permits only the conventional git user; accepting
+	// arbitrary users would make it impossible to distinguish credentials.
+	if strings.HasPrefix(locator, "git@") && strings.Count(locator, ":") == 1 && !strings.ContainsAny(locator, " \\t") {
+		return nil
+	}
+	return errors.New("unsupported locator")
+}
+
+func malformedRepositoryLocator(locator string) bool {
+	return locator == "" || strings.TrimSpace(locator) != locator || strings.IndexFunc(locator, unicode.IsControl) >= 0
+}
+
+func isNetworkRepositoryScheme(scheme string) bool {
+	switch scheme {
+	case "https", "http", "ssh", "git":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateNetworkRepositoryLocator(locator *url.URL) error {
+	if locator.Host == "" {
+		return errors.New("locator host required")
+	}
+	return nil
+}
+
+// validateRemovalRepositoryLocator keeps rollback capable of recognizing
+// legacy local-test checkouts. Removal never opens the locator: it only
+// compares it with an existing checkout's origin before deleting that owned
+// destination, unlike the materialize endpoint which must not fetch local or
+// file URLs from an HTTP caller.
+func validateRemovalRepositoryLocator(locator string) error {
+	if filepath.IsAbs(locator) || strings.HasPrefix(locator, "file:") {
+		return nil
+	}
+	return validateRepositoryLocator(locator)
+}
+
+func materializeRepository(ctx context.Context, locator, destination, baseBranch, checkoutBranch string, bindings ...*models.RemoteContribution) (bool, error) {
+	var binding *models.RemoteContribution
+	if len(bindings) > 0 {
+		binding = bindings[0]
+	}
+	return materializeRepositoryInternal(ctx, locator, destination, baseBranch, checkoutBranch, binding, nil)
+}
+
+func materializeRepositoryWithDestination(ctx context.Context, locator, destination, baseBranch, checkoutBranch string, binding *models.RemoteContribution, contributionDestination *models.ContributionDestination) (bool, error) {
+	return materializeRepositoryInternal(ctx, locator, destination, baseBranch, checkoutBranch, binding, contributionDestination)
+}
+
+func materializeRepositoryInternal(ctx context.Context, locator, destination, baseBranch, checkoutBranch string, binding *models.RemoteContribution, contributionDestination *models.ContributionDestination) (bool, error) {
+	return materializeRepositoryWithOptions(ctx, locator, destination, baseBranch, checkoutBranch, binding, contributionDestination, nil)
+}
+
+func materializeRepositoryWithOptions(ctx context.Context, locator, destination, baseBranch, checkoutBranch string, binding *models.RemoteContribution, contributionDestination *models.ContributionDestination, options *models.RepositoryCheckoutOptions) (bool, error) {
+	return materializeRepositoryWithQualifiedPRBase(ctx, locator, destination, baseBranch, checkoutBranch, 0, nil, binding, contributionDestination, options)
+}
+
+func materializeRepositoryWithQualifiedPRBase(
+	ctx context.Context, locator, destination, baseBranch, checkoutBranch string,
+	prNumber int, qualifiedPRBase *models.PRBase, binding *models.RemoteContribution,
+	contributionDestination *models.ContributionDestination, options *models.RepositoryCheckoutOptions,
+) (bool, error) {
+	if err := validateQualifiedPRBaseMaterialization(prNumber, baseBranch, checkoutBranch, qualifiedPRBase); err != nil {
+		return false, err
+	}
+	options, err := models.NormalizeRepositoryCheckoutOptions(options)
+	if err != nil {
+		return false, err
+	}
+
+	if reused, err := matchingCheckoutWithDestination(ctx, destination, locator, baseBranch, checkoutBranch, qualifiedPRBase, binding, contributionDestination); err != nil || reused {
+		if err == nil && reused {
+			err = gitcheckout.Check(destination, options)
+		}
+		return reused, err
+	}
+	// codeql[go/path-injection] destination is a direct child of the canonical workspace root; Lstat rejects links before use.
+	if _, err := os.Lstat(destination); err == nil {
+		return false, errMaterializeCollision
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect destination: %w", err)
+	}
+	parent := filepath.Dir(destination)
+	// codeql[go/path-injection] parent is the canonical workspace root containing the direct-child destination.
+	tmp, err := os.MkdirTemp(parent, ".kandev-clone-")
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	checkout := filepath.Join(tmp, "checkout")
+	if err := cloneMaterializedRepository(ctx, locator, checkout, options); err != nil {
+		return false, err
+	}
+	if err := populateMaterializedRepository(ctx, checkout, baseBranch, checkoutBranch, prNumber, qualifiedPRBase, binding, options); err != nil {
+		return false, err
+	}
+	if err := configureContributionDestination(ctx, checkout, contributionDestination); err != nil {
+		return false, err
+	}
+	// codeql[go/path-injection] checkout is newly created beneath the trusted workspace root; destination is its direct child.
+	if err := os.Rename(checkout, destination); err != nil {
+		if os.IsExist(err) {
+			return false, errMaterializeCollision
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+func validateQualifiedPRBaseMaterialization(
+	prNumber int, baseBranch, checkoutBranch string, qualifiedPRBase *models.PRBase,
+) error {
+	return validateQualifiedPRBaseRequest(&MaterializeRepositoryRequest{
+		PRNumber: prNumber, BaseBranch: baseBranch, CheckoutBranch: checkoutBranch,
+		QualifiedPRBase: qualifiedPRBase,
+	})
+}
+
+func cloneMaterializedRepository(ctx context.Context, locator, checkout string, options *models.RepositoryCheckoutOptions) error {
+	args := []string{"clone", "--no-checkout"}
+	if options != nil && options.DownloadMode == models.DownloadOnDemand {
+		args = append(args, "--filter=blob:none")
+	}
+	args = append(args, "--", locator, checkout)
+	out, err := materializeGitOutput(ctx, args...)
+	if err != nil {
+		return err
+	}
+	if options != nil && options.DownloadMode == models.DownloadOnDemand && strings.Contains(strings.ToLower(out), "filtering not recognized") {
+		return errors.New("server does not support on-demand downloads")
+	}
+	return gitcheckout.ConfigureSparse(ctx, checkout, options, materializeCheckoutGit)
+}
+
+func populateMaterializedRepository(
+	ctx context.Context, checkout, baseBranch, checkoutBranch string,
+	prNumber int, qualifiedPRBase *models.PRBase, binding *models.RemoteContribution,
+	options *models.RepositoryCheckoutOptions,
+) error {
+	if qualifiedPRBase != nil {
+		runner := func(runCtx context.Context, args ...string) (string, error) {
+			return materializeGitOutput(runCtx, append([]string{"-C", checkout}, args...)...)
+		}
+		if _, err := gitbase.Materialize(ctx, gitbase.GitRunner(runner), *qualifiedPRBase); err != nil {
+			return fmt.Errorf("materialize qualified PR base: %w", err)
+		}
+	}
+	if binding != nil {
+		if err := materializeRemoteContribution(ctx, checkout, binding); err != nil {
+			return err
+		}
+	} else if qualifiedPRBase != nil {
+		if prNumber != qualifiedPRBase.Target.Number || checkoutBranch != qualifiedPRBase.Target.HeadBranch {
+			return errors.New("qualified PR head does not match checkout request")
+		}
+		runner := func(runCtx context.Context, args ...string) (string, error) {
+			return materializeGitOutput(runCtx, append([]string{"-C", checkout}, args...)...)
+		}
+		head, err := gitbase.FetchPullRequestHead(ctx, gitbase.GitRunner(runner), qualifiedPRBase.Target)
+		if err != nil {
+			return fmt.Errorf("materialize qualified PR head: %w", err)
+		}
+		if _, err := materializeGitOutput(ctx, "-C", checkout, "checkout", "-B", checkoutBranch, head.OID); err != nil {
+			return fmt.Errorf("check out qualified PR head: %w", err)
+		}
+	} else if err := checkoutMaterializedBranch(ctx, checkout, baseBranch, checkoutBranch); err != nil {
+		return err
+	}
+	if err := gitcheckout.ApplySparse(ctx, checkout, options, materializeCheckoutGit); err != nil {
+		return err
+	}
+	if err := gitcheckout.Save(checkout, options); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateQualifiedPRBaseRequest(req *MaterializeRepositoryRequest) error {
+	if req == nil || req.QualifiedPRBase == nil {
+		return nil
+	}
+	base := req.QualifiedPRBase
+	if err := base.Validate(); err != nil {
+		return err
+	}
+	target := base.Target
+	if target.Provider != models.ComparisonTargetProviderGitHub || target.Kind != models.ComparisonTargetKindPullRequest {
+		return errors.New("qualified target is not a GitHub pull request")
+	}
+	if req.PRNumber != target.Number || req.BaseBranch != target.TargetBranch || req.CheckoutBranch != target.HeadBranch {
+		return errors.New("qualified PR identity does not match materialization request")
+	}
+	return nil
+}
+
+func matchingCheckoutWithDestination(
+	ctx context.Context, destination, locator, baseBranch, checkoutBranch string,
+	qualifiedPRBase *models.PRBase, binding *models.RemoteContribution,
+	contributionDestination *models.ContributionDestination,
+) (bool, error) {
+	var reused bool
+	var err error
+	if qualifiedPRBase != nil && binding == nil {
+		reused, err = matchingQualifiedPRCheckout(ctx, destination, locator, checkoutBranch, *qualifiedPRBase)
+	} else {
+		reused, err = matchingCheckout(ctx, destination, locator, baseBranch, checkoutBranch, binding)
+		if err == nil && reused && qualifiedPRBase != nil {
+			if err = verifyQualifiedPRBaseAtCheckout(ctx, destination, *qualifiedPRBase); err != nil {
+				return false, fmt.Errorf("verify reused qualified PR base: %w", err)
+			}
+		}
+	}
+	if err != nil || !reused || contributionDestination == nil {
+		return reused, err
+	}
+	return true, configureContributionDestination(ctx, destination, contributionDestination)
+}
+
+func matchingQualifiedPRCheckout(ctx context.Context, destination, locator, checkoutBranch string, base models.PRBase) (bool, error) {
+	exists, err := materializedCheckoutExists(destination)
+	if err != nil || !exists {
+		return false, err
+	}
+	if err := matchingCheckoutIdentity(ctx, destination, locator, checkoutBranch); err != nil {
+		return false, err
+	}
+	if err := verifyQualifiedPRBaseAtCheckout(ctx, destination, base); err != nil {
+		return false, fmt.Errorf("verify reused qualified PR base: %w", err)
+	}
+	head, err := gitbase.FetchPullRequestHead(ctx, materializeCheckoutGitRunner(destination), base.Target)
+	if err != nil {
+		return false, fmt.Errorf("verify reused qualified PR head: %w", err)
+	}
+	actual, err := materializeGitOutput(ctx, "-C", destination, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(actual), head.OID) {
+		return false, errMaterializeCollision
+	}
+	return true, nil
+}
+
+func materializeCheckoutGitRunner(checkout string) gitbase.GitRunner {
+	return func(ctx context.Context, args ...string) (string, error) {
+		return materializeGitOutput(ctx, append([]string{"-C", checkout}, args...)...)
+	}
+}
+
+func verifyQualifiedPRBaseAtCheckout(ctx context.Context, checkout string, base models.PRBase) error {
+	_, err := gitbase.Materialize(ctx, materializeCheckoutGitRunner(checkout), base)
+	return err
+}
+
+func configureContributionDestination(ctx context.Context, checkout string, destination *models.ContributionDestination) error {
+	if destination == nil {
+		return nil
+	}
+	if err := destination.Validate(); err != nil {
+		return err
+	}
+	remoteName := destination.ContributionRemoteName()
+	configured, err := materializeGitOutput(ctx, "-C", checkout, "config", "--get", "remote."+remoteName+".url")
+	if err == nil {
+		if strings.TrimSpace(configured) != destination.TargetRepository.RemoteURL {
+			return errors.New("contribution destination identity conflict")
+		}
+	} else if _, err := materializeGitOutput(ctx, "-C", checkout, "remote", "add", remoteName, destination.TargetRepository.RemoteURL); err != nil {
+		return errors.New("contribution destination could not be configured")
+	}
+	pushURLs, pushErr := materializeGitOutput(ctx, "-C", checkout, "config", "--get-all", "remote."+remoteName+".pushurl")
+	if pushErr == nil && !contributionDestinationPushURLsMatch(pushURLs, destination.TargetRepository.RemoteURL) {
+		return errors.New("contribution destination push identity conflict")
+	}
+	if pushErr != nil {
+		if _, err := materializeGitOutput(ctx, "-C", checkout, "config", "--add", "remote."+remoteName+".pushurl", destination.TargetRepository.RemoteURL); err != nil {
+			return errors.New("contribution destination push URL could not be configured")
+		}
+	}
+	branch, err := materializeGitOutput(ctx, "-C", checkout, "branch", "--show-current")
+	if err != nil || strings.TrimSpace(branch) == "" {
+		return errors.New("contribution destination branch could not be identified")
+	}
+	if _, err := materializeGitOutput(ctx, "-C", checkout, "config", "branch."+strings.TrimSpace(branch)+".pushRemote", remoteName); err != nil {
+		return errors.New("contribution destination push remote could not be configured")
+	}
+	return nil
+}
+
+func contributionDestinationPushURLsMatch(configured, target string) bool {
+	urls := strings.Split(strings.TrimSpace(configured), "\n")
+	if len(urls) == 0 || (len(urls) == 1 && urls[0] == "") {
+		return false
+	}
+	for _, configuredURL := range urls {
+		if strings.TrimSpace(configuredURL) != target {
+			return false
+		}
+	}
+	return true
+}
+
+func checkoutMaterializedBranch(ctx context.Context, checkout, baseBranch, checkoutBranch string) error {
+	branch := checkoutBranch
+	if branch == "" {
+		branch = baseBranch
+	}
+	if hasGitRef(ctx, checkout, "refs/heads/"+branch) {
+		_, err := materializeGitOutput(ctx, "-C", checkout, "checkout", branch)
+		return err
+	}
+	if hasGitRef(ctx, checkout, "refs/remotes/origin/"+branch) {
+		_, err := materializeGitOutput(ctx, "-C", checkout, "checkout", "--track", "-b", branch, "origin/"+branch)
+		return err
+	}
+	if checkoutBranch == "" {
+		return errors.New("base branch is unavailable from origin")
+	}
+	_, err := materializeGitOutput(ctx, "-C", checkout, "checkout", "-b", checkoutBranch, "origin/"+baseBranch)
+	return err
+}
+
+func hasGitRef(ctx context.Context, directory, ref string) bool {
+	_, err := materializeGitOutput(ctx, "-C", directory, "show-ref", "--verify", "--quiet", ref)
+	return err == nil
+}
+
+func materializeRemoteContribution(ctx context.Context, checkout string, binding *models.RemoteContribution) error {
+	if binding == nil {
+		return errors.New("remote contribution binding is required")
+	}
+	if err := binding.Validate(); err != nil {
+		return err
+	}
+	remoteName := binding.ContributionRemoteName()
+	configured, err := materializeGitOutput(ctx, "-C", checkout, "config", "--get", "remote."+remoteName+".url")
+	if err == nil {
+		if strings.TrimSpace(configured) != binding.SourceRepository.RemoteURL {
+			return errors.New("contribution remote identity conflict")
+		}
+	} else if _, err := materializeGitOutput(ctx, "-C", checkout, "remote", "add", remoteName, binding.SourceRepository.RemoteURL); err != nil {
+		return errors.New("contribution remote could not be configured")
+	}
+
+	remoteRef := "refs/remotes/" + remoteName + "/" + binding.HeadBranch
+	refspec := "+refs/heads/" + binding.HeadBranch + ":" + remoteRef
+	if _, err := materializeGitOutput(ctx, "-C", checkout, "fetch", "--no-tags", remoteName, refspec); err != nil {
+		return errors.New("contribution source branch is unavailable")
+	}
+	actual, err := materializeGitOutput(ctx, "-C", checkout, "rev-parse", "--verify", remoteRef+"^{commit}")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), binding.HeadSHA) {
+		return errors.New("contribution source head changed")
+	}
+
+	branch := binding.HeadBranch
+	if hasGitRef(ctx, checkout, "refs/heads/"+branch) {
+		suffix := strings.TrimPrefix(remoteName, "contrib-")
+		branch = binding.HeadBranch + "-kandev-" + suffix
+		for index := 1; hasGitRef(ctx, checkout, "refs/heads/"+branch); index++ {
+			branch = fmt.Sprintf("%s-kandev-%s-%d", binding.HeadBranch, suffix, index)
+		}
+	}
+	if _, err := materializeGitOutput(ctx, "-C", checkout, "checkout", "-b", branch, remoteRef); err != nil {
+		return errors.New("contribution branch could not be checked out")
+	}
+	if _, err := materializeGitOutput(ctx, "-C", checkout, "branch", "--set-upstream-to="+remoteName+"/"+binding.HeadBranch, branch); err != nil {
+		return errors.New("contribution branch upstream could not be configured")
+	}
+	return nil
+}
+
+func matchingCheckout(ctx context.Context, destination, locator, baseBranch, checkoutBranch string, bindings ...*models.RemoteContribution) (bool, error) {
+	var binding *models.RemoteContribution
+	if len(bindings) > 0 {
+		binding = bindings[0]
+	}
+	exists, err := materializedCheckoutExists(destination)
+	if err != nil || !exists {
+		return false, err
+	}
+	branch := checkoutBranch
+	if branch == "" {
+		branch = baseBranch
+	}
+	if binding != nil {
+		if err := matchingCheckoutOrigin(ctx, destination, locator); err != nil {
+			return false, err
+		}
+		return matchingRemoteContributionCheckout(ctx, destination, binding)
+	}
+	if err := matchingCheckoutIdentity(ctx, destination, locator, branch); err != nil {
+		return false, err
+	}
+	return matchingCheckoutCommit(ctx, destination, baseBranch, branch)
+}
+
+func materializedCheckoutExists(destination string) (bool, error) {
+	// codeql[go/path-injection] destination is a direct child of the canonical workspace root and must be a real directory before Git probes.
+	destinationInfo, err := os.Lstat(destination)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil || destinationInfo.Mode()&os.ModeSymlink != 0 || !destinationInfo.IsDir() {
+		return false, errMaterializeCollision
+	}
+	gitPath := filepath.Join(destination, ".git")
+	// codeql[go/path-injection] .git is the exact child of a real, non-symlink destination and is Lstat-checked before Git probes.
+	gitInfo, err := os.Lstat(gitPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errMaterializeCollision
+	}
+	if gitInfo.Mode()&os.ModeSymlink != 0 || !gitInfo.IsDir() {
+		return false, errMaterializeCollision
+	}
+	return true, nil
+}
+
+func matchingCheckoutIdentity(ctx context.Context, destination, locator, branch string) error {
+	// Read the URL stored in the checkout instead of the expanded URL returned by
+	// `git remote get-url`. Executor-specific insteadOf rules can rewrite the
+	// latter to a local transport, even though the checkout still belongs to the
+	// requested repository.
+	origin, err := materializeGitOutput(ctx, "-C", destination, "config", "--local", "--get", "remote.origin.url")
+	if err != nil || strings.TrimSpace(origin) != locator {
+		return errMaterializeCollision
+	}
+	currentBranch, err := materializeGitOutput(ctx, "-C", destination, "branch", "--show-current")
+	if err != nil || strings.TrimSpace(currentBranch) != branch {
+		return errMaterializeCollision
+	}
+	return nil
+}
+
+func matchingCheckoutOrigin(ctx context.Context, destination, locator string) error {
+	origin, err := materializeGitOutput(ctx, "-C", destination, "remote", "get-url", "origin")
+	if err != nil || strings.TrimSpace(origin) != locator {
+		return errMaterializeCollision
+	}
+	return nil
+}
+
+func matchingRemoteContributionCheckout(ctx context.Context, destination string, binding *models.RemoteContribution) (bool, error) {
+	if err := materializeRemoteContributionRef(ctx, destination, binding); err != nil {
+		return false, err
+	}
+	remoteName := binding.ContributionRemoteName()
+	currentBranch, err := materializeGitOutput(ctx, "-C", destination, "branch", "--show-current")
+	if err != nil || strings.TrimSpace(currentBranch) == "" {
+		return false, errMaterializeCollision
+	}
+	upstream, err := materializeGitOutput(ctx, "-C", destination, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	if err != nil || strings.TrimSpace(upstream) != remoteName+"/"+binding.HeadBranch {
+		return false, errMaterializeCollision
+	}
+	head, err := materializeGitOutput(ctx, "-C", destination, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return false, errMaterializeCollision
+	}
+	if strings.EqualFold(strings.TrimSpace(head), binding.HeadSHA) {
+		return true, nil
+	}
+	if _, err := materializeGitOutput(ctx, "-C", destination, "merge-base", "--is-ancestor", binding.HeadSHA, "HEAD"); err != nil {
+		return false, errMaterializeCollision
+	}
+	return true, nil
+}
+
+func materializeRemoteContributionRef(ctx context.Context, checkout string, binding *models.RemoteContribution) error {
+	if binding == nil {
+		return errors.New("remote contribution binding is required")
+	}
+	if err := binding.Validate(); err != nil {
+		return err
+	}
+	remoteName := binding.ContributionRemoteName()
+	configured, err := materializeGitOutput(ctx, "-C", checkout, "config", "--get", "remote."+remoteName+".url")
+	if err != nil || strings.TrimSpace(configured) != binding.SourceRepository.RemoteURL {
+		return errMaterializeCollision
+	}
+	remoteRef := "refs/remotes/" + remoteName + "/" + binding.HeadBranch
+	refspec := "+refs/heads/" + binding.HeadBranch + ":" + remoteRef
+	if _, err := materializeGitOutput(ctx, "-C", checkout, "fetch", "--no-tags", remoteName, refspec); err != nil {
+		return err
+	}
+	actual, err := materializeGitOutput(ctx, "-C", checkout, "rev-parse", "--verify", remoteRef+"^{commit}")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), binding.HeadSHA) {
+		return errors.New("contribution source head changed")
+	}
+	return nil
+}
+
+func matchingCheckoutCommit(ctx context.Context, destination, baseBranch, branch string) (bool, error) {
+	requestedRef := "origin/" + branch
+	if !hasGitRef(ctx, destination, "refs/remotes/"+requestedRef) {
+		requestedRef = "origin/" + baseBranch
+	}
+	requestedCommit, err := materializeGitOutput(ctx, "-C", destination, "rev-parse", "--verify", requestedRef+"^{commit}")
+	if err != nil {
+		return false, errMaterializeCollision
+	}
+	headCommit, err := materializeGitOutput(ctx, "-C", destination, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || strings.TrimSpace(headCommit) != strings.TrimSpace(requestedCommit) {
+		return false, errMaterializeCollision
+	}
+	return true, nil
+}
+
+func removeMaterializedRepository(ctx context.Context, workDir, destination, locator string) (bool, error) {
+	root, destinationName, err := openMaterializeRemovalRoot(workDir, destination)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = root.Close() }()
+	quarantine, err := moveToMaterializeQuarantine(root, destinationName)
+	if err != nil {
+		return false, err
+	}
+	if quarantine == "" {
+		return false, nil
+	}
+	quarantineRoot, capturedInfo, err := openMaterializedQuarantine(root, quarantine, destinationName)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = quarantineRoot.Close() }()
+	afterMaterializeQuarantineOpen(quarantine)
+	if err := validateMaterializedQuarantine(quarantineRoot, locator); err != nil {
+		return false, restoreMaterializedQuarantine(root, capturedInfo, quarantine, destinationName)
+	}
+	if err := removeCapturedMaterializedQuarantine(root, quarantineRoot, capturedInfo, quarantine); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func openMaterializeRemovalRoot(workDir, destination string) (*os.Root, string, error) {
+	canonicalWorkDir, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		return nil, "", err
+	}
+	if filepath.Dir(destination) != canonicalWorkDir {
+		return nil, "", errMaterializeCollision
+	}
+	root, err := os.OpenRoot(canonicalWorkDir)
+	if err != nil {
+		return nil, "", err
+	}
+	return root, filepath.Base(destination), nil
+}
+
+func moveToMaterializeQuarantine(root *os.Root, destination string) (string, error) {
+	quarantine, err := materializeQuarantine(root)
+	if err != nil {
+		return "", err
+	}
+	beforeMaterializeQuarantineRename()
+	// codeql[go/path-injection] Root binds both direct-child names to the canonical workspace; quarantine captures the exact object before validation.
+	if err := root.Rename(destination, quarantine); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return quarantine, nil
+}
+
+func openMaterializedQuarantine(root *os.Root, quarantine, destination string) (*os.Root, os.FileInfo, error) {
+	// codeql[go/path-injection] Root Lstat rejects a link or non-directory before opening the quarantined name.
+	quarantineInfo, err := root.Lstat(quarantine)
+	if err != nil || quarantineInfo.Mode()&os.ModeSymlink != 0 || !quarantineInfo.IsDir() {
+		return nil, nil, restoreMaterializedQuarantine(root, quarantineInfo, quarantine, destination)
+	}
+	// codeql[go/path-injection] Root opens the exact object atomically moved into its private canonical-workdir quarantine.
+	quarantineRoot, err := root.OpenRoot(quarantine)
+	if err != nil {
+		return nil, nil, restoreMaterializedQuarantine(root, nil, quarantine, destination)
+	}
+	capturedInfo, err := quarantineRoot.Lstat(".")
+	if err != nil || capturedInfo.Mode()&os.ModeSymlink != 0 || !capturedInfo.IsDir() {
+		_ = quarantineRoot.Close()
+		return nil, nil, restoreMaterializedQuarantine(root, capturedInfo, quarantine, destination)
+	}
+	return quarantineRoot, capturedInfo, nil
+}
+
+func validateMaterializedQuarantine(quarantineRoot *os.Root, locator string) error {
+	// codeql[go/path-injection] The opened quarantine root keeps .git bound to the captured directory, independent of later pathname replacement.
+	gitDir, err := quarantineRoot.Lstat(".git")
+	if err != nil || gitDir.Mode()&os.ModeSymlink != 0 || !gitDir.IsDir() {
+		return errMaterializeCollision
+	}
+	origin, err := materializeQuarantineOrigin(quarantineRoot)
+	if err != nil || strings.TrimSpace(origin) != locator {
+		return errMaterializeCollision
+	}
+	return nil
+}
+
+func removeCapturedMaterializedQuarantine(root, quarantineRoot *os.Root, capturedInfo os.FileInfo, quarantine string) error {
+	// codeql[go/path-injection] The captured quarantine root recursively removes only its own entries after origin verification.
+	if err := clearMaterializedQuarantine(quarantineRoot); err != nil {
+		return err
+	}
+	if matches, err := quarantineMatchesCaptured(root, quarantine, capturedInfo); err != nil || !matches {
+		return errMaterializeCollision
+	}
+	// codeql[go/path-injection] Root non-recursively removes the quarantined parent entry only after it still matches the captured object.
+	if err := root.Remove(quarantine); err != nil {
+		return err
+	}
+	return nil
+}
+
+func materializeQuarantine(root *os.Root) (string, error) {
+	for range 10 {
+		entropy := make([]byte, 16)
+		if _, err := rand.Read(entropy); err != nil {
+			return "", err
+		}
+		name := fmt.Sprintf(".kandev-remove-%x", entropy)
+		if err := root.Mkdir(name, 0o700); err == nil {
+			if err := root.Remove(name); err != nil {
+				return "", err
+			}
+			return name, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("allocate removal quarantine")
+}
+
+func restoreMaterializedQuarantine(root *os.Root, captured os.FileInfo, quarantine, destination string) error {
+	if captured == nil {
+		return errMaterializeCollision
+	}
+	if matches, err := quarantineMatchesCaptured(root, quarantine, captured); err != nil || !matches {
+		return errMaterializeCollision
+	}
+	if _, err := root.Lstat(destination); err == nil {
+		return errMaterializeCollision
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	// codeql[go/path-injection] Root restores the exact quarantined object only when its direct-child destination remains absent.
+	if err := root.Rename(quarantine, destination); err != nil {
+		return err
+	}
+	return errMaterializeCollision
+}
+
+func quarantineMatchesCaptured(root *os.Root, quarantine string, captured os.FileInfo) (bool, error) {
+	info, err := root.Lstat(quarantine)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(info, captured), nil
+}
+
+func materializeQuarantineOrigin(root *os.Root) (string, error) {
+	config, err := root.ReadFile(filepath.Join(".git", "config"))
+	if err != nil {
+		return "", err
+	}
+	return parseMaterializeOriginURL(string(config)), nil
+}
+
+func parseMaterializeOriginURL(config string) string {
+	inOrigin := false
+	for line := range strings.SplitSeq(config, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			fields := strings.Fields(strings.TrimSpace(line[1 : len(line)-1]))
+			inOrigin = len(fields) == 2 && strings.EqualFold(fields[0], "remote") && fields[1] == `"origin"`
+			continue
+		}
+		if !inOrigin || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "url") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func clearMaterializedQuarantine(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = directory.Close() }()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func materializeGitOutput(ctx context.Context, args ...string) (string, error) {
+	output, runErr, execCtxErr := subproc.RunGitCombinedAfterAcquire(
+		ctx,
+		subproc.GitLifecycle,
+		materializeGitTimeout(args),
+		func(execCtx context.Context) *exec.Cmd {
+			return subproc.NewGitCommand(execCtx, args...)
+		},
+	)
+	if runErr != nil || execCtxErr != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		cause := runErr
+		if cause == nil {
+			cause = execCtxErr
+		}
+		var exitCoder interface{ ExitCode() int }
+		if errors.As(cause, &exitCoder) {
+			return "", materializeGitCommandError{exitCode: exitCoder.ExitCode()}
+		}
+		return "", errors.New("git command failed")
+	}
+	return string(output), nil
+}
+
+func materializeGitTimeout(args []string) time.Duration {
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "-C":
+			index++
+		case "clone", "push", "submodule":
+			return 5 * time.Minute
+		case "fetch", "pull", "ls-remote":
+			return 30 * time.Second
+		}
+	}
+	return 30 * time.Second
+}
+
+func materializeCheckoutGit(ctx context.Context, args []string, input string) ([]byte, error) {
+	output, runErr, ctxErr := subproc.RunGitCombinedAfterAcquire(ctx, subproc.GitLifecycle, materializeGitTimeout(args), func(execCtx context.Context) *exec.Cmd {
+		cmd := subproc.NewGitCommand(execCtx, args...)
+		cmd.Stdin = strings.NewReader(input)
+		return cmd
+	})
+	if runErr != nil || ctxErr != nil {
+		return nil, errors.Join(errors.New("git checkout command failed"), ctxErr)
+	}
+	return output, nil
+}

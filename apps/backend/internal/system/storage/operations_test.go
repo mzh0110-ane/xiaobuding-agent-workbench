@@ -1,0 +1,688 @@
+package storage
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/runtime/activity"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/system/jobs"
+	systemsettings "github.com/kandev/kandev/internal/system/settings"
+	"go.uber.org/zap"
+)
+
+func TestRunNowIgnoresQuietPeriodWithoutActiveTaskWork(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	provider := &signallingCleanupProvider{called: make(chan struct{})}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool),
+		Jobs: tracker, Activity: coordinator, Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, false)
+	if err != nil {
+		t.Fatalf("RunNow: %v", err)
+	}
+	if jobID == "" {
+		t.Fatal("RunNow returned an empty job ID")
+	}
+	select {
+	case <-provider.called:
+	case <-time.After(time.Second):
+		t.Fatal("manual provider did not run")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		job := tracker.Get(jobID)
+		if job != nil && (job.State == jobs.StateSucceeded || job.State == jobs.StateFailed) {
+			if job.State != jobs.StateSucceeded {
+				t.Fatalf("manual job state=%q message=%q, want succeeded", job.State, job.Message)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("manual job did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRunNowInvalidatesOverviewAfterSuccess(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	overview := &recordingRefreshOverview{}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool),
+		Jobs: tracker, Activity: activity.NewCoordinator(activity.Options{}),
+		Providers: []CleanupProvider{&signallingCleanupProvider{called: make(chan struct{})}},
+		Overview:  overview,
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, false)
+	if err != nil {
+		t.Fatalf("RunNow: %v", err)
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateSucceeded)
+	if overview.invalidateCalls != 1 {
+		t.Fatalf("overview invalidations = %d, want 1", overview.invalidateCalls)
+	}
+}
+
+func TestRunNowRejectsCurrentTaskActivity(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	taskLease, err := coordinator.AcquireTask(context.Background(), activity.KindTestCommand)
+	if err != nil {
+		t.Fatalf("AcquireTask: %v", err)
+	}
+	defer taskLease.Release()
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool),
+		Jobs: jobs.NewTracker(nil, newOperationsTestLogger(t)), Activity: coordinator,
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, false)
+	var busyErr *BusyError
+	if !errors.As(err, &busyErr) {
+		t.Fatalf("RunNow error = %v, want BusyError", err)
+	}
+	if jobID != "" {
+		t.Fatalf("busy RunNow job ID = %q, want empty", jobID)
+	}
+	if !busyErr.ForceAvailable || len(busyErr.Resources) != 1 || busyErr.Resources[0].Label == "" {
+		t.Fatalf("busy response = %#v, want labeled force-available resource", busyErr)
+	}
+}
+
+func TestRunNowForceRunsBesideCurrentTaskActivity(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	taskLease, err := coordinator.AcquireTask(context.Background(), activity.KindTestCommand)
+	if err != nil {
+		t.Fatalf("AcquireTask: %v", err)
+	}
+	defer taskLease.Release()
+	provider := &signallingCleanupProvider{called: make(chan struct{})}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool), Jobs: tracker,
+		Activity: coordinator, Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, true)
+	if err != nil {
+		t.Fatalf("forced RunNow: %v", err)
+	}
+	select {
+	case <-provider.called:
+	case <-time.After(time.Second):
+		t.Fatal("forced cleanup did not run beside active task")
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateSucceeded)
+}
+
+func TestRunNowAllowsExplicitGoCleanupWithSavedBusyPolicy(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	settings := NewSettingsStore(rawSettings)
+	policy := DefaultSettings()
+	policy.GoCache.AllowCleanupWhileBusy = true
+	if _, err := settings.SaveSettings(context.Background(), policy); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	task, err := coordinator.AcquireTask(context.Background(), activity.KindTestCommand)
+	if err != nil {
+		t.Fatalf("AcquireTask: %v", err)
+	}
+	defer task.Release()
+	provider := &explicitGoCacheCleanupProvider{called: make(chan struct{})}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: settings, Store: newStorageStore(t, pool), Jobs: tracker,
+		Activity: coordinator, Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), []string{"go_cache"}, false)
+	if err != nil || jobID == "" {
+		t.Fatalf("RunNow = (%q, %v), want queued job without force", jobID, err)
+	}
+	select {
+	case <-provider.called:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Go cleanup did not run beside active task")
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateSucceeded)
+}
+
+func TestRunNowGoBusyPolicyStillRejectsExistingMaintenance(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	settings := NewSettingsStore(rawSettings)
+	policy := DefaultSettings()
+	policy.GoCache.AllowCleanupWhileBusy = true
+	if _, err := settings.SaveSettings(context.Background(), policy); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	held, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("TryAcquireMaintenance: %v", err)
+	}
+	defer held.Release()
+	provider := &explicitGoCacheCleanupProvider{called: make(chan struct{})}
+	operations := NewOperations(OperationsConfig{
+		Settings: settings, Store: newStorageStore(t, pool),
+		Jobs: jobs.NewTracker(nil, newOperationsTestLogger(t)), Activity: coordinator,
+		Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), []string{"go_cache"}, false)
+	var busyErr *BusyError
+	if !errors.As(err, &busyErr) || jobID != "" {
+		t.Fatalf("RunNow = (%q, %v), want non-overridable maintenance busy error", jobID, err)
+	}
+	if len(busyErr.Resources) != 1 || busyErr.Resources[0].Kind != activity.KindMaintenanceRunning {
+		t.Fatalf("busy resources = %#v, want maintenance-running", busyErr.Resources)
+	}
+	select {
+	case <-provider.called:
+		t.Fatal("Go-cache cleanup ran alongside another maintenance run")
+	default:
+	}
+}
+
+func TestRunNowDoesNotBypassForDisabledUnselectedGoCache(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	settings := NewSettingsStore(rawSettings)
+	policy := DefaultSettings()
+	policy.GoCache.AllowCleanupWhileBusy = true
+	if _, err := settings.SaveSettings(context.Background(), policy); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	task, err := coordinator.AcquireTask(context.Background(), activity.KindTestCommand)
+	if err != nil {
+		t.Fatalf("AcquireTask: %v", err)
+	}
+	defer task.Release()
+	provider := &explicitGoCacheCleanupProvider{called: make(chan struct{})}
+	operations := NewOperations(OperationsConfig{
+		Settings: settings, Store: newStorageStore(t, pool),
+		Jobs: jobs.NewTracker(nil, newOperationsTestLogger(t)), Activity: coordinator,
+		Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, false)
+	var busyErr *BusyError
+	if !errors.As(err, &busyErr) || jobID != "" {
+		t.Fatalf("RunNow = (%q, %v), want busy error without a job", jobID, err)
+	}
+	select {
+	case <-provider.called:
+		t.Fatal("unselected disabled Go cache unexpectedly ran")
+	default:
+	}
+}
+
+func TestAdoptGoCacheHonorsMutationCancellation(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	adopter := &countingGoCacheAdopter{}
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), GoCache: adopter,
+		GoCacheMutations: NewMutationGate(),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, _, err := operations.AdoptGoCache(ctx, t.TempDir(), "ADOPT"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AdoptGoCache error = %v, want cancellation", err)
+	}
+	if adopter.calls != 0 {
+		t.Fatalf("adoption validation calls = %d, want none after cancellation", adopter.calls)
+	}
+}
+
+func TestRunNowForceBlockedByExistingMaintenanceIsNotForceAvailable(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	held, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("TryAcquireMaintenance: %v", err)
+	}
+	defer held.Release()
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool), Activity: coordinator,
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, true)
+	var busyErr *BusyError
+	if !errors.As(err, &busyErr) {
+		t.Fatalf("forced RunNow error = %v, want BusyError", err)
+	}
+	if jobID != "" {
+		t.Fatalf("busy forced RunNow job ID = %q, want empty", jobID)
+	}
+	if busyErr.ForceAvailable || len(busyErr.Resources) != 1 || busyErr.Resources[0].Kind != activity.KindMaintenanceRunning {
+		t.Fatalf("busy response = %#v, want non-overridable maintenance resource", busyErr)
+	}
+}
+
+func TestRunNowMarksPreemptedTrackedJobFailed(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	coordinator := activity.NewCoordinator(activity.Options{})
+	provider := &preemptingSuccessfulProvider{
+		coordinator: coordinator,
+		lease:       make(chan *activity.TaskLease, 1),
+	}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool),
+		Jobs: tracker, Activity: coordinator, Providers: []CleanupProvider{provider},
+	})
+
+	jobID, err := operations.RunNow(context.Background(), nil, false)
+	if err != nil {
+		t.Fatalf("RunNow: %v", err)
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateFailed)
+	select {
+	case lease := <-provider.lease:
+		lease.Release()
+	case <-time.After(time.Second):
+		t.Fatal("preempting task lease was not acquired")
+	}
+}
+
+func TestSelectCleanupProvidersUsesExplicitCleanupOnlyForNamedResources(t *testing.T) {
+	provider := &explicitRecordingCleanupProvider{}
+
+	selected, err := selectCleanupProviders([]CleanupProvider{provider}, nil)
+	if err != nil {
+		t.Fatalf("select all providers: %v", err)
+	}
+	if _, err := selected[0].Cleanup(context.Background()); err != nil {
+		t.Fatalf("normal cleanup: %v", err)
+	}
+	if provider.normalCalls != 1 || provider.explicitCalls != 0 {
+		t.Fatalf("global cleanup calls = normal:%d explicit:%d", provider.normalCalls, provider.explicitCalls)
+	}
+
+	selected, err = selectCleanupProviders([]CleanupProvider{provider}, []string{"explicit", "explicit"})
+	if err != nil {
+		t.Fatalf("select named provider: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("selected providers = %d, want duplicate resource de-duplicated", len(selected))
+	}
+	if _, err := selected[0].Cleanup(context.Background()); err != nil {
+		t.Fatalf("explicit cleanup: %v", err)
+	}
+	if provider.normalCalls != 1 || provider.explicitCalls != 1 {
+		t.Fatalf("named cleanup calls = normal:%d explicit:%d", provider.normalCalls, provider.explicitCalls)
+	}
+}
+
+func TestDeleteQuarantineRejectsBeforeRetentionWithoutStartingDelete(t *testing.T) {
+	connection := newSQLite(t)
+	store := newStorageStore(t, db.NewPool(connection, connection))
+	entry := testQuarantineEntry("retained-entry")
+	entry.DeleteAfter = time.Now().UTC().Add(time.Hour)
+	if err := store.CreateQuarantineEntry(context.Background(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	quarantine := &recordingQuarantineController{}
+	operations := NewOperations(OperationsConfig{
+		Store: store, Jobs: jobs.NewTracker(nil, newOperationsTestLogger(t)), Quarantine: quarantine,
+	})
+
+	jobID, err := operations.DeleteQuarantine(context.Background(), entry.ID, "DELETE")
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("DeleteQuarantine error = %v, want ErrConflict", err)
+	}
+	if jobID != "" || quarantine.deleteCalls != 0 {
+		t.Fatalf("early deletion started: job_id=%q delete_calls=%d", jobID, quarantine.deleteCalls)
+	}
+}
+
+func TestAdoptGoCacheInvalidatesOverview(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	overview := &recordingRefreshOverview{}
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings),
+		Overview: overview,
+		GoCache:  recordingGoCacheAdopter{},
+	})
+
+	if _, _, err := operations.AdoptGoCache(context.Background(), t.TempDir(), "ADOPT"); err != nil {
+		t.Fatalf("AdoptGoCache: %v", err)
+	}
+	if overview.invalidateCalls != 1 {
+		t.Fatalf("overview invalidations = %d, want 1", overview.invalidateCalls)
+	}
+}
+
+func TestRestoreQuarantineInvalidatesOverview(t *testing.T) {
+	overview := &recordingRefreshOverview{}
+	operations := NewOperations(OperationsConfig{
+		Overview: overview, Quarantine: &recordingQuarantineController{},
+	})
+
+	if _, err := operations.RestoreQuarantine(context.Background(), "entry"); err != nil {
+		t.Fatalf("RestoreQuarantine: %v", err)
+	}
+	if overview.invalidateCalls != 1 {
+		t.Fatalf("overview invalidations = %d, want 1", overview.invalidateCalls)
+	}
+}
+
+func TestDeleteQuarantineInvalidatesOverviewAfterSuccess(t *testing.T) {
+	connection := newSQLite(t)
+	store := newStorageStore(t, db.NewPool(connection, connection))
+	entry := testQuarantineEntry("expired-entry")
+	entry.DeleteAfter = time.Now().UTC().Add(-time.Hour)
+	if err := store.CreateQuarantineEntry(context.Background(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	overview := &recordingRefreshOverview{}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Store: store, Jobs: tracker, Overview: overview,
+		Quarantine: &recordingQuarantineController{},
+	})
+
+	jobID, err := operations.DeleteQuarantine(context.Background(), entry.ID, "DELETE")
+	if err != nil {
+		t.Fatalf("DeleteQuarantine: %v", err)
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateSucceeded)
+	if overview.invalidateCalls != 1 {
+		t.Fatalf("overview invalidations = %d, want 1", overview.invalidateCalls)
+	}
+}
+
+func TestPurgeQuarantineValidatesScopeAndConfirmation(t *testing.T) {
+	controller := &recordingQuarantineController{}
+	operations := NewOperations(OperationsConfig{Quarantine: controller})
+	for _, test := range []struct {
+		scope        QuarantinePurgeScope
+		confirmation string
+	}{
+		{QuarantinePurgeScopeEligible, "DELETE ALL NOW"},
+		{QuarantinePurgeScopeAll, "DELETE ELIGIBLE"},
+		{"unknown", "DELETE ELIGIBLE"},
+	} {
+		if jobID, err := operations.PurgeQuarantine(context.Background(), test.scope, test.confirmation); !errors.Is(err, ErrValidation) || jobID != "" {
+			t.Fatalf("PurgeQuarantine(%q, %q) = (%q, %v), want validation error and no job", test.scope, test.confirmation, jobID, err)
+		}
+	}
+	if controller.purgeCalls != 0 {
+		t.Fatalf("purge calls = %d, want 0", controller.purgeCalls)
+	}
+}
+
+func TestPurgeQuarantineTracksPartialResultAndInvalidatesOverview(t *testing.T) {
+	overview := &recordingRefreshOverview{}
+	controller := &recordingQuarantineController{
+		purgeResult: QuarantinePurgeResult{
+			Scope: QuarantinePurgeScopeEligible, Considered: 2, Deleted: 1, DeletedBytes: 42,
+			Protected: 1, ProtectedBytes: 8, Failed: 0, FailedBytes: 0,
+		},
+		purgeErr: errors.New("one entry failed"),
+	}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Jobs: tracker, Overview: overview, Quarantine: controller,
+	})
+
+	jobID, err := operations.PurgeQuarantine(context.Background(), QuarantinePurgeScopeEligible, "DELETE ELIGIBLE")
+	if err != nil {
+		t.Fatalf("PurgeQuarantine: %v", err)
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateFailed)
+	job := tracker.Get(jobID)
+	if job.Result["deleted"] != float64(1) || job.Result["deleted_bytes"] != float64(42) {
+		t.Fatalf("job result = %#v, want partial purge result", job.Result)
+	}
+	if overview.invalidateCalls != 1 {
+		t.Fatalf("overview invalidations = %d, want 1", overview.invalidateCalls)
+	}
+}
+
+func TestAnalyzeForcesOverviewRefresh(t *testing.T) {
+	connection := newSQLite(t)
+	pool := db.NewPool(connection, connection)
+	rawSettings, err := systemsettings.NewStore(pool)
+	if err != nil {
+		t.Fatalf("new settings store: %v", err)
+	}
+	overview := &recordingRefreshOverview{called: make(chan struct{})}
+	tracker := jobs.NewTracker(nil, newOperationsTestLogger(t))
+	operations := NewOperations(OperationsConfig{
+		Settings: NewSettingsStore(rawSettings), Store: newStorageStore(t, pool),
+		Jobs: tracker, Overview: overview,
+	})
+
+	jobID, err := operations.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	select {
+	case <-overview.called:
+	case <-time.After(time.Second):
+		t.Fatal("Analyze did not request an overview refresh")
+	}
+	if overview.refreshCalls != 1 {
+		t.Fatalf("Refresh calls = %d, want 1", overview.refreshCalls)
+	}
+	if overview.summaryCalls != 0 {
+		t.Fatalf("Summary calls = %d, want 0", overview.summaryCalls)
+	}
+	waitForJobState(t, tracker, jobID, jobs.StateSucceeded)
+}
+
+func waitForJobState(t *testing.T, tracker *jobs.Tracker, id string, state jobs.State) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		job := tracker.Get(id)
+		if job != nil && (job.State == jobs.StateSucceeded || job.State == jobs.StateFailed) {
+			if job.State != state {
+				t.Fatalf("job state=%q message=%q, want %q", job.State, job.Message, state)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("job did not finish")
+}
+
+type recordingQuarantineController struct {
+	deleteCalls int
+	purgeCalls  int
+	purgeResult QuarantinePurgeResult
+	purgeErr    error
+}
+
+type recordingGoCacheAdopter struct{}
+
+func (recordingGoCacheAdopter) ValidateAdoption(context.Context, string, string) error {
+	return nil
+}
+
+type explicitGoCacheCleanupProvider struct {
+	called chan struct{}
+}
+
+func (*explicitGoCacheCleanupProvider) Name() string { return "go_cache" }
+func (*explicitGoCacheCleanupProvider) Cleanup(context.Context) (map[string]any, error) {
+	return nil, errors.New("explicit selection used ordinary cleanup")
+}
+func (p *explicitGoCacheCleanupProvider) CleanupExplicit(context.Context) (map[string]any, error) {
+	close(p.called)
+	return map[string]any{"cleaned": true}, nil
+}
+
+type countingGoCacheAdopter struct {
+	calls int
+}
+
+func (a *countingGoCacheAdopter) ValidateAdoption(context.Context, string, string) error {
+	a.calls++
+	return nil
+}
+
+type recordingRefreshOverview struct {
+	called          chan struct{}
+	refreshCalls    int
+	summaryCalls    int
+	invalidateCalls int
+}
+
+func (o *recordingRefreshOverview) Summary(context.Context) (Summary, error) {
+	o.summaryCalls++
+	close(o.called)
+	return Summary{}, nil
+}
+
+func (o *recordingRefreshOverview) Refresh(context.Context) (OverviewSnapshot, error) {
+	o.refreshCalls++
+	close(o.called)
+	return OverviewSnapshot{Summary: Summary{}}, nil
+}
+
+func (o *recordingRefreshOverview) Get(context.Context) (OverviewSnapshot, error) {
+	return OverviewSnapshot{}, nil
+}
+
+func (o *recordingRefreshOverview) Capabilities(context.Context, StorageMaintenanceSettings) Capabilities {
+	return Capabilities{}
+}
+
+func (o *recordingRefreshOverview) SettingsCapabilities(
+	context.Context,
+	StorageMaintenanceSettings,
+) Capabilities {
+	return Capabilities{}
+}
+
+func (o *recordingRefreshOverview) Invalidate() {
+	o.invalidateCalls++
+}
+
+type signallingCleanupProvider struct {
+	called chan struct{}
+}
+
+type explicitRecordingCleanupProvider struct {
+	normalCalls   int
+	explicitCalls int
+}
+
+func (p *explicitRecordingCleanupProvider) Name() string { return "explicit" }
+
+func (p *explicitRecordingCleanupProvider) Cleanup(context.Context) (map[string]any, error) {
+	p.normalCalls++
+	return nil, nil
+}
+
+func (p *explicitRecordingCleanupProvider) CleanupExplicit(context.Context) (map[string]any, error) {
+	p.explicitCalls++
+	return nil, nil
+}
+
+func (p *signallingCleanupProvider) Name() string { return "signalling" }
+
+func (p *signallingCleanupProvider) Cleanup(context.Context) (map[string]any, error) {
+	close(p.called)
+	return map[string]any{"cleaned": true}, nil
+}
+
+func (c *recordingQuarantineController) Restore(context.Context, string) (QuarantineEntry, error) {
+	return QuarantineEntry{}, nil
+}
+
+func (c *recordingQuarantineController) PermanentDelete(
+	context.Context,
+	string,
+	string,
+) (QuarantineEntry, error) {
+	c.deleteCalls++
+	return QuarantineEntry{}, nil
+}
+
+func (c *recordingQuarantineController) Purge(
+	context.Context,
+	QuarantinePurgeScope,
+	string,
+) (QuarantinePurgeResult, error) {
+	c.purgeCalls++
+	return c.purgeResult, c.purgeErr
+}
+
+func newOperationsTestLogger(t *testing.T) *logger.Logger {
+	t.Helper()
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return log
+}

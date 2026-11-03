@@ -1,0 +1,1332 @@
+// Package repository provides SQLite-based repository implementations for workflow entities.
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+
+	workflowcfg "github.com/kandev/kandev/config/workflows"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/db/dialect"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	"github.com/kandev/kandev/internal/workflow/models"
+)
+
+// Repository provides SQLite-based workflow storage operations.
+type Repository struct {
+	db      *sqlx.DB // writer
+	ro      *sqlx.DB // reader
+	migrate *db.MigrateLogger
+}
+
+// NewWithDB creates a new SQLite repository with existing database connections.
+func NewWithDB(writer, reader *sqlx.DB, log *logger.Logger) (*Repository, error) {
+	repo := &Repository{
+		db:      writer,
+		ro:      reader,
+		migrate: db.NewRequiredMigrateLogger(writer, log),
+	}
+	if err := repo.initSchema(); err != nil {
+		return nil, fmt.Errorf("failed to initialize workflow schema: %w", err)
+	}
+	return repo, nil
+}
+
+// initSchema creates the database tables if they don't exist.
+func (r *Repository) initSchema() error {
+	// Create workflow_templates table
+	templatesSchema := `
+	CREATE TABLE IF NOT EXISTS workflow_templates (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		description TEXT,
+		is_system INTEGER DEFAULT 0,
+		steps TEXT NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL
+	);
+	`
+	if _, err := r.db.Exec(templatesSchema); err != nil {
+		return fmt.Errorf("failed to create workflow_templates table: %w", err)
+	}
+
+	// Create workflow_steps table with new event-driven schema
+	stepsSchema := `
+	CREATE TABLE IF NOT EXISTS workflow_steps (
+		id TEXT PRIMARY KEY,
+		workflow_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		position INTEGER NOT NULL,
+		color TEXT,
+		prompt TEXT,
+		events TEXT,
+		allow_manual_move INTEGER DEFAULT 1,
+		is_start_step INTEGER DEFAULT 0,
+		show_in_command_panel INTEGER DEFAULT 1,
+		auto_archive_after_hours INTEGER DEFAULT 0,
+		profile_session_start_policy TEXT NOT NULL DEFAULT 'reuse',
+		profile_session_end_policy TEXT NOT NULL DEFAULT 'park',
+		disable_unclassified_fallback INTEGER NOT NULL DEFAULT 0,
+		wip_limit INTEGER NOT NULL DEFAULT 0,
+		pull_from_step_id TEXT NOT NULL DEFAULT '',
+		session_target TEXT,
+		auto_advance_requires_signal INTEGER NOT NULL DEFAULT 0,
+		cancel_triggers_turn_complete INTEGER NOT NULL DEFAULT 0,
+		complete_task_on_enter INTEGER NOT NULL DEFAULT 0,
+		order_revision INTEGER NOT NULL DEFAULT 0,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL,
+		FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow ON workflow_steps(workflow_id);
+	`
+	if _, err := r.db.Exec(stepsSchema); err != nil {
+		return fmt.Errorf("failed to create workflow_steps table: %w", err)
+	}
+
+	// Create session_step_history table (id column differs between SQLite and PostgreSQL)
+	var idCol string
+	if r.db.DriverName() == "pgx" {
+		idCol = "id BIGSERIAL PRIMARY KEY"
+	} else {
+		idCol = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+	}
+	historySchema := `
+	CREATE TABLE IF NOT EXISTS session_step_history (
+		` + idCol + `,
+		session_id TEXT NOT NULL,
+		from_step_id TEXT,
+		to_step_id TEXT NOT NULL,
+		trigger TEXT NOT NULL,
+		actor_id TEXT,
+		metadata TEXT,
+		created_at TIMESTAMP NOT NULL,
+		FOREIGN KEY (session_id) REFERENCES task_sessions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_session_step_history_session ON session_step_history(session_id);
+	`
+	if _, err := r.db.Exec(historySchema); err != nil {
+		return fmt.Errorf("failed to create session_step_history table: %w", err)
+	}
+
+	r.migrate.Apply("workflow_steps.show_in_command_panel", `ALTER TABLE workflow_steps ADD COLUMN show_in_command_panel INTEGER DEFAULT 1`)
+	r.migrate.Apply("workflow_steps.agent_profile_id", `ALTER TABLE workflow_steps ADD COLUMN agent_profile_id TEXT DEFAULT ''`)
+	r.migrate.Apply("workflow_steps.profile_session_start_policy", `ALTER TABLE workflow_steps ADD COLUMN profile_session_start_policy TEXT NOT NULL DEFAULT 'reuse'`)
+	_ = r.migrate.Apply("workflow_steps.profile_session_end_policy", `ALTER TABLE workflow_steps ADD COLUMN profile_session_end_policy TEXT NOT NULL DEFAULT 'park'`)
+	if err := r.migrate.Apply(
+		"workflow_steps.disable_unclassified_fallback",
+		`ALTER TABLE workflow_steps ADD COLUMN disable_unclassified_fallback INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return fmt.Errorf("failed to add workflow step unclassified fallback veto: %w", err)
+	}
+	// Phase 2 (ADR-0004) - workflow_steps.stage_type, a UX hint for the
+	// frontend ("work" | "review" | "approval" | "custom"). Backend code
+	// MUST NOT branch on it. Idempotent ALTER; default keeps existing rows at "custom".
+	r.migrate.Apply("workflow_steps.stage_type", `ALTER TABLE workflow_steps ADD COLUMN stage_type TEXT NOT NULL DEFAULT 'custom'`)
+	// ADR 0015 — gate auto-advance on an explicit `step_complete_kandev`
+	// MCP signal. Idempotent ALTER; existing rows keep today's behaviour
+	// (immediate transition on turn-end) until the column is set to 1.
+	r.migrate.Apply("workflow_steps.auto_advance_requires_signal", `ALTER TABLE workflow_steps ADD COLUMN auto_advance_requires_signal INTEGER NOT NULL DEFAULT 0`)
+	// User-cancel completion is opt-in for persisted rows. The embedded simple
+	// template supplies its own true values; this migration must never backfill
+	// existing workflows.
+	r.migrate.Apply("workflow_steps.cancel_triggers_turn_complete", `ALTER TABLE workflow_steps ADD COLUMN cancel_triggers_turn_complete INTEGER NOT NULL DEFAULT 0`)
+	_ = r.migrate.Apply("workflow_steps.complete_task_on_enter", `ALTER TABLE workflow_steps ADD COLUMN complete_task_on_enter INTEGER NOT NULL DEFAULT 0`)
+	r.migrate.Apply("workflow_steps.wip_limit", `ALTER TABLE workflow_steps ADD COLUMN wip_limit INTEGER NOT NULL DEFAULT 0`)
+	r.migrate.Apply("workflow_steps.pull_from_step_id", `ALTER TABLE workflow_steps ADD COLUMN pull_from_step_id TEXT NOT NULL DEFAULT ''`)
+	_ = r.migrate.Apply("workflow_steps.session_target", `ALTER TABLE workflow_steps ADD COLUMN session_target TEXT`)
+	r.migrate.Apply("idx_workflow_steps_pull_from", `
+		CREATE INDEX IF NOT EXISTS idx_workflow_steps_pull_from
+		ON workflow_steps(pull_from_step_id)
+	`)
+	// Kanban task reordering (REQ-TASKS-KANBAN-TASK-REORDERING-001.25):
+	// per-step monotonic counter, incremented once per committed reorder in
+	// the same serialized section that renumbers the step. Starts at 0 for
+	// every existing row so a never-reordered step is not a special case.
+	_ = r.migrate.Apply("workflow_steps.order_revision", `ALTER TABLE workflow_steps ADD COLUMN order_revision INTEGER NOT NULL DEFAULT 0`)
+
+	// Phase 2 — multi-agent participation tables. Empty rows for a step
+	// preserve today's single-agent behaviour, so existing kanban
+	// workflows are unaffected.
+	if err := r.initPhase2Schema(); err != nil {
+		return err
+	}
+	if err := r.backfillCompletionPolicy(); err != nil {
+		return fmt.Errorf("backfill task completion policy: %w", err)
+	}
+
+	// Seed system templates
+	if err := r.seedSystemTemplates(); err != nil {
+		return fmt.Errorf("failed to seed system templates: %w", err)
+	}
+
+	// Seed default workflow steps for workflows that don't have any
+	if err := r.seedDefaultWorkflowSteps(); err != nil {
+		return fmt.Errorf("failed to seed default workflow steps: %w", err)
+	}
+
+	if err := r.normalizeDuplicateStartSteps(); err != nil {
+		return fmt.Errorf("failed to normalize duplicate start steps: %w", err)
+	}
+	r.migrate.Apply("idx_workflow_steps_single_start", `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_steps_single_start
+		ON workflow_steps(workflow_id)
+		WHERE is_start_step = 1
+	`)
+
+	// Repair step_id references that were incorrectly saved as template aliases
+	// instead of UUIDs. This was caused by a frontend bug (fixed in PR #XXX).
+	if err := r.repairBrokenStepIDReferences(); err != nil {
+		return fmt.Errorf("failed to repair step_id references: %w", err)
+	}
+	if err := r.migrate.Err(); err != nil {
+		return fmt.Errorf("required workflow migration: %w", err)
+	}
+
+	return nil
+}
+
+func (r *Repository) normalizeDuplicateStartSteps() error {
+	_, err := r.db.Exec(`
+		WITH ranked AS (
+			SELECT
+				id,
+				ROW_NUMBER() OVER (
+					PARTITION BY workflow_id
+					-- Legacy repair follows last-writer-wins: keep the row
+					-- most recently marked/changed as the workflow start step.
+					ORDER BY updated_at DESC, position DESC, id DESC
+				) AS start_rank
+			FROM workflow_steps
+			WHERE is_start_step = 1
+		)
+		UPDATE workflow_steps
+		SET is_start_step = 0
+		WHERE id IN (SELECT id FROM ranked WHERE start_rank > 1)
+	`)
+	return err
+}
+
+// seedDefaultWorkflowSteps creates default workflow steps for workflows that don't have any.
+// Uses the simple template as the default workflow.
+func (r *Repository) seedDefaultWorkflowSteps() error {
+	// Find workflows without workflow steps
+	rows, err := r.db.Query(`
+		SELECT w.id FROM workflows w
+		LEFT JOIN workflow_steps ws ON ws.workflow_id = w.id
+		WHERE ws.id IS NULL
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var workflowIDs []string
+	for rows.Next() {
+		var workflowID string
+		if err := rows.Scan(&workflowID); err != nil {
+			return err
+		}
+		workflowIDs = append(workflowIDs, workflowID)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Use the simple (kanban) template for default workflow steps
+	now := time.Now()
+	simpleTemplate, err := getKanbanTemplate()
+	if err != nil {
+		return err
+	}
+
+	for _, workflowID := range workflowIDs {
+		// Build mapping from template step ID to new UUID
+		idMap := make(map[string]string, len(simpleTemplate.Steps))
+		for _, stepDef := range simpleTemplate.Steps {
+			idMap[stepDef.ID] = uuid.New().String()
+		}
+
+		for _, stepDef := range simpleTemplate.Steps {
+			events := models.RemapStepEvents(stepDef.Events, idMap)
+			eventsJSON, err := json.Marshal(events)
+			if err != nil {
+				return fmt.Errorf("failed to marshal events: %w", err)
+			}
+			sessionTargetJSON, err := marshalSessionTarget(models.RemapWorkflowSessionTarget(stepDef.SessionTarget, idMap))
+			if err != nil {
+				return fmt.Errorf("failed to marshal session target: %w", err)
+			}
+
+			if _, err := r.db.Exec(r.db.Rebind(`
+				INSERT INTO workflow_steps (
+					id, workflow_id, name, position, color,
+					prompt, events, allow_manual_move, is_start_step, show_in_command_panel,
+					agent_profile_id, profile_session_start_policy, profile_session_end_policy,
+					disable_unclassified_fallback,
+					wip_limit, pull_from_step_id, session_target, auto_advance_requires_signal,
+					cancel_triggers_turn_complete, complete_task_on_enter, created_at, updated_at
+				) VALUES (
+					?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+					?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+				)
+			`),
+				idMap[stepDef.ID], workflowID, stepDef.Name, stepDef.Position, stepDef.Color,
+				stepDef.Prompt, string(eventsJSON), dialect.BoolToInt(stepDef.AllowManualMove),
+				dialect.BoolToInt(stepDef.IsStartStep), dialect.BoolToInt(stepDef.ShowInCommandPanel), stepDef.AgentProfileID, taskmodels.NormalizeWorkflowProfileSessionStartPolicy(string(stepDef.ProfileSessionStartPolicy)), taskmodels.NormalizeWorkflowProfileSessionEndPolicy(string(stepDef.ProfileSessionEndPolicy)), dialect.BoolToInt(stepDef.DisableUnclassifiedFallback), stepDef.WIPLimit, models.RemapStepID(stepDef.PullFromStepID, idMap), sessionTargetJSON, dialect.BoolToInt(stepDef.AutoAdvanceRequiresSignal), dialect.BoolToInt(stepDef.CancelTriggersTurnComplete), dialect.BoolToInt(stepDef.CompleteTaskOnEnter), now, now,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// repairBrokenStepIDReferences fixes workflow steps that have template aliases
+// (like "review", "in-progress") instead of actual UUIDs in their step_id config.
+// This repairs data corrupted by a frontend bug where template events overwrote
+// the backend's properly remapped events.
+func (r *Repository) repairBrokenStepIDReferences() error {
+	byWorkflow, err := r.loadStepsWithStepIDRefs()
+	if err != nil {
+		return err
+	}
+	for workflowID, steps := range byWorkflow {
+		nameToUUID, err := r.buildStepNameMapping(workflowID)
+		if err != nil {
+			return err
+		}
+		if err := r.repairWorkflowSteps(steps, nameToUUID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type brokenStepRow struct {
+	id, workflowID, events string
+}
+
+func (r *Repository) loadStepsWithStepIDRefs() (map[string][]brokenStepRow, error) {
+	rows, err := r.db.Query(`
+		SELECT ws.id, ws.workflow_id, ws.events
+		FROM workflow_steps ws
+		WHERE ws.events LIKE '%"step_id"%'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	byWorkflow := make(map[string][]brokenStepRow)
+	for rows.Next() {
+		var s brokenStepRow
+		if err := rows.Scan(&s.id, &s.workflowID, &s.events); err != nil {
+			return nil, err
+		}
+		byWorkflow[s.workflowID] = append(byWorkflow[s.workflowID], s)
+	}
+	return byWorkflow, rows.Err()
+}
+
+func (r *Repository) buildStepNameMapping(workflowID string) (map[string]string, error) {
+	rows, err := r.db.Query(r.db.Rebind(`
+		SELECT id, name FROM workflow_steps WHERE workflow_id = ?
+	`), workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	nameToUUID := make(map[string]string)
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		nameToUUID[normalizeStepName(name)] = id
+	}
+	return nameToUUID, rows.Err()
+}
+
+func (r *Repository) repairWorkflowSteps(steps []brokenStepRow, nameToUUID map[string]string) error {
+	for _, step := range steps {
+		if err := r.repairSingleStep(step, nameToUUID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Repository) repairSingleStep(step brokenStepRow, nameToUUID map[string]string) error {
+	var events models.StepEvents
+	if err := json.Unmarshal([]byte(step.events), &events); err != nil {
+		return nil // Skip malformed JSON
+	}
+	if !repairEventsStepIDs(&events, nameToUUID) {
+		return nil // No repairs needed
+	}
+	data, err := json.Marshal(events)
+	if err != nil {
+		return nil
+	}
+	_, err = r.db.Exec(r.db.Rebind(`UPDATE workflow_steps SET events = ? WHERE id = ?`), string(data), step.id)
+	if err != nil {
+		return fmt.Errorf("repair step %s: %w", step.id, err)
+	}
+	return nil
+}
+
+func repairEventsStepIDs(events *models.StepEvents, nameToUUID map[string]string) bool {
+	modified := false
+	for i, a := range events.OnTurnStart {
+		if a.Type == models.OnTurnStartMoveToStep && a.Config != nil {
+			if repairStepIDConfig(a.Config, nameToUUID) {
+				events.OnTurnStart[i] = a
+				modified = true
+			}
+		}
+	}
+	for i, a := range events.OnTurnComplete {
+		if a.Type == models.OnTurnCompleteMoveToStep && a.Config != nil {
+			if repairStepIDConfig(a.Config, nameToUUID) {
+				events.OnTurnComplete[i] = a
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+// normalizeStepName converts a step name to a lookup key (lowercase, spaces→hyphens)
+func normalizeStepName(name string) string {
+	return strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+}
+
+// repairStepIDConfig fixes a step_id config value if it's a template alias.
+// Returns true if a repair was made.
+func repairStepIDConfig(cfg map[string]interface{}, nameToUUID map[string]string) bool {
+	stepID, ok := cfg["step_id"].(string)
+	if !ok {
+		return false
+	}
+	// Check if it's already a UUID (36 chars with hyphens at expected positions)
+	if len(stepID) == 36 && stepID[8] == '-' && stepID[13] == '-' {
+		return false
+	}
+	// Look up the real UUID by normalized name
+	if realUUID, found := nameToUUID[normalizeStepName(stepID)]; found {
+		cfg["step_id"] = realUUID
+		return true
+	}
+	return false
+}
+
+// getKanbanTemplate loads the kanban ("simple") template from embedded YAML.
+// Used by migration code to seed default workflow steps.
+func getKanbanTemplate() (*models.WorkflowTemplate, error) {
+	templates, err := workflowcfg.LoadTemplates()
+	if err != nil {
+		return nil, fmt.Errorf("workflows: load embedded templates: %w", err)
+	}
+	for _, t := range templates {
+		if t.ID == "simple" {
+			return t, nil
+		}
+	}
+	return nil, fmt.Errorf("workflows: kanban template (id=simple) not found in embedded YAML")
+}
+
+// seedSystemTemplates inserts the default system workflow templates.
+func (r *Repository) seedSystemTemplates() error {
+	templates, err := r.getSystemTemplates()
+	if err != nil {
+		return err
+	}
+
+	for _, tmpl := range templates {
+		// Always upsert system templates to keep them current
+		stepsJSON, err := json.Marshal(tmpl.Steps)
+		if err != nil {
+			return fmt.Errorf("failed to marshal steps for template %s: %w", tmpl.ID, err)
+		}
+
+		_, err = r.db.Exec(r.db.Rebind(`
+			INSERT INTO workflow_templates (id, name, description, is_system, steps, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO NOTHING
+		`), tmpl.ID, tmpl.Name, tmpl.Description, dialect.BoolToInt(tmpl.IsSystem), string(stepsJSON), tmpl.CreatedAt, tmpl.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("failed to upsert template %s: %w", tmpl.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// getSystemTemplates returns the predefined system workflow templates loaded from embedded YAML files.
+func (r *Repository) getSystemTemplates() ([]*models.WorkflowTemplate, error) {
+	return workflowcfg.LoadTemplates()
+}
+
+// ============================================================================
+// WorkflowTemplate CRUD Operations
+// ============================================================================
+
+// CreateTemplate creates a new workflow template.
+func (r *Repository) CreateTemplate(ctx context.Context, template *models.WorkflowTemplate) error {
+	if template.ID == "" {
+		template.ID = uuid.New().String()
+	}
+	now := time.Now().UTC()
+	template.CreatedAt = now
+	template.UpdatedAt = now
+
+	stepsJSON, err := json.Marshal(template.Steps)
+	if err != nil {
+		return fmt.Errorf("failed to marshal steps: %w", err)
+	}
+
+	_, err = r.db.ExecContext(ctx, r.db.Rebind(`
+		INSERT INTO workflow_templates (id, name, description, is_system, steps, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`), template.ID, template.Name, template.Description, dialect.BoolToInt(template.IsSystem), string(stepsJSON), template.CreatedAt, template.UpdatedAt)
+
+	return err
+}
+
+// GetTemplate retrieves a workflow template by ID.
+func (r *Repository) GetTemplate(ctx context.Context, id string) (*models.WorkflowTemplate, error) {
+	template := &models.WorkflowTemplate{}
+	var stepsJSON string
+	var isSystem int
+
+	err := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT id, name, description, is_system, steps, created_at, updated_at
+		FROM workflow_templates WHERE id = ?
+	`), id).Scan(&template.ID, &template.Name, &template.Description, &isSystem, &stepsJSON, &template.CreatedAt, &template.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("workflow template not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	template.IsSystem = isSystem == 1
+	if err := json.Unmarshal([]byte(stepsJSON), &template.Steps); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal steps: %w", err)
+	}
+
+	return template, nil
+}
+
+// UpdateTemplate updates an existing workflow template.
+func (r *Repository) UpdateTemplate(ctx context.Context, template *models.WorkflowTemplate) error {
+	template.UpdatedAt = time.Now().UTC()
+
+	stepsJSON, err := json.Marshal(template.Steps)
+	if err != nil {
+		return fmt.Errorf("failed to marshal steps: %w", err)
+	}
+
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE workflow_templates SET name = ?, description = ?, steps = ?, updated_at = ?
+		WHERE id = ? AND is_system = 0
+	`), template.Name, template.Description, string(stepsJSON), template.UpdatedAt, template.ID)
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("workflow template not found or is a system template: %s", template.ID)
+	}
+	return nil
+}
+
+// DeleteTemplate deletes a workflow template by ID.
+func (r *Repository) DeleteTemplate(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`DELETE FROM workflow_templates WHERE id = ? AND is_system = 0`), id)
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("workflow template not found or is a system template: %s", id)
+	}
+	return nil
+}
+
+func scanTemplateRows(rows *sql.Rows) ([]*models.WorkflowTemplate, error) {
+	var result []*models.WorkflowTemplate
+	for rows.Next() {
+		template := &models.WorkflowTemplate{}
+		var stepsJSON string
+		var isSystem int
+
+		err := rows.Scan(&template.ID, &template.Name, &template.Description, &isSystem, &stepsJSON, &template.CreatedAt, &template.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+
+		template.IsSystem = isSystem == 1
+		if err := json.Unmarshal([]byte(stepsJSON), &template.Steps); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal steps for template %s: %w", template.ID, err)
+		}
+
+		result = append(result, template)
+	}
+	return result, rows.Err()
+}
+
+// ListTemplates returns all workflow templates.
+func (r *Repository) ListTemplates(ctx context.Context) ([]*models.WorkflowTemplate, error) {
+	rows, err := r.ro.QueryContext(ctx, `
+		SELECT id, name, description, is_system, steps, created_at, updated_at
+		FROM workflow_templates
+		ORDER BY is_system DESC,
+		CASE
+			WHEN id = 'simple' THEN 1
+			WHEN id = 'standard' THEN 2
+			WHEN id = 'architecture' THEN 3
+			ELSE 999
+		END,
+		name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTemplateRows(rows)
+}
+
+// GetSystemTemplates returns only system workflow templates.
+func (r *Repository) GetSystemTemplates(ctx context.Context) ([]*models.WorkflowTemplate, error) {
+	rows, err := r.ro.QueryContext(ctx, `
+		SELECT id, name, description, is_system, steps, created_at, updated_at
+		FROM workflow_templates WHERE is_system = 1 ORDER BY name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTemplateRows(rows)
+}
+
+// ============================================================================
+// WorkflowStep CRUD Operations
+// ============================================================================
+
+// CreateStep creates a new workflow step.
+func (r *Repository) CreateStep(ctx context.Context, step *models.WorkflowStep) error {
+	_, err := r.CreateStepWithDemotedStartSteps(ctx, step)
+	return err
+}
+
+// CreateStepWithDemotedStartSteps creates a new workflow step and returns any
+// previously-start steps demoted as part of the same transaction.
+func (r *Repository) CreateStepWithDemotedStartSteps(ctx context.Context, step *models.WorkflowStep) ([]*models.WorkflowStep, error) {
+	return r.createStepWithDemotedStartSteps(ctx, step, nil)
+}
+
+// CreateStepWithDemotedStartStepsIfWorkflowUnchanged creates a step only while
+// its owning workflow still has the version observed by the exact Host command.
+func (r *Repository) CreateStepWithDemotedStartStepsIfWorkflowUnchanged(
+	ctx context.Context, step *models.WorkflowStep, expectedWorkflow time.Time,
+) ([]*models.WorkflowStep, error) {
+	return r.createStepWithDemotedStartSteps(ctx, step, &expectedWorkflow)
+}
+
+func (r *Repository) createStepWithDemotedStartSteps(
+	ctx context.Context, step *models.WorkflowStep, expectedWorkflow *time.Time,
+) ([]*models.WorkflowStep, error) {
+	if step.ID == "" {
+		step.ID = uuid.New().String()
+	}
+	now := time.Now().UTC()
+	step.CreatedAt = now
+	step.UpdatedAt = now
+	step.ProfileSessionStartPolicy = taskmodels.NormalizeWorkflowProfileSessionStartPolicy(string(step.ProfileSessionStartPolicy))
+	step.ProfileSessionEndPolicy = taskmodels.NormalizeWorkflowProfileSessionEndPolicy(string(step.ProfileSessionEndPolicy))
+	sessionTargetJSON, err := marshalSessionTarget(step.SessionTarget)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal session target: %w", err)
+	}
+
+	eventsJSON, err := json.Marshal(step.Events)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal events: %w", err)
+	}
+
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var demoted []*models.WorkflowStep
+	if step.IsStartStep {
+		if expectedWorkflow == nil {
+			demoted, err = r.demoteOtherStartSteps(ctx, tx, step.WorkflowID, step.ID, now)
+		} else {
+			demoted, err = r.demoteOtherStartStepsIfWorkflowUnchanged(ctx, tx, step.WorkflowID, step.ID, now, *expectedWorkflow)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	insertQuery := `
+		INSERT INTO workflow_steps (
+			id, workflow_id, name, position, color,
+			prompt, events, allow_manual_move, is_start_step, show_in_command_panel, auto_archive_after_hours, agent_profile_id, profile_session_start_policy, profile_session_end_policy, disable_unclassified_fallback, stage_type, auto_advance_requires_signal, cancel_triggers_turn_complete, complete_task_on_enter, wip_limit, pull_from_step_id, session_target, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	args := []interface{}{step.ID, step.WorkflowID, step.Name, step.Position, step.Color,
+		step.Prompt, string(eventsJSON), dialect.BoolToInt(step.AllowManualMove),
+		dialect.BoolToInt(step.IsStartStep), dialect.BoolToInt(step.ShowInCommandPanel), step.AutoArchiveAfterHours, step.AgentProfileID, taskmodels.NormalizeWorkflowProfileSessionStartPolicy(string(step.ProfileSessionStartPolicy)), taskmodels.NormalizeWorkflowProfileSessionEndPolicy(string(step.ProfileSessionEndPolicy)), dialect.BoolToInt(step.DisableUnclassifiedFallback), normalizeStageType(step.StageType), dialect.BoolToInt(step.AutoAdvanceRequiresSignal), dialect.BoolToInt(step.CancelTriggersTurnComplete), dialect.BoolToInt(step.CompleteTaskOnEnter), step.WIPLimit, step.PullFromStepID, sessionTargetJSON, step.CreatedAt, step.UpdatedAt}
+	if expectedWorkflow != nil {
+		insertQuery = strings.Replace(insertQuery, `) VALUES (`, `) SELECT `, 1)
+		insertQuery = strings.TrimSuffix(strings.TrimSpace(insertQuery), ")") + ` WHERE EXISTS (SELECT 1 FROM workflows WHERE id = ? AND updated_at = ?)`
+		args = append(args, step.WorkflowID, *expectedWorkflow)
+	}
+	result, err := tx.ExecContext(ctx, tx.Rebind(insertQuery), args...)
+	if err != nil {
+		return nil, err
+	}
+	if expectedWorkflow != nil {
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+		if rows == 0 {
+			return nil, repoerrors.ErrTaskVersionConflict
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return demoted, nil
+}
+
+// normalizeStageType returns a string fit for the workflow_steps.stage_type
+// column. Empty / invalid input collapses to "custom" so existing callers
+// who do not set the field stay schema-compliant.
+func normalizeStageType(s models.StageType) string {
+	switch s {
+	case models.StageTypeWork, models.StageTypeReview, models.StageTypeApproval, models.StageTypeCustom:
+		return string(s)
+	}
+	return string(models.StageTypeCustom)
+}
+
+func marshalSessionTarget(target *models.WorkflowSessionTarget) (interface{}, error) {
+	if target == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(target)
+	if err != nil {
+		return nil, fmt.Errorf("marshal workflow session target: %w", err)
+	}
+	return string(data), nil
+}
+
+// scanStep scans a single workflow step row including JSON events parsing.
+func (r *Repository) scanStep(row interface {
+	Scan(dest ...interface{}) error
+}) (*models.WorkflowStep, error) {
+	step := &models.WorkflowStep{}
+	var allowManualMove, isStartStep, showInCommandPanel, disableUnclassifiedFallback, autoAdvanceRequiresSignal, cancelTriggersTurnComplete, completeTaskOnEnter int
+	var autoArchiveAfterHours sql.NullInt64
+	var color, prompt, eventsJSON, agentProfileID, profileSessionStartPolicy, profileSessionEndPolicy, stageType, pullFromStepID, sessionTargetJSON sql.NullString
+
+	err := row.Scan(&step.ID, &step.WorkflowID, &step.Name, &step.Position, &color,
+		&prompt, &eventsJSON, &allowManualMove, &isStartStep, &showInCommandPanel, &autoArchiveAfterHours, &agentProfileID, &profileSessionStartPolicy, &profileSessionEndPolicy, &disableUnclassifiedFallback, &stageType, &autoAdvanceRequiresSignal, &cancelTriggersTurnComplete, &completeTaskOnEnter, &step.WIPLimit, &pullFromStepID, &sessionTargetJSON, &step.OrderRevision, &step.CreatedAt, &step.UpdatedAt)
+
+	if err != nil {
+		return nil, err
+	}
+
+	step.AllowManualMove = allowManualMove == 1
+	step.IsStartStep = isStartStep == 1
+	step.ShowInCommandPanel = showInCommandPanel == 1
+	step.DisableUnclassifiedFallback = disableUnclassifiedFallback == 1
+	step.AutoAdvanceRequiresSignal = autoAdvanceRequiresSignal == 1
+	step.CancelTriggersTurnComplete = cancelTriggersTurnComplete == 1
+	step.CompleteTaskOnEnter = completeTaskOnEnter == 1
+	if autoArchiveAfterHours.Valid {
+		step.AutoArchiveAfterHours = int(autoArchiveAfterHours.Int64)
+	}
+	if agentProfileID.Valid {
+		step.AgentProfileID = agentProfileID.String
+	}
+	step.ProfileSessionStartPolicy = taskmodels.NormalizeWorkflowProfileSessionStartPolicy(profileSessionStartPolicy.String)
+	step.ProfileSessionEndPolicy = taskmodels.NormalizeWorkflowProfileSessionEndPolicy(profileSessionEndPolicy.String)
+	if stageType.Valid && stageType.String != "" {
+		step.StageType = models.StageType(stageType.String)
+	} else {
+		step.StageType = models.StageTypeCustom
+	}
+	if pullFromStepID.Valid {
+		step.PullFromStepID = pullFromStepID.String
+	}
+	if sessionTargetJSON.Valid && sessionTargetJSON.String != "" && sessionTargetJSON.String != "null" {
+		if err := json.Unmarshal([]byte(sessionTargetJSON.String), &step.SessionTarget); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal session target: %w", err)
+		}
+	}
+	if color.Valid {
+		step.Color = color.String
+	}
+	if prompt.Valid {
+		step.Prompt = prompt.String
+	}
+	if eventsJSON.Valid && eventsJSON.String != "" {
+		if err := json.Unmarshal([]byte(eventsJSON.String), &step.Events); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal events: %w", err)
+		}
+	}
+
+	return step, nil
+}
+
+const stepSelectColumns = `id, workflow_id, name, position, color, prompt, events, allow_manual_move, is_start_step, show_in_command_panel, auto_archive_after_hours, agent_profile_id, profile_session_start_policy, profile_session_end_policy, disable_unclassified_fallback, stage_type, auto_advance_requires_signal, cancel_triggers_turn_complete, complete_task_on_enter, wip_limit, pull_from_step_id, session_target, order_revision, created_at, updated_at`
+
+// GetStep retrieves a workflow step by ID.
+func (r *Repository) GetStep(ctx context.Context, id string) (*models.WorkflowStep, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT `+stepSelectColumns+`
+		FROM workflow_steps WHERE id = ?
+	`), id)
+
+	step, err := r.scanStep(row)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: %s", models.ErrWorkflowStepNotFound, id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return step, nil
+}
+
+// UpdateStep updates an existing workflow step.
+func (r *Repository) UpdateStep(ctx context.Context, step *models.WorkflowStep) error {
+	_, err := r.UpdateStepWithDemotedStartSteps(ctx, step)
+	return err
+}
+
+// UpdateStepWithDemotedStartSteps updates a workflow step and returns any
+// previously-start steps demoted as part of the same transaction.
+func (r *Repository) UpdateStepWithDemotedStartSteps(ctx context.Context, step *models.WorkflowStep) ([]*models.WorkflowStep, error) {
+	return r.updateStepWithDemotedStartSteps(ctx, step, nil, nil)
+}
+
+// UpdateStepWithDemotedStartStepsIfUnchanged updates a step and any start-step
+// demotions only while the workflow and step retain their observed versions.
+func (r *Repository) UpdateStepWithDemotedStartStepsIfUnchanged(
+	ctx context.Context, step *models.WorkflowStep, expectedWorkflow, expectedStep time.Time,
+) ([]*models.WorkflowStep, error) {
+	return r.updateStepWithDemotedStartSteps(ctx, step, &expectedWorkflow, &expectedStep)
+}
+
+func (r *Repository) updateStepWithDemotedStartSteps(
+	ctx context.Context, step *models.WorkflowStep, expectedWorkflow, expectedStep *time.Time,
+) ([]*models.WorkflowStep, error) {
+	step.UpdatedAt = time.Now().UTC()
+	step.ProfileSessionStartPolicy = taskmodels.NormalizeWorkflowProfileSessionStartPolicy(string(step.ProfileSessionStartPolicy))
+	step.ProfileSessionEndPolicy = taskmodels.NormalizeWorkflowProfileSessionEndPolicy(string(step.ProfileSessionEndPolicy))
+	sessionTargetJSON, err := marshalSessionTarget(step.SessionTarget)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal session target: %w", err)
+	}
+
+	eventsJSON, err := json.Marshal(step.Events)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal events: %w", err)
+	}
+
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var demoted []*models.WorkflowStep
+	if step.IsStartStep {
+		if expectedWorkflow == nil {
+			demoted, err = r.demoteOtherStartSteps(ctx, tx, step.WorkflowID, step.ID, step.UpdatedAt)
+		} else {
+			demoted, err = r.demoteOtherStartStepsIfWorkflowUnchanged(ctx, tx, step.WorkflowID, step.ID, step.UpdatedAt, *expectedWorkflow)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	query := `
+		UPDATE workflow_steps SET
+			name = ?, position = ?, color = ?,
+			prompt = ?, events = ?,
+			allow_manual_move = ?, is_start_step = ?, show_in_command_panel = ?, auto_archive_after_hours = ?, agent_profile_id = ?, profile_session_start_policy = ?, profile_session_end_policy = ?, disable_unclassified_fallback = ?, stage_type = ?, auto_advance_requires_signal = ?, cancel_triggers_turn_complete = ?, complete_task_on_enter = ?, wip_limit = ?, pull_from_step_id = ?, session_target = ?, updated_at = ?
+		WHERE id = ?
+	`
+	args := []interface{}{step.Name, step.Position, step.Color,
+		step.Prompt, string(eventsJSON),
+		dialect.BoolToInt(step.AllowManualMove), dialect.BoolToInt(step.IsStartStep), dialect.BoolToInt(step.ShowInCommandPanel), step.AutoArchiveAfterHours, step.AgentProfileID, taskmodels.NormalizeWorkflowProfileSessionStartPolicy(string(step.ProfileSessionStartPolicy)), taskmodels.NormalizeWorkflowProfileSessionEndPolicy(string(step.ProfileSessionEndPolicy)), dialect.BoolToInt(step.DisableUnclassifiedFallback), normalizeStageType(step.StageType), dialect.BoolToInt(step.AutoAdvanceRequiresSignal), dialect.BoolToInt(step.CancelTriggersTurnComplete), dialect.BoolToInt(step.CompleteTaskOnEnter), step.WIPLimit, step.PullFromStepID, sessionTargetJSON, step.UpdatedAt, step.ID}
+	if expectedWorkflow != nil && expectedStep != nil {
+		query += ` AND workflow_id = ? AND updated_at = ? AND EXISTS (SELECT 1 FROM workflows WHERE id = ? AND updated_at = ?)`
+		args = append(args, step.WorkflowID, *expectedStep, step.WorkflowID, *expectedWorkflow)
+	}
+	result, err := tx.ExecContext(ctx, tx.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		if expectedWorkflow != nil && expectedStep != nil {
+			return nil, repoerrors.ErrTaskVersionConflict
+		}
+		return nil, fmt.Errorf("workflow step not found: %s", step.ID)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return demoted, nil
+}
+
+func (r *Repository) demoteOtherStartStepsIfWorkflowUnchanged(
+	ctx context.Context, tx *sqlx.Tx, workflowID, exceptStepID string, updatedAt, expectedWorkflow time.Time,
+) ([]*models.WorkflowStep, error) {
+	rows, err := tx.QueryContext(ctx, tx.Rebind(`
+		SELECT `+stepSelectColumns+`
+		FROM workflow_steps
+		WHERE workflow_id = ? AND id != ? AND is_start_step = 1
+		ORDER BY position ASC, id ASC
+	`), workflowID, exceptStepID)
+	if err != nil {
+		return nil, err
+	}
+	demoted, scanErr := r.scanSteps(rows)
+	closeErr := rows.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if _, err := tx.ExecContext(ctx, tx.Rebind(`
+		UPDATE workflow_steps SET is_start_step = 0, updated_at = ?
+		WHERE workflow_id = ? AND id != ? AND is_start_step = 1
+			AND EXISTS (SELECT 1 FROM workflows WHERE id = ? AND updated_at = ?)
+	`), updatedAt, workflowID, exceptStepID, workflowID, expectedWorkflow); err != nil {
+		return nil, err
+	}
+	for _, step := range demoted {
+		step.IsStartStep = false
+		step.UpdatedAt = updatedAt
+	}
+	return demoted, nil
+}
+
+// ReorderStepsIfUnchanged applies a complete step reorder only while the
+// workflow and all listed steps retain their observed versions.
+func (r *Repository) ReorderStepsIfUnchanged(
+	ctx context.Context, workflowID string, stepIDs []string, expectedWorkflow time.Time, expectedByID map[string]time.Time,
+) error {
+	if len(stepIDs) == 0 || len(stepIDs) != len(expectedByID) {
+		return repoerrors.ErrTaskVersionConflict
+	}
+	seen := make(map[string]struct{}, len(stepIDs))
+	for _, id := range stepIDs {
+		if _, duplicate := seen[id]; duplicate {
+			return repoerrors.ErrTaskVersionConflict
+		}
+		if _, ok := expectedByID[id]; !ok {
+			return repoerrors.ErrTaskVersionConflict
+		}
+		seen[id] = struct{}{}
+	}
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var workflowVersion time.Time
+	if err := tx.QueryRowContext(ctx, tx.Rebind(`SELECT updated_at FROM workflows WHERE id = ?`), workflowID).Scan(&workflowVersion); err != nil {
+		return repoerrors.ErrTaskVersionConflict
+	}
+	if !workflowVersion.Equal(expectedWorkflow) {
+		return repoerrors.ErrTaskVersionConflict
+	}
+	var total int
+	if err := tx.QueryRowContext(ctx, tx.Rebind(`SELECT COUNT(*) FROM workflow_steps WHERE workflow_id = ?`), workflowID).Scan(&total); err != nil {
+		return err
+	}
+	if total != len(stepIDs) {
+		return repoerrors.ErrTaskVersionConflict
+	}
+	now := time.Now().UTC()
+	for position, id := range stepIDs {
+		result, err := tx.ExecContext(ctx, tx.Rebind(`
+			UPDATE workflow_steps SET position = ?, updated_at = ?
+			WHERE id = ? AND workflow_id = ? AND updated_at = ?
+				AND EXISTS (SELECT 1 FROM workflows WHERE id = ? AND updated_at = ?)
+		`), position, now, id, workflowID, expectedByID[id], workflowID, expectedWorkflow)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return repoerrors.ErrTaskVersionConflict
+		}
+	}
+	return tx.Commit()
+}
+
+// ClearStartStepFlag clears the is_start_step flag for all steps in a workflow except the given step.
+func (r *Repository) ClearStartStepFlag(ctx context.Context, workflowID, exceptStepID string) error {
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE workflow_steps SET is_start_step = 0, updated_at = ?
+		WHERE workflow_id = ? AND id != ? AND is_start_step = 1
+	`), time.Now().UTC(), workflowID, exceptStepID)
+	return err
+}
+
+func (r *Repository) demoteOtherStartSteps(ctx context.Context, tx *sqlx.Tx, workflowID, exceptStepID string, updatedAt time.Time) ([]*models.WorkflowStep, error) {
+	rows, err := tx.QueryContext(ctx, tx.Rebind(`
+		SELECT `+stepSelectColumns+`
+		FROM workflow_steps
+		WHERE workflow_id = ? AND id != ? AND is_start_step = 1
+		ORDER BY position ASC, id ASC
+	`), workflowID, exceptStepID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	demoted, err := r.scanSteps(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.ExecContext(ctx, tx.Rebind(`
+		UPDATE workflow_steps SET is_start_step = 0, updated_at = ?
+		WHERE workflow_id = ? AND id != ? AND is_start_step = 1
+	`), updatedAt, workflowID, exceptStepID); err != nil {
+		return nil, err
+	}
+
+	for _, step := range demoted {
+		step.IsStartStep = false
+		step.UpdatedAt = updatedAt
+	}
+	return demoted, nil
+}
+
+// GetStartStep returns the step marked as is_start_step for a workflow.
+// Returns nil if no step is marked.
+func (r *Repository) GetStartStep(ctx context.Context, workflowID string) (*models.WorkflowStep, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT `+stepSelectColumns+`
+		FROM workflow_steps WHERE workflow_id = ? AND is_start_step = 1
+		LIMIT 1
+	`), workflowID)
+
+	step, err := r.scanStep(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return step, nil
+}
+
+// ClearStepReferences clears any move_to_step event config references
+// to the given step ID within the specified workflow.
+func (r *Repository) ClearStepReferences(ctx context.Context, workflowID, stepID string) error {
+	// Load all steps in the workflow and update any that reference the deleted step
+	steps, err := r.ListStepsByWorkflow(ctx, workflowID)
+	if err != nil {
+		return err
+	}
+
+	for _, step := range steps {
+		modified := false
+		var changed bool
+		step.Events.OnTurnStart, changed = removeStepReferences(step.Events.OnTurnStart, func(action models.OnTurnStartAction) bool {
+			return action.Type == models.OnTurnStartMoveToStep && referencesStep(action.Config, stepID)
+		})
+		modified = modified || changed
+		step.Events.OnTurnComplete, changed = removeStepReferences(step.Events.OnTurnComplete, func(action models.OnTurnCompleteAction) bool {
+			return action.Type == models.OnTurnCompleteMoveToStep && referencesStep(action.Config, stepID)
+		})
+		modified = modified || changed
+		step.Events, changed = clearGenericStepReferences(step.Events, stepID)
+		modified = modified || changed
+		if step.PullFromStepID == stepID {
+			step.PullFromStepID = ""
+			modified = true
+		}
+		if modified {
+			if err := r.UpdateStep(ctx, step); err != nil {
+				return fmt.Errorf("failed to clear step reference from step %s: %w", step.ID, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func removeStepReferences[T any](actions []T, shouldRemove func(T) bool) ([]T, bool) {
+	filtered := actions[:0]
+	modified := false
+	for _, action := range actions {
+		if shouldRemove(action) {
+			modified = true
+			continue
+		}
+		filtered = append(filtered, action)
+	}
+	if !modified {
+		return actions, false
+	}
+	return filtered, true
+}
+
+func referencesStep(config map[string]interface{}, stepID string) bool {
+	refID, ok := config["step_id"].(string)
+	return ok && refID == stepID
+}
+
+func clearGenericStepReferences(events models.StepEvents, stepID string) (models.StepEvents, bool) {
+	shouldRemove := func(action models.GenericAction) bool {
+		return action.Type == models.GenericActionMoveToStep && referencesStep(action.Config, stepID)
+	}
+	modified := false
+	var changed bool
+	events.OnComment, changed = removeStepReferences(events.OnComment, shouldRemove)
+	modified = modified || changed
+	events.OnBlockerResolved, changed = removeStepReferences(events.OnBlockerResolved, shouldRemove)
+	modified = modified || changed
+	events.OnChildrenCompleted, changed = removeStepReferences(events.OnChildrenCompleted, shouldRemove)
+	modified = modified || changed
+	events.OnApprovalResolved, changed = removeStepReferences(events.OnApprovalResolved, shouldRemove)
+	modified = modified || changed
+	events.OnHeartbeat, changed = removeStepReferences(events.OnHeartbeat, shouldRemove)
+	modified = modified || changed
+	events.OnBudgetAlert, changed = removeStepReferences(events.OnBudgetAlert, shouldRemove)
+	modified = modified || changed
+	events.OnAgentError, changed = removeStepReferences(events.OnAgentError, shouldRemove)
+	modified = modified || changed
+	return events, modified
+}
+
+// DeleteStep deletes a workflow step by ID.
+func (r *Repository) DeleteStep(ctx context.Context, id string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	cleanupQuery := `
+		UPDATE tasks
+		SET queued_for_step_id = '', queued_at = NULL, wip_admitted = 1, metadata = `
+	if dialect.IsPostgres(r.db.DriverName()) {
+		cleanupQuery += `(CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}'::jsonb ELSE metadata::jsonb END #- ARRAY['deferred_launch']::text[])::text`
+	} else {
+		cleanupQuery += `json_remove(CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}' ELSE metadata END, '$.deferred_launch')`
+	}
+	cleanupQuery += `, updated_at = ? WHERE queued_for_step_id = ?`
+	var taskTableExists bool
+	if dialect.IsPostgres(r.db.DriverName()) {
+		_ = tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'tasks')`).Scan(&taskTableExists)
+	} else {
+		_ = tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks')`).Scan(&taskTableExists)
+	}
+	if taskTableExists {
+		if _, err := tx.ExecContext(ctx, r.db.Rebind(cleanupQuery), time.Now().UTC(), id); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(ctx, r.db.Rebind(`DELETE FROM workflow_steps WHERE id = ?`), id)
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("workflow step not found: %s", id)
+	}
+	return tx.Commit()
+}
+
+// ListStepsByWorkflow returns all workflow steps for a workflow.
+func (r *Repository) ListStepsByWorkflow(ctx context.Context, workflowID string) ([]*models.WorkflowStep, error) {
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT `+stepSelectColumns+`
+		FROM workflow_steps WHERE workflow_id = ? ORDER BY position
+	`), workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return r.scanSteps(rows)
+}
+
+// ListStepsByWorkspaceID returns all workflow steps for all workflows in a workspace.
+func (r *Repository) ListStepsByWorkspaceID(ctx context.Context, workspaceID string) ([]*models.WorkflowStep, error) {
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT ws.id, ws.workflow_id, ws.name, ws.position, ws.color, ws.prompt, ws.events,
+			ws.allow_manual_move, ws.is_start_step, ws.show_in_command_panel, ws.auto_archive_after_hours, ws.agent_profile_id, ws.profile_session_start_policy, ws.profile_session_end_policy, ws.disable_unclassified_fallback, ws.stage_type, ws.auto_advance_requires_signal, ws.cancel_triggers_turn_complete, ws.complete_task_on_enter, ws.wip_limit, ws.pull_from_step_id, ws.session_target, ws.order_revision, ws.created_at, ws.updated_at
+		FROM workflow_steps ws
+		JOIN workflows w ON ws.workflow_id = w.id
+		WHERE w.workspace_id = ?
+		ORDER BY ws.workflow_id, ws.position
+	`), workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return r.scanSteps(rows)
+}
+
+// StepEventsRow projects (step_id, workflow_id, raw events JSON) for a
+// single workflow step. Used by the Phase 5 heartbeat / budget cron
+// handlers (see internal/scheduler/cron) so they can detect new
+// trigger keys (on_heartbeat, on_budget_alert, …) that the Phase 2
+// StepEvents struct does not yet model. The handlers parse the raw
+// JSON themselves to keep the repository decoupled from the engine's
+// trigger taxonomy.
+type StepEventsRow struct {
+	StepID     string
+	WorkflowID string
+	EventsJSON string
+}
+
+// ListAllStepEventsJSON returns the raw events JSON for every workflow
+// step in the database. Cheap enough for the Phase 5 cron tick because
+// kanban deployments have on the order of tens to low hundreds of
+// steps; the SQL filter on `events LIKE '%on_heartbeat%'` keeps the
+// scan tight even as office workflows multiply.
+func (r *Repository) ListAllStepEventsJSON(ctx context.Context) ([]StepEventsRow, error) {
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT id, workflow_id, COALESCE(events, '')
+		FROM workflow_steps
+		WHERE events LIKE '%on_heartbeat%' OR events LIKE '%on_budget_alert%'
+	`))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []StepEventsRow
+	for rows.Next() {
+		var row StepEventsRow
+		if err := rows.Scan(&row.StepID, &row.WorkflowID, &row.EventsJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// scanSteps is a helper to scan multiple workflow step rows.
+func (r *Repository) scanSteps(rows *sql.Rows) ([]*models.WorkflowStep, error) {
+	var result []*models.WorkflowStep
+	for rows.Next() {
+		step, err := r.scanStep(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, step)
+	}
+	return result, rows.Err()
+}
+
+// ============================================================================
+// SessionStepHistory Operations
+// ============================================================================
+
+// CreateHistory creates a new session step history entry.
+func (r *Repository) CreateHistory(ctx context.Context, history *models.SessionStepHistory) error {
+	now := time.Now().UTC()
+	history.CreatedAt = now
+
+	var metadataJSON *string
+	if history.Metadata != nil {
+		data, err := json.Marshal(history.Metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata: %w", err)
+		}
+		s := string(data)
+		metadataJSON = &s
+	}
+
+	id, err := dialect.InsertReturningID(ctx, r.db,
+		`INSERT INTO session_step_history (session_id, from_step_id, to_step_id, trigger, actor_id, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		history.SessionID, history.FromStepID, history.ToStepID, history.Trigger, history.ActorID, metadataJSON, history.CreatedAt)
+	if err != nil {
+		return err
+	}
+	history.ID = id
+
+	return nil
+}
+
+// ListHistoryBySession returns all step history entries for a session.
+func (r *Repository) ListHistoryBySession(ctx context.Context, sessionID string) ([]*models.SessionStepHistory, error) {
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT id, session_id, from_step_id, to_step_id, trigger, actor_id, metadata, created_at
+		FROM session_step_history WHERE session_id = ? ORDER BY created_at
+	`), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []*models.SessionStepHistory
+	for rows.Next() {
+		history := &models.SessionStepHistory{}
+		var fromStepID, actorID, metadataJSON sql.NullString
+
+		err := rows.Scan(&history.ID, &history.SessionID, &fromStepID, &history.ToStepID, &history.Trigger, &actorID, &metadataJSON, &history.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+
+		if fromStepID.Valid {
+			history.FromStepID = &fromStepID.String
+		}
+		if actorID.Valid {
+			history.ActorID = &actorID.String
+		}
+		if metadataJSON.Valid && metadataJSON.String != "" {
+			if err := json.Unmarshal([]byte(metadataJSON.String), &history.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+			}
+		}
+
+		result = append(result, history)
+	}
+	return result, rows.Err()
+}

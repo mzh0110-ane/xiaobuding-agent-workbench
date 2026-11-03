@@ -1,0 +1,71 @@
+package mcpconfig
+
+type ServerType string
+
+type ServerMode string
+
+const (
+	ServerTypeStdio          ServerType = "stdio"
+	ServerTypeHTTP           ServerType = "http"
+	ServerTypeSSE            ServerType = "sse"
+	ServerTypeStreamableHTTP ServerType = "streamable_http"
+)
+
+const (
+	ServerModeAuto       ServerMode = "auto"
+	ServerModeShared     ServerMode = "shared"
+	ServerModePerSession ServerMode = "per_session"
+)
+
+type ServerDef struct {
+	Type    ServerType        `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Mode    ServerMode        `json:"mode,omitempty"`
+	Meta    map[string]any    `json:"meta,omitempty"`
+	Extra   map[string]any    `json:"extra,omitempty"`
+}
+
+type ProfileConfig struct {
+	ProfileID   string               `json:"profile_id"`
+	ProfileName string               `json:"profile_name,omitempty"`
+	AgentID     string               `json:"agent_id,omitempty"`
+	AgentName   string               `json:"agent_name,omitempty"`
+	WorkspaceID string               `json:"-"`
+	Enabled     bool                 `json:"enabled"`
+	Servers     map[string]ServerDef `json:"servers"`
+	Meta        map[string]any       `json:"meta,omitempty"`
+}
+
+// ConfigPatch contains only the MCP document fields that can be changed by a
+// partial settings update. A nil pointer means that the field is preserved.
+type ConfigPatch struct {
+	Enabled *bool
+	Servers *map[string]ServerDef
+}
+
+type ResolvedServer struct {
+	Name    string
+	Type    ServerType
+	Mode    ServerMode
+	Command string
+	Args    []string
+	Env     map[string]string
+	URL     string
+	Headers map[string]string
+}
+
+// Policy controls which MCP transports are allowed and how they should be rewritten.
+type Policy struct {
+	AllowStdio          bool
+	AllowHTTP           bool
+	AllowSSE            bool
+	AllowStreamableHTTP bool
+	URLRewrite          map[string]string
+	EnvInjection        map[string]string
+	AllowlistServers    []string
+	DenylistServers     []string
+}

@@ -1,0 +1,85 @@
+"use client";
+
+import { useEffect } from "react";
+import { useAppStoreApi } from "@/components/state-provider";
+import { isEditableKeydownTarget, matchesShortcut } from "@/lib/keyboard/utils";
+import { getShortcut } from "@/lib/keyboard/shortcut-overrides";
+import { useCommandPanelOpen } from "@/lib/commands/command-registry";
+import { isTaskWorkspaceSearchAvailable } from "@/lib/commands/task-workspace-search";
+import { usePathname } from "@/lib/routing/client-router";
+import { isAppSidebarViewport } from "@/hooks/use-responsive-breakpoint";
+
+/**
+ * App-root keyboard shortcuts that must fire on every route — not just inside
+ * the dockview session editor.
+ *
+ * Currently handles `CONTENT_SEARCH`, `TOGGLE_SIDEBAR` (collapse/expand the
+ * global AppSidebar), and `WORKSPACE_PICKER` (open the sidebar-header workspace
+ * switcher with focus inside the menu).
+ * Previously this lived in {@link useEditorKeybinds}, which is mounted only by
+ * the dockview desktop layout, so the shortcut was dead on the Kanban board,
+ * task list, Office, Settings, etc. Mount this once near the app root (it has
+ * no dockview dependency) so the binding works everywhere.
+ *
+ * The AppSidebar is hidden below the `md` breakpoint; on mobile the toggle still
+ * flips store state but has no visible effect, which is fine.
+ *
+ * Core-vs-plugin precedence: must be mounted (in `components/global-commands.tsx`)
+ * before `usePluginShortcuts()` so this capture-phase listener registers — and
+ * therefore runs — first. `usePluginShortcuts` bails out on
+ * `event.defaultPrevented`, so a combo bound to both a core shortcut here and a
+ * plugin keybinding fires only the core action.
+ *
+ * Full precedence chain (a matching combo fires exactly one action):
+ * central `useAppShortcuts` (this hook, capture phase, mounted first) wins
+ * over plugin keybindings (`usePluginShortcuts`, capture phase, mounted
+ * second), which win over per-component core shortcuts registered via
+ * `useKeyboardShortcut` (bubble phase) — that hook also bails out on
+ * `event.defaultPrevented`.
+ */
+export function useAppShortcuts() {
+  const appStore = useAppStoreApi();
+  const { openMode } = useCommandPanelOpen();
+  const pathname = usePathname();
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+
+      const overrides = appStore.getState().userSettings.keyboardShortcuts;
+      if (matchesShortcut(e, getShortcut("CONTENT_SEARCH", overrides))) {
+        if (!isTaskWorkspaceSearchAvailable(appStore.getState(), pathname)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        openMode("search-content");
+        return;
+      }
+      if (isEditableKeydownTarget(e)) return;
+
+      if (matchesShortcut(e, getShortcut("TOGGLE_SIDEBAR", overrides))) {
+        e.preventDefault();
+        e.stopPropagation();
+        appStore.getState().toggleAppSidebar();
+        return;
+      }
+
+      if (matchesShortcut(e, getShortcut("WORKSPACE_PICKER", overrides))) {
+        // The sidebar is display:none below md (`hidden md:block`), but the
+        // menu portals to document.body — opening it there would float a
+        // detached, focus-trapped menu over the mobile nav. Match the
+        // sidebar's own boundary and let the event through untouched.
+        if (!isAppSidebarViewport()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        // The action expands a collapsed sidebar itself — the picker trigger
+        // renders only in the expanded header.
+        appStore.getState().setWorkspacePickerOpen(true);
+      }
+    };
+
+    // Capture phase so we win the event before focus-trapped surfaces (e.g.
+    // xterm.js) can swallow it — mirrors useEditorKeybinds.
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [appStore, openMode, pathname]);
+}

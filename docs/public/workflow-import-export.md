@@ -1,0 +1,377 @@
+---
+title: "Workflow Import and Export"
+description: "Move Kanban workflows between workspaces with Kandev's portable YAML format."
+---
+
+# Workflow Import / Export
+
+Kandev's versioned portable format moves Kanban workflow definitions between workspaces or installations. It carries prompts, step behavior, portable agent-profile descriptors, WIP rules, supported events, and explicit task-completion policies. It deliberately omits database IDs and workspace ownership. New exports use version 2; version 1 documents remain accepted and receive compatibility defaults at import.
+
+Use this for snapshots and one-time copies. Use [Workflow Sync](workflow-sync.md) when a GitHub repository should remain the source of truth.
+
+## Quick path
+
+1. Export a regular Kanban workflow from **Settings > Workspaces > Workflows**.
+2. Copy or save the YAML.
+3. Import it into the destination workspace.
+4. Review profile mapping and skipped names before using the workflow.
+
+## Use the UI
+
+Open **Settings → Workspaces → select a workspace → Workflows**.
+
+- **Export All** opens a YAML dialog for the saved Kanban workflows visible on that settings page. Unsaved drafts and Office-style workflows are excluded. Choose **Copy** to put the text on the clipboard.
+- A workflow card's **Export** button exports only that workflow.
+- **Import** accepts a `.yml` or `.yaml` file, or pasted YAML. It previews the workflows that will be created and skipped. Exact direct step-profile matches are selected automatically; each unmatched direct step has a profile picker.
+- The browser import does not create workflows until every affected step has a valid profile selection. If no eligible profile exists, use **Retry** after creating or enabling a profile in **Settings > Agents**. Canceling the picker leaves the workspace unchanged.
+- The result reports created and skipped workflow names.
+
+Export does not download a file or change the workflow. Import creates new workflows; it never overwrites a same-named workflow. Delete an unwanted imported workflow through the normal workflow settings flow.
+
+> **Network security:** With authentication disabled, these HTTP routes are open. Experimental authentication requires a session or personal access token, but does not replace TLS. Keep the backend on loopback or behind an authenticated, origin-protected TLS proxy before exposing them to a network.
+
+<details>
+<summary>HTTP format, fields, and reconciliation details</summary>
+
+## HTTP routes
+
+All routes are on the Kandev backend under `/api/v1`.
+
+| Method | Route | Behavior |
+|--------|-------|----------|
+| `GET` | `/workflows/:id/export` | Export one workflow as `application/x-yaml`. |
+| `GET` | `/workspaces/:id/workflows/export` | Export all non-hidden workflows in the workspace. |
+| `GET` | `/workspaces/:id/workflows/export?ids=id1,id2` | Export only the listed workflow IDs. Whitespace and empty comma elements are ignored. |
+| `POST` | `/workspaces/:id/workflows/import/preview` | Validate a portable YAML request and return skipped names, eligible global profiles, and direct step-profile matches. It does not write. |
+| `POST` | `/workspaces/:id/workflows/import` | Parse a portable YAML request and return `{"created": [...], "skipped": [...]}`. |
+
+The workspace export route treats an absent `ids` parameter as “all”; `ids=` is an explicit empty selection and returns an envelope with no workflows. Such an envelope cannot be imported because validation requires at least one workflow. The UI supplies IDs for its Kanban-only selection. A direct “all” HTTP export can include workflow styles the portable converter cannot completely represent, so prefer the UI for user-managed Kanban workflows.
+
+Import requests are limited to 1 MiB. A larger request returns `413 Request Entity Too Large` and does not write. The preview route accepts portable YAML. The browser's final import request uses `application/json` with the YAML text and explicit direct step-profile bindings; a raw `application/x-yaml` request remains available for scripts and unattended callers.
+
+Example with `curl`:
+
+```bash
+curl -fsS \
+  "http://localhost:38429/api/v1/workspaces/WORKSPACE_ID/workflows/export?ids=WORKFLOW_ID" \
+  -o workflow.yml
+
+curl -fsS \
+  -H 'Content-Type: application/x-yaml' \
+  --data-binary @workflow.yml \
+  "http://localhost:38429/api/v1/workspaces/WORKSPACE_ID/workflows/import"
+
+# Browser-style import with explicit profile bindings:
+curl -fsS \
+  -H 'Content-Type: application/json' \
+  --data-binary @import-request.json \
+  "http://localhost:38429/api/v1/workspaces/WORKSPACE_ID/workflows/import"
+```
+
+An explicit import request has this shape. `requested_profile` must repeat the
+portable descriptor for the referenced step. `profile_updated_at` is the
+candidate revision returned by the preview route.
+
+```json
+{
+  "yaml": "version: 2\ntype: kandev_workflow\nworkflows: [...]\n",
+  "step_profile_bindings": [
+    {
+      "workflow_index": 0,
+      "step_position": 1,
+      "requested_profile": {
+        "agent_name": "Claude Code",
+        "model": "optional-model-id",
+        "mode": "optional-mode-id"
+      },
+      "profile_id": "DESTINATION_PROFILE_ID",
+      "profile_updated_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+If Kandev is behind a reverse proxy, use its externally protected base URL rather than the loopback example.
+
+## Envelope
+
+Every document uses this envelope:
+
+```yaml
+version: 2
+type: kandev_workflow
+workflows:
+  - name: My Workflow
+    steps: []
+```
+
+| Field | Type | Validation |
+|-------|------|------------|
+| `version` | integer | Must be `1` or `2`. New exports use `2`; version 1 is accepted for compatibility. |
+| `type` | string | Must be exactly `kandev_workflow`. |
+| `workflows` | list | Must contain at least one item. |
+
+Unknown YAML fields are ignored by the current decoder. Do not use that as an extension mechanism: ignored data will disappear on the next export.
+
+## Workflow fields
+
+```yaml
+- name: Delivery
+  description: Plan, implement, then review.
+  agent_profile:
+    agent_name: Claude Code
+    model: optional-model-id
+    mode: optional-mode-id
+  steps: []
+```
+
+| Field | Export behavior | Import behavior |
+|-------|-----------------|-----------------|
+| `name` | Always emitted. | Exact empty string is rejected. Existing target-workspace name causes a skip. |
+| `description` | Omitted when empty. | Stored as supplied. |
+| `agent_profile` | Omitted when no workflow profile resolves. | Exact value match; see [Profile matching](#profile-matching). |
+| `steps` | Always emitted, possibly empty. | Empty lists are currently accepted, although an empty workflow is not useful. |
+
+IDs, workspace ID, ordering among workflows, source/sync ownership, style, visibility, and timestamps do not round-trip.
+
+## Step fields
+
+```yaml
+- name: Work
+  position: 1
+  color: bg-blue-500
+  prompt: |
+    Implement this task:
+    {{task_prompt}}
+  events:
+    on_enter:
+      - type: auto_start_agent
+    on_turn_complete:
+      - type: move_to_step
+        config:
+          step_position: 2
+  is_start_step: true
+  show_in_command_panel: true
+  allow_manual_move: true
+  auto_archive_after_hours: 0
+  auto_advance_requires_signal: true
+  cancel_triggers_turn_complete: true
+  wip_limit: 2
+  pull_from_step_position: 0
+  agent_profile:
+    agent_name: Claude Code
+  profile_session_start_policy: reuse
+  profile_session_end_policy: park
+  session_target:
+    kind: initial
+    # A source-step target uses: kind: step and step_position: 1
+  disable_unclassified_fallback: true
+  complete_task_on_enter: false
+```
+
+| Field | Type | Exact behavior |
+|-------|------|----------------|
+| `name` | string | Always exported; exact empty string is rejected. |
+| `position` | integer | Always exported and must be unique inside its workflow. It is an ordering key and reference anchor; built-ins use contiguous zero-based values, but validation does not require that. |
+| `color` | string | Always exported. Kandev normally stores a background utility class such as `bg-blue-500`; portable validation does not allow-list colors. |
+| `prompt` | string | Omitted when empty. `{{task_prompt}}` is the editor-supported task-description placeholder. |
+| `events` | object | Always exported, even when empty. Supported portable triggers are below. |
+| `is_start_step` | boolean | Always exported. Missing input decodes as `false`. The editor enforces one start step, but portable validation does not. During import, later `true` steps demote earlier ones. |
+| `show_in_command_panel` | boolean | Always exported. Missing input decodes as `false`. |
+| `allow_manual_move` | boolean | Always exported. Missing input decodes as `false`. |
+| `auto_archive_after_hours` | integer | Omitted when `0`; `0` disables auto-archive. The portable validator currently does not reject negative values, so use only `0` or a positive value. |
+| `agent_profile` | object | Omitted when unset; exact-match behavior is below. |
+| `profile_session_start_policy` | enum | `reuse` or `new`; controls whether this destination step reuses the newest eligible nonterminal session for its profile or always starts a fresh conversation. Missing or unknown values use `reuse`. |
+| `profile_session_end_policy` | enum | `complete` or `park`; controls whether this source step's session is closed or kept available when the workflow leaves it for a different profile. Missing or unknown values use `complete`. |
+| `session_target` | object | Optional explicit recipient. Use `{kind: initial}` for the task's launch conversation. Use `{kind: step, step_position: N}` for an earlier direct-profile step. Source-step references use positions so import can remap step IDs. |
+| `disable_unclassified_fallback` | boolean | Always exported in version 2. `true` vetoes the optional repeated-unclassified policy for this step's task session, even when its dynamic candidate policy is enabled. Missing input defaults to `false`; step create/update API requests accept this field, omitted updates preserve the saved value, and explicit `null` is invalid. |
+| `complete_task_on_enter` | boolean | Always exported in version 2. On the final workflow step, `true` marks the task `COMPLETED` when it enters that step. On non-final steps the value is retained but inactive. Version 1 derives the legacy name-based behavior only when this field is absent. |
+| `auto_advance_requires_signal` | boolean | Always exported. `true` makes `on_turn_complete` transitions wait for `step_complete_kandev`; missing input is `false`. |
+| `cancel_triggers_turn_complete` | boolean | Always exported. `true` lets an explicit user cancellation run the step's normal `on_turn_complete` actions after the cancelled turn settles; missing input is `false`. Pending clarification and non-user interruption/failure paths are not eligible. |
+| `wip_limit` | integer | Omitted when `0`. Must be non-negative; `0` is unlimited. |
+| `pull_from_step_position` | integer | Optional feeder reference using another step's `position`. It must exist, cannot point to itself, and cannot form a pull cycle. |
+
+Version 1 is the legacy format. It remains valid for workflows without an
+explicit session target. Version 2 adds `session_target` and explicit
+completion booleans. An initial target has only `kind: initial`. A source-step
+target has `kind: step` and an earlier `step_position`. The source step must
+select a profile directly and must not target another session.
+
+If a source step is missing, later than its target, or invalid after a sync
+edit, import and sync report a validation error. Kandev does not silently pick
+another conversation.
+
+`stage_type`, Office participants, recorded decisions, task data, and step history are not portable. Imported steps receive new UUIDs and the default internal stage type.
+
+## Portable events
+
+An event contains an ordered list of actions. Each action has a `type` and an optional `config` map.
+
+| Trigger | Runtime meaning | Recognized action types |
+|---------|-----------------|-------------------------|
+| `on_enter` | Step-entry processing. | `enable_plan_mode`, `auto_start_agent`, `reset_agent_context`, `set_session_mode`, `clear_decisions`, `queue_run`, `queue_run_for_each_participant` |
+| `on_turn_start` | A user sends a message. | `move_to_next`, `move_to_previous`, `move_to_step` |
+| `on_turn_complete` | An agent turn completes. | `move_to_next`, `move_to_previous`, `move_to_step`, `disable_plan_mode` |
+| `on_exit` | A task leaves the step. | `disable_plan_mode` |
+| `on_comment`, `on_blocker_resolved`, `on_children_completed`, `on_approval_resolved`, `on_heartbeat`, `on_budget_alert`, `on_agent_error` | Office/Phase-2 lifecycle events: a comment is added, a blocker is resolved, all child tasks complete, an approval is decided, a periodic heartbeat ticks, a budget threshold is crossed, or the agent errors. | `move_to_next`, `move_to_previous`, `move_to_step`, `auto_start_agent`, `queue_run`, `clear_decisions`, `queue_run_for_each_participant` |
+
+`set_session_mode` requires `config.mode` to be a non-empty string. `move_to_step` requires `config.step_position` pointing to a position in the same workflow:
+
+```yaml
+on_turn_complete:
+  - type: disable_plan_mode
+  - type: move_to_step
+    config:
+      step_position: 3
+```
+
+Internally, transitions use database `step_id` values. Export converts `step_id` to `step_position`; import creates all new IDs and converts positions back to them. Additional config keys are copied. Do not copy the embedded template files verbatim: those are an internal template schema and use symbolic `step_id` values rather than the portable envelope and positions.
+
+Portable validation is deliberately narrow. Beyond `set_session_mode` and position references, it does not currently reject every unknown action string or malformed action config. An accepted file can therefore contain an inert action. Use the action names and shapes documented here and exercise the workflow after import.
+
+### Office / Phase-2 triggers
+
+The seven Office/Phase-2 triggers listed in the table above round-trip through export and import: their actions, including `move_to_step`, are carried the same way as the four Kanban-era triggers. A Phase-2 `move_to_step` uses `config.step_position` and is validated against the workflow's step positions identically to `on_turn_start`/`on_turn_complete`.
+
+What still doesn't round-trip is Office step *metadata* that has no portable representation: `stage_type`, step participants (reviewers/approvers), recorded decisions, task data, and step history (see [Step fields](#step-fields)). The Workflows settings UI filters Office-style workflows from its list and Export All selection because of that metadata gap, not because their trigger events are dropped. Manage participant and decision state through the Office product surface; portable Kanban import/export only carries step behavior, not Office workflow state.
+
+</details>
+
+## Profile matching
+
+> **Import warning:** Validation happens before creation, but import is not one transaction across the file. A later failure can leave partial workflows or steps; inspect the workspace and delete incomplete workflows before retrying.
+
+<details>
+<summary>Profile matching and import details</summary>
+
+Profile IDs are installation-specific, so the portable descriptor stores values:
+
+```yaml
+agent_profile:
+  agent_name: Claude Code
+  model: optional-model-id
+  mode: optional-mode-id
+```
+
+`agent_name` is the agent display name, not an internal ID. Kandev searches for a profile whose display name, model, and mode all match exactly. Empty optional values also participate in the match.
+
+In the browser import flow, the preview lists enabled global profiles from the
+destination workspace. An exact direct step-profile match is selected
+automatically. Each unmatched direct step must be assigned an eligible profile
+before the import can continue. The final request includes the selected profile
+ID and its preview revision, so Kandev detects a profile that was removed,
+disabled, or changed while the picker was open. A conflict returns `409` with
+`code: workflow_import_profiles_required`; choose a replacement and submit
+again. Use Retry to refresh candidate revisions after a stale-profile conflict;
+unchanged selections remain available. Profile selection and the complete
+validation pass happen before the browser flow creates any workflow.
+
+Workflow-level profile descriptors are still matched automatically. A missing
+workflow-level match remains unset. Raw YAML imports and GitHub workflow sync
+keep their existing exact-match behavior, including leaving an unmatched direct
+step profile unset. They do not use the browser picker.
+
+If there is no exact match, import still succeeds and silently leaves that workflow or step profile unset. Before moving a file between installs, compare the destination's agent display names and supported model/mode identifiers. Never assume an illustrative model name exists in another install.
+
+## Import reconciliation and failure behavior
+
+Browser imports follow these rules:
+
+1. The preview decodes and validates the complete envelope, applies name deduplication, and returns direct step-profile candidates without creating anything.
+2. Existing workflows are compared by exact name. Matches are reported under `skipped`; they are not updated or merged.
+3. Each new workflow and its steps receive fresh IDs. Step-position references are remapped to those IDs.
+4. Exact profile matches are preselected. Unmatched direct step descriptors require explicit eligible profile selections.
+5. The final request validates every binding, profile ID, profile revision, and portable reference before creating any workflow.
+
+Browser preview, selection validation, and profile conflicts write nothing. After
+that validation pass, a database failure during creation is still not one
+transaction across the file. Inspect the workspace after a runtime error and
+delete incomplete workflows before retrying.
+
+The raw YAML endpoint retains its existing behavior. It validates before
+creation, but creation is not one transaction across the file. A database or
+profile-update failure after creation begins can leave earlier workflows, a
+workflow without all steps, or other partial state. Raw YAML callers should
+inspect the workspace after a runtime error and delete incomplete workflows
+before retrying.
+
+The validator currently does **not** require a step, contiguous or non-negative positions, unique step names, unique workflow names within the same document, a valid color, or exactly one start step. GitHub workflow sync adds a unique-step-name requirement because it reconciles by name. For predictable results, enforce all of those constraints in authored files even when the one-time importer accepts them.
+
+## Executable example
+
+This file creates a three-step queue. Work has a capacity of two and pulls from Backlog whenever a slot opens. Its turn-complete transition only runs after the agent emits the explicit completion signal.
+
+```yaml
+version: 2
+type: kandev_workflow
+workflows:
+  - name: Review Queue
+    description: Bounded implementation queue with explicit completion.
+    steps:
+      - name: Backlog
+        position: 0
+        color: bg-neutral-400
+        events: {}
+        is_start_step: false
+        show_in_command_panel: false
+        allow_manual_move: true
+        complete_task_on_enter: false
+        auto_advance_requires_signal: false
+        cancel_triggers_turn_complete: false
+
+      - name: Work
+        position: 1
+        color: bg-blue-500
+        prompt: |
+          Complete the task, verify it, then call step_complete_kandev.
+
+          {{task_prompt}}
+        events:
+          on_enter:
+            - type: auto_start_agent
+          on_turn_complete:
+            - type: move_to_step
+              config:
+                step_position: 2
+        is_start_step: true
+        show_in_command_panel: true
+        allow_manual_move: true
+        complete_task_on_enter: false
+        auto_advance_requires_signal: true
+        cancel_triggers_turn_complete: true
+        wip_limit: 2
+        pull_from_step_position: 0
+
+      - name: Review
+        position: 2
+        color: bg-yellow-500
+        events:
+          on_turn_start:
+            - type: move_to_step
+              config:
+                step_position: 1
+        is_start_step: false
+        show_in_command_panel: true
+        allow_manual_move: true
+        complete_task_on_enter: true
+        auto_advance_requires_signal: false
+        cancel_triggers_turn_complete: false
+```
+
+After import, assign a workflow default or affected step agent profile if the destination did not produce an exact portable profile match. Create a disposable task, verify Backlog → Work pulling, visible queueing at capacity, explicit completion, and Review feedback before adopting it.
+
+</details>
+
+## Troubleshooting
+
+- **`unsupported export version/type`:** use `version: 2` and `type: kandev_workflow` for new documents. Version 1 remains accepted for compatibility.
+- **Duplicate step position:** give every step in that workflow a unique integer and update every position reference.
+- **Missing `step_position`:** portable `move_to_step` never accepts a database or template `step_id`.
+- **Pull reference error:** ensure the target position exists, is not the same step, and does not participate in a cycle.
+- **Workflow skipped:** rename either the destination workflow or the imported workflow; import is create-or-skip, not update.
+- **Profile missing after import:** match display name, model, and mode exactly, or select a profile in settings afterward.
+- **Event vanished:** all eleven triggers round-trip; only Office step metadata (`stage_type`, participants, decisions, task data, step history) does not.
+- **Large import reports strange YAML:** keep the request below 1 MiB; the route truncates at that boundary.
+- **Import failed after creating something:** creation is not an all-or-nothing transaction; remove partial results and retry a corrected file.
+
+Related pages: [Workflows](workflow-tips.md), [Workflow Sync](workflow-sync.md), and [WebSocket API](websocket-api.md) for the separate live-message protocol.

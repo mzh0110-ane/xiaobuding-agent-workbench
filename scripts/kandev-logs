@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# kandev-logs — download a bounded diagnostic bundle from a running instance.
+#
+# Usage:
+#   scripts/kandev-logs <backend_port> [--source backend|frontend|all] [--output FILE]
+#
+# Options:
+#   --source SOURCE  Evidence to request (default: backend).
+#   --output FILE    Destination ZIP (default: kandev-diagnostic-<id>.zip).
+#   -h, --help       Show this help.
+#
+# Authentication:
+#   Auth-disabled instances need only a port. For authenticated instances set
+#   KANDEV_API_TOKEN in the environment. Tokens are never accepted on the
+#   command line or printed.
+#
+# Examples:
+#   scripts/kandev-logs 48429
+#   scripts/kandev-logs 48429 --source frontend
+#   KANDEV_API_TOKEN=... scripts/kandev-logs 48429 --source all --output /tmp/logs.zip
+set -euo pipefail
+
+PORT=""
+SOURCE="backend"
+OUTPUT=""
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --source) SOURCE="${2:?--source requires a value}"; shift 2 ;;
+    --output) OUTPUT="${2:?--output requires a path}"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    --*) echo "kandev-logs: unknown flag '$1'" >&2; usage 2 ;;
+    *)
+      if [[ -z "$PORT" ]]; then PORT="$1"; else
+        echo "kandev-logs: unexpected argument '$1'" >&2; usage 2
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$PORT" ]] || { echo "kandev-logs: a backend port is required." >&2; usage 2; }
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "kandev-logs: port must be numeric." >&2; exit 2; }
+[[ "$SOURCE" == "backend" || "$SOURCE" == "frontend" || "$SOURCE" == "all" ]] || {
+  echo "kandev-logs: --source must be backend, frontend, or all." >&2
+  exit 2
+}
+command -v jq >/dev/null 2>&1 || {
+  echo "kandev-logs: jq is required to inspect bundle job responses." >&2
+  exit 1
+}
+
+case "$SOURCE" in
+  backend) sources='["backend"]' ;;
+  frontend) sources='["frontend"]' ;;
+  all) sources='["backend","frontend"]' ;;
+esac
+
+base_url="http://localhost:$PORT/api/v1/system/logs/bundles"
+curl_args=(--silent --show-error --fail-with-body)
+if [[ -n "${KANDEV_API_TOKEN:-}" ]]; then
+  curl_args+=(--header "Authorization: Bearer ${KANDEV_API_TOKEN}")
+fi
+
+job="$(curl "${curl_args[@]}" --header "Content-Type: application/json" \
+  --request POST --data "{\"sources\":$sources}" "$base_url")"
+bundle_id="$(printf '%s' "$job" | jq -er '.id')"
+status="$(printf '%s' "$job" | jq -er '.status')"
+deadline=$((SECONDS + 300))
+
+while [[ "$status" == "collecting" || "$status" == "building" ]]; do
+  if (( SECONDS >= deadline )); then
+    echo "kandev-logs: bundle $bundle_id did not finish within five minutes." >&2
+    exit 1
+  fi
+  sleep 1
+  job="$(curl "${curl_args[@]}" "$base_url/$bundle_id")"
+  status="$(printf '%s' "$job" | jq -er '.status')"
+done
+
+if [[ "$status" != "ready" && "$status" != "partial" ]]; then
+  echo "kandev-logs: bundle ended in state '$status'." >&2
+  printf '%s\n' "$job" | jq . >&2
+  exit 1
+fi
+
+[[ -n "$OUTPUT" ]] || OUTPUT="kandev-diagnostic-$bundle_id.zip"
+output_dir="$(dirname "$OUTPUT")"
+mkdir -p "$output_dir"
+temp_file="$(mktemp "$output_dir/.kandev-logs.XXXXXX")"
+trap 'rm -f "$temp_file"' EXIT
+curl "${curl_args[@]}" --output "$temp_file" "$base_url/$bundle_id/download"
+chmod 600 "$temp_file"
+mv "$temp_file" "$OUTPUT"
+trap - EXIT
+echo "$OUTPUT"

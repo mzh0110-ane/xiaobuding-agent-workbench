@@ -1,0 +1,162 @@
+// Package hostutility manages long-lived per-agent-type agentctl instances
+// used for boot-time capability probes, on-demand refresh, and sessionless
+// utility prompt execution (e.g. "enhance prompt" before a task/session exists).
+//
+// Each enabled ACP-capable agent type gets one warm agentctl instance in a
+// process-scoped tmp directory. Calls spawn ephemeral ACP subprocesses through
+// that instance, exactly like task-scoped utility calls, but without needing a
+// real workspace or task session.
+package hostutility
+
+import "time"
+
+// Status reports the state of a host utility instance for a given agent type.
+type Status string
+
+const (
+	StatusProbing       Status = "probing"
+	StatusOK            Status = "ok"
+	StatusAuthRequired  Status = "auth_required"
+	StatusNotInstalled  Status = "not_installed"
+	StatusFailed        Status = "failed"
+	StatusNotConfigured Status = "not_configured"
+	StatusUnsupported   Status = "unsupported"
+)
+
+// AgentCapabilities is the cached result of probing an agent type.
+type AgentCapabilities struct {
+	AgentType    string `json:"agent_type"`
+	AgentName    string `json:"agent_name,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+
+	Status Status `json:"status"`
+	Error  string `json:"error,omitempty"`
+
+	ProtocolVersion    int                `json:"protocol_version,omitempty"`
+	LoadSession        bool               `json:"load_session,omitempty"`
+	PromptCapabilities PromptCapabilities `json:"prompt_capabilities,omitempty"`
+
+	AuthMethods []AuthMethod `json:"auth_methods,omitempty"`
+
+	Models         []Model `json:"models,omitempty"`
+	CurrentModelID string  `json:"current_model_id,omitempty"`
+
+	Modes         []Mode `json:"modes,omitempty"`
+	CurrentModeID string `json:"current_mode_id,omitempty"`
+
+	ConfigOptions []ConfigOption `json:"config_options,omitempty"`
+
+	Commands []Command `json:"commands,omitempty"`
+
+	LastCheckedAt time.Time `json:"last_checked_at"`
+	DurationMs    int       `json:"duration_ms,omitempty"`
+}
+
+// PromptCapabilities reports which prompt content block types the agent accepts.
+type PromptCapabilities struct {
+	Image           bool `json:"image,omitempty"`
+	Audio           bool `json:"audio,omitempty"`
+	EmbeddedContext bool `json:"embedded_context,omitempty"`
+}
+
+// AuthMethod is a single advertised authentication method. Meta carries
+// agent-specific extras from ACP's `_meta` field (e.g. amp/copilot's
+// `terminal-auth` launchable-login descriptor).
+type AuthMethod struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+// Model is a single advertised model. Meta carries agent-specific extras
+// from ACP's `_meta` field — e.g. GitHub Copilot exposes `copilotUsage`
+// ("1x", "0.33x", "0x") and `copilotEnablement` here.
+type Model struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+// Command is a single advertised slash command from the ACP
+// `available_commands_update` notification.
+type Command struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// Mode is a single advertised session mode.
+type Mode struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+type ConfigOption struct {
+	Type         string               `json:"type"`
+	ID           string               `json:"id"`
+	Name         string               `json:"name"`
+	Description  string               `json:"description,omitempty"`
+	CurrentValue string               `json:"current_value"`
+	Category     string               `json:"category,omitempty"`
+	Options      []ConfigOptionChoice `json:"options,omitempty"`
+}
+
+type ConfigOptionChoice struct {
+	Value       string `json:"value"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// ModelConfigResolutionRequest identifies the provider state to resolve.
+// Model is required. Mode and ConfigOptions are optional future-dependent
+// inputs for providers whose options depend on more than the model.
+type ModelConfigResolutionRequest struct {
+	Model          string
+	Mode           string
+	ConfigOptions  map[string]string
+	Refresh        bool
+	ProfileContext *ProfileProbeContext
+}
+
+// ProfileProbeContext is a validated, server-resolved launch snapshot. Scope
+// includes the authorization principal and profile identity; secret values
+// stay in Env only for the bounded subprocess lifetime.
+type ProfileProbeContext struct {
+	Scope         string
+	Env           map[string]string
+	CLIFlags      []string
+	CommandPrefix []string
+}
+
+type ProfileCapabilityRequest struct {
+	Context ProfileProbeContext
+	Refresh bool
+}
+
+type ProfileCapabilityResult struct {
+	Capabilities    AgentCapabilities
+	ContextRevision string
+}
+
+// ModelConfigResolution is the provider's complete option snapshot for one
+// model-resolution context.
+type ModelConfigResolution struct {
+	AgentType       string
+	Model           string
+	Status          Status
+	ConfigOptions   []ConfigOption
+	Error           string
+	ContextRevision string
+}
+
+// PromptResult is returned from ExecutePrompt and RawPrompt calls.
+type PromptResult struct {
+	Response       string
+	Model          string
+	PromptTokens   int
+	ResponseTokens int
+	DurationMs     int
+}

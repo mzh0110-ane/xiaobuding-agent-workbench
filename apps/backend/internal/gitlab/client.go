@@ -1,0 +1,165 @@
+package gitlab
+
+import (
+	"context"
+	"time"
+)
+
+// Client defines the interface for interacting with the GitLab API.
+//
+// Implementations: pat_client.go (REST v4 over HTTP), glab_client.go
+// (shells out to the glab CLI), mock_client.go (in-memory, gated by
+// KANDEV_MOCK_GITLAB=true), and noop_client.go (null-object fallback).
+//
+// projectPath everywhere is the namespace/path slug, e.g. "group/project"
+// or "group/subgroup/project". The MR IID (per-project sequential ID) is
+// the user-visible number.
+type Client interface {
+	// IsAuthenticated reports whether the client can talk to GitLab.
+	IsAuthenticated(ctx context.Context) (bool, error)
+
+	// GetAuthenticatedUser returns the username of the authenticated user.
+	GetAuthenticatedUser(ctx context.Context) (string, error)
+
+	// Host returns the GitLab host this client is configured against.
+	Host() string
+
+	// GetMR retrieves a single merge request by its per-project IID.
+	GetMR(ctx context.Context, projectPath string, iid int) (*MR, error)
+
+	// FindMRByBranch finds an open MR for the given source branch.
+	FindMRByBranch(ctx context.Context, projectPath, branch string) (*MR, error)
+
+	// ListAuthoredMRs lists open MRs authored by the authenticated user
+	// for a project.
+	ListAuthoredMRs(ctx context.Context, projectPath string) ([]*MR, error)
+
+	// ListReviewRequestedMRs lists open MRs where the user is a reviewer.
+	// filter is an optional additional GitLab API filter (e.g.
+	// "project_id=123" or "milestone=v1"); customQuery, when non-empty,
+	// replaces the entire generated query.
+	ListReviewRequestedMRs(ctx context.Context, filter, customQuery string) ([]*MR, error)
+
+	// ListUserGroups returns the GitLab groups the authenticated user
+	// belongs to (analogous to GitHubOrg).
+	ListUserGroups(ctx context.Context) ([]Group, error)
+
+	// SearchGroupProjects searches projects in a group, optionally
+	// filtered by a query string.
+	SearchGroupProjects(ctx context.Context, group, query string, limit int) ([]Project, error)
+
+	// ListMRApprovals lists approvals on a merge request.
+	ListMRApprovals(ctx context.Context, projectPath string, iid int) ([]MRApproval, error)
+
+	// ListMRDiscussions lists discussions (review threads) on an MR.
+	// If since is non-nil, only discussions updated after that time are
+	// returned.
+	ListMRDiscussions(ctx context.Context, projectPath string, iid int, since *time.Time) ([]MRDiscussion, error)
+
+	// CreateMRDiscussionNote posts a reply note in an existing discussion.
+	CreateMRDiscussionNote(ctx context.Context, projectPath string, iid int, discussionID, body string) (*MRNote, error)
+
+	// ResolveMRDiscussion marks a discussion as resolved.
+	ResolveMRDiscussion(ctx context.Context, projectPath string, iid int, discussionID string) error
+
+	// ListPipelines lists pipelines for a given git ref (branch or SHA).
+	ListPipelines(ctx context.Context, projectPath, ref string) ([]Pipeline, error)
+
+	// ListPipelineJobs lists the jobs belonging to a single pipeline run.
+	// Used to compute job pass-rate counts and to surface failing job
+	// names/URLs for MR auto-fix.
+	ListPipelineJobs(ctx context.Context, projectPath string, pipelineID int64) ([]PipelineJob, error)
+
+	// GetMRFeedback fetches aggregated feedback (approvals, discussions,
+	// pipelines) for an MR.
+	GetMRFeedback(ctx context.Context, projectPath string, iid int) (*MRFeedback, error)
+
+	// GetMRStatus fetches lightweight MR state (used by the poller).
+	GetMRStatus(ctx context.Context, projectPath string, iid int) (*MRStatus, error)
+
+	// ListMRFiles lists files changed in a merge request.
+	ListMRFiles(ctx context.Context, projectPath string, iid int) ([]MRFile, error)
+
+	// ListMRCommits lists commits in a merge request.
+	ListMRCommits(ctx context.Context, projectPath string, iid int) ([]MRCommitInfo, error)
+
+	// SubmitMRApproval approves an MR. To revoke an approval, call
+	// SubmitMRUnapproval.
+	SubmitMRApproval(ctx context.Context, projectPath string, iid int) error
+
+	// SubmitMRUnapproval revokes the authenticated user's approval of an MR.
+	SubmitMRUnapproval(ctx context.Context, projectPath string, iid int) error
+
+	// CreateMR opens a new merge request. Used by the agent `pr` skill.
+	CreateMR(ctx context.Context, projectPath, sourceBranch, targetBranch, title, description string, draft bool) (*MR, error)
+
+	// ListProjectBranches lists branches for a project.
+	ListProjectBranches(ctx context.Context, projectPath string) ([]RepoBranch, error)
+
+	// ListRepoTree lists one repository directory at the given ref,
+	// non-recursively. An empty path lists the repository root.
+	ListRepoTree(ctx context.Context, projectPath, path, ref string) ([]RepoTreeEntry, error)
+
+	// GetRepoFileContent returns the raw bytes of a repository file at the
+	// given ref.
+	GetRepoFileContent(ctx context.Context, projectPath, path, ref string) ([]byte, error)
+
+	// ListIssues searches for open issues. filter is an optional
+	// additional API filter; customQuery, when non-empty, replaces the
+	// entire generated query. milestone, when non-empty, restricts results
+	// to that exact milestone title (folded into customQuery when both are
+	// set and customQuery doesn't already name a milestone).
+	ListIssues(ctx context.Context, filter, customQuery, milestone string) ([]*Issue, error)
+
+	// SearchMRs searches for MRs matching the given query.
+	SearchMRs(ctx context.Context, filter, customQuery string) ([]*MR, error)
+
+	// SearchMRsPaged is the paginated variant of SearchMRs. page is
+	// 1-indexed; perPage is clamped to GitLab's 1..100 range.
+	SearchMRsPaged(ctx context.Context, filter, customQuery string, page, perPage int) (*MRSearchPage, error)
+
+	// ListIssuesPaged is the paginated variant of ListIssues.
+	ListIssuesPaged(ctx context.Context, filter, customQuery, milestone string, page, perPage int) (*IssueSearchPage, error)
+
+	// GetIssueState returns the state of a single issue ("opened" or "closed").
+	GetIssueState(ctx context.Context, projectPath string, iid int) (string, error)
+
+	// MergeMR accepts an MR. squash=true performs a squash merge regardless of
+	// project merge method. squashCommitMessage is used when squash=true.
+	MergeMR(ctx context.Context, projectPath string, iid int, squash bool, squashCommitMessage string) (*MR, error)
+
+	// GetProjectMergeMethods reads the project's merge_method + squash_option
+	// settings.
+	GetProjectMergeMethods(ctx context.Context, projectPath string) (*ProjectMergeMethods, error)
+
+	// GetProtectedBranch returns the protected-branch settings for a branch.
+	// Returns (nil, nil) when the branch isn't protected.
+	GetProtectedBranch(ctx context.Context, projectPath, branch string) (*ProtectedBranch, error)
+
+	// ListUserProjects lists projects the authenticated user is a member of.
+	ListUserProjects(ctx context.Context) ([]Project, error)
+
+	// SearchProjects searches all projects matching `query`.
+	SearchProjects(ctx context.Context, query string, limit int) ([]Project, error)
+
+	// SetMRLabels replaces an MR's labels.
+	SetMRLabels(ctx context.Context, projectPath string, iid int, labels []string) error
+
+	// SetMRAssignees replaces an MR's assignees (by user ID).
+	SetMRAssignees(ctx context.Context, projectPath string, iid int, assigneeIDs []int) error
+
+	// ListProjectMembers searches active project members eligible for reviewer
+	// assignment. IDs are GitLab's numeric user IDs.
+	ListProjectMembers(ctx context.Context, projectPath, query string) ([]ProjectMember, error)
+
+	// SetMRReviewers replaces the complete MR reviewer list. An empty slice
+	// clears all reviewers.
+	SetMRReviewers(ctx context.Context, projectPath string, iid int, reviewerIDs []int64) error
+
+	// Notification subscription state is read from and written to GitLab; it is
+	// not a Kandev automation watch.
+	GetMRSubscription(ctx context.Context, projectPath string, iid int) (*SubscriptionState, error)
+	SetMRSubscription(ctx context.Context, projectPath string, iid int, subscribed bool) (*SubscriptionState, error)
+	GetIssueSubscription(ctx context.Context, projectPath string, iid int) (*SubscriptionState, error)
+	SetIssueSubscription(ctx context.Context, projectPath string, iid int, subscribed bool) (*SubscriptionState, error)
+}

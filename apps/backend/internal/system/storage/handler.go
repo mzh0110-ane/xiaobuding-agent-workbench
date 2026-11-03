@@ -1,0 +1,569 @@
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type SettingsManager interface {
+	GetSettings(context.Context) (StorageMaintenanceSettings, error)
+	SaveSettingsWithConfirmations(context.Context, StorageMaintenanceSettings, SaveConfirmations) (StorageMaintenanceSettings, error)
+}
+
+type SettingsPatcher interface {
+	PatchSettingsWithConfirmations(context.Context, map[string]json.RawMessage, SaveConfirmations) (StorageMaintenanceSettings, error)
+}
+
+type RunLister interface {
+	ListRuns(context.Context, int) ([]MaintenanceRun, error)
+}
+
+type QuarantineLister interface {
+	ListQuarantineEntries(context.Context, bool) ([]QuarantineEntry, error)
+}
+
+type Mutations interface {
+	AdoptGoCache(context.Context, string, string) (StorageMaintenanceSettings, Capabilities, error)
+	Analyze(context.Context) (string, error)
+	RunNow(context.Context, []string, bool) (string, error)
+	RestoreQuarantine(context.Context, string) (QuarantineEntry, error)
+	DeleteQuarantine(context.Context, string, string) (string, error)
+	PurgeQuarantine(context.Context, QuarantinePurgeScope, string) (string, error)
+}
+
+type Capabilities struct {
+	ManagedGoCachePath          string `json:"managed_go_cache_path"`
+	GoCacheAdoptionAvailable    bool   `json:"go_cache_adoption_available"`
+	TemporaryArtifactsAvailable bool   `json:"temporary_artifacts_available"`
+	DockerAvailable             bool   `json:"docker_available"`
+	DockerHost                  string `json:"docker_host"`
+	HostGlobalDockerCleanup     bool   `json:"host_global_docker_cleanup_allowed"`
+}
+
+type Summary struct {
+	Workspaces         any `json:"workspaces"`
+	GoCache            any `json:"go_cache"`
+	Quarantine         any `json:"quarantine"`
+	TemporaryArtifacts any `json:"temporary_artifacts"`
+	SystemTemporary    any `json:"system_temporary"`
+	Docker             any `json:"docker"`
+	Database           any `json:"database"`
+	DatabaseBackups    any `json:"database_backups"`
+}
+
+type DiskCapacity struct {
+	Path           string  `json:"path"`
+	TotalBytes     uint64  `json:"total_bytes"`
+	UsedBytes      uint64  `json:"used_bytes"`
+	AvailableBytes uint64  `json:"available_bytes"`
+	UsedPercent    float64 `json:"used_percent"`
+	Available      bool    `json:"available"`
+	Warning        string  `json:"warning,omitempty"`
+}
+
+type DiskCapacityResponse struct {
+	DiskCapacity
+	ObservedAt            time.Time               `json:"observed_at"`
+	TemporaryRoots        []TemporaryDiskCapacity `json:"temporary_roots"`
+	TemporaryRootsWarning string                  `json:"temporary_roots_warning,omitempty"`
+}
+
+type TemporaryDiskCapacity struct {
+	RequestedPath  string    `json:"requested_path"`
+	Path           string    `json:"path"`
+	Aliases        []string  `json:"aliases,omitempty"`
+	TotalBytes     uint64    `json:"total_bytes"`
+	UsedBytes      uint64    `json:"used_bytes"`
+	AvailableBytes uint64    `json:"available_bytes"`
+	UsedPercent    float64   `json:"used_percent"`
+	Available      bool      `json:"available"`
+	Warning        string    `json:"warning,omitempty"`
+	ObservedAt     time.Time `json:"observed_at"`
+	SharedWithHome *bool     `json:"shared_with_home"`
+}
+
+type DiskRootCandidate struct {
+	RequestedPath string
+	Path          string
+	Aliases       []string
+}
+
+type DiskCapacityReader func(context.Context, string) (DiskCapacity, error)
+
+func (r DiskCapacityReader) ReadDiskCapacity(ctx context.Context, path string) (DiskCapacity, error) {
+	return r(ctx, path)
+}
+
+type DiskRootsReader func(context.Context) ([]DiskRootCandidate, error)
+
+type DiskIdentityReader func(context.Context, string) (string, error)
+
+type QuarantineSummary struct {
+	Count     int   `json:"count" db:"count"`
+	SizeBytes int64 `json:"size_bytes" db:"size_bytes"`
+}
+
+type OverviewProvider interface {
+	Summary(context.Context) (Summary, error)
+	Capabilities(context.Context, StorageMaintenanceSettings) Capabilities
+	SettingsCapabilities(context.Context, StorageMaintenanceSettings) Capabilities
+}
+
+type OverviewReader interface {
+	Get(context.Context) (OverviewSnapshot, error)
+	Capabilities(context.Context, StorageMaintenanceSettings) Capabilities
+	SettingsCapabilities(context.Context, StorageMaintenanceSettings) Capabilities
+}
+
+type OverviewStateReader interface {
+	Read(context.Context) (OverviewRead, error)
+}
+
+type HandlerConfig struct {
+	Settings          SettingsManager
+	Runs              RunLister
+	Quarantine        QuarantineLister
+	Overview          OverviewReader
+	DiskCapacity      DiskCapacityReader
+	DiskPath          string
+	DiskRoots         DiskRootsReader
+	DiskIdentity      DiskIdentityReader
+	Now               func() time.Time
+	Mutations         Mutations
+	OnSettingsChanged func(StorageMaintenanceSettings)
+	LogError          func(string, error)
+}
+
+type Handler struct {
+	config           HandlerConfig
+	diskProbeTimeout time.Duration
+}
+
+func NewHandler(config HandlerConfig) *Handler {
+	return &Handler{config: config, diskProbeTimeout: defaultDiskProbeTimeout}
+}
+
+func (h *Handler) GetSettings(ctx context.Context) (StorageMaintenanceSettings, error) {
+	if h == nil || h.config.Settings == nil {
+		return StorageMaintenanceSettings{}, errors.New("storage settings are unavailable")
+	}
+	return h.config.Settings.GetSettings(ctx)
+}
+
+func (h *Handler) SaveSettingsWithConfirmations(ctx context.Context, settings StorageMaintenanceSettings, confirmations SaveConfirmations) (StorageMaintenanceSettings, error) {
+	if h == nil || h.config.Settings == nil {
+		return StorageMaintenanceSettings{}, errors.New("storage settings are unavailable")
+	}
+	updated, err := h.config.Settings.SaveSettingsWithConfirmations(ctx, settings, confirmations)
+	if err == nil && h.config.OnSettingsChanged != nil {
+		h.config.OnSettingsChanged(updated)
+	}
+	return updated, err
+}
+
+func (h *Handler) PatchSettingsWithConfirmations(ctx context.Context, changes map[string]json.RawMessage, confirmations SaveConfirmations) (StorageMaintenanceSettings, error) {
+	if h == nil || h.config.Settings == nil {
+		return StorageMaintenanceSettings{}, errors.New("storage settings are unavailable")
+	}
+	patcher, ok := h.config.Settings.(SettingsPatcher)
+	if !ok {
+		return StorageMaintenanceSettings{}, errors.New("atomic storage settings patch is unavailable")
+	}
+	updated, err := patcher.PatchSettingsWithConfirmations(ctx, changes, confirmations)
+	if err == nil && h.config.OnSettingsChanged != nil {
+		h.config.OnSettingsChanged(updated)
+	}
+	return updated, err
+}
+
+func (h *Handler) logError(message string, err error) {
+	if h.config.LogError != nil {
+		h.config.LogError(message, err)
+	}
+}
+
+// RegisterRoutes wires storage maintenance onto the /api/v1/system groups.
+// Reading the current usage, policy, run history, and quarantine contents is
+// open to any authenticated caller; every route that changes install-wide
+// state (settings, adoption, cleanup passes, quarantine restore/purge)
+// requires the admin role.
+func RegisterRoutes(read, admin *gin.RouterGroup, handler *Handler) {
+	read.GET("/storage", handler.getStorage)
+	read.GET("/storage/disk", handler.getStorageDisk)
+	read.GET("/storage/settings", handler.getStorageSettings)
+	read.GET("/storage/runs", handler.listRuns)
+	read.GET("/storage/quarantine", handler.listQuarantine)
+	admin.PATCH("/storage/settings", handler.patchSettings)
+	admin.POST("/storage/go-cache/adopt", handler.adoptGoCache)
+	admin.POST("/storage/analyze", handler.analyze)
+	admin.POST("/storage/run", handler.runNow)
+	admin.POST("/storage/quarantine/:id/restore", handler.restoreQuarantine)
+	admin.DELETE("/storage/quarantine", handler.deleteQuarantineBulk)
+	admin.DELETE("/storage/quarantine/:id", handler.deleteQuarantine)
+}
+
+func (h *Handler) getStorageDisk(c *gin.Context) {
+	result := DiskCapacityResponse{
+		DiskCapacity: DiskCapacity{Path: h.config.DiskPath}, TemporaryRoots: []TemporaryDiskCapacity{},
+	}
+	if h.config.DiskCapacity == nil {
+		result.Warning = "disk usage unavailable"
+	} else {
+		capacity, err := h.readDiskCapacity(c.Request.Context(), h.config.DiskPath)
+		if err != nil {
+			h.logError("failed to read storage disk capacity", err)
+			result.Warning = "disk usage unavailable"
+		} else {
+			result.DiskCapacity = capacity
+			result.Path = h.config.DiskPath
+			result.Available = true
+		}
+	}
+	result.ObservedAt = h.observedAt()
+	homeIdentity, _ := h.diskIdentity(c.Request.Context(), h.config.DiskPath)
+	if h.config.DiskRoots != nil {
+		candidates, err := boundedDiskProbe(c.Request.Context(), h.probeTimeout(), h.config.DiskRoots)
+		if err != nil {
+			h.logError("failed to resolve temporary storage roots", err)
+			result.TemporaryRootsWarning = "temporary storage paths unavailable"
+		} else {
+			result.TemporaryRoots = h.readTemporaryDiskRoots(c.Request.Context(), candidates, homeIdentity)
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) observedAt() time.Time {
+	if h.config.Now != nil {
+		return h.config.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+const (
+	defaultDiskProbeTimeout = 2500 * time.Millisecond
+	maxTemporaryDiskRoots   = 2
+)
+
+func (h *Handler) readDiskCapacity(ctx context.Context, path string) (DiskCapacity, error) {
+	return boundedDiskProbe(ctx, h.probeTimeout(), func(probeCtx context.Context) (DiskCapacity, error) {
+		return h.config.DiskCapacity.ReadDiskCapacity(probeCtx, path)
+	})
+}
+
+func (h *Handler) probeTimeout() time.Duration {
+	if h != nil && h.diskProbeTimeout > 0 {
+		return h.diskProbeTimeout
+	}
+	return defaultDiskProbeTimeout
+}
+
+func (h *Handler) diskIdentity(ctx context.Context, path string) (string, error) {
+	if h.config.DiskIdentity == nil || path == "" {
+		return "", errors.New("filesystem identity is unavailable")
+	}
+	return boundedDiskProbe(ctx, h.probeTimeout(), func(probeCtx context.Context) (string, error) {
+		return h.config.DiskIdentity(probeCtx, path)
+	})
+}
+
+func (h *Handler) readTemporaryDiskRoots(
+	ctx context.Context,
+	candidates []DiskRootCandidate,
+	homeIdentity string,
+) []TemporaryDiskCapacity {
+	roots := make([]TemporaryDiskCapacity, 0, min(len(candidates), maxTemporaryDiskRoots))
+	identities := make([]string, 0, cap(roots))
+	for _, candidate := range candidates[:min(len(candidates), maxTemporaryDiskRoots)] {
+		path := candidate.Path
+		if path == "" {
+			path = candidate.RequestedPath
+		}
+		root := TemporaryDiskCapacity{
+			RequestedPath: candidate.RequestedPath,
+			Path:          path,
+			Aliases:       append([]string(nil), candidate.Aliases...),
+		}
+		if h.config.DiskCapacity == nil {
+			root.Warning = "disk usage unavailable"
+		} else {
+			capacity, err := h.readDiskCapacity(ctx, path)
+			if err != nil {
+				h.logError("failed to read temporary storage disk capacity", err)
+				root.Warning = "disk usage unavailable"
+			} else {
+				root.TotalBytes = capacity.TotalBytes
+				root.UsedBytes = capacity.UsedBytes
+				root.AvailableBytes = capacity.AvailableBytes
+				root.UsedPercent = capacity.UsedPercent
+				root.Available = true
+			}
+		}
+		root.ObservedAt = h.observedAt()
+		identity, identityErr := h.diskIdentity(ctx, path)
+		if identityErr == nil && identity != "" {
+			if homeIdentity != "" {
+				shared := identity == homeIdentity
+				root.SharedWithHome = &shared
+			}
+			if existing := rootWithIdentity(roots, identities, identity); existing >= 0 {
+				roots[existing].Aliases = append(roots[existing].Aliases, candidate.RequestedPath)
+				roots[existing].Aliases = append(roots[existing].Aliases, candidate.Aliases...)
+				if !roots[existing].Available && root.Available {
+					roots[existing].TotalBytes = root.TotalBytes
+					roots[existing].UsedBytes = root.UsedBytes
+					roots[existing].AvailableBytes = root.AvailableBytes
+					roots[existing].UsedPercent = root.UsedPercent
+					roots[existing].Available = true
+					roots[existing].Warning = ""
+					roots[existing].ObservedAt = root.ObservedAt
+				}
+				continue
+			}
+		}
+		roots = append(roots, root)
+		identities = append(identities, identity)
+	}
+	return roots
+}
+
+func rootWithIdentity(roots []TemporaryDiskCapacity, identities []string, identity string) int {
+	for index, current := range identities {
+		if current != "" && current == identity && index < len(roots) {
+			return index
+		}
+	}
+	return -1
+}
+
+func (h *Handler) listRuns(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	runs, err := h.config.Runs.ListRuns(c.Request.Context(), limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"runs": runs})
+}
+
+func (h *Handler) listQuarantine(c *gin.Context) {
+	entries, err := h.config.Quarantine.ListQuarantineEntries(c.Request.Context(), false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"entries": entries})
+}
+
+type adoptRequest struct {
+	Path    string `json:"path" binding:"required"`
+	Confirm string `json:"confirm" binding:"required"`
+}
+
+func (h *Handler) adoptGoCache(c *gin.Context) {
+	var request adoptRequest
+	if err := c.ShouldBindJSON(&request); err != nil || request.Confirm != "ADOPT" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Go-cache adoption requires ADOPT confirmation"})
+		return
+	}
+	settings, capabilities, err := h.config.Mutations.AdoptGoCache(c.Request.Context(), request.Path, request.Confirm)
+	if err != nil {
+		writeMutationError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"settings": settings, "capabilities": capabilities})
+}
+
+type runRequest struct {
+	Resources []string `json:"resources"`
+	Force     bool     `json:"force"`
+}
+
+func (h *Handler) analyze(c *gin.Context) {
+	id, err := h.config.Mutations.Analyze(c.Request.Context())
+	writeAcceptedJob(c, id, err)
+}
+
+func (h *Handler) runNow(c *gin.Context) {
+	var request runRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	id, err := h.config.Mutations.RunNow(c.Request.Context(), request.Resources, request.Force)
+	var busy *BusyError
+	if errors.As(err, &busy) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": busy.Error(), "busy_resources": busy.Resources,
+			"force_available": busy.ForceAvailable,
+		})
+		return
+	}
+	writeAcceptedJob(c, id, err)
+}
+
+func (h *Handler) restoreQuarantine(c *gin.Context) {
+	entry, err := h.config.Mutations.RestoreQuarantine(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		writeMutationError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"entry": entry})
+}
+
+type confirmationRequest struct {
+	Confirm string `json:"confirm" binding:"required"`
+}
+
+func (h *Handler) deleteQuarantine(c *gin.Context) {
+	var request confirmationRequest
+	if err := c.ShouldBindJSON(&request); err != nil || request.Confirm != QuarantineConfirmationDelete {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "quarantine deletion requires DELETE confirmation"})
+		return
+	}
+	id, err := h.config.Mutations.DeleteQuarantine(c.Request.Context(), c.Param("id"), request.Confirm)
+	writeAcceptedJob(c, id, err)
+}
+
+type bulkQuarantineRequest struct {
+	Scope   QuarantinePurgeScope `json:"scope" binding:"required"`
+	Confirm string               `json:"confirm" binding:"required"`
+}
+
+func (h *Handler) deleteQuarantineBulk(c *gin.Context) {
+	var request bulkQuarantineRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if (request.Scope == QuarantinePurgeScopeEligible && request.Confirm != QuarantineConfirmationEligible) ||
+		(request.Scope == QuarantinePurgeScopeAll && request.Confirm != QuarantineConfirmationForce) ||
+		(request.Scope != QuarantinePurgeScopeEligible && request.Scope != QuarantinePurgeScopeAll) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quarantine purge scope or confirmation"})
+		return
+	}
+	id, err := h.config.Mutations.PurgeQuarantine(c.Request.Context(), request.Scope, request.Confirm)
+	writeAcceptedJob(c, id, err)
+}
+
+func writeAcceptedJob(c *gin.Context, id string, err error) {
+	if err != nil {
+		writeMutationError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"job_id": id})
+}
+
+func writeMutationError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, ErrValidation), errors.Is(err, ErrAdoptionRequired),
+		errors.Is(err, ErrDedicatedDockerConfirmation):
+		status = http.StatusBadRequest
+	case errors.Is(err, ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, ErrConflict):
+		status = http.StatusConflict
+	}
+	c.JSON(status, gin.H{"error": err.Error()})
+}
+
+func (h *Handler) getStorage(c *gin.Context) {
+	settings, err := h.config.Settings.GetSettings(c.Request.Context())
+	if err != nil {
+		h.logError("failed to load storage settings", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load storage settings"})
+		return
+	}
+	var (
+		snapshot *OverviewSnapshot
+		analysis StorageAnalysisState
+	)
+	if stateReader, ok := h.config.Overview.(OverviewStateReader); ok {
+		read, readErr := stateReader.Read(c.Request.Context())
+		if readErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": readErr.Error()})
+			return
+		}
+		snapshot, analysis = read.Snapshot, read.Analysis
+	} else {
+		legacy, readErr := h.config.Overview.Get(c.Request.Context())
+		if readErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": readErr.Error()})
+			return
+		}
+		snapshot = &legacy
+		analysis = readyAnalysisState(0, defaultOverviewCacheTTL, legacy.AnalyzedAt, legacy.AnalyzedAt, legacy.AnalyzedAt)
+	}
+	runs, err := h.config.Runs.ListRuns(c.Request.Context(), 1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var lastRun *MaintenanceRun
+	if len(runs) > 0 {
+		lastRun = &runs[0]
+	}
+	var summary any
+	var analyzedAt any
+	if snapshot != nil {
+		summary, analyzedAt = snapshot.Summary, snapshot.AnalyzedAt
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"settings": settings, "capabilities": h.config.Overview.Capabilities(c.Request.Context(), settings),
+		"summary": summary, "analyzed_at": analyzedAt, "analysis": analysis, "last_run": lastRun,
+	})
+}
+
+func (h *Handler) getStorageSettings(c *gin.Context) {
+	settings, err := h.config.Settings.GetSettings(c.Request.Context())
+	if err != nil {
+		h.logError("failed to load storage settings", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load storage settings"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"settings":     settings,
+		"capabilities": h.config.Overview.SettingsCapabilities(c.Request.Context(), settings),
+	})
+}
+
+type patchSettingsRequest struct {
+	Settings      StorageMaintenanceSettings `json:"settings" binding:"required"`
+	Confirmations struct {
+		DedicatedDocker string `json:"dedicated_docker"`
+	} `json:"confirmations"`
+}
+
+func (h *Handler) patchSettings(c *gin.Context) {
+	var request patchSettingsRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	saved, err := h.config.Settings.SaveSettingsWithConfirmations(
+		c.Request.Context(), request.Settings,
+		SaveConfirmations{DedicatedDocker: request.Confirmations.DedicatedDocker == "DEDICATED"},
+	)
+	if err != nil {
+		if errors.Is(err, ErrValidation) || errors.Is(err, ErrAdoptionRequired) ||
+			errors.Is(err, ErrDedicatedDockerConfirmation) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save storage settings"})
+		return
+	}
+	if h.config.OnSettingsChanged != nil {
+		h.config.OnSettingsChanged(saved)
+	}
+	c.JSON(http.StatusOK, gin.H{"settings": saved})
+}

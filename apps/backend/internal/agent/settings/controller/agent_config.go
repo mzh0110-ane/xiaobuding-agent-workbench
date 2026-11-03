@@ -1,0 +1,423 @@
+package controller
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/hostutility"
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/settings/cliflags"
+	"github.com/kandev/kandev/internal/agent/settings/dto"
+	"github.com/kandev/kandev/internal/agent/settings/models"
+	"go.uber.org/zap"
+)
+
+type UpdateAgentProfileMcpConfigRequest struct {
+	Enabled bool
+	Servers map[string]mcpconfig.ServerDef
+	Meta    map[string]any
+}
+
+type UpdateAgentProfileMcpConfigPatchRequest struct {
+	Enabled *bool
+	Servers *map[string]mcpconfig.ServerDef
+}
+
+func (c *Controller) GetAgentProfileMcpConfig(ctx context.Context, profileID string) (*dto.AgentProfileMcpConfigDTO, error) {
+	config, err := c.mcpService.GetConfigByProfileID(ctx, profileID)
+	if err != nil {
+		if errors.Is(err, mcpconfig.ErrAgentProfileNotFound) {
+			return nil, ErrAgentProfileNotFound
+		}
+		if errors.Is(err, mcpconfig.ErrAgentMcpUnsupported) {
+			return nil, ErrAgentMcpUnsupported
+		}
+		return nil, err
+	}
+	return &dto.AgentProfileMcpConfigDTO{
+		ProfileID:   config.ProfileID,
+		WorkspaceID: config.WorkspaceID,
+		Enabled:     config.Enabled,
+		Servers:     config.Servers,
+		Meta:        config.Meta,
+	}, nil
+}
+
+func (c *Controller) UpdateAgentProfileMcpConfig(ctx context.Context, profileID string, req UpdateAgentProfileMcpConfigRequest) (*dto.AgentProfileMcpConfigDTO, error) {
+	config, err := c.mcpService.UpsertConfigByProfileID(ctx, profileID, &mcpconfig.ProfileConfig{
+		Enabled: req.Enabled,
+		Servers: req.Servers,
+		Meta:    req.Meta,
+	})
+	if err != nil {
+		if errors.Is(err, mcpconfig.ErrAgentProfileNotFound) {
+			return nil, ErrAgentProfileNotFound
+		}
+		if errors.Is(err, mcpconfig.ErrAgentMcpUnsupported) {
+			return nil, ErrAgentMcpUnsupported
+		}
+		return nil, err
+	}
+	return &dto.AgentProfileMcpConfigDTO{
+		ProfileID:   config.ProfileID,
+		WorkspaceID: config.WorkspaceID,
+		Enabled:     config.Enabled,
+		Servers:     config.Servers,
+		Meta:        config.Meta,
+	}, nil
+}
+
+func (c *Controller) UpdateAgentProfileMcpConfigPatch(ctx context.Context, profileID string, req UpdateAgentProfileMcpConfigPatchRequest) (*dto.AgentProfileMcpConfigDTO, error) {
+	config, err := c.mcpService.PatchConfigByProfileID(ctx, profileID, mcpconfig.ConfigPatch{
+		Enabled: req.Enabled,
+		Servers: req.Servers,
+	})
+	if err != nil {
+		if errors.Is(err, mcpconfig.ErrAgentProfileNotFound) {
+			return nil, ErrAgentProfileNotFound
+		}
+		if errors.Is(err, mcpconfig.ErrAgentMcpUnsupported) {
+			return nil, ErrAgentMcpUnsupported
+		}
+		return nil, err
+	}
+	return &dto.AgentProfileMcpConfigDTO{
+		ProfileID:   config.ProfileID,
+		WorkspaceID: config.WorkspaceID,
+		Enabled:     config.Enabled,
+		Servers:     config.Servers,
+		Meta:        config.Meta,
+	}, nil
+}
+
+// EnsureDefaultMcpConfig ensures all agent profiles that support MCP have
+// MCP enabled by default. The kandev MCP server is automatically injected
+// by agentctl at session creation time, so profiles don't need to explicitly
+// configure it.
+func (c *Controller) EnsureDefaultMcpConfig(ctx context.Context) error {
+	agentList, err := c.repo.ListAgents(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, agent := range agentList {
+		if !agent.SupportsMCP {
+			continue
+		}
+
+		profiles, err := c.repo.ListAgentProfiles(ctx, agent.ID)
+		if err != nil {
+			return err
+		}
+
+		for _, profile := range profiles {
+			if err := c.ensureProfileMcpConfig(ctx, profile); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) ensureProfileMcpConfig(ctx context.Context, profile *models.AgentProfile) error {
+	// Check if MCP config already exists
+	existingConfig, err := c.repo.GetAgentProfileMcpConfig(ctx, profile.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	// Skip if config already exists (don't overwrite user settings)
+	if existingConfig != nil {
+		return nil
+	}
+
+	// Create default MCP config with MCP enabled but no servers configured.
+	// The kandev MCP server is automatically injected by agentctl when
+	// creating a new session. Users can add additional external MCP servers.
+	config := &models.AgentProfileMcpConfig{
+		ProfileID: profile.ID,
+		Enabled:   true,
+		Servers:   map[string]interface{}{},
+		Meta:      map[string]interface{}{},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	if err := c.repo.UpsertAgentProfileMcpConfig(ctx, config); err != nil {
+		c.logger.Warn("failed to create default MCP config for profile",
+			zap.String("profile_id", profile.ID),
+			zap.String("profile_name", profile.Name),
+			zap.Error(err))
+		return nil
+	}
+
+	c.logger.Info("created default MCP config for profile",
+		zap.String("profile_id", profile.ID),
+		zap.String("profile_name", profile.Name))
+	return nil
+}
+
+// GetAgentLogo returns the SVG logo bytes for the given agent and variant.
+func (c *Controller) GetAgentLogo(ctx context.Context, agentName string, variant agents.LogoVariant) ([]byte, error) {
+	ag, ok := c.agentRegistry.Get(agentName)
+	if !ok {
+		return nil, ErrAgentNotFound
+	}
+	data := ag.Logo(variant)
+	if len(data) == 0 {
+		return nil, ErrLogoNotAvailable
+	}
+	return data, nil
+}
+
+// resolvePermissionDefaults extracts the default permission values from agent settings.
+func resolvePermissionDefaults(permSettings map[string]agents.PermissionSetting) (autoApprove, allowIndexing, skipPermissions bool) {
+	if permSettings == nil {
+		return
+	}
+	if s, exists := permSettings[agents.PermissionKeyAutoApprove]; exists {
+		autoApprove = s.Default
+	}
+	if s, exists := permSettings["allow_indexing"]; exists {
+		allowIndexing = s.Default
+	}
+	if s, exists := permSettings["dangerously_skip_permissions"]; exists {
+		skipPermissions = s.Default
+	}
+	return
+}
+
+// CommandPreviewRequest contains the draft settings for command preview
+type CommandPreviewRequest struct {
+	Model              string
+	PermissionSettings map[string]bool
+	CLIPassthrough     bool
+	CLIFlags           []dto.CLIFlagDTO
+	CommandPrefix      string
+}
+
+// PreviewAgentCommand generates a preview of the CLI command that will be executed
+func (c *Controller) PreviewAgentCommand(ctx context.Context, agentName string, req CommandPreviewRequest) (*dto.CommandPreviewResponse, error) {
+	if err := validateCommandPrefix(req.CommandPrefix); err != nil {
+		return nil, err
+	}
+	agentConfig, ok := c.agentRegistry.Get(agentName)
+	if !ok {
+		return nil, fmt.Errorf("agent type %q not found in registry", agentName)
+	}
+
+	// Resolve the user-configured cli_flags list into argv tokens. The
+	// launch path does the same via cliflags.Resolve; mirroring it here
+	// keeps the preview faithful to what the agent subprocess will see.
+	// Tolerate malformed entries silently — the preview is informational.
+	cliFlagTokens, _ := cliflags.Resolve(cliFlagsFromDTO(req.CLIFlags))
+
+	// Passthrough: BuildPassthroughCommand emits permission flags via Settings()
+	// and appends resolved profile CLI flags, matching manager_passthrough.go.
+	// ACP: mirror lifecycle.CommandBuilder.BuildCommand by appending CLIFlagTokens
+	// after the agent's BuildCommand.
+	var cmd agents.Command
+	if ptAgent, ok := agentConfig.(agents.PassthroughAgent); ok && req.CLIPassthrough {
+		cmd = ptAgent.BuildPassthroughCommand(agents.PassthroughOptions{
+			Model:            req.Model,
+			PermissionValues: req.PermissionSettings,
+			CLIFlagTokens:    cliFlagTokens,
+		})
+	} else {
+		managedRuntimeVersion := ""
+		var err error
+		if managed, ok := agentConfig.(agents.ManagedNPMRuntimeAgent); ok {
+			managedRuntimeVersion, err = c.activeRuntimeVersion(
+				ctx,
+				agentName,
+				managed.ManagedNPMRuntime().Package,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("resolve active managed runtime version: %w", err)
+			}
+		}
+		cmd = agentConfig.BuildCommand(agents.CommandOptions{
+			Model:                 req.Model,
+			PermissionValues:      req.PermissionSettings,
+			CLIFlagTokens:         cliFlagTokens,
+			PreferNativeBinary:    previewPrefersNativeBinary(agentConfig),
+			ManagedRuntimeVersion: managedRuntimeVersion,
+		})
+		if len(cliFlagTokens) > 0 {
+			cmd = cmd.With().Flag(cliFlagTokens...).Build()
+		}
+		// Prepend the launcher prefix last, mirroring
+		// lifecycle.CommandBuilder.BuildCommand. Prefixes were validated above;
+		// passthrough never applies one (neither does the launch path), so this
+		// stays in the ACP branch only.
+		if prefixTokens, err := cliflags.Tokenise(req.CommandPrefix); err == nil && len(prefixTokens) > 0 {
+			cmd = agents.NewCommand(append(prefixTokens, cmd.Args()...)...)
+		}
+	}
+
+	flagDestination := dto.FlagDestinationACPBridge
+	if req.CLIPassthrough {
+		flagDestination = dto.FlagDestinationAgentCLI
+	}
+	return &dto.CommandPreviewResponse{
+		Supported:       true,
+		Command:         cmd.Args(),
+		CommandString:   buildCommandString(cmd.Args()),
+		FlagDestination: flagDestination,
+	}, nil
+}
+
+// previewPrefersNativeBinary reports whether the command preview should show a
+// NativeBinaryAgent's standalone CLI (e.g. "copilot --acp") instead of
+// `npx -y <pkg>`. The preview is not bound to an executor, so it assumes the
+// local (standalone) host — the default executor — and probes this machine's
+// PATH, mirroring the standalone branch of lifecycle.preferNativeBinary.
+// Containerized executors keep npx at launch regardless; the preview reflects
+// the common local case.
+func previewPrefersNativeBinary(agentConfig agents.Agent) bool {
+	nb, ok := agentConfig.(agents.NativeBinaryAgent)
+	if !ok {
+		return false
+	}
+	name := nb.NativeBinaryName()
+	if name == "" {
+		return false
+	}
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+// FetchDynamicModels returns models and modes for an agent from the host
+// utility capability cache populated by the ACP probe at boot. The refresh
+// flag triggers a live Refresh() call against the warm host instance.
+func (c *Controller) FetchDynamicModels(ctx context.Context, agentName string, refresh bool) (*dto.DynamicModelsResponse, error) {
+	if _, ok := c.agentRegistry.Get(agentName); !ok {
+		return nil, ErrAgentNotFound
+	}
+	if c.hostUtility == nil {
+		return &dto.DynamicModelsResponse{
+			AgentName: agentName,
+			Status:    "not_configured",
+		}, nil
+	}
+
+	var caps hostutility.AgentCapabilities
+	if refresh {
+		var err error
+		caps, err = c.hostUtility.Refresh(ctx, agentName)
+		if err != nil {
+			s := err.Error()
+			return &dto.DynamicModelsResponse{
+				AgentName: agentName,
+				Status:    string(hostutility.StatusFailed),
+				Error:     &s,
+			}, nil
+		}
+	} else {
+		var ok bool
+		caps, ok = c.hostUtility.Get(agentName)
+		if !ok {
+			return &dto.DynamicModelsResponse{
+				AgentName: agentName,
+				Status:    "not_configured",
+			}, nil
+		}
+	}
+
+	resp := &dto.DynamicModelsResponse{
+		AgentName:      agentName,
+		Status:         string(caps.Status),
+		CurrentModelID: caps.CurrentModelID,
+		CurrentModeID:  caps.CurrentModeID,
+		Models:         []dto.ModelEntryDTO{},
+		Modes:          []dto.ModeEntryDTO{},
+	}
+	if caps.Error != "" {
+		e := caps.Error
+		resp.Error = &e
+	}
+	for _, m := range caps.Models {
+		resp.Models = append(resp.Models, dto.ModelEntryDTO{
+			ID:          m.ID,
+			Name:        m.Name,
+			Description: m.Description,
+			IsDefault:   m.ID == caps.CurrentModelID,
+			Meta:        m.Meta,
+		})
+	}
+	for _, m := range caps.Modes {
+		resp.Modes = append(resp.Modes, dto.ModeEntryDTO{
+			ID:          m.ID,
+			Name:        m.Name,
+			Description: m.Description,
+			Meta:        m.Meta,
+		})
+	}
+	for _, c := range caps.Commands {
+		resp.Commands = append(resp.Commands, dto.CommandEntryDTO{
+			Name:        c.Name,
+			Description: c.Description,
+		})
+	}
+	return resp, nil
+}
+
+// ResolveAgentModelConfig returns the complete provider configuration-option
+// snapshot after applying a selected model in a sessionless ACP probe.
+func (c *Controller) ResolveAgentModelConfig(
+	ctx context.Context,
+	agentName string,
+	req dto.ResolveAgentModelConfigRequest,
+) (*dto.AgentModelConfigResponse, error) {
+	if _, ok := c.agentRegistry.Get(agentName); !ok {
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentName)
+	}
+	if strings.TrimSpace(req.Model) == "" {
+		return nil, ErrModelRequired
+	}
+	resp := &dto.AgentModelConfigResponse{
+		AgentName:     agentName,
+		Model:         req.Model,
+		Status:        string(hostutility.StatusNotConfigured),
+		ConfigOptions: []dto.ConfigOptionDTO{},
+	}
+	var profileContext *hostutility.ProfileProbeContext
+	if req.ProfileID != "" || req.LaunchSettings != nil {
+		resolved, err := c.resolveProfileProbeContext(ctx, agentName, req.AuthorizationScope, req.ProfileID, req.LaunchSettings)
+		if err != nil {
+			return nil, err
+		}
+		profileContext = &resolved
+	}
+	if c.hostUtility == nil {
+		return resp, nil
+	}
+	resolution, err := c.hostUtility.ResolveModelConfig(ctx, agentName, hostutility.ModelConfigResolutionRequest{
+		Model:          req.Model,
+		Mode:           req.Mode,
+		ConfigOptions:  req.ConfigOptions,
+		Refresh:        req.Refresh,
+		ProfileContext: profileContext,
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp.Status = string(resolution.Status)
+	resp.ContextRevision = resolution.ContextRevision
+	resp.ConfigOptions = configOptionDTOs(resolution.ConfigOptions)
+	if resolution.Error != "" {
+		message := "model option resolution failed"
+		if resolution.Status == hostutility.StatusAuthRequired {
+			message = agentAuthenticationRequiredMessage
+		}
+		resp.Error = &message
+	}
+	return resp, nil
+}

@@ -1,0 +1,1269 @@
+package plugins
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"testing"
+	"time"
+
+	agentsettingsdto "github.com/kandev/kandev/internal/agent/settings/dto"
+	analyticsmodels "github.com/kandev/kandev/internal/analytics/models"
+	"github.com/kandev/kandev/internal/plugins/manifest"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	taskservice "github.com/kandev/kandev/internal/task/service"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	"github.com/kandev/kandev/pkg/pluginsdk"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func int64Ptr(v int64) *int64 { return &v }
+
+// ── fakes for the narrow Host data API interfaces ───────────────────────
+
+type fakeTaskDataSource struct {
+	transitionRows   map[string][]taskmodels.StepTransition
+	transitionGroups map[string][]taskmodels.TransitionGroup
+	transitionCalls  int
+	groupCalls       int
+	workspaces       []*taskmodels.Workspace
+	tasksByWorkspace map[string][]*taskmodels.Task
+	tasksByID        map[string]*taskmodels.Task
+	repositories     map[string][]*taskmodels.Repository
+	sessionsByTask   map[string][]*taskmodels.TaskSession
+	executorRunning  map[string]*taskmodels.ExecutorRunning
+	executorProfiles []*taskmodels.ExecutorProfile
+	executors        map[string]*taskmodels.Executor
+	executorErrors   map[string]error
+	executorCalls    int
+
+	// gotIncludeArchived records the includeArchived flag of every
+	// ListTasksByWorkspace call, in call order.
+	gotIncludeArchived []bool
+
+	// executorRunningCalls counts GetExecutorRunningBySessionID calls, so
+	// tests can prove Sessions().List only resolves ACPSessionID for the
+	// page it actually returns, not every session it fetched.
+	executorRunningCalls int
+
+	// listTasksByWorkspaceCalls counts ListTasksByWorkspace calls, so tests
+	// can prove a workspace with more tasks than a single page issues
+	// multiple calls instead of returning a truncated first page.
+	listTasksByWorkspaceCalls int
+
+	// dependencyViews, keyed by task ID, is returned by both
+	// BuildDependencyViews and BuildDependencyViewsBounded. A nil map
+	// yields an empty map (every task unblocked), matching the zero value a
+	// test that never sets it should observe. dependencyViewsErr, when set,
+	// is returned only by the bounded variant, simulating a fan-out refusal.
+	dependencyViews             map[string]taskservice.DependencyView
+	dependencyViewsErr          error
+	dependencyViewsCalls        int
+	dependencyViewsBoundedCalls int
+	// dependencyViewsTasks records the task IDs passed to the most recent
+	// BuildDependencyViews/Bounded call, so tests can prove attachment
+	// derives over the right (e.g. post-filter) slice.
+	dependencyViewsTasks []string
+}
+
+func (f *fakeTaskDataSource) ListTaskStepTransitions(_ context.Context, taskID string, _ int, _ string) ([]taskmodels.StepTransition, string, error) {
+	f.transitionCalls++
+	return f.transitionRows[taskID], "", nil
+}
+
+func (f *fakeTaskDataSource) ListWorkflowTransitionGroups(_ context.Context, workflowID string, _ int, _ string) ([]taskmodels.TransitionGroup, string, error) {
+	f.groupCalls++
+	return f.transitionGroups[workflowID], "", nil
+}
+
+func (f *fakeTaskDataSource) ListWorkspaces(context.Context) ([]*taskmodels.Workspace, error) {
+	return f.workspaces, nil
+}
+
+// ListTasksByWorkspace mirrors the real repository's page/pageSize semantics
+// (1-based page, offset = (page-1)*pageSize, total = the full unpaginated
+// count) so tests can prove callers that need every task actually loop
+// pagination to completion instead of assuming a single page has it all.
+func (f *fakeTaskDataSource) ListTasksByWorkspace(
+	_ context.Context, workspaceID, _, _, _ string, page, pageSize int, _ string, includeArchived, _, _, _ bool,
+) ([]*taskmodels.Task, int, error) {
+	f.gotIncludeArchived = append(f.gotIncludeArchived, includeArchived)
+	f.listTasksByWorkspaceCalls++
+	all := f.tasksByWorkspace[workspaceID]
+	total := len(all)
+	offset := (page - 1) * pageSize
+	if offset < 0 || offset >= total {
+		return []*taskmodels.Task{}, total, nil
+	}
+	end := offset + pageSize
+	if end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+
+func (f *fakeTaskDataSource) GetTask(_ context.Context, id string) (*taskmodels.Task, error) {
+	task, ok := f.tasksByID[id]
+	if !ok {
+		return nil, repoerrors.ErrTaskNotFound
+	}
+	return task, nil
+}
+
+func (f *fakeTaskDataSource) ListRepositories(_ context.Context, workspaceID string) ([]*taskmodels.Repository, error) {
+	return f.repositories[workspaceID], nil
+}
+
+func (f *fakeTaskDataSource) ListTaskSessions(_ context.Context, taskID string) ([]*taskmodels.TaskSession, error) {
+	return f.sessionsByTask[taskID], nil
+}
+
+func (f *fakeTaskDataSource) GetExecutorRunningBySessionID(_ context.Context, sessionID string) (*taskmodels.ExecutorRunning, error) {
+	f.executorRunningCalls++
+	running, ok := f.executorRunning[sessionID]
+	if !ok {
+		return nil, taskmodels.ErrExecutorRunningNotFound
+	}
+	return running, nil
+}
+
+func (f *fakeTaskDataSource) ListAllExecutorProfiles(context.Context) ([]*taskmodels.ExecutorProfile, error) {
+	return f.executorProfiles, nil
+}
+
+func (f *fakeTaskDataSource) GetExecutor(_ context.Context, id string) (*taskmodels.Executor, error) {
+	f.executorCalls++
+	if err := f.executorErrors[id]; err != nil {
+		return nil, err
+	}
+	return f.executors[id], nil
+}
+
+func (f *fakeTaskDataSource) recordDependencyViewsTasks(tasks []*taskmodels.Task) {
+	ids := make([]string, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	f.dependencyViewsTasks = ids
+}
+
+func (f *fakeTaskDataSource) BuildDependencyViews(_ context.Context, tasks []*taskmodels.Task) map[string]taskservice.DependencyView {
+	f.dependencyViewsCalls++
+	f.recordDependencyViewsTasks(tasks)
+	if f.dependencyViews == nil {
+		return map[string]taskservice.DependencyView{}
+	}
+	return f.dependencyViews
+}
+
+func (f *fakeTaskDataSource) BuildDependencyViewsBounded(_ context.Context, tasks []*taskmodels.Task) (map[string]taskservice.DependencyView, error) {
+	f.dependencyViewsBoundedCalls++
+	f.recordDependencyViewsTasks(tasks)
+	if f.dependencyViewsErr != nil {
+		return nil, f.dependencyViewsErr
+	}
+	if f.dependencyViews == nil {
+		return map[string]taskservice.DependencyView{}, nil
+	}
+	return f.dependencyViews, nil
+}
+
+type fakeWorkflowLister struct {
+	workflows map[string][]*taskmodels.Workflow
+}
+
+func (f *fakeWorkflowLister) ListWorkflows(_ context.Context, workspaceID string, _ bool) ([]*taskmodels.Workflow, error) {
+	return f.workflows[workspaceID], nil
+}
+
+type fakeWorkflowStepLister struct {
+	steps map[string][]*wfmodels.WorkflowStep
+}
+
+func (f *fakeWorkflowStepLister) ListStepsByWorkflow(_ context.Context, workflowID string) ([]*wfmodels.WorkflowStep, error) {
+	return f.steps[workflowID], nil
+}
+
+type fakeAgentProfileDataSource struct {
+	resp         *agentsettingsdto.ListAgentsResponse
+	profilesByID map[string]*AgentProfile
+	profileErr   error
+	profileCalls int
+}
+
+func (f *fakeAgentProfileDataSource) ListAgents(context.Context) (*agentsettingsdto.ListAgentsResponse, error) {
+	return f.resp, nil
+}
+
+func (f *fakeAgentProfileDataSource) GetProfileByID(_ context.Context, id string) (*AgentProfile, error) {
+	f.profileCalls++
+	if f.profileErr != nil {
+		return nil, f.profileErr
+	}
+	if profile, ok := f.profilesByID[id]; ok {
+		return profile, nil
+	}
+	return nil, ErrAgentProfileNotFound
+}
+
+type fakeSessionCodeStatsSource struct {
+	calls      int
+	lastFilter analyticsmodels.SessionCodeStatsFilter
+	stats      []*analyticsmodels.SessionCodeStats
+	err        error
+}
+
+func (f *fakeSessionCodeStatsSource) ListSessionCodeStats(
+	_ context.Context, filter analyticsmodels.SessionCodeStatsFilter,
+) ([]*analyticsmodels.SessionCodeStats, error) {
+	f.calls++
+	f.lastFilter = filter
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.stats, nil
+}
+
+type fakeMessageDataSource struct {
+	calls      int
+	lastFilter taskmodels.PluginMessageFilter
+	messages   []*taskmodels.Message
+	err        error
+}
+
+func (f *fakeMessageDataSource) ListMessagesForPlugin(
+	_ context.Context, filter taskmodels.PluginMessageFilter,
+) ([]*taskmodels.Message, error) {
+	f.calls++
+	f.lastFilter = filter
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.messages, nil
+}
+
+// fakeTaskWriter records CreateTask/UpdateTask inputs and returns canned
+// tasks, standing in for the backendapp adapter over internal/task/service.
+type fakeTaskWriter struct {
+	lastCreate  TaskCreateInput
+	lastUpdate  TaskUpdateInput
+	createCalls int
+	updateCalls int
+	created     *taskmodels.Task
+	updated     *taskmodels.Task
+	createErr   error
+	updateErr   error
+	deletedIDs  []string
+	deleteErr   error
+	lastMove    TaskMoveInput
+	moveCalls   int
+	moveResult  *TaskMoveResult
+	moveErr     error
+}
+
+func (f *fakeTaskWriter) CreateTask(_ context.Context, in TaskCreateInput) (*taskmodels.Task, error) {
+	f.createCalls++
+	f.lastCreate = in
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.created != nil {
+		return f.created, nil
+	}
+	return &taskmodels.Task{ID: "task-created", WorkspaceID: in.WorkspaceID, WorkflowID: in.WorkflowID, Title: in.Title}, nil
+}
+
+func (f *fakeTaskWriter) UpdateTask(_ context.Context, in TaskUpdateInput) (*taskmodels.Task, error) {
+	f.updateCalls++
+	f.lastUpdate = in
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	if f.updated != nil {
+		return f.updated, nil
+	}
+	return &taskmodels.Task{ID: in.ID, Title: "updated"}, nil
+}
+
+func (f *fakeTaskWriter) MoveTask(_ context.Context, in TaskMoveInput) (*TaskMoveResult, error) {
+	f.moveCalls++
+	f.lastMove = in
+	if f.moveErr != nil {
+		return nil, f.moveErr
+	}
+	if f.moveResult != nil {
+		return f.moveResult, nil
+	}
+	return &TaskMoveResult{
+		Task:         &taskmodels.Task{ID: in.TaskID, WorkflowStepID: in.WorkflowStepID},
+		Transitioned: true,
+		FromStepID:   "step-from",
+	}, nil
+}
+
+func (f *fakeTaskWriter) DeleteTask(_ context.Context, id string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deletedIDs = append(f.deletedIDs, id)
+	return nil
+}
+
+// fakeMessenger records SendMessage calls, standing in for the backendapp
+// adapter over the task service + orchestrator delivery path.
+type fakeMessenger struct {
+	calls       int
+	lastTaskID  string
+	lastSession string
+	lastText    string
+	lastSource  string
+	result      PluginMessageResult
+	err         error
+}
+
+func (f *fakeMessenger) SendMessage(_ context.Context, taskID, sessionID, text, source string) (PluginMessageResult, error) {
+	f.calls++
+	f.lastTaskID, f.lastSession, f.lastText, f.lastSource = taskID, sessionID, text, source
+	if f.err != nil {
+		return PluginMessageResult{}, f.err
+	}
+	if f.result == (PluginMessageResult{}) {
+		return PluginMessageResult{SessionID: "session-x", Status: "sent"}, nil
+	}
+	return f.result, nil
+}
+
+// fakeTaskStarter records StartTask calls behind CreateTask's start_agent.
+type fakeTaskStarter struct {
+	calls      int
+	lastID     string
+	lastLaunch TaskLaunchInput
+	err        error
+}
+
+func (f *fakeTaskStarter) StartTask(_ context.Context, taskID string, launch TaskLaunchInput) error {
+	f.calls++
+	f.lastID = taskID
+	f.lastLaunch = launch
+	return f.err
+}
+
+// testDataHost bundles a pluginHost with every fake it was wired from, so
+// tests can both drive Host calls and assert against the fakes' recorded
+// state.
+type testDataHost struct {
+	host           *pluginHost
+	tasks          *fakeTaskDataSource
+	workflows      *fakeWorkflowLister
+	steps          *fakeWorkflowStepLister
+	profiles       *fakeAgentProfileDataSource
+	codeStats      *fakeSessionCodeStatsSource
+	messages       *fakeMessageDataSource
+	defaultProfile *fakeDefaultUtilityProfileSource
+	utilRun        *fakeUtilityRunner
+	taskWriter     *fakeTaskWriter
+	messenger      *fakeMessenger
+	starter        *fakeTaskStarter
+
+	interactions *fakeInteractionDataSource
+	responder    *fakeInteractionResponder
+}
+
+// newTestDataHost builds a fully-wired pluginHost (every Host data API
+// dependency set, even if a given test's capabilities don't grant every
+// resource) so each test only needs to vary caps.
+func newTestDataHost(caps manifest.Capabilities) *testDataHost {
+	d := &testDataHost{
+		tasks:          &fakeTaskDataSource{},
+		workflows:      &fakeWorkflowLister{},
+		steps:          &fakeWorkflowStepLister{},
+		profiles:       &fakeAgentProfileDataSource{resp: &agentsettingsdto.ListAgentsResponse{}},
+		codeStats:      &fakeSessionCodeStatsSource{},
+		messages:       &fakeMessageDataSource{},
+		defaultProfile: &fakeDefaultUtilityProfileSource{},
+		utilRun:        &fakeUtilityRunner{text: "ok"},
+		taskWriter:     &fakeTaskWriter{},
+		messenger:      &fakeMessenger{},
+		starter:        &fakeTaskStarter{},
+
+		interactions: &fakeInteractionDataSource{},
+		responder:    &fakeInteractionResponder{},
+	}
+	d.host = &pluginHost{
+		pluginID:         "p1",
+		capabilities:     caps,
+		taskData:         d.tasks,
+		workflows:        d.workflows,
+		workflowSteps:    d.steps,
+		agentProfiles:    d.profiles,
+		sessionCodeStats: d.codeStats,
+		messageData:      d.messages,
+		interactionData:  d.interactions,
+		taskWriter:       d.taskWriter,
+		configs:          &fakeConfigReader{configs: map[string]any{"utility_agent": "utility-agent-42"}},
+		utilityDeps: func() (utilityDefaultProfileSource, agentProfileSource, utilityRunner) {
+			return d.defaultProfile, d.profiles, d.utilRun
+		},
+		writeDeps: func() (taskMessenger, taskStarter) {
+			return d.messenger, d.starter
+		},
+		interactionDeps: func() interactionResponder { return d.responder },
+	}
+	return d
+}
+
+// @covers AC-PLUGINS-WORKFLOW-HISTORY-001.4 AC-PLUGINS-WORKFLOW-HISTORY-002.1
+func TestHostTransitionHistoryUsesExistingReadGrants(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+	d.tasks.tasksByID = map[string]*taskmodels.Task{"task-1": {ID: "task-1", WorkspaceID: "ws-1"}}
+	d.tasks.transitionRows = map[string][]taskmodels.StepTransition{"task-1": {{ID: 9, Trigger: "test", OccurredAt: time.Now().UTC()}}}
+	reader, ok := pluginsdk.TransitionHistory(d.host)
+	if !ok {
+		t.Fatal("plugin Host transition-history extension is unavailable")
+	}
+	items, _, err := reader.ListTask(context.Background(), "task-1", pluginsdk.Page{})
+	if err != nil || len(items) != 1 || items[0].ID != "9" {
+		t.Fatalf("task history = %+v, err=%v", items, err)
+	}
+	if _, _, err := reader.ListWorkflowGroups(context.Background(), "wf-1", pluginsdk.Page{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("workflow groups without workflows grant: %v", err)
+	}
+}
+
+// ── capability gating: denied without api_read:<resource> ──────────────
+
+func TestPluginHost_Tasks_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Tasks().List(context.Background(), pluginsdk.TaskFilter{}, pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:tasks")
+
+	_, err = d.host.Tasks().Get(context.Background(), "task-1")
+	assertPermissionDenied(t, err, "api_read:tasks")
+}
+
+func TestPluginHost_Sessions_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:sessions")
+
+	_, _, err = d.host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:sessions")
+}
+
+func TestPluginHost_Workspaces_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Workspaces().List(context.Background(), pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:workspaces")
+}
+
+func TestPluginHost_Workflows_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Workflows().List(context.Background(), "ws-1", pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:workflows")
+
+	_, err = d.host.Workflows().ListSteps(context.Background(), "wf-1")
+	assertPermissionDenied(t, err, "api_read:workflows")
+}
+
+func TestPluginHost_AgentProfiles_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.AgentProfiles().List(context.Background(), pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:agent_profiles")
+}
+
+func TestPluginHost_ExecutorProfiles_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	profiles, ok := pluginsdk.ExecutorProfiles(d.host)
+	if !ok {
+		t.Fatal("plugin host must expose executor-profile reader")
+	}
+	_, _, err := profiles.List(context.Background(), pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:executor_profiles")
+}
+
+func TestPluginHost_ExecutorProfiles_ListsProfilesWithExecutorType(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"executor_profiles"}})
+	d.tasks.executorProfiles = []*taskmodels.ExecutorProfile{{ID: "profile-1", ExecutorID: "executor-1", Name: "Remote default"}}
+	d.tasks.executors = map[string]*taskmodels.Executor{
+		"executor-1": {ID: "executor-1", Type: taskmodels.ExecutorTypeRemoteDocker},
+	}
+
+	profiles, ok := pluginsdk.ExecutorProfiles(d.host)
+	if !ok {
+		t.Fatal("plugin host must expose executor-profile reader")
+	}
+	got, info, err := profiles.List(context.Background(), pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "profile-1" || got[0].DisplayName != "Remote default" || got[0].ExecutorType != "remote_docker" {
+		t.Fatalf("List() = %+v, want mapped executor profile", got)
+	}
+	if info == nil || info.HasMore {
+		t.Fatalf("PageInfo = %+v, want final page", info)
+	}
+}
+
+func TestPluginHost_ExecutorProfiles_KeepsProfileWhenExecutorWasDeleted(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"executor_profiles"}})
+	d.tasks.executorProfiles = []*taskmodels.ExecutorProfile{{ID: "profile-1", ExecutorID: "deleted", Name: "Deleted executor"}}
+	d.tasks.executorErrors = map[string]error{
+		"deleted": fmt.Errorf("lookup: %w", taskmodels.ErrExecutorNotFound),
+	}
+
+	profiles, _ := pluginsdk.ExecutorProfiles(d.host)
+	got, _, err := profiles.List(context.Background(), pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "profile-1" || got[0].ExecutorType != "" {
+		t.Fatalf("List() = %+v, want profile with an empty executor type", got)
+	}
+}
+
+func TestPluginHost_ExecutorProfiles_EnrichesOnlyRequestedPage(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"executor_profiles"}})
+	d.tasks.executorProfiles = []*taskmodels.ExecutorProfile{
+		{ID: "profile-1", ExecutorID: "executor-1"},
+		{ID: "profile-2", ExecutorID: "executor-2"},
+		{ID: "profile-3", ExecutorID: "executor-3"},
+	}
+	d.tasks.executors = map[string]*taskmodels.Executor{
+		"executor-1": {ID: "executor-1", Type: taskmodels.ExecutorTypeLocalDocker},
+		"executor-2": {ID: "executor-2", Type: taskmodels.ExecutorTypeRemoteDocker},
+		"executor-3": {ID: "executor-3", Type: taskmodels.ExecutorTypeSSH},
+	}
+
+	profiles, _ := pluginsdk.ExecutorProfiles(d.host)
+	got, info, err := profiles.List(context.Background(), pluginsdk.Page{Limit: 1})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "profile-1" || info == nil || !info.HasMore {
+		t.Fatalf("List() = %+v, info = %+v, want first of three profiles", got, info)
+	}
+	if d.tasks.executorCalls != 1 {
+		t.Fatalf("GetExecutor() calls = %d, want 1 for the returned page", d.tasks.executorCalls)
+	}
+}
+
+func TestPluginHost_Repositories_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Repositories().List(context.Background(), "ws-1", pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:repositories")
+}
+
+func TestPluginHost_Messages_DeniedWithoutCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{})
+	_, _, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{}, pluginsdk.Page{})
+	assertPermissionDenied(t, err, "api_read:messages")
+}
+
+// ── capability gating: succeeds with api_read:<resource> ───────────────
+
+func TestPluginHost_Tasks_SucceedsWithCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{
+		"ws-1": {{ID: "task-1", WorkspaceID: "ws-1", WorkflowID: "wf-1", Title: "Task 1", State: v1.TaskStateTODO}},
+	}
+	d.tasks.tasksByID = map[string]*taskmodels.Task{"task-1": d.tasks.tasksByWorkspace["ws-1"][0]}
+
+	tasks, info, err := d.host.Tasks().List(context.Background(), pluginsdk.TaskFilter{}, pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "task-1" {
+		t.Fatalf("List() = %+v, want one task-1", tasks)
+	}
+	if info == nil || info.HasMore {
+		t.Fatalf("PageInfo = %+v, want HasMore=false", info)
+	}
+
+	got, err := d.host.Tasks().Get(context.Background(), "task-1")
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if got == nil || got.Title != "Task 1" {
+		t.Fatalf("Get() = %+v, want Task 1", got)
+	}
+
+	// A missing task returns a gRPC NotFound error directly, matching what a
+	// real plugin observes over the wire (grpcHostServer.GetTask forwards
+	// this error as-is) rather than a (nil, nil) success that only the
+	// in-process caller would ever see.
+	got, err = d.host.Tasks().Get(context.Background(), "no-such-task")
+	if got != nil {
+		t.Fatalf("Get() for missing task = (%+v, %v), want (nil, NotFound)", got, err)
+	}
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("Get() for missing task error = %v, want codes.NotFound", err)
+	}
+}
+
+func TestPluginHost_Workspaces_SucceedsWithCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"workspaces"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1", Name: "Workspace 1", OwnerID: "user-1"}}
+
+	workspaces, _, err := d.host.Workspaces().List(context.Background(), pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(workspaces) != 1 || workspaces[0].Name != "Workspace 1" {
+		t.Fatalf("List() = %+v, want one Workspace 1", workspaces)
+	}
+}
+
+func TestPluginHost_Workflows_SucceedsWithCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"workflows"}})
+	d.workflows.workflows = map[string][]*taskmodels.Workflow{
+		"ws-1": {{ID: "wf-1", WorkspaceID: "ws-1", Name: "Default"}},
+	}
+	d.steps.steps = map[string][]*wfmodels.WorkflowStep{
+		"wf-1": {
+			{ID: "step-1", WorkflowID: "wf-1", Name: "Todo", Position: 0, StageType: wfmodels.StageType("work")},
+			{
+				ID: "step-2", WorkflowID: "wf-1", Name: "Work", Position: 1, StageType: wfmodels.StageType("custom"),
+				Events: wfmodels.StepEvents{
+					OnEnter: []wfmodels.OnEnterAction{
+						{Type: wfmodels.OnEnterAutoStartAgent},
+						{Type: wfmodels.OnEnterRunCodeReview, Config: map[string]interface{}{"agent_profile_id": "profile-1"}},
+					},
+				},
+			},
+		},
+	}
+
+	workflows, _, err := d.host.Workflows().List(context.Background(), "ws-1", pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(workflows) != 1 || workflows[0].ID != "wf-1" {
+		t.Fatalf("List() = %+v, want one wf-1", workflows)
+	}
+
+	steps, err := d.host.Workflows().ListSteps(context.Background(), "wf-1")
+	if err != nil {
+		t.Fatalf("ListSteps() unexpected error: %v", err)
+	}
+	if len(steps) != 2 || steps[0].StageType != "work" {
+		t.Fatalf("ListSteps() = %+v, want two steps, first with StageType=work", steps)
+	}
+	if steps[0].OnEnterActionTypes != nil {
+		t.Fatalf("steps[0].OnEnterActionTypes = %+v, want nil for a step with no on_enter actions", steps[0].OnEnterActionTypes)
+	}
+	wantTypes := []string{"auto_start_agent", "run_code_review"}
+	if !reflect.DeepEqual(steps[1].OnEnterActionTypes, wantTypes) {
+		t.Fatalf("steps[1].OnEnterActionTypes = %+v, want %+v", steps[1].OnEnterActionTypes, wantTypes)
+	}
+}
+
+func TestPluginHost_AgentProfiles_SucceedsWithCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"agent_profiles"}})
+	d.profiles.resp = &agentsettingsdto.ListAgentsResponse{
+		Agents: []agentsettingsdto.AgentDTO{
+			{
+				ID: "agent-1",
+				Profiles: []agentsettingsdto.AgentProfileDTO{
+					{ID: "profile-1", AgentID: "agent-1", Name: "Default", AgentDisplayName: "Claude", Model: "claude-x", Mode: "code"},
+				},
+			},
+		},
+	}
+
+	profiles, _, err := d.host.AgentProfiles().List(context.Background(), pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].DisplayName != "Claude" || profiles[0].Model != "claude-x" {
+		t.Fatalf("List() = %+v, want one Claude/claude-x profile", profiles)
+	}
+}
+
+func TestPluginHost_Repositories_SucceedsWithCapability(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"repositories"}})
+	branch := "main"
+	d.tasks.repositories = map[string][]*taskmodels.Repository{
+		"ws-1": {{
+			ID: "repo-1", WorkspaceID: "ws-1", Name: "team/kandev", DefaultBranch: branch,
+			SourceType: "provider", Provider: "example-vcs", ProviderRepoID: "repo-42", ProviderHost: "code.example.test",
+			ProviderOwner: "team", ProviderName: "kandev", RemoteURL: "https://code.example.test/scm/team/kandev.git",
+			LocalPath: "/private/checkout", SetupScript: "secret setup", CleanupScript: "secret cleanup", DevScript: "secret dev", CopyFiles: ".env",
+		}},
+	}
+
+	repos, _, err := d.host.Repositories().List(context.Background(), "ws-1", pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(repos) != 1 || repos[0].Name != "team/kandev" || repos[0].DefaultBranch == nil || *repos[0].DefaultBranch != "main" {
+		t.Fatalf("List() = %+v, want one kandev repo on main", repos)
+	}
+	if repos[0].SourceType != "provider" || repos[0].ProviderID != "example-vcs" || repos[0].ProviderRepositoryID != "repo-42" || repos[0].ProviderHost != "code.example.test" || repos[0].OwnerOrProject != "team" || repos[0].ProviderName != "kandev" || repos[0].RemoteURL != "https://code.example.test/scm/team/kandev.git" {
+		t.Fatalf("List() = %+v, want provider origin identity", repos[0])
+	}
+}
+
+func TestRepositoryModelToDTO_StripsRemoteURLCredentials(t *testing.T) {
+	dto := repositoryModelToDTO(&taskmodels.Repository{
+		RemoteURL: "https://user:secret@code.example.test/team/repo.git",
+	})
+	if dto.RemoteURL != "https://code.example.test/team/repo.git" {
+		t.Fatalf("RemoteURL = %q, want credential-free URL", dto.RemoteURL)
+	}
+}
+
+// TestFetchTasksForWorkspaces_DoesNotTruncateBeyondPageSize proves a
+// workspace with more tasks than a single taskFetchPageSize page is fully
+// enumerated, not silently cut off at the first page.
+func TestFetchTasksForWorkspaces_DoesNotTruncateBeyondPageSize(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+	const total = taskFetchPageSize + 1
+	tasks := make([]*taskmodels.Task, total)
+	for i := 0; i < total; i++ {
+		tasks[i] = &taskmodels.Task{ID: fmt.Sprintf("task-%04d", i), WorkspaceID: "ws-1"}
+	}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": tasks}
+
+	got, err := d.host.fetchTasksForWorkspaces(context.Background(), []string{"ws-1"}, false, false)
+	if err != nil {
+		t.Fatalf("fetchTasksForWorkspaces() unexpected error: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("fetchTasksForWorkspaces() returned %d tasks, want %d (must not silently truncate at taskFetchPageSize)", len(got), total)
+	}
+	if d.tasks.listTasksByWorkspaceCalls < 2 {
+		t.Fatalf("ListTasksByWorkspace called %d times, want >= 2 (a single %d-task page can't hold %d tasks)",
+			d.tasks.listTasksByWorkspaceCalls, taskFetchPageSize, total)
+	}
+}
+
+// TestPluginHost_Tasks_List_DoesNotTruncateBeyondPageSize is the
+// end-to-end version of the above: Tasks().List's HasMore/pagination must
+// stay accurate even when the underlying per-workspace fetch spans more than
+// one taskFetchPageSize page.
+func TestPluginHost_Tasks_List_DoesNotTruncateBeyondPageSize(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+	const total = taskFetchPageSize + 1
+	tasks := make([]*taskmodels.Task, total)
+	for i := 0; i < total; i++ {
+		tasks[i] = &taskmodels.Task{ID: fmt.Sprintf("task-%04d", i), WorkspaceID: "ws-1"}
+	}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": tasks}
+
+	// maxPageLimit caps a single RPC page at 200 items, so walk every page
+	// via cursor and count the total returned across the whole read.
+	seen := 0
+	cursor := ""
+	for {
+		page, info, err := d.host.Tasks().List(context.Background(), pluginsdk.TaskFilter{WorkspaceIDs: []string{"ws-1"}}, pluginsdk.Page{Limit: 200, Cursor: cursor})
+		if err != nil {
+			t.Fatalf("List() unexpected error: %v", err)
+		}
+		seen += len(page)
+		if info == nil || !info.HasMore {
+			break
+		}
+		cursor = info.NextCursor
+	}
+	if seen != total {
+		t.Fatalf("Tasks().List() across all pages returned %d tasks, want %d (must not silently truncate at taskFetchPageSize)", seen, total)
+	}
+}
+
+// ── Session DTO mapping: acp_session_id sourcing ────────────────────────
+
+func TestPluginHost_Sessions_ACPSessionIDFromMetadata(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{
+		"task-1": {{
+			ID:        "session-1",
+			TaskID:    "task-1",
+			State:     taskmodels.TaskSessionStateRunning,
+			StartedAt: time.Now(),
+			Metadata:  map[string]any{"acp": map[string]any{"session_id": "acp-from-metadata"}},
+		}},
+	}
+	// Also seed an executors_running row so the test proves metadata wins
+	// over the fallback when both are present.
+	d.tasks.executorRunning = map[string]*taskmodels.ExecutorRunning{
+		"session-1": {SessionID: "session-1", ResumeToken: "acp-from-fallback"},
+	}
+
+	sessions, _, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ACPSessionID != "acp-from-metadata" {
+		t.Fatalf("List() = %+v, want ACPSessionID=acp-from-metadata", sessions)
+	}
+}
+
+func TestPluginHost_Sessions_ACPSessionIDFallsBackToExecutorRunning(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{
+		"task-1": {{ID: "session-1", TaskID: "task-1", State: taskmodels.TaskSessionStateRunning, StartedAt: time.Now()}},
+	}
+	d.tasks.executorRunning = map[string]*taskmodels.ExecutorRunning{
+		"session-1": {SessionID: "session-1", ResumeToken: "acp-from-fallback"},
+	}
+
+	sessions, _, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ACPSessionID != "acp-from-fallback" {
+		t.Fatalf("List() = %+v, want ACPSessionID=acp-from-fallback", sessions)
+	}
+}
+
+func TestPluginHost_Sessions_ACPSessionIDEmptyWhenNeitherSourceHasIt(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{
+		"task-1": {{ID: "session-1", TaskID: "task-1", State: taskmodels.TaskSessionStateRunning, StartedAt: time.Now()}},
+	}
+	// No executorRunning entry for session-1: GetExecutorRunningBySessionID
+	// returns ErrExecutorRunningNotFound, which must be swallowed.
+
+	sessions, _, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ACPSessionID != "" {
+		t.Fatalf("List() = %+v, want empty ACPSessionID", sessions)
+	}
+}
+
+// TestPluginHost_Sessions_PaginatesBeforeResolvingACPSessionID proves
+// Sessions().List resolves ACPSessionID (a per-item DB call via
+// resolveACPSessionID's GetExecutorRunningBySessionID fallback) only for the
+// page it returns, not for every session it fetched — pagination must happen
+// on the raw, already-sorted sessions BEFORE the per-item DTO conversion, or
+// a Page{Limit: 2} read over 5 sessions would issue 5 lookups instead of 2.
+func TestPluginHost_Sessions_PaginatesBeforeResolvingACPSessionID(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+
+	const total = 5
+	sessions := make([]*taskmodels.TaskSession, total)
+	base := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < total; i++ {
+		// No Metadata: resolveACPSessionID always falls through to
+		// GetExecutorRunningBySessionID for every one of these sessions.
+		sessions[i] = &taskmodels.TaskSession{
+			ID:        fmt.Sprintf("session-%d", i),
+			TaskID:    "task-1",
+			State:     taskmodels.TaskSessionStateRunning,
+			StartedAt: base.Add(time.Duration(total-i) * time.Hour), // session-0 newest
+		}
+	}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{"task-1": sessions}
+
+	const limit = 2
+	page, info, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{Limit: limit})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(page) != limit {
+		t.Fatalf("List() returned %d sessions, want %d", len(page), limit)
+	}
+	if info == nil || !info.HasMore {
+		t.Fatalf("PageInfo = %+v, want HasMore=true", info)
+	}
+	if d.tasks.executorRunningCalls != limit {
+		t.Fatalf("GetExecutorRunningBySessionID called %d times, want %d (only the returned page, not all %d fetched sessions)",
+			d.tasks.executorRunningCalls, limit, total)
+	}
+}
+
+// TestPluginHost_SessionsCodeStats_DelegatesToAnalyticsService proves
+// Sessions().CodeStats reaches the injected analytics service with the
+// filter translated 1:1, and maps its results back unchanged (ADR 0043(b):
+// SessionCodeStats is a stable, computed shape returned as-is).
+func TestPluginHost_SessionsCodeStats_DelegatesToAnalyticsService(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.codeStats.stats = []*analyticsmodels.SessionCodeStats{
+		{SessionID: "session-1", LinesAddedCommitted: int64Ptr(10), LinesDeletedCommitted: int64Ptr(2), LinesAddedPeakPending: 5, LinesDeletedPeakPending: 1},
+	}
+
+	filter := pluginsdk.SessionFilter{TaskIDs: []string{"task-1"}, WorkspaceIDs: []string{"ws-1"}, States: []string{"RUNNING"}}
+	stats, info, err := d.host.Sessions().CodeStats(context.Background(), filter, pluginsdk.Page{Limit: 10})
+	if err != nil {
+		t.Fatalf("CodeStats() unexpected error: %v", err)
+	}
+	if d.codeStats.calls != 1 {
+		t.Fatalf("analytics service called %d times, want 1", d.codeStats.calls)
+	}
+	if len(d.codeStats.lastFilter.TaskIDs) != 1 || d.codeStats.lastFilter.TaskIDs[0] != "task-1" {
+		t.Errorf("filter.TaskIDs = %v, want [task-1]", d.codeStats.lastFilter.TaskIDs)
+	}
+	if len(d.codeStats.lastFilter.WorkspaceIDs) != 1 || d.codeStats.lastFilter.WorkspaceIDs[0] != "ws-1" {
+		t.Errorf("filter.WorkspaceIDs = %v, want [ws-1]", d.codeStats.lastFilter.WorkspaceIDs)
+	}
+	if len(d.codeStats.lastFilter.States) != 1 || d.codeStats.lastFilter.States[0] != "RUNNING" {
+		t.Errorf("filter.States = %v, want [RUNNING]", d.codeStats.lastFilter.States)
+	}
+	// Limit is requested as limit+1 (the HasMore probe row) — see
+	// sessionReader.CodeStats' doc comment.
+	if d.codeStats.lastFilter.Limit != 11 {
+		t.Errorf("filter.Limit = %d, want 11 (requested 10 + 1 probe row)", d.codeStats.lastFilter.Limit)
+	}
+	if len(stats) != 1 || stats[0].SessionID != "session-1" ||
+		!stats[0].CommittedLinesAvailable || stats[0].LinesAddedCommitted != 10 {
+		t.Fatalf("CodeStats() = %+v, want session-1 passed through unchanged", stats)
+	}
+	if info == nil || info.HasMore {
+		t.Fatalf("PageInfo = %+v, want HasMore=false", info)
+	}
+}
+
+// TestPluginHost_SessionsCodeStats_HasMoreWhenExtraProbeRowReturned proves
+// the limit+1 probe-row trick correctly reports HasMore and trims the extra
+// row before returning results.
+func TestPluginHost_SessionsCodeStats_HasMoreWhenExtraProbeRowReturned(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	d.codeStats.stats = []*analyticsmodels.SessionCodeStats{
+		{SessionID: "session-1"}, {SessionID: "session-2"},
+	}
+
+	stats, info, err := d.host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{Limit: 1})
+	if err != nil {
+		t.Fatalf("CodeStats() unexpected error: %v", err)
+	}
+	if len(stats) != 1 || stats[0].SessionID != "session-1" {
+		t.Fatalf("CodeStats() = %+v, want exactly one trimmed result", stats)
+	}
+	if info == nil || !info.HasMore || info.NextCursor != "1" {
+		t.Fatalf("PageInfo = %+v, want HasMore=true NextCursor=1", info)
+	}
+}
+
+func TestPluginHost_SessionsCodeStats_PropagatesAnalyticsError(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	wantErr := errors.New("boom")
+	d.codeStats.err = wantErr
+
+	_, _, err := d.host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("CodeStats() error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestPluginHost_Sessions_TaskIDsScopedToWorkspaceIDs proves SessionFilter's
+// TaskIDs and WorkspaceIDs are ANDed together: a task id that resolves to a
+// task outside the requested workspaces must not leak its sessions, even
+// though the id itself was explicitly requested.
+func TestPluginHost_Sessions_TaskIDsScopedToWorkspaceIDs(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	task1 := &taskmodels.Task{ID: "task-1", WorkspaceID: "ws-1"}
+	task2 := &taskmodels.Task{ID: "task-2", WorkspaceID: "ws-2"}
+	d.tasks.tasksByID = map[string]*taskmodels.Task{"task-1": task1, "task-2": task2}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{
+		"task-1": {{ID: "session-1", TaskID: "task-1", State: taskmodels.TaskSessionStateRunning, StartedAt: time.Now()}},
+		"task-2": {{ID: "session-2", TaskID: "task-2", State: taskmodels.TaskSessionStateRunning, StartedAt: time.Now()}},
+	}
+
+	filter := pluginsdk.SessionFilter{TaskIDs: []string{"task-1", "task-2"}, WorkspaceIDs: []string{"ws-1"}}
+	sessions, _, err := d.host.Sessions().List(context.Background(), filter, pluginsdk.Page{})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "session-1" {
+		t.Fatalf("List() = %+v, want only session-1 (task-2 is outside the requested workspace)", sessions)
+	}
+}
+
+// ── Stable sort: deterministic pagination across equal timestamps ───────
+
+// TestSortTasksNewestFirst_TiesBrokenByID proves sortTasksNewestFirst orders
+// equal-CreatedAt tasks deterministically by ID, not by whatever order
+// sort.Slice's unstable algorithm happens to leave them in — an offset-based
+// paginated read of tasks sharing a CreatedAt second (a plausible seed/batch
+// scenario) must return the same order on every call, or successive pages
+// can skip or duplicate a task.
+func TestSortTasksNewestFirst_TiesBrokenByID(t *testing.T) {
+	same := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tasks := []*taskmodels.Task{
+		{ID: "c", CreatedAt: same},
+		{ID: "a", CreatedAt: same},
+		{ID: "b", CreatedAt: same},
+	}
+
+	sortTasksNewestFirst(tasks)
+
+	got := []string{tasks[0].ID, tasks[1].ID, tasks[2].ID}
+	want := []string{"a", "b", "c"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortTasksNewestFirst() order = %v, want %v (equal CreatedAt must tie-break by ID)", got, want)
+		}
+	}
+}
+
+// TestSortSessionsNewestFirst_TiesBrokenByID mirrors
+// TestSortTasksNewestFirst_TiesBrokenByID for sessions (StartedAt instead of
+// CreatedAt).
+func TestSortSessionsNewestFirst_TiesBrokenByID(t *testing.T) {
+	same := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sessions := []*taskmodels.TaskSession{
+		{ID: "c", StartedAt: same},
+		{ID: "a", StartedAt: same},
+		{ID: "b", StartedAt: same},
+	}
+
+	sortSessionsNewestFirst(sessions)
+
+	got := []string{sessions[0].ID, sessions[1].ID, sessions[2].ID}
+	want := []string{"a", "b", "c"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortSessionsNewestFirst() order = %v, want %v (equal StartedAt must tie-break by ID)", got, want)
+		}
+	}
+}
+
+// ── DTO mapping ──────────────────────────────────────────────────────────
+
+func TestTaskModelToDTO_MapsFields(t *testing.T) {
+	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	task := &taskmodels.Task{
+		ID:             "task-1",
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-1",
+		WorkflowStepID: "step-7f3a9c2b-0001-4f42-a5d1-9c0e8b7d6a5f",
+		Title:          "Fix bug",
+		Description:    "details",
+		State:          v1.TaskStateInProgress,
+		Priority:       "high",
+		Origin:         "agent_created",
+		CreatedAt:      created,
+		UpdatedAt:      created,
+		ParentID:       "parent-1",
+		Identifier:     "KAN-1",
+		IsEphemeral:    false,
+		Repositories: []*taskmodels.TaskRepository{
+			{ID: "tr-1", RepositoryID: "repo-1", BaseBranch: "main", Position: 0, CheckoutBranch: "feature/fix"},
+		},
+		Labels:   `["bug","customer"]`,
+		Metadata: map[string]any{"k": "v"},
+	}
+
+	dto := taskModelToDTO(task)
+
+	if dto.ID != "task-1" || dto.State != "IN_PROGRESS" || dto.CreatedBy != "agent_created" {
+		t.Fatalf("taskModelToDTO() = %+v, unexpected core fields", dto)
+	}
+	if dto.Priority != "high" {
+		t.Errorf("Priority = %q, want high", dto.Priority)
+	}
+	if dto.CreatedAt != created.Format(time.RFC3339) {
+		t.Errorf("CreatedAt = %q, want RFC3339 %q", dto.CreatedAt, created.Format(time.RFC3339))
+	}
+	if dto.ParentID == nil || *dto.ParentID != "parent-1" {
+		t.Errorf("ParentID = %v, want parent-1", dto.ParentID)
+	}
+	if len(dto.Repositories) != 1 || dto.Repositories[0].RepositoryID != "repo-1" || dto.Repositories[0].CheckoutBranch != "feature/fix" {
+		t.Errorf("Repositories = %+v, want one repo-1", dto.Repositories)
+	}
+	if dto.Metadata["k"] != "v" {
+		t.Errorf("Metadata = %+v, want k=v", dto.Metadata)
+	}
+	if dto.WorkflowStepID != "step-7f3a9c2b-0001-4f42-a5d1-9c0e8b7d6a5f" {
+		t.Errorf("WorkflowStepID = %q, want %q", dto.WorkflowStepID, "step-7f3a9c2b-0001-4f42-a5d1-9c0e8b7d6a5f")
+	}
+	if got, want := dto.Labels, []string{"bug", "customer"}; !reflect.DeepEqual(got, want) { //nolint:staticcheck // verifies deprecated API v1 compatibility
+		t.Errorf("Labels = %v, want %v", got, want)
+	}
+}
+
+func TestTaskModelToDTO_MalformedLabelsFallbackToEmpty(t *testing.T) {
+	dto := taskModelToDTO(&taskmodels.Task{ID: "task-1", Labels: `not-json`})
+	labels := dto.Labels //nolint:staticcheck // verifies deprecated API v1 compatibility
+	if len(labels) != 0 {
+		t.Errorf("Labels = %#v, want empty fallback for malformed stored JSON", labels)
+	}
+}
+
+func TestTaskModelToDTO_EmptyParentIDIsNil(t *testing.T) {
+	dto := taskModelToDTO(&taskmodels.Task{ID: "task-1"})
+	if dto.ParentID != nil {
+		t.Fatalf("ParentID = %v, want nil for a root task", dto.ParentID)
+	}
+}
+
+// ── Archived-task visibility ────────────────────────────────────────────
+
+// Sessions().List must fetch tasks WITH archived included (an archived
+// task's sessions are still real sessions), while Tasks().List keeps
+// archived tasks out of plugin-visible work items.
+func TestPluginHost_ArchivedTaskFetchFlags(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions", "tasks"}})
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+
+	if _, _, err := d.host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{}); err != nil {
+		t.Fatalf("Sessions().List unexpected error: %v", err)
+	}
+	if _, _, err := d.host.Tasks().List(context.Background(), pluginsdk.TaskFilter{}, pluginsdk.Page{}); err != nil {
+		t.Fatalf("Tasks().List unexpected error: %v", err)
+	}
+
+	want := []bool{true, false} // sessions read first (archived in), tasks read second (archived out)
+	if len(d.tasks.gotIncludeArchived) != 2 ||
+		d.tasks.gotIncludeArchived[0] != want[0] || d.tasks.gotIncludeArchived[1] != want[1] {
+		t.Fatalf("includeArchived per call = %v, want %v", d.tasks.gotIncludeArchived, want)
+	}
+}
+
+// ── Messages reader ─────────────────────────────────────────────────────
+
+func TestPluginHost_Messages_SucceedsAndStripsSystemContent(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+	created := time.Date(2026, 7, 20, 9, 30, 0, 0, time.UTC)
+	d.messages.messages = []*taskmodels.Message{
+		{
+			ID:            "m1",
+			TaskSessionID: "s1",
+			TaskID:        "t1",
+			TurnID:        "turn1",
+			AuthorType:    taskmodels.MessageAuthorUser,
+			Content:       "<kandev-system>secret prompt</kandev-system>Please summarize yesterday.",
+			Type:          taskmodels.MessageTypeMessage,
+			CreatedAt:     created,
+		},
+		{
+			ID:            "m2",
+			TaskSessionID: "s1",
+			TaskID:        "t1",
+			TurnID:        "turn1",
+			AuthorType:    taskmodels.MessageAuthorAgent,
+			Content:       "Here is the summary.",
+			Type:          "", // empty type must default to "message"
+			CreatedAt:     created.Add(time.Minute),
+		},
+	}
+
+	msgs, info, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{
+		SessionIDs: []string{"s1"},
+	}, pluginsdk.Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("List() len = %d, want 2", len(msgs))
+	}
+	if msgs[0].Content != "Please summarize yesterday." {
+		t.Fatalf("content[0] = %q, want system block stripped", msgs[0].Content)
+	}
+	if msgs[0].AuthorType != "user" || msgs[1].AuthorType != "agent" {
+		t.Fatalf("author types = %q/%q, want user/agent", msgs[0].AuthorType, msgs[1].AuthorType)
+	}
+	if msgs[1].Type != "message" {
+		t.Fatalf("type[1] = %q, want defaulted to message", msgs[1].Type)
+	}
+	if msgs[0].SessionID != "s1" || msgs[0].TaskID != "t1" || msgs[0].TurnID != "turn1" {
+		t.Fatalf("ids = %+v, want session/task/turn set", msgs[0])
+	}
+	if msgs[0].CreatedAt != "2026-07-20T09:30:00Z" {
+		t.Fatalf("created_at = %q, want RFC3339", msgs[0].CreatedAt)
+	}
+	if info == nil || info.HasMore {
+		t.Fatalf("PageInfo = %+v, want HasMore=false", info)
+	}
+}
+
+func TestPluginHost_Messages_PassesFilterAndTimeRange(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+	since := "2026-07-20T00:00:00Z"
+	until := "2026-07-21T00:00:00Z"
+
+	_, _, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{
+		SessionIDs: []string{"s1", "s2"},
+		TaskIDs:    []string{"t1"},
+		Types:      []string{"message", "content"},
+		Since:      &since,
+		Until:      &until,
+	}, pluginsdk.Page{Limit: 10})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	got := d.messages.lastFilter
+	if len(got.SessionIDs) != 2 || len(got.TaskIDs) != 1 || len(got.Types) != 2 {
+		t.Fatalf("filter passthrough = %+v", got)
+	}
+	if got.Since == nil || !got.Since.Equal(time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("since = %v, want parsed 2026-07-20", got.Since)
+	}
+	if got.Until == nil || !got.Until.Equal(time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("until = %v, want parsed 2026-07-21", got.Until)
+	}
+	// Reader requests one extra row past the page limit to derive HasMore.
+	if got.Limit != 11 {
+		t.Fatalf("data-source Limit = %d, want page-limit+1 (11)", got.Limit)
+	}
+}
+
+func TestPluginHost_Messages_PaginatesWithHasMore(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+	base := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	// Data source returns limit+1 rows (3) for a page limit of 2 → HasMore.
+	for i := 0; i < 3; i++ {
+		d.messages.messages = append(d.messages.messages, &taskmodels.Message{
+			ID:         fmt.Sprintf("m%d", i),
+			AuthorType: taskmodels.MessageAuthorUser,
+			Content:    "hi",
+			CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+		})
+	}
+
+	msgs, info, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{}, pluginsdk.Page{Limit: 2})
+	if err != nil {
+		t.Fatalf("List() unexpected error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("page len = %d, want 2 (trimmed from 3)", len(msgs))
+	}
+	if info == nil || !info.HasMore || info.NextCursor != "2" {
+		t.Fatalf("PageInfo = %+v, want HasMore=true NextCursor=2", info)
+	}
+}
+
+func TestPluginHost_Messages_TooManyFilterValuesIsInvalidArgument(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+	sessionIDs := make([]string, maxMessageFilterValues+1)
+	for i := range sessionIDs {
+		sessionIDs[i] = fmt.Sprintf("s%d", i)
+	}
+	_, _, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{SessionIDs: sessionIDs}, pluginsdk.Page{})
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+	if d.messages.calls != 0 {
+		t.Fatalf("data source called %d times, want 0 (rejected before query)", d.messages.calls)
+	}
+}
+
+func TestPluginHost_Messages_InvalidTimeIsInvalidArgument(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+	bad := "not-a-timestamp"
+	_, _, err := d.host.Messages().List(context.Background(), pluginsdk.MessageFilter{Since: &bad}, pluginsdk.Page{})
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+	if d.messages.calls != 0 {
+		t.Fatalf("data source called %d times, want 0 (rejected before query)", d.messages.calls)
+	}
+}

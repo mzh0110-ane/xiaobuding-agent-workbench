@@ -1,0 +1,565 @@
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
+import { TooltipProvider } from "@kandev/ui/tooltip";
+import { FileRow } from "./changes-panel-file-row";
+
+const responsive = vi.hoisted(() => ({ isFinePointer: true, isMobile: false }));
+const clipboardMocks = vi.hoisted(() => ({ copyToClipboard: vi.fn() }));
+const toastMocks = vi.hoisted(() => ({ toast: vi.fn() }));
+
+vi.mock("@/lib/utils/copy-to-clipboard", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/utils/copy-to-clipboard")>();
+  return { ...actual, copyToClipboard: clipboardMocks.copyToClipboard };
+});
+vi.mock("@/components/toast-provider", () => ({ useToast: () => toastMocks }));
+
+vi.mock("@/hooks/use-responsive-breakpoint", () => ({
+  useResponsiveBreakpoint: () => responsive,
+}));
+
+afterEach(() => {
+  cleanup();
+  clipboardMocks.copyToClipboard.mockReset();
+  toastMocks.toast.mockReset();
+  responsive.isFinePointer = true;
+  responsive.isMobile = false;
+});
+
+const moreActionsLabel = "Show more actions";
+const unsafePathCases = [
+  { name: "newline", path: "packages/ui/src/line\nbreak.tsx" },
+  { name: "escape", path: "packages/ui/src/escape\u001b.tsx" },
+  { name: "delete", path: "packages/ui/src/delete\u007f.tsx" },
+];
+
+const noop = () => {};
+const noopSelect = () => false;
+
+const baseFile = {
+  status: "modified" as const,
+  staged: false,
+  plus: 18,
+  minus: 3,
+  oldPath: undefined,
+};
+
+function renderRow(path: string, onOpenDiff = noop) {
+  return render(
+    <TooltipProvider>
+      <ul>
+        <FileRow
+          file={{ ...baseFile, path }}
+          isPending={false}
+          onSelect={noopSelect}
+          onOpenDiff={onOpenDiff}
+          onStage={noop}
+          onUnstage={noop}
+          onDiscard={noop}
+          onEditFile={noop}
+        />
+      </ul>
+    </TooltipProvider>,
+  );
+}
+
+describe("FileRow copy path", () => {
+  it("copies the repository-relative path from the desktop actions without opening the diff", () => {
+    const onOpenDiff = vi.fn();
+    const path = "packages/ui/src/button.tsx";
+    const { getByRole } = renderRow(path, onOpenDiff);
+
+    fireEvent.click(getByRole("button", { name: "Copy path" }));
+
+    expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith(path);
+    expect(onOpenDiff).not.toHaveBeenCalled();
+  });
+
+  it("copies the repository-relative path from the phone menu without opening the diff", async () => {
+    responsive.isFinePointer = false;
+    const onOpenDiff = vi.fn();
+    const path = "packages/ui/src/mobile-button.tsx";
+    const { getByRole, findByRole } = renderRow(path, onOpenDiff);
+
+    fireEvent.keyDown(getByRole("button", { name: moreActionsLabel }), { key: "Enter" });
+    const copyPath = await findByRole("menuitem", { name: "Copy path" });
+    fireEvent.click(copyPath);
+
+    expect(clipboardMocks.copyToClipboard).toHaveBeenCalledWith(path);
+    expect(onOpenDiff).not.toHaveBeenCalled();
+    expect(copyPath.className).toContain("min-h-11");
+  });
+
+  it.each(unsafePathCases)(
+    "refuses to copy a $name control-character path from the desktop actions",
+    async ({ path }) => {
+      const { getByRole } = renderRow(path);
+
+      fireEvent.click(getByRole("button", { name: "Copy path" }));
+
+      expect(clipboardMocks.copyToClipboard).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(toastMocks.toast).toHaveBeenCalledWith({
+          description: "This path contains control characters and cannot be copied.",
+        }),
+      );
+    },
+  );
+
+  it.each(unsafePathCases)(
+    "refuses to copy a $name control-character path from the phone menu",
+    async ({ path }) => {
+      responsive.isFinePointer = false;
+      const { getByRole, findByRole } = renderRow(path);
+
+      fireEvent.keyDown(getByRole("button", { name: moreActionsLabel }), { key: "Enter" });
+      fireEvent.click(await findByRole("menuitem", { name: "Copy path" }));
+
+      expect(clipboardMocks.copyToClipboard).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(toastMocks.toast).toHaveBeenCalledWith({
+          description: "This path contains control characters and cannot be copied.",
+        }),
+      );
+    },
+  );
+});
+
+describe("FileRow selection focus", () => {
+  it("focuses a selected row so Escape can clear selection", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "selected.ts" }}
+            isPending={false}
+            onSelect={() => true}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector("[data-changes-file='selected.ts']") as HTMLElement;
+    fireEvent.click(row, { ctrlKey: true });
+
+    expect(row.tabIndex).toBe(-1);
+    expect(document.activeElement).toBe(row);
+  });
+});
+
+describe("FileRow truncation (regression: path overlaps diff stats in narrow panel)", () => {
+  it("file name span allows truncation so a long name does not overflow visually", () => {
+    // Bug: when the panel is narrow, a long file name renders past its container
+    // and overlaps the diff counts (+/-) on the right. Fix: file name span must be
+    // truncatable (truncate + min-w-0), not whitespace-nowrap+shrink-0.
+    const { container } = renderRow("deeply/nested/folder/render_text_to_image_controller_test.go");
+    const fileNameSpan = container.querySelector(
+      "span.font-medium.text-foreground",
+    ) as HTMLElement | null;
+
+    expect(fileNameSpan).not.toBeNull();
+    expect(fileNameSpan!.className).toContain("truncate");
+    expect(fileNameSpan!.className).toContain("min-w-0");
+    // Must NOT prevent shrinking — that's what causes the overflow.
+    expect(fileNameSpan!.className).not.toContain("shrink-0");
+  });
+
+  it("folder span keeps truncate so the folder portion is shortened first", () => {
+    const { container } = renderRow("a/b/c/d/file.go");
+    const folderSpan = container.querySelector("span.text-foreground\\/60") as HTMLElement | null;
+
+    expect(folderSpan).not.toBeNull();
+    expect(folderSpan!.className).toContain("truncate");
+  });
+
+  it("right-side stats container has shrink-0 so it stays in place when path is long", () => {
+    // Without shrink-0 on the stats column, flex layout could squeeze the
+    // diff counts. Anchoring it ensures the file name truncates instead.
+    const { container } = renderRow("file.go");
+    // The stats container is the second direct child of the <li>
+    const li = container.querySelector("li") as HTMLElement | null;
+    expect(li).not.toBeNull();
+    const statsContainer = li!.children[1] as HTMLElement;
+    expect(statsContainer.className).toContain("shrink-0");
+  });
+
+  it("renders a file with no folder without crashing and exposes the file name", () => {
+    const { container } = renderRow("README.md");
+    const fileNameSpan = container.querySelector(
+      "span.font-medium.text-foreground",
+    ) as HTMLElement | null;
+    expect(fileNameSpan?.textContent).toBe("README.md");
+    // No folder element when there's no slash in the path.
+    const folderSpan = container.querySelector("span.text-foreground\\/60");
+    expect(folderSpan).toBeNull();
+  });
+
+  it("passes diff source + repository context on open diff", () => {
+    const onOpenDiff = vi.fn();
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{
+              ...baseFile,
+              path: "README.md",
+              repositoryName: "frontend",
+              changeLayer: "staged",
+            }}
+            isPending={false}
+            onSelect={noopSelect}
+            onOpenDiff={onOpenDiff}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector("[data-testid='file-row-README.md']") as HTMLElement | null;
+    expect(row).not.toBeNull();
+    fireEvent.click(row!);
+    expect(onOpenDiff).toHaveBeenCalledWith("README.md", {
+      source: "uncommitted",
+      repositoryName: "frontend",
+      changeLayer: "staged",
+    });
+  });
+
+  it("opens image files in the file preview with repository context", () => {
+    const onOpenDiff = vi.fn();
+    const onEditFile = vi.fn();
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{
+              ...baseFile,
+              path: "docs/screenshots/mobile-chat.webp",
+              repositoryName: "frontend",
+            }}
+            isPending={false}
+            onSelect={noopSelect}
+            onOpenDiff={onOpenDiff}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={onEditFile}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector(
+      "[data-changes-file='docs/screenshots/mobile-chat.webp']",
+    ) as HTMLElement | null;
+    expect(row).not.toBeNull();
+    fireEvent.click(row!);
+
+    expect(onEditFile).toHaveBeenCalledWith("docs/screenshots/mobile-chat.webp", "frontend");
+    expect(onOpenDiff).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileRow status marker", () => {
+  it("does not repeat pending diff text or show unknown line counts", () => {
+    const { container, queryByText } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{
+              ...baseFile,
+              path: "src/pending.ts",
+              plus: undefined,
+              minus: undefined,
+              diffState: "pending",
+            }}
+            isPending={false}
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    expect(queryByText("Diff is loading")).toBeNull();
+    expect(container.querySelector("[data-file-status='modified']")).not.toBeNull();
+  });
+
+  it("shows previous-path context for a moved file", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{
+              ...baseFile,
+              path: "src/new-name.ts",
+              status: "renamed",
+              oldPath: "src/old-name.ts",
+            }}
+            isPending={false}
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const marker = container.querySelector("[data-file-status='renamed']");
+    expect(marker?.getAttribute("aria-label")).toBe("Moved from src/old-name.ts");
+  });
+});
+
+describe("FileRow hover swap (stats <-> actions occupy same cell)", () => {
+  // Goal: hovering must not shift the file name. The stats group and the
+  // hover-actions group live in the same CSS grid cell — stats fade out and
+  // actions fade in, so the right cluster's width is stable.
+  it("stats container fades out on hover and never intercepts pointer events", () => {
+    const { container } = renderRow("file.go");
+    const li = container.querySelector("li") as HTMLElement;
+    const gridWrapper = li.children[1] as HTMLElement;
+    const statsLayer = gridWrapper.children[0] as HTMLElement;
+    expect(statsLayer.className).toContain("group-hover:opacity-0");
+    expect(statsLayer.className).toContain("transition-opacity");
+    // Defensive: stats has no interactive children today, but blocking pointer
+    // events on this always-non-interactive layer prevents a future regression
+    // if someone adds a clickable element here.
+    expect(statsLayer.className).toContain("pointer-events-none");
+  });
+
+  it("actions container fades in on hover and only accepts pointer/keyboard events while hovered", () => {
+    const { container } = renderRow("file.go");
+    const li = container.querySelector("li") as HTMLElement;
+    const gridWrapper = li.children[1] as HTMLElement;
+    const actionsLayer = gridWrapper.children[1] as HTMLElement;
+    expect(actionsLayer.className).toContain("opacity-0");
+    expect(actionsLayer.className).toContain("group-hover:opacity-100");
+    expect(actionsLayer.className).toContain("transition-opacity");
+    // Critical: the actions div is the top child in the same grid cell, so
+    // without pointer-events gating it would eat clicks aimed at the
+    // visually-shown stats. (Keyboard Tab focus is a separate concern — a
+    // pre-existing gap not closed by `pointer-events: none`, which only
+    // blocks mouse/touch.)
+    expect(actionsLayer.className).toContain("pointer-events-none");
+    expect(actionsLayer.className).toContain("group-hover:pointer-events-auto");
+  });
+
+  it("wrapper stacks both layers into one grid cell so width is max(stats, actions)", () => {
+    const { container } = renderRow("file.go");
+    const li = container.querySelector("li") as HTMLElement;
+    const gridWrapper = li.children[1] as HTMLElement;
+    expect(gridWrapper.className).toContain("grid");
+    // Arbitrary child selector pins every direct child to row 1 / col 1 so
+    // they overlap instead of laying out side-by-side.
+    expect(gridWrapper.className).toContain("col-start-1");
+    expect(gridWrapper.className).toContain("row-start-1");
+  });
+
+  it("keeps statistics in the identity and exposes one menu for coarse pointers", () => {
+    responsive.isFinePointer = false;
+    const { getByTitle, getByRole, queryByTitle } = renderRow("file.go");
+    expect(getByTitle("file.go").textContent).toContain("+18");
+    expect(getByRole("button", { name: moreActionsLabel })).not.toBeNull();
+    expect(queryByTitle("Stage file")).toBeNull();
+  });
+
+  it("uses the touch menu on a phone even with a fine pointer", () => {
+    responsive.isMobile = true;
+    const { getByRole, queryByTitle } = renderRow("file.go");
+    expect(getByRole("button", { name: moreActionsLabel })).not.toBeNull();
+    expect(queryByTitle("Stage file")).toBeNull();
+  });
+
+  it("keeps pending feedback in the identity and disables staging in the menu", async () => {
+    responsive.isFinePointer = false;
+    const { container, getByTitle, getByRole, findByRole } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "pending-mobile.go" }}
+            isPending
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const spinner = container.querySelector("svg.animate-spin");
+    expect(spinner).not.toBeNull();
+    expect(spinner?.closest("button")).toBe(getByTitle("pending-mobile.go"));
+    fireEvent.keyDown(getByRole("button", { name: moreActionsLabel }), { key: "Enter" });
+    expect(
+      (await findByRole("menuitem", { name: "Stage file" })).getAttribute("aria-disabled"),
+    ).toBe("true");
+  });
+});
+
+describe("FileRow tree-mode hover stage action", () => {
+  it("keeps the stage button in the icon slot instead of the right hover actions", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "src/file.go" }}
+            isPending={false}
+            treeMode
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector("[data-changes-file='src/file.go']") as HTMLElement | null;
+    expect(row).not.toBeNull();
+
+    const iconSlot = row!.querySelector("[data-testid='file-row-icon-action-slot']");
+    expect(iconSlot).not.toBeNull();
+    expect(iconSlot!.classList.contains("size-4")).toBe(true);
+    expect(iconSlot!.querySelector("button[title='Stage file']")).not.toBeNull();
+
+    const rightActions = row!.querySelector("[data-testid='file-row-hover-actions']");
+    expect(rightActions).not.toBeNull();
+    expect(rightActions!.querySelector("button[title='Stage file']")).toBeNull();
+  });
+
+  it("keeps the unstage button in the same icon slot for staged files", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "src/staged.go", staged: true }}
+            isPending={false}
+            treeMode
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector(
+      "[data-changes-file='src/staged.go']",
+    ) as HTMLElement | null;
+    expect(row).not.toBeNull();
+
+    const iconSlot = row!.querySelector("[data-testid='file-row-icon-action-slot']");
+    expect(iconSlot).not.toBeNull();
+    expect(iconSlot!.classList.contains("size-4")).toBe(true);
+    expect(iconSlot!.querySelector("button[title='Unstage file']")).not.toBeNull();
+
+    const rightActions = row!.querySelector("[data-testid='file-row-hover-actions']");
+    expect(rightActions).not.toBeNull();
+    expect(rightActions!.querySelector("button[title='Unstage file']")).toBeNull();
+  });
+
+  it("unstages a touch tree row through its menu without opening a diff", async () => {
+    responsive.isFinePointer = false;
+
+    const onUnstage = vi.fn();
+    const onOpenDiff = vi.fn();
+    const { getByRole, findByRole } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "src/mobile.go", staged: true }}
+            isPending={false}
+            treeMode
+            onSelect={noopSelect}
+            onOpenDiff={onOpenDiff}
+            onStage={noop}
+            onUnstage={onUnstage}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    fireEvent.keyDown(getByRole("button", { name: moreActionsLabel }), { key: "Enter" });
+    fireEvent.click(await findByRole("menuitem", { name: "Unstage file" }));
+    expect(onUnstage).toHaveBeenCalledWith("src/mobile.go", undefined);
+    expect(onOpenDiff).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileRow active-tab highlight", () => {
+  it("renders data-active='true' and border-primary when isActive", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "active.ts" }}
+            isPending={false}
+            isActive
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector("[data-changes-file='active.ts']") as HTMLElement | null;
+    expect(row).not.toBeNull();
+    expect(row!.getAttribute("data-active")).toBe("true");
+    expect(row!.className).toContain("border-primary/50");
+  });
+
+  it("keeps highlight when isActive and isSelected are both true", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ul>
+          <FileRow
+            file={{ ...baseFile, path: "both.ts" }}
+            isPending={false}
+            isActive
+            isSelected
+            onSelect={noopSelect}
+            onOpenDiff={noop}
+            onStage={noop}
+            onUnstage={noop}
+            onDiscard={noop}
+            onEditFile={noop}
+          />
+        </ul>
+      </TooltipProvider>,
+    );
+
+    const row = container.querySelector("[data-changes-file='both.ts']") as HTMLElement | null;
+    expect(row).not.toBeNull();
+    expect(row!.getAttribute("data-active")).toBe("true");
+    expect(row!.getAttribute("data-selected")).toBe("true");
+    expect(row!.className).toContain("border-primary/50");
+  });
+});

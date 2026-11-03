@@ -1,0 +1,3723 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/kandev/kandev/internal/agentruntime"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	officesqlite "github.com/kandev/kandev/internal/office/repository/sqlite"
+	"github.com/kandev/kandev/internal/orgunit"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository"
+	sqliterepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/testutil"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	workflowrepo "github.com/kandev/kandev/internal/workflow/repository"
+	"github.com/kandev/kandev/internal/worktree"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// MockEventBus implements bus.EventBus for testing
+type MockEventBus struct {
+	mu              sync.Mutex
+	publishedEvents []*bus.Event
+	closed          bool
+	// publishErrors, when non-nil, makes Publish fail for the listed
+	// subjects, for tests of publish-failure retry semantics.
+	publishErrors map[string]error
+}
+
+// These read/cascade fakes reject a field mutation outside their test scope.
+type unsupportedTaskFieldUpdater struct{}
+
+func (unsupportedTaskFieldUpdater) UpdateTaskFieldsWithParentAdmission(context.Context, string, models.TaskFieldUpdate, repository.TaskParentValidator) (*models.TaskFieldUpdateResult, error) {
+	return nil, errors.New("field updates are not supported by this test repository")
+}
+
+type recordingTaskClarificationCanceller struct {
+	sessions    []string
+	hasDeadline []bool
+	contextErrs []error
+	err         error
+}
+
+func (c *recordingTaskClarificationCanceller) ExpireSessionAndNotify(
+	ctx context.Context,
+	sessionID string,
+) (int, error) {
+	c.sessions = append(c.sessions, sessionID)
+	_, hasDeadline := ctx.Deadline()
+	c.hasDeadline = append(c.hasDeadline, hasDeadline)
+	c.contextErrs = append(c.contextErrs, ctx.Err())
+	return 1, c.err
+}
+
+type parkedProjectionCancelCall struct {
+	taskID      string
+	sessionID   string
+	newState    models.TaskSessionState
+	hasDeadline bool
+}
+
+type recordingParkedProjectionCanceller struct {
+	calls []parkedProjectionCancelCall
+}
+
+func (c *recordingParkedProjectionCanceller) ClearParkedProjectionOnSessionTerminated(
+	ctx context.Context,
+	taskID, sessionID string,
+	newState models.TaskSessionState,
+) {
+	_, hasDeadline := ctx.Deadline()
+	c.calls = append(c.calls, parkedProjectionCancelCall{
+		taskID: taskID, sessionID: sessionID, newState: newState, hasDeadline: hasDeadline,
+	})
+}
+
+func NewMockEventBus() *MockEventBus {
+	return &MockEventBus{
+		publishedEvents: make([]*bus.Event, 0),
+	}
+}
+
+func (m *MockEventBus) Publish(ctx context.Context, subject string, event *bus.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err, inject := m.publishErrors[subject]; inject {
+		return err
+	}
+	m.publishedEvents = append(m.publishedEvents, event)
+	return nil
+}
+
+func (m *MockEventBus) Subscribe(subject string, handler bus.EventHandler) (bus.Subscription, error) {
+	return nil, nil
+}
+
+func (m *MockEventBus) QueueSubscribe(subject, queue string, handler bus.EventHandler) (bus.Subscription, error) {
+	return nil, nil
+}
+
+func (m *MockEventBus) Request(ctx context.Context, subject string, event *bus.Event, timeout time.Duration) (*bus.Event, error) {
+	return nil, nil
+}
+
+func (m *MockEventBus) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+}
+
+func (m *MockEventBus) IsConnected() bool {
+	return !m.closed
+}
+
+func (m *MockEventBus) GetPublishedEvents() []*bus.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.publishedEvents
+}
+
+func (m *MockEventBus) ClearEvents() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishedEvents = make([]*bus.Event, 0)
+}
+
+func createTestService(t *testing.T) (*Service, *MockEventBus, *sqliterepo.Repository) {
+	t.Helper()
+	return createTestServiceWithSessionsRepo(t, func(repo *sqliterepo.Repository) repository.SessionRepository {
+		return repo
+	})
+}
+
+// testWorkflowStepGetter keeps legacy service tests focused on their own
+// behavior while mirroring production's required workflow-step dependency.
+// Integrity tests install an exact getter (or nil) for boundary assertions.
+type testWorkflowStepGetter struct {
+	repo *sqliterepo.Repository
+}
+
+func (g *testWorkflowStepGetter) GetStep(ctx context.Context, stepID string) (*wfmodels.WorkflowStep, error) {
+	rows, err := g.repo.DB().QueryContext(ctx, `SELECT id FROM workflows ORDER BY created_at DESC, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	workflowIDs := make([]string, 0, 1)
+	derivedWorkflowID := strings.Replace(stepID, "step", "wf", 1)
+	for rows.Next() {
+		var workflowID string
+		if err := rows.Scan(&workflowID); err != nil {
+			return nil, err
+		}
+		if workflowID == derivedWorkflowID {
+			return &wfmodels.WorkflowStep{ID: stepID, WorkflowID: workflowID}, nil
+		}
+		workflowIDs = append(workflowIDs, workflowID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(workflowIDs) > 0 {
+		return &wfmodels.WorkflowStep{ID: stepID, WorkflowID: workflowIDs[0]}, nil
+	}
+	return nil, errors.New("workflow step not found")
+}
+
+func (*testWorkflowStepGetter) GetNextStepByPosition(context.Context, string, int) (*wfmodels.WorkflowStep, error) {
+	return nil, nil
+}
+
+// createTestServiceWithSessionsRepo mirrors createTestService but lets a
+// caller substitute the Sessions repository (e.g. to wrap it with a test-only
+// hook) while reusing the same DB setup, migrations, and cleanup-worker
+// wiring for every other field.
+// testUnits exposes each test's unit service so a seed can build a tree.
+var testUnits = map[string]*orgunit.Service{}
+
+var serviceTestSQLiteTemplate = testutil.NewSQLiteTemplate(func(database *sqlx.DB) error {
+	if _, err := sqliterepo.NewWithDB(database, database, nil); err != nil {
+		return err
+	}
+	if _, err := worktree.NewSQLiteStore(database, database); err != nil {
+		return err
+	}
+	// Match production startup order, including Office's task constraints.
+	if _, err := officesqlite.NewWithDB(database, database, nil); err != nil {
+		return err
+	}
+	if _, err := workflowrepo.NewWithDB(database, database, nil); err != nil {
+		return err
+	}
+	_, err := orgunit.NewStore(db.NewPool(database, database))
+	return err
+})
+
+func createTestServiceWithSessionsRepo(
+	t *testing.T,
+	wrapSessions func(*sqliterepo.Repository) repository.SessionRepository,
+) (*Service, *MockEventBus, *sqliterepo.Repository) {
+	t.Helper()
+	return createTestServiceWithTaskAndSessionRepos(t, func(repo *sqliterepo.Repository) repository.TaskRepository {
+		return repo
+	}, wrapSessions)
+}
+
+func createTestServiceWithTaskAndSessionRepos(
+	t *testing.T,
+	wrapTasks func(*sqliterepo.Repository) repository.TaskRepository,
+	wrapSessions func(*sqliterepo.Repository) repository.SessionRepository,
+) (*Service, *MockEventBus, *sqliterepo.Repository) {
+	t.Helper()
+	sqlxDB, _ := serviceTestSQLiteTemplate.Open(t)
+	repo := sqliterepo.NewWithInitializedDB(sqlxDB, sqlxDB, nil)
+	eventBus := NewMockEventBus()
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json", OutputPath: "stdout"})
+	svc := NewService(Repos{
+		Workspaces:        repo,
+		Tasks:             wrapTasks(repo),
+		TaskRepos:         repo,
+		Workflows:         repo,
+		Messages:          repo,
+		Turns:             repo,
+		Sessions:          wrapSessions(repo),
+		GitSnapshots:      repo,
+		RepoEntities:      repo,
+		RepositorySets:    repo,
+		BranchPolicies:    repo,
+		RepositoryCleanup: repo,
+		Executors:         repo,
+		Environments:      repo,
+		TaskEnvironments:  repo,
+		Reviews:           repo,
+		ResourceCleanups:  repo,
+		Usage:             repo,
+		BackgroundWork:    repo,
+	}, eventBus, log, RepositoryDiscoveryConfig{})
+	svc.SetWorkspaceBootstrapper(repo)
+	// Reach comes from the unit tree, so the service tests wire the real one
+	// rather than a stub: a resolver the wiring never calls protects nothing.
+	unitStore, unitErr := orgunit.NewStore(db.NewPool(sqlxDB, sqlxDB))
+	if unitErr != nil {
+		t.Fatalf("failed to init unit store: %v", unitErr)
+	}
+	unitSvc := orgunit.NewService(unitStore, nil)
+	unitSvc.SetWorkspaceCounter(repo)
+	svc.SetUnitPlacer(unitSvc)
+	svc.SetUnitReach(unitSvc)
+	testUnits[t.Name()] = unitSvc
+	t.Cleanup(func() { delete(testUnits, t.Name()) })
+	svc.SetWorkflowStepGetter(&testWorkflowStepGetter{repo: repo})
+	if err := svc.StartTaskResourceCleanupWorker(context.Background()); err != nil {
+		t.Fatalf("failed to start task resource cleanup worker: %v", err)
+	}
+	t.Cleanup(svc.StopTaskResourceCleanupWorker)
+	return svc, eventBus, repo
+}
+
+func TestService_ListRepositoriesPrunesMissingTaskWorktreeRepository(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	taskRoot := filepath.Join(t.TempDir(), "tasks")
+	svc.discoveryConfig.TaskWorktreeRoots = []string{taskRoot}
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateRepository(ctx, &models.Repository{
+		ID:          "repo-orphaned-worktree",
+		WorkspaceID: "ws-1",
+		Name:        "orphaned-worktree",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   filepath.Join(taskRoot, "deleted-task", "repo"),
+	}); err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+
+	repositories, err := svc.ListRepositories(ctx, "ws-1")
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repositories) != 0 {
+		t.Fatalf("ListRepositories returned %d repositories, want orphan pruned", len(repositories))
+	}
+	if _, err := repo.GetRepository(ctx, "repo-orphaned-worktree"); err == nil {
+		t.Fatal("orphaned task worktree repository remains live")
+	}
+
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 || events[0].Type != "repository.deleted" {
+		t.Fatalf("published events = %#v, want one repository.deleted event", events)
+	}
+}
+
+func TestService_ListRepositoriesPreservesExistingAndUserOwnedRepositories(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	testRoot := t.TempDir()
+	taskRoot := filepath.Join(testRoot, "tasks")
+	existingTaskWorktree := filepath.Join(taskRoot, "active-task", "repo")
+	if err := os.MkdirAll(existingTaskWorktree, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	svc.discoveryConfig.TaskWorktreeRoots = []string{taskRoot}
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	for _, repository := range []*models.Repository{
+		{
+			ID:          "repo-active-worktree",
+			WorkspaceID: "ws-1",
+			Name:        "active-worktree",
+			SourceType:  sourceTypeLocal,
+			LocalPath:   existingTaskWorktree,
+		},
+		{
+			ID:          "repo-user-owned",
+			WorkspaceID: "ws-1",
+			Name:        "user-owned",
+			SourceType:  sourceTypeLocal,
+			LocalPath:   filepath.Join(testRoot, "unmounted-user-repo"),
+		},
+	} {
+		if err := repo.CreateRepository(ctx, repository); err != nil {
+			t.Fatalf("CreateRepository(%s): %v", repository.ID, err)
+		}
+	}
+
+	repositories, err := svc.ListRepositories(ctx, "ws-1")
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repositories) != 2 {
+		t.Fatalf("ListRepositories returned %d repositories, want both preserved", len(repositories))
+	}
+	if events := eventBus.GetPublishedEvents(); len(events) != 0 {
+		t.Fatalf("published events = %#v, want none", events)
+	}
+}
+
+func TestService_ListRepositoriesPreservesMissingTaskWorktreeWithResumableSession(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	taskRoot := filepath.Join(t.TempDir(), "tasks")
+	svc.discoveryConfig.TaskWorktreeRoots = []string{taskRoot}
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateRepository(ctx, &models.Repository{
+		ID:          "repo-active-session",
+		WorkspaceID: "ws-1",
+		Name:        "active-session",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   filepath.Join(taskRoot, "active-task", "repo"),
+	}); err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{ID: "task-1", WorkspaceID: "ws-1", Title: "Task"}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskRepository(ctx, &models.TaskRepository{
+		ID:           "task-repo-1",
+		TaskID:       "task-1",
+		RepositoryID: "repo-active-session",
+	}); err != nil {
+		t.Fatalf("CreateTaskRepository: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-1",
+		TaskID: "task-1",
+		State:  models.TaskSessionStateRunning,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession: %v", err)
+	}
+
+	for _, state := range []models.TaskSessionState{
+		models.TaskSessionStateRunning,
+		models.TaskSessionStateIdle,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			if err := repo.UpdateTaskSessionState(ctx, "session-1", state, ""); err != nil {
+				t.Fatalf("UpdateTaskSessionState: %v", err)
+			}
+			repositories, err := svc.ListRepositories(ctx, "ws-1")
+			if err != nil {
+				t.Fatalf("ListRepositories: %v", err)
+			}
+			if len(repositories) != 1 || repositories[0].ID != "repo-active-session" {
+				t.Fatalf("ListRepositories = %#v, want resumable repository preserved", repositories)
+			}
+		})
+	}
+	if _, err := repo.GetRepository(ctx, "repo-active-session"); err != nil {
+		t.Fatalf("resumable repository was deleted: %v", err)
+	}
+	if events := eventBus.GetPublishedEvents(); len(events) != 0 {
+		t.Fatalf("published events = %#v, want none", events)
+	}
+}
+
+func TestService_ListRepositoriesPreservesRepositoryWhenPruningFails(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	taskRoot := filepath.Join(t.TempDir(), "tasks")
+	svc.discoveryConfig.TaskWorktreeRoots = []string{taskRoot}
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateRepository(ctx, &models.Repository{
+		ID:          "repo-prune-error",
+		WorkspaceID: "ws-1",
+		Name:        "prune-error",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   filepath.Join(taskRoot, "deleted-task", "repo"),
+	}); err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	svc.repoEntities = failingPruneRepository{RepositoryEntityRepository: repo}
+
+	repositories, err := svc.ListRepositories(ctx, "ws-1")
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repositories) != 1 || repositories[0].ID != "repo-prune-error" {
+		t.Fatalf("ListRepositories = %#v, want repository preserved", repositories)
+	}
+	if events := eventBus.GetPublishedEvents(); len(events) != 0 {
+		t.Fatalf("published events = %#v, want none", events)
+	}
+}
+
+func TestService_ListRepositoriesPreservesRepositoryWhenRetainedRowReadFails(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	taskRoot := filepath.Join(t.TempDir(), "tasks")
+	svc.discoveryConfig.TaskWorktreeRoots = []string{taskRoot}
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateRepository(ctx, &models.Repository{
+		ID:          "repo-read-error",
+		WorkspaceID: "ws-1",
+		Name:        "read-error",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   filepath.Join(taskRoot, "active-task", "repo"),
+	}); err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	svc.repoEntities = retainedRepositoryReadError{RepositoryEntityRepository: repo}
+
+	repositories, err := svc.ListRepositories(ctx, "ws-1")
+	if err != nil {
+		t.Fatalf("ListRepositories: %v", err)
+	}
+	if len(repositories) != 1 || repositories[0].ID != "repo-read-error" {
+		t.Fatalf("ListRepositories = %#v, want repository preserved", repositories)
+	}
+	if events := eventBus.GetPublishedEvents(); len(events) != 0 {
+		t.Fatalf("published events = %#v, want none", events)
+	}
+}
+
+type failingPruneRepository struct {
+	repository.RepositoryEntityRepository
+}
+
+func (failingPruneRepository) DeleteRepositoryIfNoActiveTaskSessions(context.Context, string) (bool, error) {
+	return false, errors.New("database unavailable")
+}
+
+type retainedRepositoryReadError struct {
+	repository.RepositoryEntityRepository
+}
+
+func (retainedRepositoryReadError) DeleteRepositoryIfNoActiveTaskSessions(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (retainedRepositoryReadError) GetRepository(context.Context, string) (*models.Repository, error) {
+	return nil, errors.New("database unavailable")
+}
+
+// Task tests
+
+func TestService_CreateTask(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	// Create workflow first
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	workflow := &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Test Workflow"}
+	_ = repo.CreateWorkflow(ctx, workflow)
+	repository := &models.Repository{ID: "repo-123", WorkspaceID: "ws-1", Name: "Test Repo"}
+	_ = repo.CreateRepository(ctx, repository)
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-123",
+		WorkflowStepID: "step-123",
+		Title:          "Test Task",
+		Description:    "A test task",
+		Priority:       "high",
+		Repositories: []TaskRepositoryInput{
+			{
+				RepositoryID: "repo-123",
+				BaseBranch:   "main",
+			},
+		},
+	}
+
+	taskResult, err := svc.CreateTask(ctx, req)
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	if task.ID == "" {
+		t.Error("expected task ID to be set")
+	}
+	if task.Title != "Test Task" {
+		t.Errorf("expected title 'Test Task', got %s", task.Title)
+	}
+	if task.State != v1.TaskStateCreated {
+		t.Errorf("expected state CREATED, got %s", task.State)
+	}
+
+	// Check event was published
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != "task.created" {
+		t.Errorf("expected event type 'task.created', got %s", events[0].Type)
+	}
+	// workspace_id MUST be in the event payload so the office WS handler
+	// can workspace-scope the dashboard refetch.
+	data, ok := events[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("event data is not map[string]interface{}, got %T", events[0].Data)
+	}
+	if got := data["workspace_id"]; got != "ws-1" {
+		t.Errorf("expected workspace_id 'ws-1' in event payload, got %v", got)
+	}
+}
+
+func TestService_CreateTaskProbesDefaultBranchForExplicitRepositoryOutsideDiscoveryRoots(t *testing.T) {
+	isolateGitEnvForTest(t)
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	repoPath := filepath.Join(t.TempDir(), "explicit-repo")
+	initRealGitRepo(t, repoPath)
+	cmd := exec.Command("git", "checkout", "-b", "feature/current")
+	cmd.Dir = repoPath
+	cmd.Env = isolatedGitEnv()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout feature branch: %v: %s", err, output)
+	}
+
+	const workspaceID = "ws-explicit"
+	const workflowID = "wf-explicit"
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "Explicit repository",
+		Repositories: []TaskRepositoryInput{{
+			LocalPath: repoPath, BaseBranch: "feature/current", Name: "explicit-repo",
+		}},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("task repositories = %d, want 1", len(task.Repositories))
+	}
+	saved, err := repo.GetRepository(ctx, task.Repositories[0].RepositoryID)
+	if err != nil {
+		t.Fatalf("GetRepository: %v", err)
+	}
+	if saved.DefaultBranch != "main" {
+		t.Fatalf("DefaultBranch = %q, want main", saved.DefaultBranch)
+	}
+}
+
+func TestResolveRepoInputLocalDeduplicatesCanonicalPathAliases(t *testing.T) {
+	isolateGitEnvForTest(t)
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	const workspaceID = "ws-canonical-alias"
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+
+	repoPath := filepath.Join(t.TempDir(), "canonical-repo")
+	initRealGitRepo(t, repoPath)
+	aliasPath := filepath.Join(t.TempDir(), "repository-alias")
+	if err := os.Symlink(repoPath, aliasPath); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	canonicalPath, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	repoByPath := map[string]*models.Repository{}
+	aliasID, _, aliasCreated, err := svc.resolveRepoInputLocal(
+		ctx,
+		workspaceID,
+		TaskRepositoryInput{LocalPath: aliasPath},
+		repoByPath,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("resolve alias: %v", err)
+	}
+	if !aliasCreated {
+		t.Fatal("expected alias lookup to create repository")
+	}
+
+	canonicalID, _, canonicalCreated, err := svc.resolveRepoInputLocal(
+		ctx,
+		workspaceID,
+		TaskRepositoryInput{LocalPath: canonicalPath},
+		repoByPath,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("resolve canonical path: %v", err)
+	}
+	if canonicalCreated {
+		t.Fatal("canonical alias created a duplicate repository")
+	}
+	if canonicalID != aliasID {
+		t.Fatalf("canonical repository ID = %q, want %q", canonicalID, aliasID)
+	}
+}
+
+// TestService_CreateTask_DefaultsPriorityWhenEmpty pins the regression
+// from the office priority migration. The migration added a CHECK
+// constraint that the priority column must be one of {critical, high,
+// medium, low}; callers that don't set Priority on the request (e.g.
+// the onboarding adapter creating the CEO's first task) must still
+// produce a row that satisfies the constraint. buildTask defaults the
+// priority to "medium" exactly for this case.
+func TestService_CreateTask_DefaultsPriorityWhenEmpty(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "WF"})
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-1",
+		WorkflowStepID: "step-1",
+		Title:          "Onboarding-style task with no priority",
+		// Priority intentionally omitted — caller didn't set it.
+	}
+	taskResult, err := svc.CreateTask(ctx, req)
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask with empty priority should succeed, got %v", err)
+	}
+	if task.Priority != "medium" {
+		t.Errorf("expected default priority 'medium', got %q", task.Priority)
+	}
+}
+
+func TestService_TaskPriorityRejectsUnknownValues(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-priority", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-priority", WorkspaceID: "ws-priority", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if _, err := svc.CreateTask(ctx, &CreateTaskRequest{WorkspaceID: "ws-priority", WorkflowID: "wf-priority", Title: "Bad priority", Priority: "urgent"}); err == nil {
+		t.Fatal("CreateTask accepted an unknown priority")
+	}
+	if err := repo.CreateTask(ctx, &models.Task{ID: "task-priority", WorkspaceID: "ws-priority", WorkflowID: "wf-priority", Title: "Priority", Priority: "medium"}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	priority := "urgent"
+	if _, err := svc.UpdateTask(ctx, "task-priority", &UpdateTaskRequest{Priority: &priority}); err == nil {
+		t.Fatal("UpdateTask accepted an unknown priority")
+	}
+}
+
+func TestValidateTaskPriority(t *testing.T) {
+	for _, priority := range []string{"critical", "high", "medium", "low"} {
+		if err := ValidateTaskPriority(priority); err != nil {
+			t.Errorf("ValidateTaskPriority(%q) = %v, want nil", priority, err)
+		}
+	}
+	if err := ValidateTaskPriority("urgent"); err == nil {
+		t.Error("ValidateTaskPriority(urgent) = nil, want error")
+	}
+}
+
+func TestService_CreateTask_RejectsDuplicateRepositories(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{ID: "repo-dup", WorkspaceID: "ws-1", Name: "Dup"})
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-1",
+		WorkflowStepID: "step-1",
+		Title:          "dup repos",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: "repo-dup", BaseBranch: "main"},
+			{RepositoryID: "repo-dup", BaseBranch: "main"},
+		},
+	}
+	_, err := svc.CreateTask(ctx, req)
+	if err == nil {
+		t.Fatal("expected duplicate-repository error, got nil")
+	}
+	// The error must name the repository (its display name) rather than leak
+	// the raw repository UUID, which the create-task dialog shows verbatim.
+	if !strings.Contains(err.Error(), "Dup") {
+		t.Errorf("expected error to name the repo (%q), got: %v", "Dup", err)
+	}
+	if strings.Contains(err.Error(), "repo-dup") {
+		t.Errorf("expected error not to leak repository UUID, got: %v", err)
+	}
+}
+
+// Regression: two PR URLs of the same GitHub repo (e.g. /pull/1116 and
+// /pull/1117) parse to the same owner/repo and collapse to one repositoryID,
+// tripping the duplicate guard. The error must name owner/repo, not the UUID.
+func TestService_CreateTask_RejectsDuplicateGitHubURLs(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "WF"})
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-1",
+		WorkflowStepID: "step-1",
+		Title:          "dup PR urls",
+		Repositories: []TaskRepositoryInput{
+			{GitHubURL: "https://github.com/kdlbs/kandev/pull/1116"},
+			{GitHubURL: "https://github.com/kdlbs/kandev/pull/1117"},
+		},
+	}
+	_, err := svc.CreateTask(ctx, req)
+	if err == nil {
+		t.Fatal("expected duplicate-repository error, got nil")
+	}
+	if !strings.Contains(err.Error(), "kdlbs/kandev") {
+		t.Errorf("expected error to name owner/repo (kdlbs/kandev), got: %v", err)
+	}
+}
+
+func TestService_CreateTask_AcceptsMultipleDistinctRepositories(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{ID: "repo-front", WorkspaceID: "ws-1", Name: "front"})
+	_ = repo.CreateRepository(ctx, &models.Repository{ID: "repo-back", WorkspaceID: "ws-1", Name: "back"})
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-1",
+		WorkflowID:     "wf-1",
+		WorkflowStepID: "step-1",
+		Title:          "multi",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: "repo-front", BaseBranch: "main"},
+			{RepositoryID: "repo-back", BaseBranch: "main"},
+		},
+	}
+	taskResult, err := svc.CreateTask(ctx, req)
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 2 {
+		t.Errorf("expected 2 task repositories, got %d", len(task.Repositories))
+	}
+}
+
+func TestService_CreateTask_RejectsRepositoryFromOtherWorkspace(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-a", Name: "A"})
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-b", Name: "B"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-a", WorkspaceID: "ws-a", Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{ID: "repo-b", WorkspaceID: "ws-b", Name: "B repo"})
+
+	req := &CreateTaskRequest{
+		WorkspaceID:    "ws-a",
+		WorkflowID:     "wf-a",
+		WorkflowStepID: "step-1",
+		Title:          "cross-ws",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: "repo-b", BaseBranch: "main"},
+		},
+	}
+	_, err := svc.CreateTask(ctx, req)
+	if err == nil {
+		t.Fatal("expected cross-workspace repository error, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not belong to workspace") {
+		t.Errorf("expected workspace-ownership error, got: %v", err)
+	}
+}
+
+func TestService_CreateTask_RewritesTaskWorktreeRepositoryIDToProviderRepository(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID    = "ws-1"
+		workflowID     = "wf-1"
+		badRepoID      = "repo-task-worktree"
+		providerRepoID = "repo-provider"
+		prHeadBranch   = "feature/adding-a-download-ot-5sl"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            badRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            providerRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev",
+		SourceType:    sourceTypeProvider,
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: badRepoID, BaseBranch: prHeadBranch},
+		},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("expected 1 task repository, got %d", len(task.Repositories))
+	}
+	if task.Repositories[0].RepositoryID != providerRepoID {
+		t.Fatalf("expected provider repository %q, got %q", providerRepoID, task.Repositories[0].RepositoryID)
+	}
+	if task.Repositories[0].BaseBranch != prHeadBranch {
+		t.Fatalf("expected base branch %q, got %q", prHeadBranch, task.Repositories[0].BaseBranch)
+	}
+}
+
+func TestService_CreateTask_RewritesTaskWorktreeRepositoryIDToSafeLocalRepository(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID    = "ws-1"
+		workflowID     = "wf-1"
+		badRepoID      = "repo-task-worktree"
+		localRepoID    = "repo-local-source"
+		providerRepoID = "repo-provider"
+		prHeadBranch   = "feature/adding-a-download-ot-5sl"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            badRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            localRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/workspaces/kandev",
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            providerRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev provider",
+		SourceType:    sourceTypeProvider,
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: badRepoID, BaseBranch: prHeadBranch},
+		},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("expected 1 task repository, got %d", len(task.Repositories))
+	}
+	if task.Repositories[0].RepositoryID != localRepoID {
+		t.Fatalf("expected safe local repository %q, got %q", localRepoID, task.Repositories[0].RepositoryID)
+	}
+	if task.Repositories[0].BaseBranch != prHeadBranch {
+		t.Fatalf("expected base branch %q, got %q", prHeadBranch, task.Repositories[0].BaseBranch)
+	}
+	repos, listErr := repo.ListRepositories(ctx, workspaceID)
+	if listErr != nil {
+		t.Fatalf("ListRepositories: %v", listErr)
+	}
+	if len(repos) != 3 {
+		t.Fatalf("expected no additional repository to be created, got %d repositories", len(repos))
+	}
+}
+
+func TestService_CreateTask_RewritesTaskWorktreeLocalPathToSafeLocalRepository(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID  = "ws-1"
+		workflowID   = "wf-1"
+		badRepoID    = "repo-task-worktree"
+		localRepoID  = "repo-local-source"
+		taskPath     = "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev"
+		prHeadBranch = "feature/adding-a-download-ot-5sl"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            badRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     taskPath,
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            localRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/workspaces/kandev",
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{LocalPath: taskPath, BaseBranch: prHeadBranch},
+		},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("expected 1 task repository, got %d", len(task.Repositories))
+	}
+	if task.Repositories[0].RepositoryID != localRepoID {
+		t.Fatalf("expected safe local repository %q, got %q", localRepoID, task.Repositories[0].RepositoryID)
+	}
+	if task.Repositories[0].BaseBranch != prHeadBranch {
+		t.Fatalf("expected base branch %q, got %q", prHeadBranch, task.Repositories[0].BaseBranch)
+	}
+}
+
+func TestService_CreateTask_RejectsUnmatchedTaskWorktreeLocalPath(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID = "ws-1"
+		workflowID  = "wf-1"
+		taskPath    = "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+
+	_, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{LocalPath: taskPath, BaseBranch: "feature/pr-head"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected CreateTask to reject unmatched task-worktree local path")
+	}
+	if !strings.Contains(err.Error(), "points at a Kandev task worktree") {
+		t.Fatalf("expected task-worktree local path error, got %v", err)
+	}
+	repos, listErr := repo.ListRepositories(ctx, workspaceID)
+	if listErr != nil {
+		t.Fatalf("ListRepositories: %v", listErr)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("expected no repository to be created, got %d", len(repos))
+	}
+}
+
+func TestService_CreateTask_CreatesProviderRepositoryForTaskWorktreeRepositoryID(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID = "ws-1"
+		workflowID  = "wf-1"
+		badRepoID   = "repo-task-worktree"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            badRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: badRepoID, BaseBranch: "feature/pr-head"},
+		},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("expected 1 task repository, got %d", len(task.Repositories))
+	}
+	createdRepoID := task.Repositories[0].RepositoryID
+	if createdRepoID == badRepoID {
+		t.Fatal("expected task to use a provider repository, got the task worktree repository")
+	}
+	createdRepo, err := repo.GetRepository(ctx, createdRepoID)
+	if err != nil {
+		t.Fatalf("GetRepository(%q): %v", createdRepoID, err)
+	}
+	if createdRepo.SourceType != sourceTypeProvider {
+		t.Fatalf("expected provider source type, got %q", createdRepo.SourceType)
+	}
+	if createdRepo.LocalPath != "" {
+		t.Fatalf("expected provider repository without local path, got %q", createdRepo.LocalPath)
+	}
+	if createdRepo.Provider != "github" || createdRepo.ProviderOwner != "kdlbs" || createdRepo.ProviderName != "kandev" {
+		t.Fatalf("unexpected provider identity: %+v", createdRepo)
+	}
+}
+
+func TestService_CreateTask_ErrorsForTaskWorktreeRepositoryWithoutProviderIdentity(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID = "ws-1"
+		workflowID  = "wf-1"
+		badRepoID   = "repo-task-worktree"
+	)
+
+	svc.discoveryConfig.TaskWorktreeRoots = []string{"/data/tasks"}
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:          badRepoID,
+		WorkspaceID: workspaceID,
+		Name:        "task worktree without provider identity",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   "/data/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+	})
+
+	_, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{RepositoryID: badRepoID, BaseBranch: "feature/pr-head"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing provider identity error")
+	}
+	if !strings.Contains(err.Error(), "points at a Kandev task worktree") {
+		t.Fatalf("expected task worktree provider identity error, got %v", err)
+	}
+	repos, listErr := repo.ListRepositories(ctx, workspaceID)
+	if listErr != nil {
+		t.Fatalf("ListRepositories: %v", listErr)
+	}
+	if len(repos) != 1 {
+		t.Fatalf("expected no provider repository to be created, got %d repositories", len(repos))
+	}
+}
+
+func TestService_CreateTask_GitHubURLIgnoresTaskWorktreeProviderMatch(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const (
+		workspaceID = "ws-1"
+		workflowID  = "wf-1"
+		badRepoID   = "repo-task-worktree"
+	)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: workflowID, WorkspaceID: workspaceID, Name: "WF"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            badRepoID,
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	taskResult, err := svc.CreateTask(ctx, &CreateTaskRequest{
+		WorkspaceID:    workspaceID,
+		WorkflowID:     workflowID,
+		WorkflowStepID: "step-1",
+		Title:          "PR review",
+		Repositories: []TaskRepositoryInput{
+			{GitHubURL: "https://github.com/kdlbs/kandev/pull/1567"},
+		},
+	})
+	task := taskResult.Task
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if len(task.Repositories) != 1 {
+		t.Fatalf("expected 1 task repository, got %d", len(task.Repositories))
+	}
+	createdRepoID := task.Repositories[0].RepositoryID
+	if createdRepoID == badRepoID {
+		t.Fatal("expected GitHub URL resolution to ignore the task worktree repository")
+	}
+	createdRepo, err := repo.GetRepository(ctx, createdRepoID)
+	if err != nil {
+		t.Fatalf("GetRepository(%q): %v", createdRepoID, err)
+	}
+	if createdRepo.SourceType != sourceTypeProvider {
+		t.Fatalf("expected provider source type, got %q", createdRepo.SourceType)
+	}
+	if createdRepo.LocalPath != "" {
+		t.Fatalf("expected provider repository without local path, got %q", createdRepo.LocalPath)
+	}
+}
+
+func TestService_FindOrCreateRepository_ReturnsCreatedForTaskWorktreeReplacement(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const workspaceID = "ws-1"
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            "repo-task-worktree",
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+
+	resolved, created, err := svc.FindOrCreateRepository(ctx, &FindOrCreateRepositoryRequest{
+		WorkspaceID:   workspaceID,
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("FindOrCreateRepository: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created=true for provider replacement row")
+	}
+	if resolved.SourceType != sourceTypeProvider {
+		t.Fatalf("expected provider source type, got %q", resolved.SourceType)
+	}
+	if resolved.LocalPath != "" {
+		t.Fatalf("expected provider repository without local path, got %q", resolved.LocalPath)
+	}
+}
+
+func TestService_FindOrCreateRepository_ErrorsWhenTaskWorktreeReplacementDisappears(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	const workspaceID = "ws-1"
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: workspaceID, Name: "Workspace"})
+	_ = repo.CreateRepository(ctx, &models.Repository{
+		ID:            "repo-task-worktree",
+		WorkspaceID:   workspaceID,
+		Name:          "kdlbs/kandev task worktree",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     "/root/.kandev/tasks/pr-1541-fix-skip-cle_3bm/kdlbs-kandev",
+		Provider:      "github",
+		ProviderHost:  githubProviderHost,
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	svc.repoEntities = missingReplacementLookupRepository{
+		RepositoryEntityRepository: repo,
+		preserveID:                 "repo-task-worktree",
+	}
+
+	_, _, err := svc.FindOrCreateRepository(ctx, &FindOrCreateRepositoryRequest{
+		WorkspaceID:   workspaceID,
+		Provider:      "github",
+		ProviderOwner: "kdlbs",
+		ProviderName:  "kandev",
+		DefaultBranch: "main",
+	})
+	if err == nil {
+		t.Fatal("expected missing replacement repository error")
+	}
+	if !strings.Contains(err.Error(), "no longer exists") {
+		t.Fatalf("expected missing replacement error, got %v", err)
+	}
+}
+
+func TestSameProviderIdentityIncludesNormalizedHost(t *testing.T) {
+	public := &models.Repository{
+		Provider: "gitlab", ProviderHost: "https://gitlab.com", ProviderOwner: "group", ProviderName: "project",
+	}
+	selfManaged := &models.Repository{
+		Provider: "gitlab", ProviderHost: "https://gitlab.internal", ProviderOwner: "group", ProviderName: "project",
+	}
+	if sameProviderIdentity(public, selfManaged) {
+		t.Fatal("repositories on different GitLab hosts matched")
+	}
+	legacyGitHub := &models.Repository{Provider: "github", ProviderOwner: "group", ProviderName: "project"}
+	canonicalGitHub := &models.Repository{
+		Provider: "github", ProviderHost: githubProviderHost, ProviderOwner: "group", ProviderName: "project",
+	}
+	if !sameProviderIdentity(legacyGitHub, canonicalGitHub) {
+		t.Fatal("legacy hostless GitHub repository did not match the canonical GitHub host")
+	}
+}
+
+type missingReplacementLookupRepository struct {
+	repository.RepositoryEntityRepository
+	preserveID string
+}
+
+func (r missingReplacementLookupRepository) GetRepository(ctx context.Context, id string) (*models.Repository, error) {
+	if id != r.preserveID {
+		return nil, nil
+	}
+	return r.RepositoryEntityRepository.GetRepository(ctx, id)
+}
+
+func TestService_CreateRepository_DefaultWorktreeBranchPrefix(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Repo",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+	if created.WorktreeBranchPrefix != worktree.DefaultBranchPrefix {
+		t.Fatalf("expected default prefix %q, got %q", worktree.DefaultBranchPrefix, created.WorktreeBranchPrefix)
+	}
+	if !created.PullBeforeWorktree {
+		t.Fatalf("expected pull_before_worktree to default to true")
+	}
+
+	stored, err := repo.GetRepository(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRepository failed: %v", err)
+	}
+	if stored.WorktreeBranchPrefix != worktree.DefaultBranchPrefix {
+		t.Fatalf("expected stored prefix %q, got %q", worktree.DefaultBranchPrefix, stored.WorktreeBranchPrefix)
+	}
+	if !stored.PullBeforeWorktree {
+		t.Fatalf("expected stored pull_before_worktree to default to true")
+	}
+}
+
+func TestService_CreateRepository_CopyFilesSymlinkKeyword(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Repo",
+		CopyFiles:   ".env, .env.local:symlink",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+	if created.CopyFiles != ".env, .env.local:symlink" {
+		t.Fatalf("copy_files not persisted verbatim: %q", created.CopyFiles)
+	}
+}
+
+func TestService_CreateRepository_ColonBearingCopyFilesPath(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Repo",
+		CopyFiles:   ".env.local:hardlink",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+	if created.CopyFiles != ".env.local:hardlink" {
+		t.Fatalf("copy_files not persisted verbatim: %q", created.CopyFiles)
+	}
+}
+
+func TestService_UpdateRepository_MalformedCopyFilesMode(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{WorkspaceID: "ws-1", Name: "Test Repo"})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+
+	bad := ":symlink"
+	_, err = svc.UpdateRepository(ctx, created.ID, &UpdateRepositoryRequest{CopyFiles: &bad})
+	if !errors.Is(err, ErrInvalidRepositorySettings) {
+		t.Fatalf("expected ErrInvalidRepositorySettings, got %v", err)
+	}
+}
+
+func TestService_CreateRepository_DefaultWorktreeBranchTemplate(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Repo",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+	if created.WorktreeBranchTemplate != worktree.DefaultBranchNameTemplate {
+		t.Fatalf("expected default template %q, got %q", worktree.DefaultBranchNameTemplate, created.WorktreeBranchTemplate)
+	}
+
+	stored, err := repo.GetRepository(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRepository failed: %v", err)
+	}
+	if stored.WorktreeBranchTemplate != worktree.DefaultBranchNameTemplate {
+		t.Fatalf("expected stored template %q, got %q", worktree.DefaultBranchNameTemplate, stored.WorktreeBranchTemplate)
+	}
+}
+
+func TestService_UpdateRepository_WorktreeBranchTemplate(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Repo",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+
+	template := "feature/{ticket}-{title}"
+	updated, err := svc.UpdateRepository(ctx, created.ID, &UpdateRepositoryRequest{
+		WorktreeBranchTemplate: &template,
+	})
+	if err != nil {
+		t.Fatalf("UpdateRepository failed: %v", err)
+	}
+	if updated.WorktreeBranchTemplate != template {
+		t.Fatalf("expected template %q, got %q", template, updated.WorktreeBranchTemplate)
+	}
+
+	stored, err := repo.GetRepository(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRepository failed: %v", err)
+	}
+	if stored.WorktreeBranchTemplate != template {
+		t.Fatalf("expected stored template %q, got %q", template, stored.WorktreeBranchTemplate)
+	}
+}
+
+func TestService_CreateRepository_PullBeforeWorktreeFalse(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+
+	pullFalse := false
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID:        "ws-1",
+		Name:               "Test Repo",
+		PullBeforeWorktree: &pullFalse,
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository failed: %v", err)
+	}
+	if created.PullBeforeWorktree {
+		t.Fatalf("expected pull_before_worktree to be false when explicitly set")
+	}
+
+	stored, err := repo.GetRepository(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRepository failed: %v", err)
+	}
+	if stored.PullBeforeWorktree {
+		t.Fatalf("expected stored pull_before_worktree to be false")
+	}
+}
+
+func TestService_GetTask(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	// Create required entities
+	setupTestTask(t, repo)
+
+	retrieved, err := svc.GetTask(ctx, "task-123")
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if retrieved.Title != "Test Task" {
+		t.Errorf("expected title 'Test Task', got %s", retrieved.Title)
+	}
+}
+
+func TestService_GetTaskNotFound(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	ctx := context.Background()
+
+	_, err := svc.GetTask(ctx, "nonexistent")
+	if err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestService_UpdateTask(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Original", Priority: "medium"})
+	eventBus.ClearEvents()
+
+	newTitle := "Updated Title"
+	req := &UpdateTaskRequest{Title: &newTitle}
+
+	updated, err := svc.UpdateTask(ctx, "task-123", req)
+	if err != nil {
+		t.Fatalf("failed to update task: %v", err)
+	}
+	if updated.Title != "Updated Title" {
+		t.Errorf("expected title 'Updated Title', got %s", updated.Title)
+	}
+
+	// Check event was published
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != "task.updated" {
+		t.Errorf("expected event type 'task.updated', got %s", events[0].Type)
+	}
+}
+
+func TestService_DeleteTask(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	eventBus.ClearEvents()
+
+	err := svc.DeleteTask(ctx, "task-123")
+	if err != nil {
+		t.Fatalf("failed to delete task: %v", err)
+	}
+
+	// Verify task is deleted
+	_, err = svc.GetTask(ctx, "task-123")
+	if err == nil {
+		t.Error("expected task to be deleted")
+	}
+
+	// Check event was published
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+}
+
+func TestService_DeleteTaskWithReason_PublishesReason(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	eventBus.ClearEvents()
+
+	if err := svc.DeleteTaskWithReason(ctx, "task-123", "pr_approved_by_user"); err != nil {
+		t.Fatalf("DeleteTaskWithReason: %v", err)
+	}
+
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != "task.deleted" {
+		t.Fatalf("expected event type 'task.deleted', got %s", events[0].Type)
+	}
+	data, ok := events[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("event data is not map[string]interface{}, got %T", events[0].Data)
+	}
+	if got := data["reason"]; got != "pr_approved_by_user" {
+		t.Errorf("expected reason 'pr_approved_by_user' in payload, got %v", got)
+	}
+}
+
+func TestService_DeleteTask_OmitsReasonWhenUnset(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	eventBus.ClearEvents()
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	data, ok := events[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("event data is not map[string]interface{}, got %T", events[0].Data)
+	}
+	if _, present := data["reason"]; present {
+		t.Errorf("expected no reason key when deleting without a reason, got %v", data["reason"])
+	}
+}
+
+func TestService_DeleteTaskStopsExecutorRunningForTerminalSession(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-terminal" {
+		t.Fatalf("StopExecution executionID = %q, want exec-terminal", call.executionID)
+	}
+	if call.reason != "task deleted" {
+		t.Fatalf("StopExecution reason = %q, want task deleted", call.reason)
+	}
+	if !call.force {
+		t.Fatal("StopExecution force = false, want true")
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+func TestService_DeleteTaskPreservesExecutorRunningWhenStopFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErr = errors.New("runtime still shutting down")
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+	sessionDir := filepath.Join(quickChatDir, "session-completed")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	_ = stopper.waitForStopExecution(t)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); err != nil {
+		t.Fatalf("executor row should remain retryable after stop failure: %v", err)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("quick-chat directory should remain when stop fails: %v", err)
+	}
+	var cleanupState string
+	if err := repo.DB().QueryRowContext(ctx, `
+		SELECT state FROM task_resource_cleanup_jobs
+		WHERE task_id = ? AND trigger = 'delete'
+	`, "task-123").Scan(&cleanupState); err != nil {
+		t.Fatalf("load cleanup retry state: %v", err)
+	}
+	if cleanupState != string(models.TaskResourceCleanupStateRetryWait) {
+		t.Fatalf("cleanup state = %q, want retry_wait", cleanupState)
+	}
+}
+
+func TestService_DeleteTaskDefersResourceCleanupOnPartialStopFailure(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErrByID = map[string]error{
+		"exec-failed": errors.New("runtime still shutting down"),
+	}
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+	cleanup := &recordingWorktreeCleanup{
+		worktrees: []*worktree.Worktree{
+			{ID: "wt-failed", TaskID: "task-123", SessionID: "session-failed"},
+			{ID: "wt-ok", TaskID: "task-123", SessionID: "session-ok"},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	for _, sessionID := range []string{"session-failed", "session-ok"} {
+		_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+			ID:     sessionID,
+			TaskID: "task-123",
+			State:  models.TaskSessionStateCompleted,
+		})
+		sessionDir := filepath.Join(quickChatDir, sessionID)
+		if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+			t.Fatalf("mkdir session dir: %v", err)
+		}
+	}
+	for _, row := range []*models.ExecutorRunning{
+		{
+			ID:               "session-failed",
+			SessionID:        "session-failed",
+			TaskID:           "task-123",
+			ExecutorID:       "executor-1",
+			Runtime:          agentruntime.RuntimeStandalone,
+			Status:           models.ExecutorRunningStatusStarting,
+			AgentExecutionID: "exec-failed",
+		},
+		{
+			ID:               "session-ok",
+			SessionID:        "session-ok",
+			TaskID:           "task-123",
+			ExecutorID:       "executor-1",
+			Runtime:          agentruntime.RuntimeStandalone,
+			Status:           models.ExecutorRunningStatusStarting,
+			AgentExecutionID: "exec-ok",
+		},
+	} {
+		if err := repo.UpsertExecutorRunning(ctx, row); err != nil {
+			t.Fatalf("seed executor running: %v", err)
+		}
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	calls := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		calls[stopper.waitForStopExecution(t).executionID] = true
+	}
+	if !calls["exec-failed"] || !calls["exec-ok"] {
+		t.Fatalf("unexpected StopExecution calls: %#v", calls)
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := os.Stat(filepath.Join(quickChatDir, "session-ok")); err != nil {
+		t.Fatalf("successful session quick-chat directory should remain until retry, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(quickChatDir, "session-failed")); err != nil {
+		t.Fatalf("failed session quick-chat directory should remain: %v", err)
+	}
+	cleanedIDs := cleanup.cleanedIDs()
+	if len(cleanedIDs) != 0 {
+		t.Fatalf("worktrees should remain until source capture can retry, got %#v", cleanedIDs)
+	}
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-failed"); err != nil {
+		t.Fatalf("failed session executor row should remain retryable: %v", err)
+	}
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-ok"); err != nil {
+		t.Fatalf("successful session executor row should remain retryable until cleanup completes: %v", err)
+	}
+}
+
+func TestService_QuickChatExpirationDeletesExpiredCandidates(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-expire", Name: "Expire"}); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	expiredTaskID := "quick-expired"
+	recentTaskID := "quick-recent"
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+	createQuickChatExpirationServiceFixture(t, repo, ctx, expiredTaskID, now.Add(-8*24*time.Hour))
+	createQuickChatExpirationServiceFixture(t, repo, ctx, recentTaskID, now.Add(-time.Hour))
+	expiredSessionDir := filepath.Join(quickChatDir, expiredTaskID+"-session")
+	if err := os.MkdirAll(expiredSessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir expired session dir: %v", err)
+	}
+
+	svc.runQuickChatExpiration(ctx, now)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetTask(ctx, expiredTaskID); err == nil {
+		t.Fatal("expired quick chat should be deleted")
+	}
+	if _, err := repo.GetTask(ctx, recentTaskID); err != nil {
+		t.Fatalf("recent quick chat should remain: %v", err)
+	}
+	if _, err := os.Stat(expiredSessionDir); !os.IsNotExist(err) {
+		t.Fatalf("expired quick-chat directory should be removed, got %v", err)
+	}
+	if !eventBusHasType(eventBus, "task.deleted") {
+		t.Fatalf("expected task.deleted event, got %#v", eventBus.GetPublishedEvents())
+	}
+}
+
+func TestService_QuickChatExpirationLoopRunsOnStartup(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-expire", Name: "Expire"}); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	taskID := "quick-expired-startup"
+	createQuickChatExpirationServiceFixture(t, repo, ctx, taskID, time.Now().UTC().Add(-8*24*time.Hour))
+
+	svc.StartQuickChatExpirationLoop(ctx)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetTask(context.Background(), taskID); err == nil {
+		t.Fatal("expired quick chat should be deleted by startup sweep")
+	}
+}
+
+func TestService_DeleteExpiredQuickChatTaskIgnoresMissingTask(t *testing.T) {
+	svc, _, _ := createTestService(t)
+
+	deleted, err := svc.deleteExpiredQuickChatTask(context.Background(), "missing", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("deleteExpiredQuickChatTask missing task: %v", err)
+	}
+	if deleted {
+		t.Fatal("missing task should not be reported as deleted")
+	}
+}
+
+func createQuickChatExpirationServiceFixture(
+	t *testing.T,
+	repo *sqliterepo.Repository,
+	ctx context.Context,
+	taskID string,
+	updatedAt time.Time,
+) {
+	t.Helper()
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:          taskID,
+		WorkspaceID: "ws-expire",
+		Title:       taskID,
+		State:       v1.TaskStateTODO,
+		Priority:    "medium",
+		IsEphemeral: true,
+		CreatedAt:   updatedAt.Add(-time.Hour),
+		UpdatedAt:   updatedAt,
+	}); err != nil {
+		t.Fatalf("CreateTask(%s): %v", taskID, err)
+	}
+	if _, err := repo.DB().ExecContext(ctx,
+		`UPDATE tasks SET created_at = ?, updated_at = ? WHERE id = ?`,
+		updatedAt.Add(-time.Hour), updatedAt, taskID,
+	); err != nil {
+		t.Fatalf("backdate task(%s): %v", taskID, err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:        taskID + "-session",
+		TaskID:    taskID,
+		State:     models.TaskSessionStateCompleted,
+		StartedAt: updatedAt.Add(-time.Hour),
+		UpdatedAt: updatedAt,
+		IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession(%s): %v", taskID, err)
+	}
+}
+
+func TestService_DeleteTaskCleansMissingSessionExecutorRowAfterStop(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-missing",
+		SessionID:        "session-missing",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-missing",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-missing" {
+		t.Fatalf("StopExecution executionID = %q, want exec-missing", call.executionID)
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-missing"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("missing-session executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+func TestService_ArchiveTaskStopsExecutorRunningForTerminalSession(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.ArchiveTask(ctx, "task-123"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-terminal" {
+		t.Fatalf("StopExecution executionID = %q, want exec-terminal", call.executionID)
+	}
+	if call.reason != "task archived" {
+		t.Fatalf("StopExecution reason = %q, want task archived", call.reason)
+	}
+	if !call.force {
+		t.Fatal("StopExecution force = false, want true")
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+// TestService_ArchiveTaskPublishesSessionStateChangedForActiveSessions is the
+// regression test for the stuck-spinner bug: archiving a task with an active
+// session cancels that session in the DB (verified elsewhere), but any client
+// cache kept fresh exclusively by session.state_changed — e.g. an Office task
+// list's "is running" indicator — never learns about it unless ArchiveTask
+// also publishes the event. Without the fix, the archived task's session
+// would sit at RUNNING in every client cache forever.
+func TestService_ArchiveTaskPublishesSessionStateChangedForActiveSessions(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "task-1", WorkspaceID: "ws-1", WorkflowID: "wf-1", WorkflowStepID: "step-1",
+		Title: "Test", Priority: "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-running", TaskID: "task-1", State: models.TaskSessionStateRunning,
+		AgentProfileID: "agent-1", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession: %v", err)
+	}
+
+	clarifications := &recordingTaskClarificationCanceller{}
+	svc.SetClarificationCanceller(clarifications)
+	if err := svc.ArchiveTask(ctx, "task-1"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+
+	var found *bus.Event
+	for _, evt := range eventBus.GetPublishedEvents() {
+		if evt.Type != events.TaskSessionStateChanged {
+			continue
+		}
+		data, ok := evt.Data.(map[string]interface{})
+		if !ok || data["session_id"] != "session-running" {
+			continue
+		}
+		found = evt
+	}
+	if found == nil {
+		t.Fatal("expected a session.state_changed event for session-running, got none")
+	}
+	data := found.Data.(map[string]interface{})
+	if got := data["old_state"]; got != string(models.TaskSessionStateRunning) {
+		t.Errorf("old_state = %v, want RUNNING", got)
+	}
+	if got := data["new_state"]; got != string(models.TaskSessionStateCancelled) {
+		t.Errorf("new_state = %v, want CANCELLED", got)
+	}
+	if got := data["task_id"]; got != "task-1" {
+		t.Errorf("task_id = %v, want task-1", got)
+	}
+	if got := data["agent_profile_id"]; got != "agent-1" {
+		t.Errorf("agent_profile_id = %v, want agent-1", got)
+	}
+	updatedAtStr, _ := data["updated_at"].(string)
+	if _, err := time.Parse(time.RFC3339Nano, updatedAtStr); err != nil {
+		t.Errorf("updated_at %q not parseable as RFC3339Nano: %v", updatedAtStr, err)
+	}
+
+	session, err := repo.GetTaskSession(ctx, "session-running")
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.State != models.TaskSessionStateCancelled {
+		t.Errorf("session state = %q, want CANCELLED", session.State)
+	}
+	if len(clarifications.sessions) != 1 || clarifications.sessions[0] != "session-running" {
+		t.Fatalf("expired clarification sessions = %v, want [session-running]", clarifications.sessions)
+	}
+	if len(clarifications.hasDeadline) != 1 || !clarifications.hasDeadline[0] {
+		t.Fatalf("clarification expiry deadlines = %v, want one bounded context", clarifications.hasDeadline)
+	}
+	if len(clarifications.contextErrs) != 1 || clarifications.contextErrs[0] != nil {
+		t.Fatalf("clarification expiry context errors = %v, want active context", clarifications.contextErrs)
+	}
+}
+
+// TestService_ArchiveTaskClearsParkedProjectionForCancelledSessions is the
+// regression test for the archive-side parked-projection leak: ArchiveTask
+// cancels active sessions through a bulk repository update that never passes
+// through the orchestrator's per-session state-transition chokepoint, so
+// nothing stopped that session's parked sampling loop or cleared its
+// tracking. Without a wired ParkedProjectionCanceller, an archived task whose
+// session was parked would keep publishing parked_on_background_work forever.
+func TestService_ArchiveTaskClearsParkedProjectionForCancelledSessions(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "task-1", WorkspaceID: "ws-1", WorkflowID: "wf-1", WorkflowStepID: "step-1",
+		Title: "Test", Priority: "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-parked", TaskID: "task-1", State: models.TaskSessionStateWaitingForInput,
+		AgentProfileID: "agent-1", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession: %v", err)
+	}
+
+	parked := &recordingParkedProjectionCanceller{}
+	svc.SetParkedProjectionCanceller(parked)
+	if err := svc.ArchiveTask(ctx, "task-1"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+
+	if len(parked.calls) != 1 {
+		t.Fatalf("parked projection cancel calls = %v, want exactly one", parked.calls)
+	}
+	call := parked.calls[0]
+	if call.taskID != "task-1" || call.sessionID != "session-parked" {
+		t.Errorf("call = %+v, want task-1/session-parked", call)
+	}
+	if call.newState != models.TaskSessionStateCancelled {
+		t.Errorf("newState = %q, want CANCELLED", call.newState)
+	}
+	if !call.hasDeadline {
+		t.Error("expected a bounded context for the parked-projection cancel call")
+	}
+}
+
+// TestService_PublishSessionsCancelledCoversSessionsMissingFromSnapshot is a
+// defensive-coverage test: CancelActiveTaskSessionsByTaskID re-evaluates
+// active sessions atomically and returns full session rows directly, so a
+// returned session can have no matching entry in a caller-supplied snapshot
+// taken moments earlier. publishSessionsCancelled must build the event
+// entirely from that returned row — old_state is the only field allowed to
+// fall back to an empty best-effort hint when snapshot has nothing for the
+// session's ID; every other field, including agent_profile_id, must come
+// from the row cancelledSessions already carries, not be silently dropped
+// or fabricated.
+func TestService_PublishSessionsCancelledCoversSessionsMissingFromSnapshot(t *testing.T) {
+	svc, eventBus, _ := createTestService(t)
+	ctx := context.Background()
+
+	// The exact shape of the race: CancelActiveTaskSessionsByTaskID returned
+	// this session's row, but the caller's pre-cancel snapshot is empty.
+	cancelledSession := &models.TaskSession{
+		ID:             "session-not-in-snapshot",
+		TaskID:         "task-race",
+		State:          models.TaskSessionStateCancelled,
+		AgentProfileID: "agent-1",
+		UpdatedAt:      time.Now().UTC(),
+	}
+
+	svc.publishSessionsCancelled(ctx, "task-race", nil, []*models.TaskSession{cancelledSession}, "task archived")
+
+	var found *bus.Event
+	for _, evt := range eventBus.GetPublishedEvents() {
+		if evt.Type != events.TaskSessionStateChanged {
+			continue
+		}
+		data, ok := evt.Data.(map[string]interface{})
+		if ok && data["session_id"] == "session-not-in-snapshot" {
+			found = evt
+		}
+	}
+	if found == nil {
+		t.Fatal("expected a session.state_changed event for the snapshot-missing session, got none")
+	}
+	data := found.Data.(map[string]interface{})
+	if got := data["new_state"]; got != string(models.TaskSessionStateCancelled) {
+		t.Errorf("new_state = %v, want CANCELLED", got)
+	}
+	if got := data["old_state"]; got != "" {
+		t.Errorf("old_state = %v, want empty (no snapshot hint available)", got)
+	}
+	if got := data["agent_profile_id"]; got != "agent-1" {
+		t.Errorf("agent_profile_id = %v, want agent-1 (must come from the returned row, not the snapshot)", got)
+	}
+}
+
+// cancelHookSessionRepository wraps the real session repository so a test
+// can deterministically simulate a client disconnecting the instant after
+// CancelActiveTaskSessionsByTaskID's DB write commits — the exact race
+// finalizeCancelledSessions guards against by publishing on a
+// context.WithoutCancel derivative. Test-only: production code has no
+// equivalent hook.
+type cancelHookSessionRepository struct {
+	*sqliterepo.Repository
+	afterCancelSessions func()
+}
+
+func (r *cancelHookSessionRepository) CancelActiveTaskSessionsByTaskID(
+	ctx context.Context, taskID, reason string,
+) ([]*models.TaskSession, error) {
+	cancelledSessions, err := r.Repository.CancelActiveTaskSessionsByTaskID(ctx, taskID, reason)
+	if r.afterCancelSessions != nil {
+		r.afterCancelSessions()
+	}
+	return cancelledSessions, err
+}
+
+// TestService_ArchiveTaskPublishesEventAfterClientDisconnect is the
+// regression test for the client-disconnect race: finalizeCancelledSessions
+// commits the session-cancellation DB write on the caller's ctx, then
+// publishes session.state_changed on a context.WithoutCancel derivative
+// specifically so that a client disconnecting (cancelling ctx) in the instant
+// right after that DB write still gets the event. A
+// cancelHookSessionRepository simulates that race deterministically by
+// cancelling ctx from inside CancelActiveTaskSessionsByTaskID, right after
+// the real DB write returns.
+func TestService_ArchiveTaskPublishesEventAfterClientDisconnect(t *testing.T) {
+	hook := &cancelHookSessionRepository{}
+	svc, eventBus, repo := createTestServiceWithSessionsRepo(t, func(repo *sqliterepo.Repository) repository.SessionRepository {
+		hook.Repository = repo
+		return hook
+	})
+
+	setupCtx := context.Background()
+	if err := repo.CreateWorkspace(setupCtx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(setupCtx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if err := repo.CreateTask(setupCtx, &models.Task{
+		ID: "task-1", WorkspaceID: "ws-1", WorkflowID: "wf-1", WorkflowStepID: "step-1",
+		Title: "Test", Priority: "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskSession(setupCtx, &models.TaskSession{
+		ID: "session-running", TaskID: "task-1", State: models.TaskSessionStateRunning,
+		AgentProfileID: "agent-1", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	hook.afterCancelSessions = cancel
+
+	if err := svc.ArchiveTask(ctx, "task-1"); err != nil {
+		t.Fatalf("ArchiveTask returned an error even though ctx was only cancelled after the sessions DB write committed: %v", err)
+	}
+
+	var found *bus.Event
+	for _, evt := range eventBus.GetPublishedEvents() {
+		if evt.Type != events.TaskSessionStateChanged {
+			continue
+		}
+		data, ok := evt.Data.(map[string]interface{})
+		if ok && data["session_id"] == "session-running" {
+			found = evt
+		}
+	}
+	if found == nil {
+		t.Fatal("expected a session.state_changed event for session-running despite the post-commit ctx cancellation, got none")
+	}
+	data := found.Data.(map[string]interface{})
+	if got := data["session_id"]; got != "session-running" {
+		t.Errorf("session_id = %v, want session-running", got)
+	}
+	if got := data["new_state"]; got != string(models.TaskSessionStateCancelled) {
+		t.Errorf("new_state = %v, want CANCELLED", got)
+	}
+	updatedAtStr, _ := data["updated_at"].(string)
+	if _, err := time.Parse(time.RFC3339Nano, updatedAtStr); err != nil {
+		t.Errorf("updated_at %q not parseable as RFC3339Nano: %v", updatedAtStr, err)
+	}
+
+	session, err := repo.GetTaskSession(context.Background(), "session-running")
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.State != models.TaskSessionStateCancelled {
+		t.Errorf("session state = %q, want CANCELLED", session.State)
+	}
+}
+
+// flakyCancelSessionRepository wraps the real session repository so a test
+// can deterministically simulate CancelActiveTaskSessionsByTaskID failing
+// with a transient error (e.g. the kind of writer-contention timeout the
+// repository's own internal 10s bound produces) on its first N-1 calls and
+// succeeding on the Nth. Test-only: production code has no equivalent hook.
+type flakyCancelSessionRepository struct {
+	*sqliterepo.Repository
+	mu           sync.Mutex
+	failuresLeft int
+	calls        int
+}
+
+func (r *flakyCancelSessionRepository) CancelActiveTaskSessionsByTaskID(
+	ctx context.Context, taskID, reason string,
+) ([]*models.TaskSession, error) {
+	r.mu.Lock()
+	r.calls++
+	if r.failuresLeft > 0 {
+		r.failuresLeft--
+		r.mu.Unlock()
+		return nil, errors.New("simulated transient sqlite writer contention timeout")
+	}
+	r.mu.Unlock()
+	return r.Repository.CancelActiveTaskSessionsByTaskID(ctx, taskID, reason)
+}
+
+func (r *flakyCancelSessionRepository) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// TestService_ArchiveTaskRetriesTransientSessionCancellationFailure is the
+// regression test for the retry loop in finalizeCancelledSessions:
+// CancelActiveTaskSessionsByTaskID is bounded by its own internal timeout,
+// so a lone attempt failing (e.g. to writer contention) used to be swallowed
+// immediately, leaving the archived task's sessions stuck active with no
+// cancellation event ever published. Failing the first two calls and
+// succeeding on the third proves the retry loop keeps trying within its
+// bounded attempt budget and still delivers the session.state_changed event
+// once the underlying write finally succeeds.
+func TestService_ArchiveTaskRetriesTransientSessionCancellationFailure(t *testing.T) {
+	flaky := &flakyCancelSessionRepository{failuresLeft: 2}
+	svc, eventBus, repo := createTestServiceWithSessionsRepo(t, func(repo *sqliterepo.Repository) repository.SessionRepository {
+		flaky.Repository = repo
+		return flaky
+	})
+
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "task-flaky", WorkspaceID: "ws-1", WorkflowID: "wf-1", WorkflowStepID: "step-1",
+		Title: "Test", Priority: "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-flaky", TaskID: "task-flaky", State: models.TaskSessionStateRunning,
+		AgentProfileID: "agent-1", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession: %v", err)
+	}
+
+	if err := svc.ArchiveTask(ctx, "task-flaky"); err != nil {
+		t.Fatalf("ArchiveTask returned an error even though the retry loop should have recovered: %v", err)
+	}
+
+	if got, want := flaky.callCount(), 3; got != want {
+		t.Fatalf("CancelActiveTaskSessionsByTaskID call count = %d, want %d (2 failures + 1 success)", got, want)
+	}
+
+	var found *bus.Event
+	for _, evt := range eventBus.GetPublishedEvents() {
+		if evt.Type != events.TaskSessionStateChanged {
+			continue
+		}
+		data, ok := evt.Data.(map[string]interface{})
+		if ok && data["session_id"] == "session-flaky" {
+			found = evt
+		}
+	}
+	if found == nil {
+		t.Fatal("expected a session.state_changed event for session-flaky after the retry loop recovered, got none")
+	}
+	data := found.Data.(map[string]interface{})
+	if got := data["new_state"]; got != string(models.TaskSessionStateCancelled) {
+		t.Errorf("new_state = %v, want CANCELLED", got)
+	}
+
+	session, err := repo.GetTaskSession(context.Background(), "session-flaky")
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.State != models.TaskSessionStateCancelled {
+		t.Errorf("session state = %q, want CANCELLED", session.State)
+	}
+}
+
+func TestFinalizeCancelledSessionsStopsRetryAtDeadline(t *testing.T) {
+	flaky := &flakyCancelSessionRepository{failuresLeft: 3}
+	svc, _, _ := createTestServiceWithSessionsRepo(t, func(repo *sqliterepo.Repository) repository.SessionRepository {
+		flaky.Repository = repo
+		return flaky
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	svc.finalizeCancelledSessions(ctx, "task-deadline", nil, time.Now().Add(20*time.Millisecond), models.SessionArchiveCancelReason)
+
+	if got := flaky.callCount(); got != 1 {
+		t.Fatalf("CancelActiveTaskSessionsByTaskID call count = %d, want 1 after deadline", got)
+	}
+}
+
+// TestService_ArchiveTaskPublishesEventsForAllCancelledSessions is the
+// regression test for the shared-deadline bug: publishSessionsCancelled used
+// to run its per-session Publish call under one deadline shared across the
+// whole cancelledSessions batch, so a slow synchronous subscriber for one
+// session could starve the event for every session queued after it.
+// Archiving a task with two active sessions and asserting both get their own
+// session.state_changed event proves the fix (each session now gets an
+// independent 10s timeout) without relying on a real timing race.
+func TestService_ArchiveTaskPublishesEventsForAllCancelledSessions(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow"}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID: "task-multi", WorkspaceID: "ws-1", WorkflowID: "wf-1", WorkflowStepID: "step-1",
+		Title: "Test", Priority: "medium",
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-running-a", TaskID: "task-multi", State: models.TaskSessionStateRunning,
+		AgentProfileID: "agent-1", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession(session-running-a): %v", err)
+	}
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-running-b", TaskID: "task-multi", State: models.TaskSessionStateWaitingForInput,
+		AgentProfileID: "agent-2",
+	}); err != nil {
+		t.Fatalf("CreateTaskSession(session-running-b): %v", err)
+	}
+
+	if err := svc.ArchiveTask(ctx, "task-multi"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+
+	foundBySessionID := make(map[string]*bus.Event)
+	for _, evt := range eventBus.GetPublishedEvents() {
+		if evt.Type != events.TaskSessionStateChanged {
+			continue
+		}
+		data, ok := evt.Data.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		sessionID, _ := data["session_id"].(string)
+		if sessionID == "session-running-a" || sessionID == "session-running-b" {
+			foundBySessionID[sessionID] = evt
+		}
+	}
+	for _, sessionID := range []string{"session-running-a", "session-running-b"} {
+		evt, ok := foundBySessionID[sessionID]
+		if !ok {
+			t.Fatalf("expected a session.state_changed event for %s, got none (events: %#v)", sessionID, eventBus.GetPublishedEvents())
+		}
+		data := evt.Data.(map[string]interface{})
+		if got := data["new_state"]; got != string(models.TaskSessionStateCancelled) {
+			t.Errorf("%s: new_state = %v, want CANCELLED", sessionID, got)
+		}
+		if got := data["task_id"]; got != "task-multi" {
+			t.Errorf("%s: task_id = %v, want task-multi", sessionID, got)
+		}
+	}
+
+	for _, sessionID := range []string{"session-running-a", "session-running-b"} {
+		session, err := repo.GetTaskSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("GetTaskSession(%s): %v", sessionID, err)
+		}
+		if session.State != models.TaskSessionStateCancelled {
+			t.Errorf("%s: session state = %q, want CANCELLED", sessionID, session.State)
+		}
+	}
+}
+
+func TestService_ArchiveTaskClaimsExactExecutionBeforeCancellingSession(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	stateAtClaim := make(chan models.TaskSessionState, 1)
+	stopper.claimExecutionFunc = func(sessionID, executionID string, force bool) bool {
+		if sessionID != "session-running" || executionID != "exec-running" || !force {
+			t.Fatalf("teardown claim = (%q, %q, %v)", sessionID, executionID, force)
+		}
+		session, err := repo.GetTaskSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("load session at teardown claim: %v", err)
+		}
+		stateAtClaim <- session.State
+		return true
+	}
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "session-running", TaskID: "task-123", State: models.TaskSessionStateRunning,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-running",
+		SessionID:        "session-running",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-running",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.ArchiveTask(ctx, "task-123"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+	select {
+	case state := <-stateAtClaim:
+		if state != models.TaskSessionStateRunning {
+			t.Fatalf("session state at teardown claim = %q, want RUNNING", state)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("archive did not claim its exact execution")
+	}
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-running" || !call.force {
+		t.Fatalf("StopExecution call = %#v", call)
+	}
+	waitForCleanupDone(t, svc)
+}
+
+func TestService_DeleteTaskFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+
+	err := svc.DeleteTask(ctx, "task-123")
+	if !errors.Is(err, inventoryErr) {
+		t.Fatalf("DeleteTask error = %v, want inventory error", err)
+	}
+	if _, err := repo.GetTask(ctx, "task-123"); err != nil {
+		t.Fatalf("task should remain when runtime inventory fails: %v", err)
+	}
+}
+
+func TestService_ArchiveTaskFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+
+	err := svc.ArchiveTask(ctx, "task-123")
+	if !errors.Is(err, inventoryErr) {
+		t.Fatalf("ArchiveTask error = %v, want inventory error", err)
+	}
+	task, err := repo.GetTask(ctx, "task-123")
+	if err != nil {
+		t.Fatalf("task should remain when runtime inventory fails: %v", err)
+	}
+	if task.ArchivedAt != nil {
+		t.Fatal("task should not be archived when runtime inventory fails")
+	}
+}
+
+func TestService_ArchiveTaskPersistsCleanupIntentBeforeMutation(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-cleanup", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-cleanup", WorkspaceID: "ws-cleanup", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{
+		ID: "task-cleanup", WorkspaceID: "ws-cleanup", WorkflowID: "wf-cleanup",
+		WorkflowStepID: "step-cleanup", Title: "Cleanup", Priority: "medium",
+	})
+
+	if err := svc.ArchiveTask(ctx, "task-cleanup"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+	var count int
+	if err := repo.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task_resource_cleanup_jobs
+		WHERE task_id = ? AND trigger = 'archive'
+	`, "task-cleanup").Scan(&count); err != nil {
+		t.Fatalf("count cleanup jobs: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("archive cleanup jobs = %d, want 1", count)
+	}
+}
+
+func TestService_CleanupTaskResourcesFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+	cleanup := &recordingWorktreeCleanup{
+		worktrees: []*worktree.Worktree{
+			{ID: "wt-1", TaskID: "task-123", SessionID: "session-completed"},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+	sessionDir := filepath.Join(quickChatDir, "session-completed")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	svc.CleanupTaskResources(ctx, "task-123", true)
+
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); err != nil {
+		t.Fatalf("executor row should remain when runtime inventory fails: %v", err)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("quick-chat directory should remain when runtime inventory fails: %v", err)
+	}
+	if cleanedIDs := cleanup.cleanedIDs(); len(cleanedIDs) != 0 {
+		t.Fatalf("worktrees should not be cleaned when runtime inventory fails, got %#v", cleanedIDs)
+	}
+}
+
+func TestService_ListTasks(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	svc.workspaceFolders = repo
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-1", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Task 1", Priority: "medium"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-2", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Task 2", Priority: "medium"})
+	_ = repo.CreateWorkspaceSourceBatch(ctx, &models.WorkspaceSourceBatch{TaskID: "task-1", Sources: []models.WorkspaceSource{{Folder: &models.TaskWorkspaceFolder{LocalPath: "/canonical/docs", DisplayName: "docs"}}}})
+
+	tasks, err := svc.ListTasks(ctx, "wf-123")
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(tasks))
+	}
+	if len(tasks[0].WorkspaceFolders) != 1 || tasks[0].WorkspaceFolders[0].DisplayName != "docs" {
+		t.Fatalf("list workspace folders = %#v, want hydrated docs folder", tasks[0].WorkspaceFolders)
+	}
+}
+
+type stopExecutionCall struct {
+	executionID string
+	reason      string
+	force       bool
+}
+
+type recordingTaskExecutionStopper struct {
+	stopExecutionCh      chan stopExecutionCall
+	stopExecutionErr     error
+	stopExecutionErrByID map[string]error
+	stopSessionErr       error
+	claimExecutionFunc   func(sessionID, executionID string, force bool) bool
+}
+
+// Durable cleanup runs on a worker and can be delayed by race-instrumented
+// SQLite setup under CI load. Keep asynchronous cleanup assertions bounded
+// without coupling them to a sub-second scheduler window.
+const asyncTaskCleanupTestTimeout = 5 * time.Second
+
+func newRecordingTaskExecutionStopper() *recordingTaskExecutionStopper {
+	return &recordingTaskExecutionStopper{stopExecutionCh: make(chan stopExecutionCall, 8)}
+}
+
+func (s *recordingTaskExecutionStopper) StopTask(context.Context, string, string, bool) error {
+	return nil
+}
+
+func (s *recordingTaskExecutionStopper) StopSession(context.Context, string, string, bool) error {
+	return s.stopSessionErr
+}
+
+func (s *recordingTaskExecutionStopper) StopExecution(_ context.Context, executionID, reason string, force bool) error {
+	s.stopExecutionCh <- stopExecutionCall{executionID: executionID, reason: reason, force: force}
+	if s.stopExecutionErrByID != nil {
+		if err := s.stopExecutionErrByID[executionID]; err != nil {
+			return err
+		}
+	}
+	return s.stopExecutionErr
+}
+
+func (s *recordingTaskExecutionStopper) RegisterExecutionStopOwner(sessionID, executionID string, force bool) {
+	if s.claimExecutionFunc == nil {
+		return
+	}
+	s.claimExecutionFunc(sessionID, executionID, force)
+}
+
+func (s *recordingTaskExecutionStopper) waitForStopExecution(t *testing.T) stopExecutionCall {
+	t.Helper()
+	select {
+	case call := <-s.stopExecutionCh:
+		return call
+	case <-time.After(asyncTaskCleanupTestTimeout):
+		t.Fatal("timed out waiting for StopExecution")
+		return stopExecutionCall{}
+	}
+}
+
+type failingExecutorRepository struct {
+	repository.ExecutorRepository
+	listByTaskErr error
+}
+
+func (r failingExecutorRepository) ListExecutorsRunningByTaskID(context.Context, string) ([]*models.ExecutorRunning, error) {
+	return nil, r.listByTaskErr
+}
+
+type recordingWorktreeCleanup struct {
+	mu                sync.Mutex
+	worktrees         []*worktree.Worktree
+	worktreesByTaskID map[string][]*worktree.Worktree
+	cleaned           []*worktree.Worktree
+	referenceCounts   map[string]int
+	released          []*worktree.Worktree
+	excludedSessions  []string
+}
+
+func (c *recordingWorktreeCleanup) OnTaskDeleted(context.Context, string) error {
+	return nil
+}
+
+func (c *recordingWorktreeCleanup) GetAllByTaskID(_ context.Context, taskID string) ([]*worktree.Worktree, error) {
+	if c.worktreesByTaskID != nil {
+		return c.worktreesByTaskID[taskID], nil
+	}
+	return c.worktrees, nil
+}
+
+func (c *recordingWorktreeCleanup) CaptureArchiveSourceManifests(
+	_ context.Context, worktrees []*worktree.Worktree,
+) (map[string]worktree.ArchiveSourceManifest, error) {
+	manifests := make(map[string]worktree.ArchiveSourceManifest, len(worktrees))
+	for _, wt := range worktrees {
+		if wt == nil {
+			continue
+		}
+		manifests[wt.ID] = worktree.ArchiveSourceManifest{
+			TaskID: wt.TaskID, TaskEnvironmentID: wt.TaskEnvironmentID,
+			WorktreeID: wt.ID, RepositoryID: wt.RepositoryID,
+			HeadOID: "test-head", IndexStateSHA256: "test-index", PathPresent: true,
+		}
+	}
+	return manifests, nil
+}
+
+func (c *recordingWorktreeCleanup) CleanupWorktrees(_ context.Context, worktrees []*worktree.Worktree) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleaned = append(c.cleaned, worktrees...)
+	return nil
+}
+
+func (c *recordingWorktreeCleanup) CountActiveWorktreeReferences(_ context.Context, worktreeID string, excludeSessionIDs []string) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.excludedSessions = append([]string(nil), excludeSessionIDs...)
+	return c.referenceCounts[worktreeID], nil
+}
+
+func (c *recordingWorktreeCleanup) ReleaseWorktreeReference(_ context.Context, wt *worktree.Worktree) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.released = append(c.released, wt)
+	return nil
+}
+
+func (c *recordingWorktreeCleanup) cleanedIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids := make([]string, 0, len(c.cleaned))
+	for _, wt := range c.cleaned {
+		if wt != nil {
+			ids = append(ids, wt.ID)
+		}
+	}
+	return ids
+}
+
+func (c *recordingWorktreeCleanup) releasedIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids := make([]string, 0, len(c.released))
+	for _, wt := range c.released {
+		if wt != nil {
+			ids = append(ids, wt.ID)
+		}
+	}
+	return ids
+}
+
+func TestService_CleanupDestructiveTaskResourcesPreservesSharedWorktree(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	cleanup := &recordingWorktreeCleanup{
+		referenceCounts: map[string]int{"worktree-shared": 1},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+
+	session := &models.TaskSession{ID: "session-owner", TaskID: "task-owner"}
+	wt := &worktree.Worktree{
+		ID:        "worktree-shared",
+		TaskID:    session.TaskID,
+		SessionID: session.ID,
+	}
+	errs := svc.cleanupDestructiveTaskResources(
+		context.Background(), session.TaskID, []*models.TaskSession{session},
+		[]*worktree.Worktree{wt}, taskEnvironmentCleanup{}, nil,
+	)
+
+	if len(errs) != 0 {
+		t.Fatalf("cleanup errors = %v, want none", errs)
+	}
+	if got := cleanup.cleanedIDs(); len(got) != 0 {
+		t.Fatalf("physically cleaned worktrees = %v, want none", got)
+	}
+	// The single environment-repository row is shared; nothing is released.
+	if got := cleanup.releasedIDs(); len(got) != 0 {
+		t.Fatalf("released worktrees = %v, want none (shared row is preserved)", got)
+	}
+	if got := cleanup.excludedSessions; len(got) != 1 || got[0] != session.ID {
+		t.Fatalf("excluded sessions = %v, want [%s]", got, session.ID)
+	}
+}
+
+func waitForCleanupDone(t *testing.T, svc *Service) {
+	t.Helper()
+	select {
+	case <-svc.cleanupDoneForTest:
+	case <-time.After(asyncTaskCleanupTestTimeout):
+		t.Fatal("timed out waiting for async task cleanup")
+	}
+}
+
+func TestService_UpdateTaskState(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	task := &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", State: v1.TaskStateTODO, Priority: "medium"}
+	_ = repo.CreateTask(ctx, task)
+	eventBus.ClearEvents()
+
+	updated, err := svc.UpdateTaskState(ctx, "task-123", v1.TaskStateInProgress)
+	if err != nil {
+		t.Fatalf("failed to update task state: %v", err)
+	}
+	if updated.State != v1.TaskStateInProgress {
+		t.Errorf("expected state IN_PROGRESS, got %s", updated.State)
+	}
+
+	// Check event was published
+	events := eventBus.GetPublishedEvents()
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != "task.state_changed" {
+		t.Errorf("expected event type 'task.state_changed', got %s", events[0].Type)
+	}
+}
+
+func TestService_MoveTask(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+
+	task := &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-todo", Title: "Test", State: v1.TaskStateTODO, Priority: "medium"}
+	_ = repo.CreateTask(ctx, task)
+	eventBus.ClearEvents()
+
+	moved, err := svc.MoveTask(ctx, "task-123", "wf-123", "step-done", 0)
+	if err != nil {
+		t.Fatalf("failed to move task: %v", err)
+	}
+	if moved.Task.WorkflowStepID != "step-done" {
+		t.Errorf("expected workflow step 'step-done', got %s", moved.Task.WorkflowStepID)
+	}
+}
+
+// Workflow tests
+
+func TestService_CreateWorkflow(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	req := &CreateWorkflowRequest{
+		WorkspaceID: "ws-1",
+		Name:        "Test Workflow",
+		Description: "A test workflow",
+	}
+
+	workflow, err := svc.CreateWorkflow(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create workflow: %v", err)
+	}
+	if workflow.ID == "" {
+		t.Error("expected workflow ID to be set")
+	}
+	if workflow.Name != "Test Workflow" {
+		t.Errorf("expected name 'Test Workflow', got %s", workflow.Name)
+	}
+}
+
+func TestService_GetWorkflow(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	workflow := &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Test Workflow"}
+	_ = repo.CreateWorkflow(ctx, workflow)
+
+	retrieved, err := svc.GetWorkflow(ctx, "wf-123")
+	if err != nil {
+		t.Fatalf("failed to get workflow: %v", err)
+	}
+	if retrieved.Name != "Test Workflow" {
+		t.Errorf("expected name 'Test Workflow', got %s", retrieved.Name)
+	}
+}
+
+func TestService_UpdateWorkflow(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	workflow := &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Original"}
+	_ = repo.CreateWorkflow(ctx, workflow)
+
+	newName := "Updated"
+	req := &UpdateWorkflowRequest{Name: &newName}
+
+	updated, err := svc.UpdateWorkflow(ctx, "wf-123", req)
+	if err != nil {
+		t.Fatalf("failed to update workflow: %v", err)
+	}
+	if updated.Name != "Updated" {
+		t.Errorf("expected name 'Updated', got %s", updated.Name)
+	}
+}
+
+func TestService_UpdateWorkflow_PublishesPromptOnWorkflowEvent(t *testing.T) {
+	// Cross-tab WS sync (use-workflow-settings.ts) relies on workflow.updated
+	// carrying the current prompt, the same way it already carries
+	// description and agent_profile_id.
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	workflow := &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Original"}
+	_ = repo.CreateWorkflow(ctx, workflow)
+
+	newPrompt := "Updated prompt"
+	req := &UpdateWorkflowRequest{Prompt: &newPrompt}
+
+	if _, err := svc.UpdateWorkflow(ctx, "wf-123", req); err != nil {
+		t.Fatalf("failed to update workflow: %v", err)
+	}
+
+	if len(eventBus.publishedEvents) == 0 {
+		t.Fatal("expected a workflow.updated event to be published")
+	}
+	last := eventBus.publishedEvents[len(eventBus.publishedEvents)-1]
+	data, ok := last.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected event data to be a map, got %T", last.Data)
+	}
+	if data["prompt"] != newPrompt {
+		t.Errorf("expected published prompt %q, got %v", newPrompt, data["prompt"])
+	}
+}
+func TestService_DeleteWorkflow(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	workflow := &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Test Workflow"}
+	_ = repo.CreateWorkflow(ctx, workflow)
+	automation := &models.Task{
+		ID: "automation-run-delete", WorkspaceID: "ws-1", WorkflowID: workflow.ID,
+		IsEphemeral: true, Origin: models.TaskOriginAutomationRun, Title: "Automation run",
+	}
+	if err := repo.CreateTask(ctx, automation); err != nil {
+		t.Fatalf("create automation task: %v", err)
+	}
+
+	err := svc.DeleteWorkflow(ctx, "wf-123")
+	if err != nil {
+		t.Fatalf("failed to delete workflow: %v", err)
+	}
+
+	_, err = svc.GetWorkflow(ctx, "wf-123")
+	if err == nil {
+		t.Error("expected workflow to be deleted")
+	}
+	archived, err := repo.GetTask(ctx, automation.ID)
+	if err != nil {
+		t.Fatalf("get automation task after workflow deletion: %v", err)
+	}
+	if archived.ArchivedAt == nil {
+		t.Fatal("automation-origin task was omitted from workflow deletion cascade")
+	}
+
+}
+
+func TestService_ListWorkflows(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Workflow 1"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-2", WorkspaceID: "ws-1", Name: "Workflow 2"})
+
+	workflows, err := svc.ListWorkflows(ctx, "ws-1", false)
+	if err != nil {
+		t.Fatalf("failed to list workflows: %v", err)
+	}
+	if len(workflows) != 2 {
+		t.Errorf("expected 2 workflows, got %d", len(workflows))
+	}
+}
+
+// Message tests
+
+func setupTestTask(t *testing.T, repo *sqliterepo.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test Task", Priority: "medium"})
+}
+
+func setupTestSession(t *testing.T, repo *sqliterepo.Repository) string {
+	t.Helper()
+	ctx := context.Background()
+	session := &models.TaskSession{
+		ID:             "session-123",
+		TaskID:         "task-123",
+		AgentProfileID: "profile-123",
+		State:          models.TaskSessionStateStarting,
+	}
+	_ = repo.CreateTaskSession(ctx, session)
+	return session.ID
+}
+
+func TestService_DismissLastAgentError(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	occurredAt := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	lastErr := models.LastAgentError{
+		Message:          "peer disconnected before response",
+		OccurredAt:       occurredAt,
+		AgentExecutionID: "exec-1",
+	}
+	if err := repo.SetSessionMetadataKey(ctx, sessionID, models.SessionMetaKeyLastAgentError, lastErr); err != nil {
+		t.Fatalf("seed last agent error: %v", err)
+	}
+
+	session, err := svc.DismissLastAgentError(ctx, sessionID, lastErr.Stamp())
+	if err != nil {
+		t.Fatalf("dismiss last agent error: %v", err)
+	}
+	got, ok := models.LoadLastAgentError(session.Metadata)
+	if !ok {
+		t.Fatalf("expected last agent error metadata after dismiss")
+	}
+	if !got.IsDismissed() {
+		t.Fatalf("expected dismissed last agent error, got %#v", got)
+	}
+}
+
+func TestService_DismissLastAgentErrorAcceptsBrowserTimestampStamp(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	occurredAt, err := time.Parse(time.RFC3339Nano, "2026-06-14T12:00:00.310Z")
+	if err != nil {
+		t.Fatalf("parse occurred_at: %v", err)
+	}
+	lastErr := models.LastAgentError{
+		Message:    "peer disconnected before response",
+		OccurredAt: occurredAt,
+	}
+	if err := repo.SetSessionMetadataKey(ctx, sessionID, models.SessionMetaKeyLastAgentError, lastErr); err != nil {
+		t.Fatalf("seed last agent error: %v", err)
+	}
+
+	session, err := svc.DismissLastAgentError(ctx, sessionID, "2026-06-14T12:00:00.310Z:"+lastErr.Message)
+	if err != nil {
+		t.Fatalf("dismiss last agent error: %v", err)
+	}
+	got, ok := models.LoadLastAgentError(session.Metadata)
+	if !ok {
+		t.Fatalf("expected last agent error metadata after dismiss")
+	}
+	if !got.IsDismissed() {
+		t.Fatalf("expected dismissed last agent error, got %#v", got)
+	}
+}
+
+func TestService_DismissLastAgentErrorIgnoresStaleStamp(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	lastErr := models.LastAgentError{
+		Message:    "fresh error",
+		OccurredAt: time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC),
+	}
+	if err := repo.SetSessionMetadataKey(ctx, sessionID, models.SessionMetaKeyLastAgentError, lastErr); err != nil {
+		t.Fatalf("seed last agent error: %v", err)
+	}
+
+	session, err := svc.DismissLastAgentError(ctx, sessionID, "stale:error")
+	if err != nil {
+		t.Fatalf("dismiss last agent error: %v", err)
+	}
+	got, ok := models.LoadLastAgentError(session.Metadata)
+	if !ok {
+		t.Fatalf("expected last agent error metadata after stale dismiss")
+	}
+	if got.IsDismissed() {
+		t.Fatalf("expected stale dismiss to leave error visible, got %#v", got)
+	}
+}
+
+func setupTestTurn(t *testing.T, repo *sqliterepo.Repository, sessionID, taskID, turnID string) string {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	turn := &models.Turn{
+		ID:            turnID,
+		TaskSessionID: sessionID,
+		TaskID:        taskID,
+		StartedAt:     now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := repo.CreateTurn(ctx, turn); err != nil {
+		t.Fatalf("failed to create test turn: %v", err)
+	}
+	return turn.ID
+}
+
+// TestService_MarkSessionRead verifies MarkSessionRead advances the session's
+// read cursor when messageID is a real message belonging to sessionID, and
+// round-trips through GetTaskSession.
+func TestService_MarkSessionRead(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+	if err := repo.CreateMessage(ctx, &models.Message{
+		ID: "msg-1", TaskSessionID: sessionID, TaskID: "task-123", TurnID: turnID,
+		AuthorType: models.MessageAuthorAgent, Content: "hello",
+	}); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+
+	session, err := svc.MarkSessionRead(ctx, sessionID, "msg-1")
+	if err != nil {
+		t.Fatalf("MarkSessionRead: %v", err)
+	}
+	if session.LastReadMessageID != "msg-1" {
+		t.Fatalf("session.LastReadMessageID = %q, want %q", session.LastReadMessageID, "msg-1")
+	}
+
+	reloaded, err := svc.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if reloaded.LastReadMessageID != "msg-1" {
+		t.Fatalf("reloaded LastReadMessageID = %q, want %q", reloaded.LastReadMessageID, "msg-1")
+	}
+}
+
+// TestService_MarkSessionReadRejectsCrossSessionMessage verifies a message
+// belonging to a different session is rejected rather than silently
+// persisted as the cursor.
+func TestService_MarkSessionReadRejectsCrossSessionMessage(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	if err := repo.CreateTaskSession(ctx, &models.TaskSession{ID: "session-other", TaskID: "task-123"}); err != nil {
+		t.Fatalf("seed other session: %v", err)
+	}
+	turnID := setupTestTurn(t, repo, "session-other", "task-123", "turn-other")
+	if err := repo.CreateMessage(ctx, &models.Message{
+		ID: "msg-other", TaskSessionID: "session-other", TaskID: "task-123", TurnID: turnID,
+		AuthorType: models.MessageAuthorAgent, Content: "from another session",
+	}); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+
+	_, markErr := svc.MarkSessionRead(ctx, sessionID, "msg-other")
+	if !errors.Is(markErr, ErrInvalidMarkSessionRead) {
+		t.Fatalf("MarkSessionRead error = %v, want ErrInvalidMarkSessionRead", markErr)
+	}
+
+	session, err := svc.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.LastReadMessageID != "" {
+		t.Fatalf("LastReadMessageID = %q, want unchanged empty cursor", session.LastReadMessageID)
+	}
+}
+
+// TestService_MarkSessionReadRejectsUnknownMessage verifies a nonexistent
+// (e.g. frontend-synthetic) message id is rejected without touching the
+// session's cursor.
+func TestService_MarkSessionReadRejectsUnknownMessage(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+
+	_, err := svc.MarkSessionRead(ctx, sessionID, "task-description")
+	if !errors.Is(err, ErrInvalidMarkSessionRead) {
+		t.Fatalf("MarkSessionRead error = %v, want ErrInvalidMarkSessionRead", err)
+	}
+
+	session, err := svc.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.LastReadMessageID != "" {
+		t.Fatalf("LastReadMessageID = %q, want unchanged empty cursor", session.LastReadMessageID)
+	}
+}
+
+// TestService_MarkSessionReadRejectsEmptyIDs verifies MarkSessionRead
+// validates both ids up front, before touching the repository, and leaves
+// no cursor mutation behind.
+func TestService_MarkSessionReadRejectsEmptyIDs(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+
+	tests := []struct {
+		name      string
+		sessionID string
+		messageID string
+	}{
+		{name: "empty session id", sessionID: "", messageID: "msg-1"},
+		{name: "empty message id", sessionID: sessionID, messageID: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := svc.MarkSessionRead(ctx, tc.sessionID, tc.messageID); err == nil {
+				t.Fatal("expected MarkSessionRead to reject the request")
+			}
+		})
+	}
+
+	session, err := svc.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession: %v", err)
+	}
+	if session.LastReadMessageID != "" {
+		t.Fatalf("LastReadMessageID = %q, want unchanged empty cursor", session.LastReadMessageID)
+	}
+}
+
+func TestService_CreateMessage(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	// Create a task first
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+	eventBus.ClearEvents()
+
+	req := &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TurnID:        turnID,
+		Content:       "This is a test comment",
+		AuthorType:    "user",
+		AuthorID:      "user-123",
+	}
+
+	comment, err := svc.CreateMessage(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create comment: %v", err)
+	}
+
+	if comment.ID == "" {
+		t.Error("expected comment ID to be set")
+	}
+	if comment.Content != "This is a test comment" {
+		t.Errorf("expected content 'This is a test comment', got %s", comment.Content)
+	}
+	if comment.AuthorType != models.MessageAuthorUser {
+		t.Errorf("expected author type 'user', got %s", comment.AuthorType)
+	}
+
+	// Check event was published
+	published := eventBus.GetPublishedEvents()
+	if countEvents(published, events.MessageAdded) != 1 {
+		t.Errorf("expected one %s event, got %v", events.MessageAdded, eventTypes(published))
+	}
+	findPublishedEvent(t, published, events.MessageAdded)
+}
+
+func TestService_ClarificationMessageEventsCarryPendingActionProjection(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-clarification")
+	if err := repo.UpdateTaskSessionState(
+		ctx,
+		sessionID,
+		models.TaskSessionStateWaitingForInput,
+		"",
+	); err != nil {
+		t.Fatalf("set session waiting: %v", err)
+	}
+	eventBus.ClearEvents()
+
+	message, err := svc.CreateMessage(ctx, &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        "task-123",
+		TurnID:        turnID,
+		Content:       "Choose",
+		AuthorType:    "agent",
+		Type:          string(models.MessageTypeClarificationRequest),
+		Metadata:      map[string]interface{}{"pending_id": "pending-1", "status": "pending"},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+	addedData := singlePublishedEventDataOfType(t, eventBus, events.MessageAdded)
+	if got := addedData["pending_action"]; got != "clarification" {
+		t.Fatalf("message.added pending_action = %#v, want clarification", got)
+	}
+	addedRevision, ok := addedData["pending_action_revision"].(models.PendingActionRevision)
+	if !ok || addedRevision.Epoch == "" || addedRevision.Sequence == 0 {
+		t.Fatalf("message.added pending_action_revision = %#v", addedData["pending_action_revision"])
+	}
+
+	eventBus.ClearEvents()
+	message.Metadata["status"] = "answered"
+	if err := svc.UpdateMessage(ctx, message); err != nil {
+		t.Fatalf("UpdateMessage: %v", err)
+	}
+	data := singlePublishedEventDataOfType(t, eventBus, events.MessageUpdated)
+	if got, ok := data["pending_action"]; !ok || got != nil {
+		t.Fatalf("message.updated pending_action = %#v, want explicit nil", got)
+	}
+	updatedRevision, ok := data["pending_action_revision"].(models.PendingActionRevision)
+	if !ok || updatedRevision.Epoch != addedRevision.Epoch || updatedRevision.Sequence <= addedRevision.Sequence {
+		t.Fatalf("message.updated pending_action_revision = %#v, want after %#v", updatedRevision, addedRevision)
+	}
+}
+
+func TestService_OrdinaryMessageAuthorityEventsRefreshPendingAction(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	sourceTurnID := "turn-pending-source"
+	sourceTime := time.Now().UTC().Add(-time.Minute)
+	if err := repo.CreateTurn(ctx, &models.Turn{
+		ID:            sourceTurnID,
+		TaskSessionID: sessionID,
+		TaskID:        "task-123",
+		StartedAt:     sourceTime,
+		CreatedAt:     sourceTime,
+	}); err != nil {
+		t.Fatalf("create source turn: %v", err)
+	}
+	if _, err := svc.CreateMessage(ctx, &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        "task-123",
+		TurnID:        sourceTurnID,
+		Content:       "Choose",
+		AuthorType:    "agent",
+		Type:          string(models.MessageTypeClarificationRequest),
+		Metadata:      map[string]interface{}{"pending_id": "pending-source", "status": "pending"},
+	}); err != nil {
+		t.Fatalf("create source clarification: %v", err)
+	}
+
+	successor, err := svc.ReserveTurn(ctx, sessionID, &models.PromptDispatchRecovery{})
+	if err != nil {
+		t.Fatalf("ReserveTurn: %v", err)
+	}
+	eventBus.ClearEvents()
+	ordinary, err := svc.CreateMessage(ctx, &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        "task-123",
+		TurnID:        successor.ID,
+		Content:       "Successor output",
+		AuthorType:    "agent",
+	})
+	if err != nil {
+		t.Fatalf("create successor message: %v", err)
+	}
+	added := singlePublishedEventDataOfType(t, eventBus, events.MessageAdded)
+	if got, exists := added["pending_action"]; !exists || got != nil {
+		t.Fatalf("ordinary message.added pending_action = %#v, want explicit nil", got)
+	}
+
+	eventBus.ClearEvents()
+	if err := svc.DeleteMessage(ctx, ordinary.ID); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	deleted := singlePublishedEventDataOfType(t, eventBus, events.MessageDeleted)
+	if got := deleted["pending_action"]; got != "clarification" {
+		t.Fatalf("ordinary message.deleted pending_action = %#v, want clarification", got)
+	}
+}
+
+func TestService_CreateMessageIdempotentReturnsCommittedMessage(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-idempotent")
+	request := &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        "task-123",
+		TurnID:        turnID,
+		Content:       "the original prompt",
+		AuthorType:    "user",
+	}
+
+	first, err := svc.CreateMessageIdempotent(ctx, "client-message-1", request)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	retry := *request
+	retry.Content = "the retry should not be stored"
+	second, err := svc.CreateMessageIdempotent(ctx, "client-message-1", &retry)
+	if err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	if second.ID != first.ID || second.Content != first.Content {
+		t.Fatalf("retry returned %+v, want original %+v", second, first)
+	}
+	if published := eventBus.GetPublishedEvents(); countEvents(published, events.MessageAdded) != 1 {
+		t.Fatalf("published events = %v, want one %s", eventTypes(published), events.MessageAdded)
+	}
+
+	messages, err := repo.ListMessages(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("stored messages = %d, want 1", len(messages))
+	}
+}
+
+func TestService_CreateAgentMessage(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+
+	req := &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TurnID:        turnID,
+		Content:       "What should I do next?",
+		AuthorType:    "agent",
+		AuthorID:      "agent-123",
+		RequestsInput: true,
+	}
+
+	comment, err := svc.CreateMessage(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create comment: %v", err)
+	}
+
+	if comment.AuthorType != models.MessageAuthorAgent {
+		t.Errorf("expected author type 'agent', got %s", comment.AuthorType)
+	}
+	if !comment.RequestsInput {
+		t.Error("expected RequestsInput to be true")
+	}
+}
+
+type failingTurnCreator struct {
+	repository.TurnRepository
+	err error
+}
+
+func (f failingTurnCreator) CreateTurnWithStepStamp(context.Context, *models.Turn) (bool, error) {
+	return false, f.err
+}
+
+func TestService_CreateMessageReturnsTurnStartError(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnErr := errors.New("turn table unavailable")
+	svc.turns = failingTurnCreator{TurnRepository: repo, err: turnErr}
+
+	_, err := svc.CreateMessage(ctx, &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		Content:       "new prompt",
+		AuthorType:    "user",
+	})
+
+	if !errors.Is(err, turnErr) {
+		t.Fatalf("CreateMessage error = %v, want wrapped turn error", err)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+		t.Fatalf("CreateMessage returned masked FK error: %v", err)
+	}
+}
+
+func TestService_CreateMessageWithIDReturnsTurnStartError(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnErr := errors.New("turn table unavailable")
+	svc.turns = failingTurnCreator{TurnRepository: repo, err: turnErr}
+
+	_, err := svc.CreateMessageWithID(ctx, "message-123", &CreateMessageRequest{
+		TaskSessionID: sessionID,
+		Content:       "streamed output",
+		AuthorType:    "agent",
+	})
+
+	if !errors.Is(err, turnErr) {
+		t.Fatalf("CreateMessageWithID error = %v, want wrapped turn error", err)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+		t.Fatalf("CreateMessageWithID returned masked FK error: %v", err)
+	}
+}
+
+func TestService_CreateMessageSessionNotFound(t *testing.T) {
+	svc, _, _ := createTestService(t)
+	ctx := context.Background()
+
+	req := &CreateMessageRequest{
+		TaskSessionID: "nonexistent",
+		Content:       "Test comment",
+	}
+
+	_, err := svc.CreateMessage(ctx, req)
+	if err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestService_GetMessage(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+
+	comment := &models.Message{ID: "comment-123", TaskSessionID: sessionID, TaskID: "task-123", TurnID: turnID, AuthorType: models.MessageAuthorUser, Content: "Test"}
+	_ = repo.CreateMessage(ctx, comment)
+
+	retrieved, err := svc.GetMessage(ctx, "comment-123")
+	if err != nil {
+		t.Fatalf("failed to get comment: %v", err)
+	}
+	if retrieved.Content != "Test" {
+		t.Errorf("expected content 'Test', got %s", retrieved.Content)
+	}
+}
+
+func TestService_ListMessages(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+
+	_ = repo.CreateMessage(ctx, &models.Message{ID: "comment-1", TaskSessionID: sessionID, TaskID: "task-123", TurnID: turnID, AuthorType: models.MessageAuthorUser, Content: "Comment 1"})
+	_ = repo.CreateMessage(ctx, &models.Message{ID: "comment-2", TaskSessionID: sessionID, TaskID: "task-123", TurnID: turnID, AuthorType: models.MessageAuthorAgent, Content: "Comment 2"})
+
+	comments, err := svc.ListMessages(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("failed to list comments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Errorf("expected 2 comments, got %d", len(comments))
+	}
+}
+
+func TestService_DeleteMessage(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	setupTestTask(t, repo)
+	sessionID := setupTestSession(t, repo)
+	turnID := setupTestTurn(t, repo, sessionID, "task-123", "turn-123")
+
+	comment := &models.Message{ID: "comment-123", TaskSessionID: sessionID, TaskID: "task-123", TurnID: turnID, AuthorType: models.MessageAuthorUser, Content: "Test"}
+	_ = repo.CreateMessage(ctx, comment)
+
+	err := svc.DeleteMessage(ctx, "comment-123")
+	if err != nil {
+		t.Fatalf("failed to delete comment: %v", err)
+	}
+
+	_, err = svc.GetMessage(ctx, "comment-123")
+	if err == nil {
+		t.Error("expected comment to be deleted")
+	}
+}

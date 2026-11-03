@@ -1,0 +1,106 @@
+import { type Page } from "@playwright/test";
+import { runWithBackendRecovery, test as base } from "./test-base";
+import { OfficeApiClient } from "../helpers/office-api-client";
+import { ApiClient } from "../helpers/api-client";
+
+type OfficeFixtures = {
+  officeApi: OfficeApiClient;
+  officeSeed: {
+    workspaceId: string;
+    agentId: string;
+    projectId: string;
+    workflowId: string;
+  };
+};
+
+export const test = base.extend<{ testPage: Page }, OfficeFixtures>({
+  // Worker-scoped: create office API client pointing at the worker's backend.
+  officeApi: [
+    async ({ backend }, use) => {
+      const client = new OfficeApiClient(backend.baseUrl);
+      await use(client);
+    },
+    { scope: "worker" },
+  ],
+
+  // Worker-scoped: complete onboarding once per worker and expose the
+  // resulting workspace/agent/project IDs to all tests in the suite.
+  officeSeed: [
+    async ({ officeApi, apiClient, seedData }, use) => {
+      const result = await officeApi.completeOnboarding({
+        workspaceName: "E2E Workspace",
+        taskPrefix: "E2E",
+        agentName: "CEO",
+        agentProfileId: seedData.agentProfileId,
+        executorPreference: "local_pc",
+      });
+      const { workspaces } = await apiClient.listWorkspaces();
+      const workflowId = workspaces.find(
+        (workspace) => workspace.id === result.workspaceId,
+      )?.office_workflow_id;
+      if (!workflowId) {
+        throw new Error(
+          `E2E office seed failed: workspace ${result.workspaceId} has no office workflow`,
+        );
+      }
+      await use({
+        workspaceId: result.workspaceId,
+        agentId: result.agentId,
+        projectId: result.projectId,
+        workflowId,
+      });
+    },
+    { scope: "worker" },
+  ],
+
+  // Override testPage to set the active workspace to officeSeed.workspaceId
+  // so that office UI pages render with the seeded office data.
+  //
+  // The base test-base.ts testPage runs e2eReset against seedData.workspaceId,
+  // but onboarding allocates its OWN workspace ID (officeSeed.workspaceId),
+  // so per-test office task / session leftovers leak across tests unless we
+  // reset the office workspace here as well.
+  testPage: async ({ testPage: basePage, backend, apiClient, officeSeed, seedData }, use) => {
+    await runWithBackendRecovery(backend, async () => {
+      if (officeSeed.workspaceId !== seedData.workspaceId) {
+        await apiClient.e2eReset(officeSeed.workspaceId, [
+          seedData.workflowId,
+          officeSeed.workflowId,
+        ]);
+      }
+      await apiClient.saveUserSettings({
+        workspace_id: officeSeed.workspaceId,
+        workflow_filter_id: seedData.workflowId,
+        keyboard_shortcuts: {},
+        enable_preview_on_click: false,
+      });
+    });
+    await use(basePage);
+  },
+});
+
+// Tests in this suite deliberately exercise status transitions. Reset the
+// worker-shared CEO before every test so a previous paused/stopped/working
+// state cannot make the scheduler silently reject the next assignment.
+test.beforeEach(async ({ backend, officeApi, officeSeed }) => {
+  await runWithBackendRecovery(backend, () =>
+    officeApi.updateAgentStatus(officeSeed.agentId, "idle"),
+  );
+});
+
+// Office's approval gate (apps/backend/internal/office/dashboard/service_tasks.go
+// applyApprovalGate) redirects a "done" write to in_review unless the task is
+// on its workflow's terminal step (last by position). Tests that drive a task
+// all the way to "done" need it parked there first; this resolves the
+// highest-position step for the workflow and moves the task onto it.
+export async function moveTaskToTerminalStep(
+  apiClient: ApiClient,
+  workflowId: string,
+  taskId: string,
+): Promise<void> {
+  const { steps } = await apiClient.listWorkflowSteps(workflowId);
+  const terminalStep = steps.reduce((max, step) => (step.position > max.position ? step : max));
+  await apiClient.moveTask(taskId, workflowId, terminalStep.id);
+}
+
+export { expect } from "@playwright/test";

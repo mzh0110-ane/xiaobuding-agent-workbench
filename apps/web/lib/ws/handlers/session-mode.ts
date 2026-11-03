@@ -1,0 +1,46 @@
+import type { StoreApi } from "zustand";
+import type { AppState } from "@/lib/state/store";
+import type { WsHandlers } from "@/lib/ws/handlers/types";
+import type { SessionModeChangedPayload } from "@/lib/types/backend";
+
+export function registerSessionModeHandlers(store: StoreApi<AppState>): WsHandlers {
+  return {
+    "session.mode_changed": (message) => {
+      const payload = message.payload as SessionModeChangedPayload | undefined;
+      if (!payload?.session_id) {
+        return;
+      }
+      const sessionId = payload.session_id;
+      // Empty current_mode_id means the agent exited its special mode
+      const modeId = payload.current_mode_id || "";
+      const availableModes = payload.available_modes?.map((m) => ({
+        id: m.id,
+        name: m.name,
+        description: m.description,
+      }));
+
+      // Present only when the session is not in the mode Kandev asked for.
+      const requestedModeId = payload.requested_mode_id || undefined;
+      const settingsPolicy = payload.session_settings_policy;
+
+      if (modeId) {
+        if (settingsPolicy) {
+          store
+            .getState()
+            .setSessionMode(sessionId, modeId, availableModes, requestedModeId, settingsPolicy);
+        } else {
+          store.getState().setSessionMode(sessionId, modeId, availableModes, requestedModeId);
+        }
+      } else {
+        // Keep availableModes so the UI still knows what modes exist
+        if (settingsPolicy) {
+          store
+            .getState()
+            .setSessionMode(sessionId, "", availableModes, requestedModeId, settingsPolicy);
+        } else {
+          store.getState().setSessionMode(sessionId, "", availableModes, requestedModeId);
+        }
+      }
+    },
+  };
+}

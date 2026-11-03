@@ -1,0 +1,153 @@
+package linear
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"testing/synctest"
+
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+// pollerFixture wires a Service against a real in-memory store and fake
+// client/secret store. The auth-loop semantics live in
+// internal/integrations/healthpoll; the tests here cover the linear-specific
+// integration of the loop with Service.RecordAuthHealth (org_slug capture,
+// error preservation) and the Start/Stop smoke wiring.
+type pollerFixture struct {
+	store   *Store
+	secrets *fakeSecretStore
+	client  *fakeClient
+	svc     *Service
+	poller  *Poller
+}
+
+func newPollerFixture(t *testing.T) *pollerFixture {
+	t.Helper()
+	f := &pollerFixture{
+		store:   newTestStore(t),
+		secrets: newFakeSecretStore(),
+		client:  &fakeClient{},
+	}
+	f.svc = NewService(f.store, f.secrets, func(_ *LinearConfig, _ string) Client {
+		return f.client
+	}, logger.Default())
+	f.poller = NewPoller(f.svc, logger.Default())
+	return f
+}
+
+// saveConfig persists the default workspace config directly via the store + secret
+// fakes — bypassing Service.SetConfig avoids racing against its async probe.
+func (f *pollerFixture) saveConfig(t *testing.T, secret string) {
+	t.Helper()
+	f.saveConfigForWorkspace(t, "", secret)
+}
+
+// saveConfigForWorkspace persists a workspace config directly via the store +
+// secret fakes — bypassing Service.SetConfig avoids racing against its async
+// probe.
+func (f *pollerFixture) saveConfigForWorkspace(t *testing.T, workspaceID, secret string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := f.store.UpsertConfigForWorkspace(ctx, workspaceID, &LinearConfig{
+		AuthMethod: AuthMethodAPIKey,
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	secretWorkspaceID := workspaceID
+	if secretWorkspaceID == "" {
+		var err error
+		secretWorkspaceID, err = f.store.defaultWorkspaceID()
+		if err != nil {
+			t.Fatalf("resolve default workspace: %v", err)
+		}
+	}
+	key := SecretKeyForWorkspace(secretWorkspaceID)
+	if err := f.secrets.Set(ctx, key, "linear", secret); err != nil {
+		t.Fatalf("save secret: %v", err)
+	}
+}
+
+func TestService_RecordAuthHealth_RecordsSuccess(t *testing.T) {
+	f := newPollerFixture(t)
+	f.saveConfig(t, "tok")
+	f.client.testAuthFn = func() (*TestConnectionResult, error) {
+		return &TestConnectionResult{OK: true, OrgSlug: "acme"}, nil
+	}
+
+	f.svc.RecordAuthHealth(context.Background())
+
+	cfg, _ := f.store.GetConfig(context.Background())
+	if cfg == nil {
+		t.Fatal("config disappeared")
+	}
+	if !cfg.LastOk {
+		t.Error("expected LastOk=true after successful probe")
+	}
+	if cfg.OrgSlug != "acme" {
+		t.Errorf("expected org_slug captured, got %q", cfg.OrgSlug)
+	}
+}
+
+func TestService_RecordAuthHealth_RecordsFailure(t *testing.T) {
+	f := newPollerFixture(t)
+	f.saveConfig(t, "tok")
+	f.client.testAuthFn = func() (*TestConnectionResult, error) {
+		return &TestConnectionResult{OK: false, Error: "401 unauthorized"}, nil
+	}
+
+	f.svc.RecordAuthHealth(context.Background())
+
+	cfg, _ := f.store.GetConfig(context.Background())
+	if cfg.LastOk {
+		t.Error("expected LastOk=false after failed probe")
+	}
+	if cfg.LastError != "401 unauthorized" {
+		t.Errorf("expected error preserved, got %q", cfg.LastError)
+	}
+}
+
+func TestService_RecordAuthHealth_ClientError(t *testing.T) {
+	f := newPollerFixture(t)
+	f.saveConfig(t, "tok")
+	f.client.testAuthFn = func() (*TestConnectionResult, error) {
+		return nil, errors.New("network timeout")
+	}
+
+	f.svc.RecordAuthHealth(context.Background())
+
+	cfg, _ := f.store.GetConfig(context.Background())
+	if cfg.LastOk {
+		t.Error("expected LastOk=false on client error")
+	}
+}
+
+func TestPoller_Start_ProbesWhenConfigured(t *testing.T) {
+	// Smoke test: confirms the prober adapter wires HasConfig →
+	// Service.RecordAuthHealth when the loop is started, end-to-end. Wrapped
+	// in synctest so the goroutine the poller spawns runs deterministically
+	// against fake time instead of relying on a wall-clock deadline.
+	synctest.Test(t, func(t *testing.T) {
+		f := newPollerFixture(t)
+		f.saveConfig(t, "tok")
+		var probed bool
+		f.client.testAuthFn = func() (*TestConnectionResult, error) {
+			return &TestConnectionResult{OK: true}, nil
+		}
+		f.svc.SetProbeHook(func() {
+			probed = true
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.poller.Start(ctx)
+		defer f.poller.Stop()
+
+		// Wait for the immediate-on-Start probe pass to finish.
+		synctest.Wait()
+
+		if !probed {
+			t.Errorf("expected probe to fire when configured")
+		}
+	})
+}

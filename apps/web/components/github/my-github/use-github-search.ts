@@ -1,0 +1,142 @@
+"use client";
+
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { searchUserPRs, searchUserIssues } from "@/lib/api/domains/github-api";
+import type { GitHubPR, GitHubIssue } from "@/lib/types/github";
+import type { PresetOption } from "./search-bar";
+import { t } from "@/lib/i18n";
+
+type SearchKind = "pr" | "issue";
+
+export const SEARCH_PAGE_SIZE = 25;
+
+type SearchState<T> = {
+  items: T[];
+  loading: boolean;
+  error: string | null;
+  lastFetchedAt: Date | null;
+  total: number;
+};
+
+type FetchArgs = {
+  preset: string;
+  customQuery: string;
+  repoFilter: string;
+  page: number;
+  workspaceId: string;
+};
+
+type UseGitHubSearchOptions = {
+  enabled?: boolean;
+  kind: SearchKind;
+  presets: PresetOption[];
+  preset: string;
+  customQuery: string;
+  repoFilter?: string;
+  workspaceId?: string | null;
+};
+
+export function buildParams(
+  presets: PresetOption[],
+  preset: string,
+  customQuery: string,
+  repoFilter: string,
+) {
+  const trimmed = customQuery.trim();
+  const repoQualifier = repoFilter ? `repo:${repoFilter}` : "";
+  if (trimmed) {
+    return { query: [trimmed, repoQualifier].filter(Boolean).join(" ") };
+  }
+  const found = presets.find((p) => p.value === preset);
+  const filter = [found?.filter ?? "", repoQualifier].filter(Boolean).join(" ");
+  return { filter };
+}
+
+export function useGitHubSearch<T extends GitHubPR | GitHubIssue>({
+  enabled = true,
+  kind,
+  presets,
+  preset,
+  customQuery,
+  repoFilter = "",
+  workspaceId = null,
+}: UseGitHubSearchOptions) {
+  const [state, setState] = useState<SearchState<T>>({
+    items: [],
+    loading: false,
+    error: null,
+    lastFetchedAt: null,
+    total: 0,
+  });
+  const [page, setPage] = useState(1);
+  // Monotonic request counter: responses from older requests are dropped so
+  // a slow page-N request can't overwrite a fresher page-1 result after a
+  // filter change.
+  const requestSeq = useRef(0);
+  const workspaceRef = useRef(workspaceId);
+
+  useLayoutEffect(() => {
+    workspaceRef.current = workspaceId;
+  }, [workspaceId]);
+
+  // Reset to page 1 whenever the filter inputs change.
+  useEffect(() => {
+    setPage(1);
+  }, [preset, customQuery, repoFilter, workspaceId, kind]);
+
+  const fetchData = useCallback(
+    async ({
+      preset: ep,
+      customQuery: ec,
+      repoFilter: er,
+      page: epage,
+      workspaceId: ews,
+    }: FetchArgs) => {
+      const seq = ++requestSeq.current;
+      setState((s) => ({ ...s, loading: true, error: null }));
+      try {
+        const base = buildParams(presets, ep, ec, er);
+        const params = { ...base, page: epage, perPage: SEARCH_PAGE_SIZE, workspaceId: ews };
+        const response =
+          kind === "pr" ? await searchUserPRs(params) : await searchUserIssues(params);
+        if (seq !== requestSeq.current || ews !== workspaceRef.current) return;
+        const items = (kind === "pr"
+          ? (response as { prs: GitHubPR[] }).prs
+          : (response as { issues: GitHubIssue[] }).issues) as unknown as T[];
+        setState({
+          items: items ?? [],
+          loading: false,
+          error: null,
+          lastFetchedAt: new Date(),
+          total: response.total_count ?? (items ?? []).length,
+        });
+      } catch (err) {
+        if (seq !== requestSeq.current || ews !== workspaceRef.current) return;
+        setState((s) => ({
+          items: [],
+          loading: false,
+          error: err instanceof Error ? err.message : t("github:failedToSearchGitHub"),
+          lastFetchedAt: s.lastFetchedAt,
+          total: 0,
+        }));
+      }
+    },
+    [kind, presets],
+  );
+
+  useEffect(() => {
+    if (!enabled || !workspaceId) {
+      requestSeq.current += 1;
+      setState({ items: [], loading: false, error: null, lastFetchedAt: null, total: 0 });
+      return;
+    }
+    void fetchData({ preset, customQuery, repoFilter, page, workspaceId });
+  }, [enabled, fetchData, preset, customQuery, repoFilter, page, workspaceId]);
+
+  const refresh = useCallback(() => {
+    if (!enabled || !workspaceId) return Promise.resolve();
+    return fetchData({ preset, customQuery, repoFilter, page, workspaceId });
+  }, [enabled, fetchData, preset, customQuery, repoFilter, page, workspaceId]);
+
+  return { ...state, page, setPage, pageSize: SEARCH_PAGE_SIZE, refresh };
+}

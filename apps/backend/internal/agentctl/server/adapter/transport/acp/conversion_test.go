@@ -1,0 +1,1465 @@
+package acp
+
+import (
+	"encoding/json"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/coder/acp-go-sdk"
+	"github.com/kandev/kandev/internal/agentctl/acpcompat"
+	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+func TestSendUpdateAppliesCancelableBackpressure(t *testing.T) {
+	a := newTestAdapter()
+
+	for index := 0; index < cap(a.updatesCh); index++ {
+		a.sendUpdate(AgentEvent{Type: streams.EventTypeReasoning, ReasoningText: "chunk"})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.sendUpdate(AgentEvent{Type: streams.EventTypeReasoning, ReasoningText: "final"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("sendUpdate bypassed a full per-agent queue")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	<-a.updatesCh
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sendUpdate did not resume after queue space became available")
+	}
+
+	if err := a.Close(); err != nil {
+		t.Fatalf("close adapter: %v", err)
+	}
+}
+
+func TestSendUpdateBackpressureIsCanceledOnClose(t *testing.T) {
+	a := newTestAdapter()
+	for index := 0; index < cap(a.updatesCh); index++ {
+		a.sendUpdate(AgentEvent{Type: streams.EventTypeReasoning, ReasoningText: "chunk"})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.sendUpdate(AgentEvent{Type: streams.EventTypeReasoning, ReasoningText: "final"})
+		close(done)
+	}()
+
+	if err := a.Close(); err != nil {
+		t.Fatalf("close adapter: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sendUpdate remained blocked after adapter close")
+	}
+}
+
+func TestSendUpdateSnapshotsNormalizedPayloadBeforeQueueing(t *testing.T) {
+	a := newTestAdapter()
+	t.Cleanup(func() { _ = a.Close() })
+
+	nested := map[string]any{"value": "before"}
+	payload := streams.NewGeneric("custom_tool", map[string]any{"nested": nested})
+	a.sendUpdate(AgentEvent{
+		Type:              streams.EventTypeToolCall,
+		NormalizedPayload: payload,
+	})
+
+	event := <-a.updatesCh
+	nested["value"] = "after"
+
+	data, err := json.Marshal(event.NormalizedPayload)
+	if err != nil {
+		t.Fatalf("marshal queued payload: %v", err)
+	}
+	want := `{"kind":"generic","generic":{"name":"custom_tool","input":{"nested":{"value":"before"}}}}`
+	if string(data) != want {
+		t.Fatalf("queued payload changed after source mutation: got %s, want %s", data, want)
+	}
+}
+
+func TestSendUpdateLockedSnapshotsNormalizedPayloadBeforeQueueing(t *testing.T) {
+	a := newTestAdapter()
+	t.Cleanup(func() { _ = a.Close() })
+
+	nested := map[string]any{"value": "before"}
+	payload := streams.NewGeneric("custom_tool", map[string]any{"nested": nested})
+	a.mu.Lock()
+	if !a.sendUpdateLocked(AgentEvent{
+		Type:              streams.EventTypeToolCall,
+		NormalizedPayload: payload,
+	}) {
+		a.mu.Unlock()
+		t.Fatal("sendUpdateLocked did not enqueue event")
+	}
+	a.mu.Unlock()
+
+	event := <-a.updatesCh
+	nested["value"] = "after"
+	data, err := json.Marshal(event.NormalizedPayload)
+	if err != nil {
+		t.Fatalf("marshal queued payload: %v", err)
+	}
+	if !json.Valid(data) || string(data) == "" {
+		t.Fatalf("queued payload is not valid JSON: %s", data)
+	}
+	if string(data) != `{"kind":"generic","generic":{"name":"custom_tool","input":{"nested":{"value":"before"}}}}` {
+		t.Fatalf("queued payload changed after source mutation: %s", data)
+	}
+}
+
+func TestQueuedNormalizedPayloadCanMarshalDuringSourceMutation(t *testing.T) {
+	a := newTestAdapter()
+	t.Cleanup(func() { _ = a.Close() })
+
+	nested := map[string]any{"value": "before"}
+	payload := streams.NewGeneric("custom_tool", map[string]any{"nested": nested})
+	a.sendUpdate(AgentEvent{
+		Type:              streams.EventTypeToolCall,
+		NormalizedPayload: payload,
+	})
+	event := <-a.updatesCh
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for index := 0; index < 10000; index++ {
+			nested["value"] = index
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for index := 0; index < 10000; index++ {
+			if _, err := json.Marshal(event.NormalizedPayload); err != nil {
+				t.Errorf("marshal queued payload: %v", err)
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	data, err := json.Marshal(event.NormalizedPayload)
+	if err != nil {
+		t.Fatalf("marshal final queued payload: %v", err)
+	}
+	if !json.Valid(data) || string(data) == "" {
+		t.Fatalf("queued payload is not valid JSON: %s", data)
+	}
+	if string(data) != `{"kind":"generic","generic":{"name":"custom_tool","input":{"nested":{"value":"before"}}}}` {
+		t.Fatalf("queued payload changed during source mutation: %s", data)
+	}
+}
+
+func TestConvertACPConfigOptions_PreservesDescriptions(t *testing.T) {
+	description := "Controls how much reasoning the model performs."
+	valueDescription := "Uses more reasoning for complex tasks."
+	options := acp.SessionConfigSelectOptionsUngrouped{{
+		Value:       "high",
+		Name:        "High",
+		Description: &valueDescription,
+	}}
+
+	converted := convertACPConfigOptions([]acp.SessionConfigOption{{
+		Select: &acp.SessionConfigOptionSelect{
+			Type:         "select",
+			Id:           "reasoning_effort",
+			Name:         "Reasoning effort",
+			Description:  &description,
+			CurrentValue: "high",
+			Options:      acp.SessionConfigSelectOptions{Ungrouped: &options},
+		},
+	}})
+
+	raw, err := json.Marshal(converted)
+	if err != nil {
+		t.Fatalf("marshal converted config options: %v", err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal converted config options: %v", err)
+	}
+	if got := payload[0]["description"]; got != description {
+		t.Errorf("option description = %#v, want %q", got, description)
+	}
+	values := payload[0]["options"].([]any)
+	if got := values[0].(map[string]any)["description"]; got != valueDescription {
+		t.Errorf("value description = %#v, want %q", got, valueDescription)
+	}
+}
+
+func TestExtractConfigOptions_PreservesDescriptions(t *testing.T) {
+	converted := extractConfigOptions(map[string]any{
+		"configOptions": []any{map[string]any{
+			"type":         "select",
+			"id":           "fast_mode",
+			"name":         "Fast mode",
+			"description":  "Controls fast execution.",
+			"currentValue": "off",
+			"options": []any{map[string]any{
+				"value":       "off",
+				"name":        "Off",
+				"description": "Uses standard execution.",
+			}},
+		}},
+	})
+
+	raw, err := json.Marshal(converted)
+	if err != nil {
+		t.Fatalf("marshal extracted config options: %v", err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal extracted config options: %v", err)
+	}
+	if got := payload[0]["description"]; got != "Controls fast execution." {
+		t.Errorf("option description = %#v, want provider description", got)
+	}
+	values := payload[0]["options"].([]any)
+	if got := values[0].(map[string]any)["description"]; got != "Uses standard execution." {
+		t.Errorf("value description = %#v, want provider description", got)
+	}
+}
+
+// newTestAdapter creates a minimal Adapter suitable for unit testing conversion functions.
+// It uses a nop logger and a buffered updates channel so tests can drain events.
+func newTestAdapter() *Adapter {
+	log, _ := logger.NewLogger(logger.LoggingConfig{
+		Level:      "error",
+		Format:     "json",
+		OutputPath: "stderr",
+	})
+	cfg := &shared.Config{
+		AgentID: "test-agent",
+		WorkDir: "/tmp/test",
+	}
+	return NewAdapter(cfg, log)
+}
+
+// drainEvents reads all buffered events from the adapter's updates channel.
+func drainEvents(a *Adapter) []AgentEvent {
+	var events []AgentEvent
+	for {
+		select {
+		case ev := <-a.updatesCh:
+			events = append(events, ev)
+		default:
+			return events
+		}
+	}
+}
+
+// --- derefStr ---
+
+func TestDerefStr_NilPointer(t *testing.T) {
+	result := derefStr[string](nil)
+	if result != "" {
+		t.Errorf("derefStr(nil) = %q, want empty string", result)
+	}
+}
+
+func TestDerefStr_NonNilPointer(t *testing.T) {
+	s := "hello"
+	result := derefStr(&s)
+	if result != "hello" {
+		t.Errorf("derefStr(&%q) = %q, want %q", s, result, s)
+	}
+}
+
+func TestDerefStr_EmptyString(t *testing.T) {
+	s := ""
+	result := derefStr(&s)
+	if result != "" {
+		t.Errorf("derefStr(&%q) = %q, want empty string", s, result)
+	}
+}
+
+// --- convertContentBlockToStreams ---
+
+func TestConvertContentBlockToStreams_Text(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.TextBlock("hello world")
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for text content block")
+	}
+	if result.Type != "text" {
+		t.Errorf("Type = %q, want %q", result.Type, "text")
+	}
+	if result.Text != "hello world" {
+		t.Errorf("Text = %q, want %q", result.Text, "hello world")
+	}
+}
+
+func TestConvertContentBlockToStreams_Image(t *testing.T) {
+	a := newTestAdapter()
+	uri := "https://example.com/img.png"
+	cb := acp.ContentBlock{
+		Image: &acp.ContentBlockImage{
+			Data:     "base64data",
+			MimeType: "image/png",
+			Type:     "image",
+			Uri:      &uri,
+		},
+	}
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for image content block")
+	}
+	if result.Type != "image" {
+		t.Errorf("Type = %q, want %q", result.Type, "image")
+	}
+	if result.Data != "base64data" {
+		t.Errorf("Data = %q, want %q", result.Data, "base64data")
+	}
+	if result.MimeType != "image/png" {
+		t.Errorf("MimeType = %q, want %q", result.MimeType, "image/png")
+	}
+	if result.URI != "https://example.com/img.png" {
+		t.Errorf("URI = %q, want %q", result.URI, "https://example.com/img.png")
+	}
+}
+
+func TestConvertContentBlockToStreams_ImageWithoutURI(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.ImageBlock("base64data", "image/jpeg")
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for image content block")
+	}
+	if result.Type != "image" {
+		t.Errorf("Type = %q, want %q", result.Type, "image")
+	}
+	if result.URI != "" {
+		t.Errorf("URI = %q, want empty string for image without URI", result.URI)
+	}
+}
+
+func TestConvertContentBlockToStreams_Audio(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.AudioBlock("audiodata", "audio/mp3")
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for audio content block")
+	}
+	if result.Type != "audio" {
+		t.Errorf("Type = %q, want %q", result.Type, "audio")
+	}
+	if result.Data != "audiodata" {
+		t.Errorf("Data = %q, want %q", result.Data, "audiodata")
+	}
+	if result.MimeType != "audio/mp3" {
+		t.Errorf("MimeType = %q, want %q", result.MimeType, "audio/mp3")
+	}
+}
+
+func TestConvertContentBlockToStreams_ResourceLink(t *testing.T) {
+	a := newTestAdapter()
+	mime := "text/plain"
+	title := "My Resource"
+	desc := "A description"
+	size := 1024
+	cb := acp.ContentBlock{
+		ResourceLink: &acp.ContentBlockResourceLink{
+			Uri:         "file:///path/to/file.txt",
+			Name:        "file.txt",
+			MimeType:    &mime,
+			Title:       &title,
+			Description: &desc,
+			Size:        &size,
+			Type:        "resource_link",
+		},
+	}
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for resource_link content block")
+	}
+	if result.Type != "resource_link" {
+		t.Errorf("Type = %q, want %q", result.Type, "resource_link")
+	}
+	if result.URI != "file:///path/to/file.txt" {
+		t.Errorf("URI = %q, want %q", result.URI, "file:///path/to/file.txt")
+	}
+	if result.Name != "file.txt" {
+		t.Errorf("Name = %q, want %q", result.Name, "file.txt")
+	}
+	if result.MimeType != "text/plain" {
+		t.Errorf("MimeType = %q, want %q", result.MimeType, "text/plain")
+	}
+	if result.Title != "My Resource" {
+		t.Errorf("Title = %q, want %q", result.Title, "My Resource")
+	}
+	if result.Description != "A description" {
+		t.Errorf("Description = %q, want %q", result.Description, "A description")
+	}
+	if result.Size == nil || *result.Size != 1024 {
+		t.Errorf("Size = %v, want 1024", result.Size)
+	}
+}
+
+func TestConvertContentBlockToStreams_ResourceLinkNilOptionals(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.ResourceLinkBlock("file.txt", "file:///path")
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for resource_link content block")
+	}
+	if result.Type != "resource_link" {
+		t.Errorf("Type = %q, want %q", result.Type, "resource_link")
+	}
+	if result.MimeType != "" {
+		t.Errorf("MimeType = %q, want empty when nil", result.MimeType)
+	}
+	if result.Title != "" {
+		t.Errorf("Title = %q, want empty when nil", result.Title)
+	}
+	if result.Description != "" {
+		t.Errorf("Description = %q, want empty when nil", result.Description)
+	}
+	if result.Size != nil {
+		t.Errorf("Size = %v, want nil", result.Size)
+	}
+}
+
+func TestConvertContentBlockToStreams_ResourceWithTextContents(t *testing.T) {
+	a := newTestAdapter()
+	mime := "text/plain"
+	cb := acp.ResourceBlock(acp.EmbeddedResourceResource{
+		TextResourceContents: &acp.TextResourceContents{
+			Uri:      "file:///readme.md",
+			Text:     "# Hello",
+			MimeType: &mime,
+		},
+	})
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for resource content block")
+	}
+	if result.Type != "resource" {
+		t.Errorf("Type = %q, want %q", result.Type, "resource")
+	}
+	if result.URI != "file:///readme.md" {
+		t.Errorf("URI = %q, want %q", result.URI, "file:///readme.md")
+	}
+	if result.Text != "# Hello" {
+		t.Errorf("Text = %q, want %q", result.Text, "# Hello")
+	}
+	if result.MimeType != "text/plain" {
+		t.Errorf("MimeType = %q, want %q", result.MimeType, "text/plain")
+	}
+}
+
+func TestConvertContentBlockToStreams_ResourceWithBlobContents(t *testing.T) {
+	a := newTestAdapter()
+	mime := "application/octet-stream"
+	cb := acp.ResourceBlock(acp.EmbeddedResourceResource{
+		BlobResourceContents: &acp.BlobResourceContents{
+			Uri:      "file:///data.bin",
+			Blob:     "blobdata",
+			MimeType: &mime,
+		},
+	})
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for resource content block")
+	}
+	if result.Type != "resource" {
+		t.Errorf("Type = %q, want %q", result.Type, "resource")
+	}
+	if result.URI != "file:///data.bin" {
+		t.Errorf("URI = %q, want %q", result.URI, "file:///data.bin")
+	}
+	if result.Data != "blobdata" {
+		t.Errorf("Data = %q, want %q", result.Data, "blobdata")
+	}
+	if result.MimeType != "application/octet-stream" {
+		t.Errorf("MimeType = %q, want %q", result.MimeType, "application/octet-stream")
+	}
+}
+
+func TestConvertContentBlockToStreams_UnknownType(t *testing.T) {
+	a := newTestAdapter()
+	// Empty ContentBlock with no variant set
+	cb := acp.ContentBlock{}
+
+	result := a.convertContentBlockToStreams(cb)
+
+	if result != nil {
+		t.Errorf("expected nil for unknown content block type, got %+v", result)
+	}
+}
+
+// --- convertToolCallContents ---
+
+func TestConvertToolCallContents_EmptyInput(t *testing.T) {
+	a := newTestAdapter()
+
+	result := a.convertToolCallContents(nil)
+	if result != nil {
+		t.Errorf("expected nil for nil input, got %v", result)
+	}
+
+	result = a.convertToolCallContents([]acp.ToolCallContent{})
+	if result != nil {
+		t.Errorf("expected nil for empty input, got %v", result)
+	}
+}
+
+func TestConvertToolCallContents_DiffItem(t *testing.T) {
+	a := newTestAdapter()
+	oldText := "old content"
+	contents := []acp.ToolCallContent{
+		{
+			Diff: &acp.ToolCallContentDiff{
+				Path:    "src/main.ts",
+				OldText: &oldText,
+				NewText: "new content",
+				Type:    "diff",
+			},
+		},
+	}
+
+	result := a.convertToolCallContents(contents)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(result))
+	}
+	if result[0].Type != "diff" {
+		t.Errorf("Type = %q, want %q", result[0].Type, "diff")
+	}
+	if result[0].Path != "src/main.ts" {
+		t.Errorf("Path = %q, want %q", result[0].Path, "src/main.ts")
+	}
+	if result[0].OldText == nil || *result[0].OldText != "old content" {
+		t.Errorf("OldText = %v, want 'old content'", result[0].OldText)
+	}
+	if result[0].NewText != "new content" {
+		t.Errorf("NewText = %q, want %q", result[0].NewText, "new content")
+	}
+}
+
+func TestConvertToolCallContents_TerminalItem(t *testing.T) {
+	a := newTestAdapter()
+	contents := []acp.ToolCallContent{
+		{
+			Terminal: &acp.ToolCallContentTerminal{
+				TerminalId: "term-123",
+				Type:       "terminal",
+			},
+		},
+	}
+
+	result := a.convertToolCallContents(contents)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(result))
+	}
+	if result[0].Type != "terminal" {
+		t.Errorf("Type = %q, want %q", result[0].Type, "terminal")
+	}
+	if result[0].TerminalID != "term-123" {
+		t.Errorf("TerminalID = %q, want %q", result[0].TerminalID, "term-123")
+	}
+}
+
+func TestConvertToolCallContents_ContentItemWithTextBlock(t *testing.T) {
+	a := newTestAdapter()
+	contents := []acp.ToolCallContent{
+		{
+			Content: &acp.ToolCallContentContent{
+				Content: acp.TextBlock("tool output text"),
+				Type:    "content",
+			},
+		},
+	}
+
+	result := a.convertToolCallContents(contents)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(result))
+	}
+	if result[0].Type != "content" {
+		t.Errorf("Type = %q, want %q", result[0].Type, "content")
+	}
+	if result[0].Content == nil {
+		t.Fatal("expected Content to be set")
+	}
+	if result[0].Content.Type != "text" {
+		t.Errorf("Content.Type = %q, want %q", result[0].Content.Type, "text")
+	}
+	if result[0].Content.Text != "tool output text" {
+		t.Errorf("Content.Text = %q, want %q", result[0].Content.Text, "tool output text")
+	}
+}
+
+func TestConvertToolCallContents_MixedItems(t *testing.T) {
+	a := newTestAdapter()
+	oldText := "before"
+	contents := []acp.ToolCallContent{
+		{
+			Diff: &acp.ToolCallContentDiff{
+				Path:    "file.go",
+				OldText: &oldText,
+				NewText: "after",
+				Type:    "diff",
+			},
+		},
+		{
+			Terminal: &acp.ToolCallContentTerminal{
+				TerminalId: "term-456",
+				Type:       "terminal",
+			},
+		},
+		{
+			Content: &acp.ToolCallContentContent{
+				Content: acp.TextBlock("some text"),
+				Type:    "content",
+			},
+		},
+	}
+
+	result := a.convertToolCallContents(contents)
+
+	if len(result) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(result))
+	}
+	if result[0].Type != "diff" {
+		t.Errorf("item[0].Type = %q, want %q", result[0].Type, "diff")
+	}
+	if result[1].Type != "terminal" {
+		t.Errorf("item[1].Type = %q, want %q", result[1].Type, "terminal")
+	}
+	if result[2].Type != "content" {
+		t.Errorf("item[2].Type = %q, want %q", result[2].Type, "content")
+	}
+}
+
+// --- convertMessageChunk ---
+
+func TestConvertNotification_PreservesProtocolMessageIDs(t *testing.T) {
+	a := newTestAdapter()
+	tests := []struct {
+		name   string
+		update acp.SessionUpdate
+		text   string
+		role   string
+	}{
+		{
+			name: "assistant",
+			update: acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content:   acp.TextBlock("assistant text"),
+				MessageId: acp.Ptr(acp.MessageId("assistant-message")),
+			}},
+			text: "assistant text",
+		},
+		{
+			name: "user",
+			update: acp.SessionUpdate{UserMessageChunk: &acp.SessionUpdateUserMessageChunk{
+				Content:   acp.TextBlock("user text"),
+				MessageId: acp.Ptr(acp.MessageId("user-message")),
+			}},
+			text: "user text",
+			role: "user",
+		},
+		{
+			name: "thought",
+			update: acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+				Content:   acp.TextBlock("thought text"),
+				MessageId: acp.Ptr(acp.MessageId("thought-message")),
+			}},
+			text: "thought text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := a.convertNotification(acp.SessionNotification{
+				SessionId: "session-1",
+				Update:    tt.update,
+			})
+			if event == nil {
+				t.Fatal("expected converted event")
+			}
+			if event.ProtocolMessageID != tt.name+"-message" {
+				t.Errorf("ProtocolMessageID = %q, want %q", event.ProtocolMessageID, tt.name+"-message")
+			}
+			if event.Role != tt.role {
+				t.Errorf("Role = %q, want %q", event.Role, tt.role)
+			}
+			if event.Text != tt.text && event.ReasoningText != tt.text {
+				t.Errorf("converted text = (%q, %q), want %q", event.Text, event.ReasoningText, tt.text)
+			}
+		})
+	}
+}
+
+func TestConvertMessageChunk_TextAssistant(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.TextBlock("Hello from assistant")
+
+	result := a.convertMessageChunk("session-1", cb, "assistant")
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Type != streams.EventTypeMessageChunk {
+		t.Errorf("Type = %q, want %q", result.Type, streams.EventTypeMessageChunk)
+	}
+	if result.SessionID != "session-1" {
+		t.Errorf("SessionID = %q, want %q", result.SessionID, "session-1")
+	}
+	if result.Text != "Hello from assistant" {
+		t.Errorf("Text = %q, want %q", result.Text, "Hello from assistant")
+	}
+	if result.Role != "" {
+		t.Errorf("Role = %q, want empty for assistant messages", result.Role)
+	}
+	if len(result.ContentBlocks) != 0 {
+		t.Errorf("ContentBlocks should be empty for text, got %d", len(result.ContentBlocks))
+	}
+}
+
+func TestConvertMessageChunk_PreservesAssistantWhitespaceOnlyText(t *testing.T) {
+	a := newTestAdapter()
+	cases := []string{" ", "\n", "\n\n"}
+
+	for _, text := range cases {
+		result := a.convertMessageChunk("session-1", acp.TextBlock(text), "assistant")
+
+		if result == nil {
+			t.Errorf("expected non-nil result for %q", text)
+			continue
+		}
+		if result.Text != text {
+			t.Errorf("Text = %q, want %q", result.Text, text)
+		}
+	}
+}
+
+func TestConvertMessageChunk_MonitorEnvelopeRemovedLeavesWhitespace_DropsChunk(t *testing.T) {
+	a := newTestAdapter()
+	seedMonitor(t, a, "s1", "t1", "tc-monitor")
+
+	// The envelope is the only non-whitespace content; after stripping it only
+	// "\n\n" remains. Because monitorTextRemoved is true and the remainder is
+	// whitespace-only, the chunk should be suppressed (return nil).
+	chunk := acp.TextBlock(
+		"<task-notification><task-id>t1</task-id><event>x</event></task-notification>\n\n",
+	)
+	ev := a.convertMessageChunk("s1", chunk, "assistant")
+	if ev != nil {
+		t.Errorf("expected nil (envelope stripped to whitespace-only should drop), got %+v", ev)
+	}
+}
+
+func TestConvertMessageChunk_TextUser(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.TextBlock("Hello from user")
+
+	result := a.convertMessageChunk("session-2", cb, "user")
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Role != "user" {
+		t.Errorf("Role = %q, want %q", result.Role, "user")
+	}
+	if result.Text != "Hello from user" {
+		t.Errorf("Text = %q, want %q", result.Text, "Hello from user")
+	}
+}
+
+func TestConvertMessageChunk_ImageContent(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.ImageBlock("imgdata", "image/png")
+
+	result := a.convertMessageChunk("session-3", cb, "assistant")
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Type != streams.EventTypeMessageChunk {
+		t.Errorf("Type = %q, want %q", result.Type, streams.EventTypeMessageChunk)
+	}
+	if result.Text != "" {
+		t.Errorf("Text = %q, want empty for image content", result.Text)
+	}
+	if len(result.ContentBlocks) != 1 {
+		t.Fatalf("expected 1 ContentBlock, got %d", len(result.ContentBlocks))
+	}
+	if result.ContentBlocks[0].Type != "image" {
+		t.Errorf("ContentBlocks[0].Type = %q, want %q", result.ContentBlocks[0].Type, "image")
+	}
+	if result.ContentBlocks[0].Data != "imgdata" {
+		t.Errorf("ContentBlocks[0].Data = %q, want %q", result.ContentBlocks[0].Data, "imgdata")
+	}
+}
+
+func TestConvertMessageChunk_UnknownContent(t *testing.T) {
+	a := newTestAdapter()
+	// Empty ContentBlock with no variant set
+	cb := acp.ContentBlock{}
+
+	result := a.convertMessageChunk("session-4", cb, "assistant")
+
+	if result != nil {
+		t.Errorf("expected nil for unknown content type, got %+v", result)
+	}
+}
+
+func TestConvertMessageChunk_AudioContent(t *testing.T) {
+	a := newTestAdapter()
+	cb := acp.AudioBlock("audiodata", "audio/wav")
+
+	result := a.convertMessageChunk("session-5", cb, "assistant")
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(result.ContentBlocks) != 1 {
+		t.Fatalf("expected 1 ContentBlock, got %d", len(result.ContentBlocks))
+	}
+	if result.ContentBlocks[0].Type != "audio" {
+		t.Errorf("ContentBlocks[0].Type = %q, want %q", result.ContentBlocks[0].Type, "audio")
+	}
+}
+
+// --- cancelActiveToolCalls ---
+
+func TestCancelActiveToolCalls_EmitsEventsAndClears(t *testing.T) {
+	a := newTestAdapter()
+	sessionID := "session-cancel"
+
+	// Set up active tool calls
+	a.activeToolCalls["tc-1"] = &streams.NormalizedPayload{}
+	a.activeToolCalls["tc-2"] = &streams.NormalizedPayload{}
+
+	a.cancelActiveToolCalls(sessionID)
+
+	// Verify the activeToolCalls map is cleared
+	if len(a.activeToolCalls) != 0 {
+		t.Errorf("activeToolCalls should be empty after cancel, got %d entries", len(a.activeToolCalls))
+	}
+
+	// Drain events from the channel
+	events := drainEvents(a)
+
+	if len(events) != 2 {
+		t.Fatalf("expected 2 cancel events, got %d", len(events))
+	}
+
+	// Collect tool call IDs from events
+	seenIDs := map[string]bool{}
+	for _, ev := range events {
+		if ev.Type != streams.EventTypeToolUpdate {
+			t.Errorf("event Type = %q, want %q", ev.Type, streams.EventTypeToolUpdate)
+		}
+		if ev.SessionID != sessionID {
+			t.Errorf("event SessionID = %q, want %q", ev.SessionID, sessionID)
+		}
+		if ev.ToolStatus != "cancelled" {
+			t.Errorf("event ToolStatus = %q, want %q", ev.ToolStatus, "cancelled")
+		}
+		seenIDs[ev.ToolCallID] = true
+	}
+	if !seenIDs["tc-1"] {
+		t.Error("expected cancel event for tc-1")
+	}
+	if !seenIDs["tc-2"] {
+		t.Error("expected cancel event for tc-2")
+	}
+}
+
+func TestCancelActiveToolCalls_EmptyMap(t *testing.T) {
+	a := newTestAdapter()
+
+	// Should not panic or emit events when map is empty
+	a.cancelActiveToolCalls("session-empty")
+
+	events := drainEvents(a)
+	if len(events) != 0 {
+		t.Errorf("expected 0 events for empty activeToolCalls, got %d", len(events))
+	}
+}
+
+// --- convertAvailableCommands ---
+
+func TestConvertAvailableCommands_Basic(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{
+				Name:        "commit",
+				Description: "Commit changes",
+			},
+			{
+				Name:        "review",
+				Description: "Review code",
+			},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-cmd", update)
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Type != streams.EventTypeAvailableCommands {
+		t.Errorf("Type = %q, want %q", result.Type, streams.EventTypeAvailableCommands)
+	}
+	if result.SessionID != "session-cmd" {
+		t.Errorf("SessionID = %q, want %q", result.SessionID, "session-cmd")
+	}
+	if len(result.AvailableCommands) != 2 {
+		t.Fatalf("expected 2 commands, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].Name != "commit" {
+		t.Errorf("command[0].Name = %q, want %q", result.AvailableCommands[0].Name, "commit")
+	}
+	if result.AvailableCommands[0].Description != "Commit changes" {
+		t.Errorf("command[0].Description = %q, want %q", result.AvailableCommands[0].Description, "Commit changes")
+	}
+	if result.AvailableCommands[1].Name != "review" {
+		t.Errorf("command[1].Name = %q, want %q", result.AvailableCommands[1].Name, "review")
+	}
+}
+
+func TestConvertAvailableCommands_WithInputHint(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{
+				Name:        "search",
+				Description: "Search codebase",
+				Input: &acp.AvailableCommandInput{
+					Unstructured: &acp.UnstructuredCommandInput{
+						Hint: "Enter search query",
+					},
+				},
+			},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-hint", update)
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(result.AvailableCommands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].InputHint != "Enter search query" {
+		t.Errorf("InputHint = %q, want %q", result.AvailableCommands[0].InputHint, "Enter search query")
+	}
+}
+
+func TestConvertAvailableCommands_NoInputHint(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{
+				Name:        "help",
+				Description: "Show help",
+				Input:       nil,
+			},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-nohint", update)
+
+	if result.AvailableCommands[0].InputHint != "" {
+		t.Errorf("InputHint = %q, want empty for nil Input", result.AvailableCommands[0].InputHint)
+	}
+}
+
+func TestConvertAvailableCommands_Empty(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{},
+	}
+
+	result := a.convertAvailableCommands("session-empty", update)
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(result.AvailableCommands) != 0 {
+		t.Errorf("expected 0 commands, got %d", len(result.AvailableCommands))
+	}
+}
+
+func TestConvertAvailableCommands_Dedup(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{Name: "pr-comments", Description: "Address PR review comments"},
+			{Name: "pr-comments", Description: "Address PR review comments"},
+			{Name: "pr-comments", Description: "Address PR review comments"},
+			{Name: "push-pr", Description: "Push and open PR"},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-dedup", update)
+
+	if len(result.AvailableCommands) != 2 {
+		t.Fatalf("expected 2 commands after dedup, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].Name != "pr-comments" {
+		t.Errorf("command[0].Name = %q, want %q", result.AvailableCommands[0].Name, "pr-comments")
+	}
+	if result.AvailableCommands[1].Name != "push-pr" {
+		t.Errorf("command[1].Name = %q, want %q", result.AvailableCommands[1].Name, "push-pr")
+	}
+}
+
+func TestConvertAvailableCommands_DedupPreservesFirst(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{Name: "review", Description: "First description"},
+			{Name: "review", Description: "Second description"},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-first", update)
+
+	if len(result.AvailableCommands) != 1 {
+		t.Fatalf("expected 1 command after dedup, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].Description != "First description" {
+		t.Errorf("Description = %q, want %q (first occurrence should win)",
+			result.AvailableCommands[0].Description, "First description")
+	}
+}
+
+func TestConvertAvailableCommands_NoDuplicates(t *testing.T) {
+	a := newTestAdapter()
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{Name: "commit", Description: "Commit changes"},
+			{Name: "review", Description: "Review code"},
+			{Name: "push-pr", Description: "Push and open PR"},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-nodup", update)
+
+	if len(result.AvailableCommands) != 3 {
+		t.Fatalf("expected 3 commands (no dedup needed), got %d", len(result.AvailableCommands))
+	}
+}
+
+func TestConvertAvailableCommands_CursorPlaceholderDescriptionCleared(t *testing.T) {
+	a := newTestAdapterForAgent(acpcompat.CursorAgentID)
+	// cursor-agent sends a bare dash run for commands with no real description.
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{Name: "bootstrap-go-service", Description: "---"},
+			{Name: "preferences", Description: "  ---  "},
+			{Name: "commit", Description: "Commit changes"},
+			{Name: "worktree", Description: ""},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-placeholder", update)
+
+	if len(result.AvailableCommands) != 4 {
+		t.Fatalf("expected 4 commands, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].Description != "" {
+		t.Errorf("command[0].Description = %q, want empty (dash placeholder cleared)",
+			result.AvailableCommands[0].Description)
+	}
+	if result.AvailableCommands[1].Description != "" {
+		t.Errorf("command[1].Description = %q, want empty (padded dash placeholder cleared)",
+			result.AvailableCommands[1].Description)
+	}
+	if result.AvailableCommands[2].Description != "Commit changes" {
+		t.Errorf("command[2].Description = %q, want %q (real description preserved)",
+			result.AvailableCommands[2].Description, "Commit changes")
+	}
+	if result.AvailableCommands[3].Description != "" {
+		t.Errorf("command[3].Description = %q, want empty (already empty preserved)",
+			result.AvailableCommands[3].Description)
+	}
+}
+
+// A non-Cursor agent that legitimately advertises a dashes-only description
+// keeps it: the placeholder cleanup is Cursor-scoped.
+func TestConvertAvailableCommands_NonCursorDescriptionPreserved(t *testing.T) {
+	a := newTestAdapterForAgent("claude-acp")
+	update := &acp.SessionAvailableCommandsUpdate{
+		AvailableCommands: []acp.AvailableCommand{
+			{Name: "rule", Description: "---"},
+		},
+	}
+
+	result := a.convertAvailableCommands("session-noncursor", update)
+
+	if len(result.AvailableCommands) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(result.AvailableCommands))
+	}
+	if result.AvailableCommands[0].Description != "---" {
+		t.Errorf("command[0].Description = %q, want %q (non-Cursor description untouched)",
+			result.AvailableCommands[0].Description, "---")
+	}
+}
+
+// --- generated usage/session-info updates ---
+
+func TestConvertNotification_UsageUpdateFixture(t *testing.T) {
+	a := newTestAdapter()
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"usage_update","size":200000,"used":56047,"cost":{"amount":9.76,"currency":"USD"}}}`)
+	var notification acp.SessionNotification
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if notification.Update.UsageUpdate == nil {
+		t.Fatal("generated SDK did not decode usage_update")
+	}
+
+	result := a.convertNotification(notification)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for usage_update")
+	}
+	if result.Type != streams.EventTypeContextWindow {
+		t.Errorf("Type = %q, want %q", result.Type, streams.EventTypeContextWindow)
+	}
+	if result.SessionID != "s1" {
+		t.Errorf("SessionID = %q, want %q", result.SessionID, "s1")
+	}
+	if result.ContextWindowSize != 200000 {
+		t.Errorf("ContextWindowSize = %d, want 200000", result.ContextWindowSize)
+	}
+	if result.ContextWindowUsed != 56047 {
+		t.Errorf("ContextWindowUsed = %d, want 56047", result.ContextWindowUsed)
+	}
+	if result.ContextWindowRemaining != 143953 {
+		t.Errorf("ContextWindowRemaining = %d, want 143953", result.ContextWindowRemaining)
+	}
+	expectedEff := float64(56047) / float64(200000) * 100
+	if result.ContextEfficiency != expectedEff {
+		t.Errorf("ContextEfficiency = %f, want %f", result.ContextEfficiency, expectedEff)
+	}
+}
+
+func TestConvertNotification_SessionInfoUpdateFixture(t *testing.T) {
+	a := newTestAdapter()
+	t.Cleanup(func() { _ = a.Close() })
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","title":"Linux File Guide","updatedAt":"2026-06-13T19:37:46Z","_meta":{"cursor":{"requestId":"req-1"}}}}`)
+	var notification acp.SessionNotification
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if notification.Update.SessionInfoUpdate == nil {
+		t.Fatal("generated SDK did not decode session_info_update")
+	}
+
+	result := a.convertNotification(notification)
+
+	if result == nil {
+		t.Fatal("expected non-nil result for session_info_update")
+	}
+	if result.Type != streams.EventTypeSessionInfo {
+		t.Errorf("Type = %q, want %q", result.Type, streams.EventTypeSessionInfo)
+	}
+	if result.SessionID != "s1" {
+		t.Errorf("SessionID = %q, want %q", result.SessionID, "s1")
+	}
+	if result.SessionTitle != "Linux File Guide" {
+		t.Errorf("SessionTitle = %q, want Linux File Guide", result.SessionTitle)
+	}
+	if result.SessionUpdatedAt != "2026-06-13T19:37:46Z" {
+		t.Errorf("SessionUpdatedAt = %q, want timestamp", result.SessionUpdatedAt)
+	}
+	if got := result.SessionMeta["cursor"].(map[string]any)["requestId"]; got != "req-1" {
+		t.Errorf("SessionMeta cursor.requestId = %v, want req-1", got)
+	}
+}
+
+func TestConvertNotification_SessionInfoUpdateGoalFixture(t *testing.T) {
+	a := newTestAdapter()
+	t.Cleanup(func() { _ = a.Close() })
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","_meta":{"goal":{"objective":"Coordinate contributor PR reviews","status":"active","createdAt":1789079689000,"updatedAt":1789287777000,"tokenBudget":null,"tokensUsed":9547009,"timeUsedSeconds":47312,"controlMethod":"_session/goal"}}}}`)
+	var notification acp.SessionNotification
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("unmarshal goal fixture: %v", err)
+	}
+	if notification.Update.SessionInfoUpdate == nil {
+		t.Fatal("generated SDK did not decode goal session_info_update")
+	}
+
+	result := a.convertNotification(notification)
+	if result == nil {
+		t.Fatal("expected non-nil result for goal session_info_update")
+	}
+	goal, ok := result.SessionMeta["goal"].(map[string]any)
+	if !ok {
+		t.Fatalf("goal metadata type = %T, want map[string]any", result.SessionMeta["goal"])
+	}
+	if goal["status"] != "active" || goal["objective"] != "Coordinate contributor PR reviews" {
+		t.Fatalf("goal metadata = %#v", goal)
+	}
+}
+
+func TestConvertUsageUpdate_ZeroUsed(t *testing.T) {
+	a := newTestAdapter()
+
+	result := a.convertUsageUpdate("s1", usageUpdate(200_000, 0))
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.ContextWindowRemaining != 200000 {
+		t.Errorf("ContextWindowRemaining = %d, want 200000", result.ContextWindowRemaining)
+	}
+	if result.ContextEfficiency != 0 {
+		t.Errorf("ContextEfficiency = %f, want 0", result.ContextEfficiency)
+	}
+}
+
+func TestConvertUsageUpdate_UsedExceedsSize(t *testing.T) {
+	a := newTestAdapter()
+
+	result := a.convertUsageUpdate("s1", usageUpdate(100_000, 110_000))
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.ContextWindowRemaining != 0 {
+		t.Errorf("ContextWindowRemaining = %d, want 0 (clamped)", result.ContextWindowRemaining)
+	}
+}
+
+func TestConvertUsageUpdate_ZeroSize(t *testing.T) {
+	a := newTestAdapter()
+
+	result := a.convertUsageUpdate("s1", usageUpdate(0, 0))
+
+	if result != nil {
+		t.Errorf("expected nil for zero size (division by zero guard), got %+v", result)
+	}
+}
+
+func usageUpdate(size, used int64) *acp.SessionUsageUpdate {
+	return &acp.SessionUsageUpdate{
+		SessionUpdate: "usage_update",
+		Size:          int(size),
+		Used:          int(used),
+	}
+}
+
+func TestConvertUsageUpdate_StickyMaxSize(t *testing.T) {
+	t.Run("default turn raises max from 200K to 1M", func(t *testing.T) {
+		a := newTestAdapter()
+
+		first := a.convertUsageUpdate("s1", usageUpdate(200_000, 5_000))
+		if first == nil || first.ContextWindowSize != 200_000 {
+			t.Fatalf("first size = %d, want 200000", sizeOrZero(first))
+		}
+
+		second := a.convertUsageUpdate("s1", usageUpdate(1_000_000, 5_000))
+		if second == nil || second.ContextWindowSize != 1_000_000 {
+			t.Fatalf("second size = %d, want 1000000", sizeOrZero(second))
+		}
+	})
+
+	t.Run("stale 200K start-frame cannot shrink after 1M end-frame", func(t *testing.T) {
+		a := newTestAdapter()
+		_, _ = a.convertUsageUpdate("s1", usageUpdate(200_000, 5_000)), a.convertUsageUpdate("s1", usageUpdate(1_000_000, 5_000))
+
+		stale := a.convertUsageUpdate("s1", usageUpdate(200_000, 233_900))
+		if stale == nil {
+			t.Fatal("expected non-nil stale frame result")
+		}
+		if stale.ContextWindowSize != 1_000_000 {
+			t.Errorf("ContextWindowSize = %d, want 1000000", stale.ContextWindowSize)
+		}
+		expectedEff := float64(233_900) / float64(1_000_000) * 100
+		if stale.ContextEfficiency != expectedEff {
+			t.Errorf("ContextEfficiency = %f, want %f", stale.ContextEfficiency, expectedEff)
+		}
+		if stale.ContextWindowRemaining != 766_100 {
+			t.Errorf("ContextWindowRemaining = %d, want 766100", stale.ContextWindowRemaining)
+		}
+	})
+
+	t.Run("sonnet stays at 200K", func(t *testing.T) {
+		a := newTestAdapter()
+		first := a.convertUsageUpdate("s1", usageUpdate(200_000, 5_000))
+		second := a.convertUsageUpdate("s1", usageUpdate(200_000, 7_000))
+		if first.ContextWindowSize != 200_000 || second.ContextWindowSize != 200_000 {
+			t.Fatalf("sizes = %d, %d; want 200000 both", first.ContextWindowSize, second.ContextWindowSize)
+		}
+	})
+
+	t.Run("sonnet[1m] is 1M from first frame", func(t *testing.T) {
+		a := newTestAdapter()
+		result := a.convertUsageUpdate("s1", usageUpdate(1_000_000, 5_000))
+		if result == nil || result.ContextWindowSize != 1_000_000 {
+			t.Fatalf("size = %d, want 1000000", sizeOrZero(result))
+		}
+	})
+
+	t.Run("sessions track max independently", func(t *testing.T) {
+		a := newTestAdapter()
+		_, _ = a.convertUsageUpdate("s1", usageUpdate(1_000_000, 5_000)), a.convertUsageUpdate("s2", usageUpdate(200_000, 5_000))
+		s1 := a.convertUsageUpdate("s1", usageUpdate(200_000, 10_000))
+		s2 := a.convertUsageUpdate("s2", usageUpdate(200_000, 10_000))
+		if s1.ContextWindowSize != 1_000_000 {
+			t.Errorf("s1 size = %d, want 1000000", s1.ContextWindowSize)
+		}
+		if s2.ContextWindowSize != 200_000 {
+			t.Errorf("s2 size = %d, want 200000", s2.ContextWindowSize)
+		}
+	})
+
+	t.Run("reset after model switch allows downshift to 200K", func(t *testing.T) {
+		a := newTestAdapter()
+		_, _ = a.convertUsageUpdate("s1", usageUpdate(200_000, 5_000)), a.convertUsageUpdate("s1", usageUpdate(1_000_000, 5_000))
+
+		a.resetContextWindowMaxSize("s1")
+		afterSwitch := a.convertUsageUpdate("s1", usageUpdate(200_000, 26_000))
+		if afterSwitch == nil || afterSwitch.ContextWindowSize != 200_000 {
+			t.Fatalf("after switch size = %d, want 200000", sizeOrZero(afterSwitch))
+		}
+	})
+}
+
+func sizeOrZero(ev *AgentEvent) int64 {
+	if ev == nil {
+		return 0
+	}
+	return ev.ContextWindowSize
+}
+
+// --- emitInitialModeState ---
+
+func TestEmitInitialModeState(t *testing.T) {
+	a := newTestAdapter()
+	a.sessionID = "session-mode"
+
+	modes := &acp.SessionModeState{
+		CurrentModeId: "architect",
+	}
+
+	a.emitInitialModeState("session-mode", modes)
+
+	events := drainEvents(a)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != streams.EventTypeSessionMode {
+		t.Errorf("Type = %q, want %q", events[0].Type, streams.EventTypeSessionMode)
+	}
+	if events[0].SessionID != "session-mode" {
+		t.Errorf("SessionID = %q, want %q", events[0].SessionID, "session-mode")
+	}
+	if events[0].CurrentModeID != "architect" {
+		t.Errorf("CurrentModeID = %q, want %q", events[0].CurrentModeID, "architect")
+	}
+}
+
+func TestEmitInitialModeState_CachesAvailableModes(t *testing.T) {
+	a := newTestAdapter()
+	a.sessionID = "session-cache"
+
+	desc := "Architect mode"
+	modes := &acp.SessionModeState{
+		CurrentModeId: "architect",
+		AvailableModes: []acp.SessionMode{
+			{Id: "default", Name: "Default"},
+			{Id: "architect", Name: "Architect", Description: &desc},
+		},
+	}
+
+	a.emitInitialModeState("session-cache", modes)
+	drainEvents(a) // consume the emitted event
+
+	// Verify modes were cached in the adapter
+	a.mu.RLock()
+	cached := a.availableModes
+	a.mu.RUnlock()
+
+	if len(cached) != 2 {
+		t.Fatalf("expected 2 cached modes, got %d", len(cached))
+	}
+	if cached[0].ID != "default" {
+		t.Errorf("cached[0].ID = %q, want %q", cached[0].ID, "default")
+	}
+	if cached[1].ID != "architect" {
+		t.Errorf("cached[1].ID = %q, want %q", cached[1].ID, "architect")
+	}
+	if cached[1].Description != "Architect mode" {
+		t.Errorf("cached[1].Description = %q, want %q", cached[1].Description, "Architect mode")
+	}
+}
+
+// --- sendUpdate ---
+
+func TestSendUpdate_NormalOperation(t *testing.T) {
+	a := newTestAdapter()
+	event := AgentEvent{
+		Type:      streams.EventTypeComplete,
+		SessionID: "session-send",
+	}
+
+	a.sendUpdate(event)
+
+	events := drainEvents(a)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != streams.EventTypeComplete {
+		t.Errorf("Type = %q, want %q", events[0].Type, streams.EventTypeComplete)
+	}
+}
+
+func TestSendUpdate_ClosedAdapter(t *testing.T) {
+	a := newTestAdapter()
+	// Close the adapter
+	_ = a.Close()
+
+	// Should not panic when sending to closed adapter
+	// (sendUpdate checks the closed flag)
+	// We need a fresh adapter since Close() closes the channel
+	a2 := newTestAdapter()
+	a2.mu.Lock()
+	a2.closed = true
+	a2.mu.Unlock()
+
+	// This should not panic
+	a2.sendUpdate(AgentEvent{Type: streams.EventTypeComplete})
+}

@@ -1,0 +1,235 @@
+import { getBackendConfig } from "@/lib/config";
+import { signalBackendReloadRequired } from "@/lib/platform/backend-reload-coordinator";
+import { readInterimSettingsInterlockToken } from "@/src/boot-payload";
+
+const interimSettingsInterlockHeader = "X-Kandev-Interim-Settings-Interlock";
+export const INTERIM_SETTINGS_INTERLOCK_ERROR_CODE = "interim_settings_interlock_required";
+
+export type ApiRequestOptions = {
+  baseUrl?: string;
+  cache?: RequestCache;
+  init?: RequestInit;
+};
+
+export type ConditionalJsonResult<T> =
+  | { status: "not-modified"; data?: undefined; etag: string | null }
+  | { status: "ok"; data: T; etag: string | null };
+
+/**
+ * Error thrown by fetchJson on non-2xx responses. `body` carries the parsed
+ * JSON response body (if any) so callers can react to structured fields like
+ * the dirty_files list returned with HTTP 409.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+  readonly errorCode?: string;
+  readonly retryAfterSeconds?: number;
+  handled = false;
+  constructor(message: string, status: number, body: unknown, retryAfterSeconds?: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+    this.errorCode =
+      body &&
+      typeof body === "object" &&
+      "error_code" in body &&
+      typeof (body as { error_code?: unknown }).error_code === "string"
+        ? (body as { error_code: string }).error_code
+        : undefined;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function resolveUrl(pathOrUrl: string, baseUrl: string) {
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+  return `${baseUrl}${pathOrUrl}`;
+}
+
+// Notified when a request carries a Kandev session challenge. The auth gate
+// (src/main.tsx) registers a callback that clears the store's auth slice and
+// redirects to the login page, so a session that expires mid-use doesn't leave
+// the SPA stuck making requests against a stale authenticated identity.
+let onUnauthorized: (() => void) | null = null;
+
+export function setOnUnauthorized(cb: (() => void) | null): void {
+  onUnauthorized = cb;
+}
+
+function isKandevAuthChallenge(response: Response): boolean {
+  const challenge = response.headers.get("WWW-Authenticate");
+  return challenge?.split(",").some((value) => /^Bearer(?:\s|$)/i.test(value.trim())) ?? false;
+}
+
+async function throwFromResponse(response: Response): Promise<never> {
+  let body: unknown = null;
+  let message = `Request failed: ${response.status} ${response.statusText}`;
+  try {
+    body = await response.json();
+  } catch {
+    // body remains null
+  }
+  if (body && typeof body === "object" && "error" in body) {
+    const errVal = (body as { error?: unknown }).error;
+    if (typeof errVal === "string") message = errVal;
+  }
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  const error = new ApiError(
+    message,
+    response.status,
+    body,
+    Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+  );
+  if (error.errorCode === INTERIM_SETTINGS_INTERLOCK_ERROR_CODE) {
+    signalBackendReloadRequired("settings_interlock_rejected");
+    error.handled = true;
+  }
+  throw error;
+}
+
+export function isHandledApiError(error: unknown): error is ApiError & { handled: true } {
+  return error instanceof ApiError && error.handled;
+}
+
+export async function fetchJson<T>(pathOrUrl: string, options?: ApiRequestOptions): Promise<T> {
+  const baseUrl = options?.baseUrl ?? getBackendConfig().apiBaseUrl;
+  const url = resolveUrl(pathOrUrl, baseUrl);
+  const response = await fetch(url, {
+    ...options?.init,
+    cache: options?.cache,
+    // Send the session cookie for opt-in authentication.
+    credentials: "include",
+    headers: buildRequestHeaders(options),
+  });
+  if (!response.ok) {
+    if (response.status === 401 && isKandevAuthChallenge(response)) onUnauthorized?.();
+    await throwFromResponse(response);
+  }
+  if (response.status === 204) return undefined as T;
+  const text = await response.text();
+  if (!text) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(
+      `Request failed: ${response.status} ${response.statusText}`,
+      response.status,
+      null,
+    );
+  }
+}
+
+/** Fetches JSON while exposing a conditional GET's 304 response as a value. */
+export async function fetchConditionalJson<T>(
+  pathOrUrl: string,
+  options?: ApiRequestOptions,
+): Promise<ConditionalJsonResult<T>> {
+  const baseUrl = options?.baseUrl ?? getBackendConfig().apiBaseUrl;
+  const url = resolveUrl(pathOrUrl, baseUrl);
+  const response = await fetch(url, {
+    ...options?.init,
+    cache: options?.cache ?? "no-store",
+    credentials: "include",
+    headers: buildRequestHeaders(options),
+  });
+  const etag = response.headers.get("ETag");
+  if (response.status === 304) return { status: "not-modified", etag };
+  if (!response.ok) {
+    if (response.status === 401 && isKandevAuthChallenge(response)) onUnauthorized?.();
+    await throwFromResponse(response);
+  }
+  if (response.status === 204) {
+    return { status: "ok", data: undefined as T, etag };
+  }
+  const text = await response.text();
+  if (!text) return { status: "ok", data: undefined as T, etag };
+  try {
+    return { status: "ok", data: JSON.parse(text) as T, etag };
+  } catch {
+    throw new ApiError(
+      `Request failed: ${response.status} ${response.statusText}`,
+      response.status,
+      null,
+    );
+  }
+}
+
+/**
+ * Fetches a binary response body (e.g. a zip download) as a Blob. Unlike
+ * fetchJson, no Content-Type is forced on the request and the body is never
+ * parsed as JSON — the caller consumes raw bytes. Non-2xx responses reject
+ * with the same ApiError classification fetchJson uses, so callers get one
+ * error shape to handle regardless of which fetch helper they used.
+ */
+export async function fetchBlob(pathOrUrl: string, options?: ApiRequestOptions): Promise<Blob> {
+  const baseUrl = options?.baseUrl ?? getBackendConfig().apiBaseUrl;
+  const url = resolveUrl(pathOrUrl, baseUrl);
+  const response = await fetch(url, {
+    ...options?.init,
+    cache: options?.cache,
+    credentials: "include",
+    headers: requestHeaders(options?.init?.headers),
+  });
+  if (!response.ok) {
+    if (response.status === 401 && isKandevAuthChallenge(response)) onUnauthorized?.();
+    await throwFromResponse(response);
+  }
+  return response.blob();
+}
+
+// buildRequestHeaders assembles the JSON content-type header plus the
+// interim-settings interlock token on mutating requests.
+function buildRequestHeaders(options?: ApiRequestOptions): Headers {
+  const headers = requestHeaders(options?.init?.headers);
+  const body = options?.init?.body;
+  const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+  if (!isFormData) headers.set("Content-Type", "application/json");
+  if (isMutation(options?.init?.method)) {
+    const token = readInterimSettingsInterlockToken();
+    if (token) headers.set(interimSettingsInterlockHeader, token);
+  }
+  return headers;
+}
+
+function isMutation(method: string | undefined): boolean {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(method?.toUpperCase() ?? "GET");
+}
+
+function requestHeaders(headers: HeadersInit | undefined): Headers {
+  return new Headers(headers);
+}
+
+/**
+ * Wraps fetchJson with up to `maxAttempts` retries (default 3) and
+ * exponential backoff starting at `baseDelayMs` (default 100 ms).
+ *
+ * Only transient network errors (TypeError: fetch failed, ECONNRESET,
+ * ECONNREFUSED) are retried. ApiError (non-2xx HTTP status) propagates
+ * immediately — the backend response is authoritative.
+ *
+ * Use for idempotent SSR and client-side reads that can race against a
+ * backend restart or a saturated connection pool.
+ */
+export async function fetchJsonWithRetry<T>(
+  pathOrUrl: string,
+  options?: ApiRequestOptions,
+  maxAttempts = 3,
+  baseDelayMs = 100,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fetchJson<T>(pathOrUrl, options);
+    } catch (err) {
+      if (err instanceof ApiError) throw err; // do not retry HTTP errors
+      lastError = err;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** attempt));
+      }
+    }
+  }
+  throw lastError;
+}

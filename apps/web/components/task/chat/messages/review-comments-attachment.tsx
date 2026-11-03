@@ -1,0 +1,123 @@
+"use client";
+
+import { groupCommentsByFile } from "@/lib/state/slices/comments/group-review";
+import { useState } from "react";
+import { Button } from "@kandev/ui/button";
+import { Badge } from "@kandev/ui/badge";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@kandev/ui/collapsible";
+import { IconChevronDown, IconChevronRight, IconMessage } from "@tabler/icons-react";
+import { cn } from "@kandev/ui/lib/utils";
+import type { ReviewComment } from "@/lib/state/slices/comments";
+import { formatLineRange } from "@/lib/diff";
+import { useTranslation } from "react-i18next";
+
+interface ReviewCommentsAttachmentProps {
+  /** Review comments from the message */
+  comments: ReviewComment[];
+  /** Additional class name */
+  className?: string;
+}
+
+/**
+ * Renders review comments attached to a sent user message.
+ * Shows a compact summary that expands to show full comment details.
+ */
+export function ReviewCommentsAttachment({ comments, className }: ReviewCommentsAttachmentProps) {
+  const { t } = useTranslation();
+  const [isOpen, setIsOpen] = useState(false);
+
+  if (!comments || comments.length === 0) {
+    return null;
+  }
+
+  const groups = groupCommentsByFile(comments);
+  const fileCount = groups.length;
+  const totalComments = comments.length;
+
+  return (
+    <Collapsible open={isOpen} onOpenChange={setIsOpen}>
+      <div className={cn("mt-2 rounded-lg border border-border bg-muted/30", className)}>
+        {/* Header */}
+        <CollapsibleTrigger asChild>
+          <Button
+            variant="ghost"
+            className="flex w-full items-center justify-start gap-2 px-3 py-2"
+          >
+            {isOpen ? (
+              <IconChevronDown className="h-4 w-4 shrink-0" />
+            ) : (
+              <IconChevronRight className="h-4 w-4 shrink-0" />
+            )}
+
+            <IconMessage className="h-4 w-4 shrink-0 text-blue-500" />
+
+            <span className="text-sm font-medium">{t("task:reviewCommentsTitle")}</span>
+
+            <Badge variant="secondary" className="ml-auto text-xs">
+              {t("task:commentsOnFiles", {
+                count: totalComments,
+                files: t("task:fileCountLabel", { count: fileCount }),
+              })}
+            </Badge>
+          </Button>
+        </CollapsibleTrigger>
+
+        {/* Expanded content */}
+        <CollapsibleContent>
+          <div className="border-t border-border/50 px-3 py-2">
+            {groups.map(({ key, filePath, comments: fileComments }) => (
+              <div key={key} className="mb-3 last:mb-0">
+                {/* File header */}
+                <div className="mb-1.5 flex items-center gap-1.5 text-xs">
+                  <span className="font-medium text-muted-foreground">{filePath}</span>
+                  <span className="text-muted-foreground/60">({fileComments.length})</span>
+                </div>
+
+                {/* Comments */}
+                <div className="space-y-2">
+                  {fileComments.map((comment) => (
+                    <div
+                      key={comment.id}
+                      className="rounded-md border border-border/50 bg-card p-2"
+                    >
+                      {/* Line info */}
+                      <div className="mb-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                        <span className="font-medium">
+                          {comment.source === "review-file"
+                            ? t("review:fileComment")
+                            : formatLineRange(comment.startLine, comment.endLine)}
+                        </span>
+                        {comment.source === "diff" && (
+                          <span>
+                            (
+                            {comment.side === "additions"
+                              ? t("task:diffSideNew")
+                              : t("task:diffSideOld")}
+                            )
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Code preview */}
+                      {comment.source === "diff" && comment.codeContent && (
+                        <pre className="mb-1.5 overflow-x-auto rounded bg-muted p-1.5 text-[10px] leading-tight">
+                          <code>{comment.codeContent}</code>
+                        </pre>
+                      )}
+
+                      {/* Comment text */}
+                      <p className="whitespace-pre-wrap text-xs leading-relaxed">{comment.text}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </CollapsibleContent>
+      </div>
+    </Collapsible>
+  );
+}
+
+// Re-export from unified comment system
+export { formatReviewCommentsAsMarkdown } from "@/lib/state/slices/comments/format";

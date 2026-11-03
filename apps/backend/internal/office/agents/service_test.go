@@ -1,0 +1,613 @@
+package agents
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
+
+	agentfamily "github.com/kandev/kandev/internal/agent/agents"
+	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
+	settingsstore "github.com/kandev/kandev/internal/agent/settings/store"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/office/repository/sqlite"
+	"github.com/kandev/kandev/internal/office/shared"
+)
+
+type testActivityLogger struct{}
+
+type failingProfileStore struct{}
+
+func (f failingProfileStore) GetAgentProfile(context.Context, string) (*models.AgentInstance, error) {
+	return nil, errors.New("profile unavailable")
+}
+
+func (f failingProfileStore) UpdateAgentProfile(context.Context, *models.AgentInstance) error {
+	return errors.New("profile update failed")
+}
+
+func (t *testActivityLogger) LogActivity(_ context.Context, _, _, _, _, _, _, _ string) {}
+func (t *testActivityLogger) LogActivityWithRun(_ context.Context, _, _, _, _, _, _, _, _, _ string) {
+}
+
+type fakeGovernanceSettings struct {
+	requireNewAgents bool
+}
+
+func (f *fakeGovernanceSettings) GetRequireApprovalForNewAgents(
+	_ context.Context,
+	_ string,
+) (bool, error) {
+	return f.requireNewAgents, nil
+}
+
+type fakeApprovalCreator struct {
+	approvals []*models.Approval
+}
+
+func (f *fakeApprovalCreator) CreateApprovalWithActivity(
+	_ context.Context,
+	approval *models.Approval,
+) error {
+	f.approvals = append(f.approvals, approval)
+	return nil
+}
+
+func newTestAgentService(t *testing.T) (*AgentService, *sqlite.Repository) {
+	t.Helper()
+	db, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, _, err := settingsstore.Provide(db, db, nil); err != nil {
+		t.Fatalf("settings store init: %v", err)
+	}
+
+	repo, err := sqlite.NewWithDB(db, db, nil)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+	svc := NewAgentService(repo, logger.Default(), &testActivityLogger{})
+	return svc, repo
+}
+
+func newTestAgentServiceWithProfileStore(
+	t *testing.T,
+) (*AgentService, *sqlite.Repository, settingsstore.Repository) {
+	t.Helper()
+	db, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	profileStore, _, err := settingsstore.Provide(db, db, nil)
+	if err != nil {
+		t.Fatalf("settings store init: %v", err)
+	}
+	repo, err := sqlite.NewWithDB(db, db, nil)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+	svc := NewAgentService(repo, logger.Default(), &testActivityLogger{})
+	svc.SetProfileStore(profileStore)
+	return svc, repo, profileStore
+}
+
+func TestCreateAgentInstance_CEOReceivesProjectSkillByDefault(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "CEO",
+		Role:        models.AgentRoleCEO,
+	}
+
+	stored := createAndGetAgent(t, svc, repo, agent)
+	assertSkillSlugMembership(t, stored.DesiredSkills, "kandev-projects", true)
+}
+
+func TestCreateAgentInstance_NonCEORolesDoNotReceiveProjectSkillByDefault(t *testing.T) {
+	for _, role := range []models.AgentRole{
+		models.AgentRoleWorker,
+		models.AgentRoleSpecialist,
+		models.AgentRoleAssistant,
+		models.AgentRoleSecurity,
+		models.AgentRoleQA,
+		models.AgentRoleDevOps,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			svc, repo := newTestAgentService(t)
+			agent := &models.AgentInstance{
+				WorkspaceID: "ws-1",
+				Name:        string(role),
+				Role:        role,
+			}
+
+			stored := createAndGetAgent(t, svc, repo, agent)
+			assertSkillSlugMembership(t, stored.DesiredSkills, "kandev-projects", false)
+		})
+	}
+}
+
+func TestCreateAgentInstance_PreservesExplicitSystemSkills(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	agent := &models.AgentInstance{
+		WorkspaceID:   "ws-1",
+		Name:          "CEO",
+		Role:          models.AgentRoleCEO,
+		DesiredSkills: `["memory"]`,
+		SkillIDs:      `["explicit-memory-id"]`,
+	}
+
+	expectedDesiredSkills := agent.DesiredSkills
+	expectedSkillIDs := agent.SkillIDs
+	stored := createAndGetAgent(t, svc, repo, agent)
+	if stored.DesiredSkills != expectedDesiredSkills || stored.SkillIDs != expectedSkillIDs {
+		t.Fatalf("explicit skills changed: desired=%s ids=%s", stored.DesiredSkills, stored.SkillIDs)
+	}
+	assertSkillSlugMembership(t, stored.DesiredSkills, "kandev-projects", false)
+}
+
+func TestCreateAgentInstance_RejectsCEOWithManager(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	manager := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Manager",
+		Role:        models.AgentRoleWorker,
+	})
+
+	err := svc.CreateAgentInstance(context.Background(), &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "CEO",
+		Role:        models.AgentRoleCEO,
+		ReportsTo:   manager.ID,
+	})
+	if !errors.Is(err, ErrAgentCEOReportsTo) {
+		t.Fatalf("CreateAgentInstance error = %v, want %v", err, ErrAgentCEOReportsTo)
+	}
+}
+
+func TestUpdateAgentInstance_RejectsCEOWithManager(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	ceo := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "CEO",
+		Role:        models.AgentRoleCEO,
+	})
+	ceo.ReportsTo = "manager-id"
+
+	err := svc.UpdateAgentInstance(context.Background(), ceo)
+	if !errors.Is(err, ErrAgentCEOReportsTo) {
+		t.Fatalf("UpdateAgentInstance error = %v, want %v", err, ErrAgentCEOReportsTo)
+	}
+}
+
+func TestCreateAgentInstance_RejectsCrossWorkspaceManager(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	foreign := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-other",
+		Name:        "Foreign manager",
+		Role:        models.AgentRoleWorker,
+	})
+
+	err := svc.CreateAgentInstance(context.Background(), &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Worker",
+		Role:        models.AgentRoleWorker,
+		ReportsTo:   foreign.ID,
+	})
+	if !errors.Is(err, ErrAgentReportsToInvalid) {
+		t.Fatalf("CreateAgentInstance error = %v, want %v", err, ErrAgentReportsToInvalid)
+	}
+}
+
+func TestUpdateAgentInstance_RejectsReportingCycle(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	ceo := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "CEO",
+		Role:        models.AgentRoleCEO,
+	})
+	manager := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Manager",
+		Role:        models.AgentRoleWorker,
+		ReportsTo:   ceo.ID,
+	})
+	worker := createAndGetAgent(t, svc, repo, &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Worker",
+		Role:        models.AgentRoleWorker,
+		ReportsTo:   manager.ID,
+	})
+	manager.ReportsTo = worker.ID
+
+	err := svc.UpdateAgentInstance(context.Background(), manager)
+	if !errors.Is(err, ErrAgentReportsToCycle) {
+		t.Fatalf("UpdateAgentInstance error = %v, want %v", err, ErrAgentReportsToCycle)
+	}
+}
+
+func createAndGetAgent(
+	t *testing.T,
+	svc *AgentService,
+	repo *sqlite.Repository,
+	agent *models.AgentInstance,
+) *models.AgentInstance {
+	t.Helper()
+	if err := svc.CreateAgentInstance(context.Background(), agent); err != nil {
+		t.Fatalf("CreateAgentInstance: %v", err)
+	}
+	stored, err := repo.GetAgentInstance(context.Background(), agent.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInstance: %v", err)
+	}
+	return stored
+}
+
+func assertSkillSlugMembership(t *testing.T, raw, slug string, want bool) {
+	t.Helper()
+	var slugs []string
+	if err := json.Unmarshal([]byte(raw), &slugs); err != nil {
+		t.Fatalf("decode desired_skills %q: %v", raw, err)
+	}
+	for _, got := range slugs {
+		if got == slug {
+			if !want {
+				t.Fatalf("desired_skills %v unexpectedly contains %q", slugs, slug)
+			}
+			return
+		}
+	}
+	if want {
+		t.Fatalf("desired_skills %v does not contain %q", slugs, slug)
+	}
+}
+
+func TestCreateAgentInstance_RollsBackWhenCanonicalProfileUpdateFails(t *testing.T) {
+	svc, _ := newTestAgentService(t)
+	svc.SetProfileStore(failingProfileStore{})
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1", Name: "CTO", Role: models.AgentRoleSpecialist,
+	}
+
+	if err := svc.CreateAgentInstance(context.Background(), agent); err == nil {
+		t.Fatal("expected canonical profile update failure")
+	}
+	if _, err := svc.GetAgentFromConfig(context.Background(), agent.Name); err == nil {
+		t.Fatal("agent row survived failed canonical profile update")
+	}
+}
+
+// TestCreateAgentInstance_PersistsEnabledTrue guards against a regression
+// where persistAgent's canonical-profile write round-tripped an AgentInstance
+// whose Enabled field was never set, overwriting the row's own DEFAULT 1
+// with 0 immediately after insert. A repo-only fixture (no profileStore)
+// can't see this: it never exercises profileStore.UpdateAgentProfile, so the
+// disabling write never happens and Enabled reads back as its Go zero value
+// regardless. Only the real settings-store-backed profileStore proves the
+// stored column value.
+func TestCreateAgentInstance_PersistsEnabledTrue(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "CEO",
+		Role:        models.AgentRoleCEO,
+	}
+
+	if err := svc.CreateAgentInstance(ctx, agent); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	stored, err := profileStore.GetAgentProfile(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("get agent profile: %v", err)
+	}
+	if !stored.Enabled {
+		t.Fatal("newly created office agent is not enabled; ValidateAssigneeAgentProfile would reject it")
+	}
+}
+
+func TestUpdateAgent_ProfileSelectionRebindsExecutionProfile(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	provider := &settingsmodels.Agent{ID: "provider-db-id", Name: "claude-acp"}
+	if err := profileStore.CreateAgent(ctx, provider); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	source := &settingsmodels.AgentProfile{
+		ID:               "source-profile",
+		AgentID:          provider.ID,
+		Name:             "Work",
+		AgentDisplayName: "Claude",
+		Enabled:          true,
+		Model:            "opus",
+		Mode:             "bypassPermissions",
+		ConfigOptions:    map[string]string{"effort": "high"},
+		AutoApprove:      true,
+		CLIFlags: []settingsmodels.CLIFlag{
+			{Flag: "--dangerously-skip-permissions", Enabled: true},
+		},
+		EnvVars: []settingsmodels.ProfileEnvVar{
+			{Key: "CLAUDE_CONFIG_DIR", Value: "/data/home/.claude-work"},
+		},
+	}
+	if err := profileStore.CreateAgentProfile(ctx, source); err != nil {
+		t.Fatalf("create source profile: %v", err)
+	}
+	target := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Researcher",
+		Role:        models.AgentRoleSpecialist,
+	}
+	if err := svc.CreateAgentInstance(ctx, target); err != nil {
+		t.Fatalf("create office agent: %v", err)
+	}
+
+	rec := newPatchAgentRecorder(t, svc, target.ID, `{"agent_profile_id":"source-profile"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	stored, err := profileStore.GetAgentProfile(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("get updated office agent: %v", err)
+	}
+	if stored.Name != "Researcher" || stored.Role != models.AgentRoleSpecialist || stored.WorkspaceID != "ws-1" {
+		t.Fatalf("office identity changed: name=%q role=%q workspace=%q", stored.Name, stored.Role, stored.WorkspaceID)
+	}
+	if stored.Model == "opus" || stored.Mode == "bypassPermissions" {
+		t.Errorf("Office runtime fields were overwritten: model=%q mode=%q", stored.Model, stored.Mode)
+	}
+	if stored.AgentID != provider.ID || stored.ExecutionAgentProfileID != "" {
+		t.Errorf("concrete source selection = family %q binding %q, want family %q and no dynamic binding",
+			stored.AgentID, stored.ExecutionAgentProfileID, provider.ID)
+	}
+	if stored.AutoApprove || len(stored.CLIFlags) != 0 {
+		t.Errorf("Office permission fields were overwritten: auto=%v flags=%+v", stored.AutoApprove, stored.CLIFlags)
+	}
+	if len(stored.ConfigOptions) != 0 {
+		t.Errorf("Office config options were overwritten: %+v", stored.ConfigOptions)
+	}
+	if len(stored.EnvVars) != 0 {
+		t.Errorf("Office environment was overwritten: %+v", stored.EnvVars)
+	}
+}
+
+func TestApplyProfileConfigurationCopiesOnlyProviderFamily(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	provider := &settingsmodels.Agent{ID: "provider-db-id", Name: "claude-acp"}
+	if err := profileStore.CreateAgent(ctx, provider); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	source := &settingsmodels.AgentProfile{
+		ID: "source-profile", AgentID: provider.ID, Name: "Work", Model: "opus",
+		Enabled:     true,
+		AutoApprove: true, EnvVars: []settingsmodels.ProfileEnvVar{{Key: "SECRET", Value: "value"}},
+	}
+	if err := profileStore.CreateAgentProfile(ctx, source); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	target := &models.AgentInstance{WorkspaceID: "ws-1", Name: "CTO", Model: "identity-model"}
+	if err := svc.ApplyProfileConfiguration(ctx, target, source.ID); err != nil {
+		t.Fatalf("assign provider family: %v", err)
+	}
+	if target.AgentID != provider.ID {
+		t.Fatalf("agent family = %q, want %q", target.AgentID, provider.ID)
+	}
+	if target.Model != "identity-model" || target.AutoApprove || len(target.EnvVars) != 0 {
+		t.Fatalf("runtime config copied onto Office identity: %+v", target)
+	}
+}
+
+func TestUpdateAgent_ProfileSelectionBindsDynamicExecutionSource(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	dynamicFamily := &settingsmodels.Agent{ID: "dynamic", Name: agentfamily.DynamicAgentID}
+	if err := profileStore.CreateAgent(ctx, dynamicFamily); err != nil {
+		t.Fatalf("create dynamic family: %v", err)
+	}
+	source := &settingsmodels.AgentProfile{
+		ID: "dynamic-source", AgentID: dynamicFamily.ID, Name: "Cascade", Enabled: true,
+	}
+	if err := profileStore.CreateAgentProfile(ctx, source); err != nil {
+		t.Fatalf("create dynamic profile: %v", err)
+	}
+	target := &models.AgentInstance{
+		WorkspaceID: "ws-1", Name: "Existing CEO", Role: models.AgentRoleCEO,
+		AgentID: dynamicFamily.ID, Enabled: true,
+	}
+	if err := svc.CreateAgentInstance(ctx, target); err != nil {
+		t.Fatalf("create office agent: %v", err)
+	}
+
+	rec := newPatchAgentRecorder(t, svc, target.ID, `{"agent_profile_id":"dynamic-source"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	stored, err := profileStore.GetAgentProfile(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("get updated office agent: %v", err)
+	}
+	if stored.ExecutionAgentProfileID != source.ID || stored.AgentID != dynamicFamily.ID {
+		t.Fatalf("dynamic source selection = family %q binding %q, want %q/%q",
+			stored.AgentID, stored.ExecutionAgentProfileID, dynamicFamily.ID, source.ID)
+	}
+}
+
+func TestApplyProfileConfigurationBindsDynamicSource(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	provider := &settingsmodels.Agent{ID: "dynamic", Name: "dynamic"}
+	if err := profileStore.CreateAgent(ctx, provider); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	source := &settingsmodels.AgentProfile{
+		ID: "source-dynamic", AgentID: provider.ID, Name: "Cascade",
+		Enabled: true,
+	}
+	if err := profileStore.CreateAgentProfile(ctx, source); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	target := &models.AgentInstance{WorkspaceID: "ws-1", Name: "CEO"}
+
+	if err := svc.ApplyProfileConfiguration(ctx, target, source.ID); err != nil {
+		t.Fatalf("apply profile configuration: %v", err)
+	}
+	if target.AgentID != provider.ID {
+		t.Fatalf("agent family = %q, want %q", target.AgentID, provider.ID)
+	}
+	if target.ExecutionAgentProfileID != source.ID {
+		t.Fatalf("execution binding = %q, want %q", target.ExecutionAgentProfileID, source.ID)
+	}
+}
+
+func TestApplyProfileConfiguration_RejectsCrossWorkspaceSource(t *testing.T) {
+	svc, _, profileStore := newTestAgentServiceWithProfileStore(t)
+	ctx := context.Background()
+	provider := &settingsmodels.Agent{ID: "provider-db-id", Name: "claude-acp"}
+	if err := profileStore.CreateAgent(ctx, provider); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	source := &settingsmodels.AgentProfile{
+		ID:          "other-workspace-profile",
+		AgentID:     provider.ID,
+		Name:        "Private",
+		WorkspaceID: "ws-other",
+		Enabled:     true,
+		EnvVars: []settingsmodels.ProfileEnvVar{
+			{Key: "PRIVATE_CONFIG", Value: "/private/path"},
+		},
+	}
+	if err := profileStore.CreateAgentProfile(ctx, source); err != nil {
+		t.Fatalf("create source profile: %v", err)
+	}
+	target := &models.AgentInstance{WorkspaceID: "ws-1", Name: "Worker"}
+
+	err := svc.ApplyProfileConfiguration(ctx, target, source.ID)
+	if err == nil {
+		t.Fatal("expected cross-workspace source profile to be rejected")
+	}
+	if len(target.EnvVars) != 0 {
+		t.Fatalf("cross-workspace environment was copied: %+v", target.EnvVars)
+	}
+}
+
+func TestCreateAgentInstanceWithCaller_PersistsPendingAgentWhenApprovalRequired(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	ctx := context.Background()
+	approvalCreator := &fakeApprovalCreator{}
+	svc.SetGovernanceSettings(&fakeGovernanceSettings{requireNewAgents: true})
+	svc.SetGovernanceApproval(approvalCreator)
+
+	caller := &models.AgentInstance{ID: "creator-1", Name: "CEO", Role: models.AgentRoleCEO}
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "QA Reviewer",
+		Role:        models.AgentRoleQA,
+	}
+
+	if err := svc.CreateAgentInstanceWithCaller(ctx, agent, caller, "expand testing"); err != nil {
+		t.Fatalf("CreateAgentInstanceWithCaller: %v", err)
+	}
+
+	stored, err := repo.GetAgentInstance(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInstance: %v", err)
+	}
+	if stored.Status != models.AgentStatusPendingApproval {
+		t.Fatalf("status = %q, want pending_approval", stored.Status)
+	}
+	if stored.Permissions == "" || stored.Permissions == "{}" {
+		t.Fatal("expected default permissions on pending agent")
+	}
+	if len(approvalCreator.approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1", len(approvalCreator.approvals))
+	}
+
+	approval := approvalCreator.approvals[0]
+	if approval.Type != models.ApprovalTypeHireAgent {
+		t.Fatalf("approval type = %q, want hire_agent", approval.Type)
+	}
+	if approval.RequestedByAgentProfileID != caller.ID {
+		t.Fatalf("requested_by = %q, want %q", approval.RequestedByAgentProfileID, caller.ID)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(approval.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload["agent_profile_id"] != agent.ID {
+		t.Errorf("agent_profile_id = %v, want %q", payload["agent_profile_id"], agent.ID)
+	}
+	if payload["creator_agent_id"] != caller.ID {
+		t.Errorf("creator_agent_id = %v, want %q", payload["creator_agent_id"], caller.ID)
+	}
+	if payload["permissions"] != shared.DefaultPermissions(shared.AgentRoleQA) {
+		t.Errorf("permissions = %v, want role defaults", payload["permissions"])
+	}
+}
+
+func TestCreateAgentInstanceWithCaller_InheritsCallerExecutorPreference(t *testing.T) {
+	svc, repo := newTestAgentService(t)
+	ctx := context.Background()
+
+	caller := &models.AgentInstance{
+		ID:                 "creator-1",
+		WorkspaceID:        "ws-1",
+		Name:               "CEO",
+		Role:               models.AgentRoleCEO,
+		ExecutorPreference: `{"type":"local_pc"}`,
+	}
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Worker",
+		Role:        models.AgentRoleWorker,
+	}
+
+	if err := svc.CreateAgentInstanceWithCaller(ctx, agent, caller, "delegate"); err != nil {
+		t.Fatalf("CreateAgentInstanceWithCaller: %v", err)
+	}
+
+	stored, err := repo.GetAgentInstance(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("GetAgentInstance: %v", err)
+	}
+	if stored.ExecutorPreference != caller.ExecutorPreference {
+		t.Fatalf("executor_preference = %q, want inherited %q",
+			stored.ExecutorPreference, caller.ExecutorPreference)
+	}
+}
+
+func TestCreateAgentInstanceWithCaller_UICreateBypassesGovernance(t *testing.T) {
+	svc, _ := newTestAgentService(t)
+	ctx := context.Background()
+	approvalCreator := &fakeApprovalCreator{}
+	svc.SetGovernanceSettings(&fakeGovernanceSettings{requireNewAgents: true})
+	svc.SetGovernanceApproval(approvalCreator)
+
+	agent := &models.AgentInstance{
+		WorkspaceID: "ws-1",
+		Name:        "Frontend Worker",
+		Role:        models.AgentRoleWorker,
+	}
+
+	if err := svc.CreateAgentInstanceWithCaller(ctx, agent, nil, ""); err != nil {
+		t.Fatalf("CreateAgentInstanceWithCaller: %v", err)
+	}
+	if agent.Status != models.AgentStatusIdle {
+		t.Fatalf("status = %q, want idle", agent.Status)
+	}
+	if len(approvalCreator.approvals) != 0 {
+		t.Fatalf("approvals = %d, want 0", len(approvalCreator.approvals))
+	}
+}

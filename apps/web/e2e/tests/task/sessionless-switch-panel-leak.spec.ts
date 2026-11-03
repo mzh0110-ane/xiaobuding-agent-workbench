@@ -1,0 +1,176 @@
+import path from "node:path";
+import fs from "node:fs";
+import { type Page, expect } from "@playwright/test";
+import { test } from "../../fixtures/test-base";
+import type { SeedData } from "../../fixtures/test-base";
+import type { ApiClient } from "../../helpers/api-client";
+import { watchWs } from "../../helpers/causal-waits";
+import { GitHelper, makeGitEnv, createStandardProfile } from "../../helpers/git-helper";
+import { SessionPage } from "../../pages/session-page";
+import { waitForLatestSessionDone } from "../../helpers/session";
+
+/**
+ * Regression: switching from a task with env-scoped panels open (file-editor,
+ * diff-viewer, commit-detail, browser, vscode) to a task that
+ * needs an env prepared used to leave those panels mounted in the dockview
+ * for the entire `await launchSession(...)` round-trip + WS env-id
+ * propagation. They surfaced as stray tabs (e.g. a file-editor tab) on the
+ * new task's page while it was still preparing.
+ *
+ * Fix: `prepareAndSwitchTask` calls `releaseLayoutToDefault` BEFORE awaiting
+ * the launch, dropping env-scoped portals so the user sees a clean slate.
+ * `pr-detail` is intentionally excluded: it is now a layout-owned default
+ * panel, so a fresh default layout correctly includes it during preparation.
+ */
+
+async function setupTaskWithFilePanel(args: {
+  testPage: Page;
+  apiClient: ApiClient;
+  seedData: SeedData;
+  backendTmpDir: string;
+}): Promise<{ session: SessionPage; filename: string }> {
+  const git = new GitHelper(
+    path.join(args.backendTmpDir, "repos", "e2e-repo"),
+    makeGitEnv(args.backendTmpDir),
+  );
+  const filename = "leak-fixture.ts";
+  // Local-executor specs can leave the worker-scoped seed clone on a task
+  // branch. Make this fixture independent of file execution order.
+  git.exec("git checkout main");
+  git.createFile(filename, "// leak fixture\n");
+  git.stageAll();
+  git.commit("seed leak fixture");
+  git.pushMainWithRetry();
+
+  const profile = await createStandardProfile(args.apiClient, "panel-leak-source");
+  const task = await args.apiClient.createTaskWithAgent(
+    args.seedData.workspaceId,
+    "Panel Leak Source",
+    profile.id,
+    {
+      description: "Source task with env-scoped file panel open",
+      workflow_id: args.seedData.workflowId,
+      workflow_step_id: args.seedData.startStepId,
+      repository_ids: [args.seedData.repositoryId],
+    },
+  );
+  await waitForLatestSessionDone(
+    args.apiClient,
+    task.id,
+    1,
+    "source task did not finish preparing its workspace",
+  );
+
+  let workspacePath = "";
+  await expect
+    .poll(
+      async () => {
+        const environment = await args.apiClient.getTaskEnvironment(task.id);
+        workspacePath = environment?.workspace_path ?? environment?.repos?.[0]?.worktree_path ?? "";
+        return (
+          environment?.status === "ready" &&
+          workspacePath !== "" &&
+          fs.existsSync(path.join(workspacePath, filename))
+        );
+      },
+      {
+        timeout: 45_000,
+        message: "source task environment contains the committed file fixture",
+      },
+    )
+    .toBe(true);
+
+  const gateway = watchWs(args.testPage);
+  await args.testPage.goto(`/t/${task.id}`);
+  const session = new SessionPage(args.testPage);
+  await session.waitForLoad();
+  const treeResponse = gateway.waitForResponse("workspace.tree.get");
+  await args.testPage.reload();
+  await session.waitForLoad();
+  await treeResponse;
+  await session.waitForChatIdle({ timeout: 45_000 });
+  await session.clickTab("Files");
+  await expect(session.files).toBeVisible({ timeout: 10_000 });
+  const node = await session.fileTree.waitForFileTreeNode(filename, 30_000);
+  await node.click();
+  // The file-editor panel is env-scoped — exactly the kind that used to leak.
+  await expect(args.testPage.getByTestId("preview-tab-file-editor")).toBeVisible({
+    timeout: 10_000,
+  });
+  return { session, filename };
+}
+
+/** Read live component names that are not part of the default layout. */
+async function readLiveDockviewComponents(testPage: Page): Promise<string[]> {
+  return testPage.evaluate(() => {
+    type Panel = { id: string; api?: { component?: string } };
+    type Api = { panels: Panel[] };
+    const api = (window as unknown as { __dockviewApi__?: Api }).__dockviewApi__;
+    if (!api) return [];
+    return api.panels.map((p) => p.api?.component ?? "");
+  });
+}
+
+const NON_DEFAULT_ENV_SCOPED_COMPONENTS = [
+  "file-editor",
+  "diff-viewer",
+  "commit-detail",
+  "browser",
+  "vscode",
+];
+
+test.describe("Sessionless task switch — env-scoped panel cleanup", () => {
+  test("dropping into a sessionless task releases the previous task's env-scoped panels", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+
+    // Source task: open a file-editor panel (env-scoped).
+    const { session } = await setupTaskWithFilePanel({
+      testPage,
+      apiClient,
+      seedData,
+      backendTmpDir: backend.tmpDir,
+    });
+
+    // Sanity: the env-scoped panel is in the live dockview.
+    const beforeComponents = await readLiveDockviewComponents(testPage);
+    expect(beforeComponents).toContain("file-editor");
+
+    // Sessionless target task — clicking it triggers prepareAndSwitchTask,
+    // which awaits launchSession before any layout switch could otherwise run.
+    const target = await apiClient.createTask(seedData.workspaceId, "Panel Leak Target", {
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: [seedData.repositoryId],
+    });
+
+    const targetRow = session.taskInSidebar("Panel Leak Target");
+    await expect(targetRow).toBeVisible({ timeout: 10_000 });
+    await session.clickTaskInSidebar("Panel Leak Target");
+
+    // Bug invariant: env-scoped panels from the source task must NOT be
+    // visible on the target task's page during prepare. Poll a short window
+    // — without the fix the file-editor panel survives the entire
+    // launchSession round-trip + WS env-id propagation (multi-second).
+    await expect
+      .poll(
+        async () => {
+          const components = await readLiveDockviewComponents(testPage);
+          return components.some((c) => NON_DEFAULT_ENV_SCOPED_COMPONENTS.includes(c));
+        },
+        {
+          timeout: 5_000,
+          message: "env-scoped panels from previous task must be released on sessionless switch",
+        },
+      )
+      .toBe(false);
+
+    // And the URL eventually reflects the target task (sanity that the click
+    // actually triggered the select flow).
+    await expect(testPage).toHaveURL(new RegExp(`/t/${target.id}(?:\\?|$)`), { timeout: 30_000 });
+  });
+});

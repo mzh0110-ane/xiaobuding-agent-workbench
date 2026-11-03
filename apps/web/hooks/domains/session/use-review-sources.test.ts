@@ -1,0 +1,621 @@
+import { describe, it, expect } from "vitest";
+import { buildReviewSources } from "./use-review-sources";
+import { resolvePRReviewRepositoryName } from "@/components/review/types";
+import type { PRDiffFile } from "@/lib/types/github";
+
+const RENAMED_PATH = "src/new-name.ts";
+const PREVIOUS_PATH = "src/old-name.ts";
+
+/* eslint-disable max-lines-per-function -- comprehensive source merge cases */
+describe("buildReviewSources", () => {
+  it("returns empty result when no inputs", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toEqual([]);
+    expect(result.sourceCounts).toEqual({ uncommitted: 0, committed: 0, pr: 0 });
+  });
+
+  it("tags uncommitted files from gitStatus", () => {
+    const result = buildReviewSources({
+      gitStatus: {
+        files: {
+          "src/a.ts": {
+            diff: "@@ -1 +1 @@\n-a\n+b\n",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+          },
+        },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.allFiles[0].path).toBe("src/a.ts");
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("tags committed files from cumulativeDiff", () => {
+    const cumulativeDiff = {
+      base_commit: "single-repo-base-sha",
+      files: {
+        "src/b.ts": {
+          diff: "@@ -1 +1 @@\n-x\n+y\n",
+          status: "modified",
+          additions: 1,
+          deletions: 1,
+        },
+      },
+    };
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("committed");
+    expect(result.allFiles[0]).toMatchObject({ base_ref: "single-repo-base-sha" });
+    expect(result.sourceCounts).toEqual({ uncommitted: 0, committed: 1, pr: 0 });
+  });
+
+  it("tags pr files from prDiffFiles", () => {
+    const prFiles: PRDiffFile[] = [
+      {
+        filename: "src/c.ts",
+        status: "modified",
+        patch: "@@ -1 +1 @@\n-p\n+q\n",
+        additions: 1,
+        deletions: 1,
+      },
+    ];
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: prFiles,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("pr");
+    expect(result.allFiles[0].repository_name).toBeUndefined();
+    expect(result.sourceCounts).toEqual({ uncommitted: 0, committed: 0, pr: 1 });
+  });
+
+  it("keeps a patchless PR rename with its previous path", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: [
+        {
+          filename: RENAMED_PATH,
+          old_path: PREVIOUS_PATH,
+          status: "renamed",
+          patch: "",
+          additions: 0,
+          deletions: 0,
+        },
+      ],
+    });
+
+    expect(result.allFiles).toEqual([
+      expect.objectContaining({
+        path: RENAMED_PATH,
+        old_path: PREVIOUS_PATH,
+        status: "renamed",
+        diff: "",
+        source: "pr",
+      }),
+    ]);
+    expect(result.sourceCounts).toEqual({ uncommitted: 0, committed: 0, pr: 1 });
+  });
+
+  it("normalizes removed and unknown PR statuses", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: [
+        { filename: "gone.ts", status: "removed", patch: "", additions: 0, deletions: 1 },
+        { filename: "copied.ts", status: "copied", patch: "", additions: 1, deletions: 0 },
+      ],
+    });
+
+    expect(Object.fromEntries(result.allFiles.map((file) => [file.path, file.status]))).toEqual({
+      "copied.ts": "modified",
+      "gone.ts": "deleted",
+    });
+  });
+
+  it("keeps patchless uncommitted and cumulative files with metadata", () => {
+    const result = buildReviewSources({
+      gitStatus: {
+        files: {
+          "assets/logo.png": {
+            status: "modified",
+            diff_skip_reason: "binary",
+          },
+        },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: {
+        files: {
+          [RENAMED_PATH]: {
+            status: "renamed",
+            old_path: PREVIOUS_PATH,
+          },
+        },
+      },
+      prDiffFiles: undefined,
+    });
+
+    expect(result.allFiles).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "assets/logo.png",
+          diff_skip_reason: "binary",
+          diff: "",
+          source: "uncommitted",
+        }),
+        expect.objectContaining({
+          path: RENAMED_PATH,
+          old_path: PREVIOUS_PATH,
+          status: "renamed",
+          diff: "",
+          source: "committed",
+        }),
+      ]),
+    );
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 1, pr: 0 });
+  });
+
+  it("dedupes by path: uncommitted wins over committed wins over PR", () => {
+    const prFiles: PRDiffFile[] = [
+      {
+        filename: "src/shared.ts",
+        status: "modified",
+        patch: "@@ -1 +1 @@\n-pr\n+pr\n",
+        additions: 1,
+        deletions: 1,
+      },
+    ];
+    const result = buildReviewSources({
+      gitStatus: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@ -1 +1 @@\n-u\n+u\n",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+          },
+        },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@ -1 +1 @@\n-c\n+c\n",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+          },
+        },
+      },
+      prDiffFiles: prFiles,
+      useRepositoryKeys: false,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.allFiles[0].repository_name).toBeUndefined();
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("counts files across three distinct sources", () => {
+    const prFiles: PRDiffFile[] = [
+      {
+        filename: "src/c.ts",
+        status: "modified",
+        patch: "@@ -1 +1 @@\n-p\n+q\n",
+        additions: 1,
+        deletions: 1,
+      },
+    ];
+    const result = buildReviewSources({
+      gitStatus: {
+        files: { "src/a.ts": { diff: "@@a@@", status: "modified", additions: 1, deletions: 0 } },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: {
+        files: { "src/b.ts": { diff: "@@b@@", status: "modified", additions: 1, deletions: 0 } },
+      },
+      prDiffFiles: prFiles,
+    });
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 1, pr: 1 });
+    expect(result.allFiles).toHaveLength(3);
+  });
+
+  it("multi-repo: tags uncommitted files with repository_name from statusByRepo", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "src/x.ts": {
+                diff: "@@x@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+        {
+          repository_name: "backend",
+          status: {
+            files: {
+              "src/y.go": {
+                diff: "@@y@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(2);
+    expect(result.sourceCounts).toEqual({ uncommitted: 2, committed: 0, pr: 0 });
+    const repoNames = result.allFiles.map((f) => f.repository_name).sort();
+    expect(repoNames).toEqual(["backend", "frontend"]);
+  });
+
+  it("multi-repo uncommitted + cumulativeDiff overlap: file appears once as uncommitted", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "src/shared.ts": {
+                diff: "@@u@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@c@@",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+          },
+        },
+      },
+      prDiffFiles: undefined,
+      useRepositoryKeys: false,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.allFiles[0].repository_name).toBeUndefined();
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("dedupes PR files using the canonical workspace repo rather than provider repo name", () => {
+    const prRepoName = resolvePRReviewRepositoryName(
+      { repository_id: "repo-1", repo: "widgets" },
+      "acme/widgets",
+    );
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "acme-widgets",
+          status: {
+            files: {
+              "src/shared.ts": {
+                diff: "@@u@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: [
+        {
+          filename: "src/shared.ts",
+          status: "modified",
+          patch: "@@p@@",
+          additions: 1,
+          deletions: 0,
+        },
+      ],
+      prRepoName,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("dedupes repo-scoped PR files against bare-path uncommitted gitStatus entries", () => {
+    const result = buildReviewSources({
+      gitStatus: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@u@@",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+          },
+        },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: null,
+      prDiffFiles: [
+        {
+          filename: "src/shared.ts",
+          status: "modified",
+          patch: "@@p@@",
+          additions: 1,
+          deletions: 0,
+        },
+      ],
+      prRepoName: "frontend",
+      useRepositoryKeys: false,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.allFiles[0].repository_name).toBeUndefined();
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("dedupes repo-scoped cumulative files against bare-path uncommitted gitStatus entries", () => {
+    const result = buildReviewSources({
+      gitStatus: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@u@@",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+          },
+        },
+      },
+      statusByRepo: undefined,
+      cumulativeDiff: {
+        files: {
+          "src/shared.ts": {
+            diff: "@@c@@",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+            repository_name: "frontend",
+          },
+        },
+      },
+      prDiffFiles: undefined,
+      useRepositoryKeys: false,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].source).toBe("uncommitted");
+    expect(result.allFiles[0].repository_name).toBeUndefined();
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 0 });
+  });
+
+  it("multi-repo: same filename uncommitted in one repo, committed in another — both appear", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "README.md": { diff: "@@f@@", status: "modified", additions: 1, deletions: 0 },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: {
+        files: {
+          "README.md": {
+            diff: "@@b@@",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+            repository_name: "backend",
+          },
+        },
+      },
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(2);
+    const byRepo = Object.fromEntries(result.allFiles.map((f) => [f.repository_name, f]));
+    expect(byRepo["frontend"]?.source).toBe("uncommitted");
+    expect(byRepo["backend"]?.source).toBe("committed");
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 1, pr: 0 });
+  });
+
+  it("multi-repo: same filename uncommitted in one repo, PR in another — both appear", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "README.md": { diff: "@@f@@", status: "modified", additions: 1, deletions: 0 },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: [
+        { filename: "README.md", status: "modified", patch: "@@p@@", additions: 1, deletions: 0 },
+      ],
+      prRepoName: "backend",
+    });
+    expect(result.allFiles).toHaveLength(2);
+    const byRepo = Object.fromEntries(result.allFiles.map((f) => [f.repository_name, f]));
+    expect(byRepo["frontend"]?.source).toBe("uncommitted");
+    expect(byRepo["backend"]?.source).toBe("pr");
+    expect(result.sourceCounts).toEqual({ uncommitted: 1, committed: 0, pr: 1 });
+  });
+
+  it("multi-repo: same filename in two repos both appear (no collision)", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "README.md": {
+                diff: "@@frontend@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+        {
+          repository_name: "backend",
+          status: {
+            files: {
+              "README.md": {
+                diff: "@@backend@@",
+                status: "modified",
+                additions: 2,
+                deletions: 0,
+              },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(2);
+    const byRepo = Object.fromEntries(result.allFiles.map((f) => [f.repository_name, f]));
+    expect(byRepo["frontend"]?.path).toBe("README.md");
+    expect(byRepo["backend"]?.path).toBe("README.md");
+    expect(result.sourceCounts).toEqual({ uncommitted: 2, committed: 0, pr: 0 });
+  });
+
+  it("keeps repo and path combinations containing colons distinct", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "frontend:src",
+          status: {
+            files: {
+              "app.ts": { diff: "@@first@@", status: "modified", additions: 1, deletions: 0 },
+            },
+          },
+        },
+        {
+          repository_name: "frontend",
+          status: {
+            files: {
+              "src:app.ts": {
+                diff: "@@second@@",
+                status: "modified",
+                additions: 1,
+                deletions: 0,
+              },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+
+    expect(result.allFiles.map((file) => [file.repository_name, file.path])).toEqual([
+      ["frontend", "src:app.ts"],
+      ["frontend:src", "app.ts"],
+    ]);
+  });
+
+  // Regression for the multi-repo cumulative-diff bug: backend's
+  // `mergeCumulativeFiles` uses a `<repo>\x00<path>` map key and stamps the
+  // clean repo-relative path on `file.path`. The old code read the path from
+  // the map key, so the displayed path contained the embedded NUL+repo and
+  // the dedup key was `<repo>:<repo>\x00<path>` (mismatched against any
+  // other source). Verify we now use `file.path` when present.
+  it("multi-repo cumulative: NUL-composite map key + stamped path renders clean path", () => {
+    const cumulativeDiff = {
+      files: {
+        "frontend\u0000src/x.ts": {
+          diff: "@@x@@",
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          repository_name: "frontend",
+          path: "src/x.ts",
+          base_ref: "frontend-base-sha",
+        },
+      },
+    };
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: undefined,
+      cumulativeDiff,
+      prDiffFiles: undefined,
+    });
+    expect(result.allFiles).toHaveLength(1);
+    expect(result.allFiles[0].path).toBe("src/x.ts");
+    expect(result.allFiles[0].repository_name).toBe("frontend");
+    expect(result.allFiles[0].source).toBe("committed");
+    expect(result.allFiles[0]).toMatchObject({ base_ref: "frontend-base-sha" });
+  });
+
+  it("sorts files by repository_name then path", () => {
+    const result = buildReviewSources({
+      gitStatus: undefined,
+      statusByRepo: [
+        {
+          repository_name: "zeta",
+          status: {
+            files: {
+              "z.ts": { diff: "@@@@", status: "modified", additions: 0, deletions: 0 },
+            },
+          },
+        },
+        {
+          repository_name: "alpha",
+          status: {
+            files: {
+              "b.ts": { diff: "@@@@", status: "modified", additions: 0, deletions: 0 },
+              "a.ts": { diff: "@@@@", status: "modified", additions: 0, deletions: 0 },
+            },
+          },
+        },
+      ],
+      cumulativeDiff: null,
+      prDiffFiles: undefined,
+    });
+    const paths = result.allFiles.map((f) => `${f.repository_name}:${f.path}`);
+    expect(paths).toEqual(["alpha:a.ts", "alpha:b.ts", "zeta:z.ts"]);
+  });
+});

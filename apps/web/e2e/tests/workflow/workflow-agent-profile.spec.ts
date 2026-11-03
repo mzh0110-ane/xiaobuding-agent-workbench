@@ -1,0 +1,385 @@
+import { test, expect } from "../../fixtures/test-base";
+import { useRegularMode } from "../../helpers/regular-mode";
+import { WorkflowSettingsPage } from "../../pages/workflow-settings-page";
+import { KanbanPage } from "../../pages/kanban-page";
+
+// Exercises the regular task-create dialog (New Task in the sidebar); run with office off.
+useRegularMode();
+
+test.describe("Workflow agent profile", () => {
+  test("saves the workflow-level agent profile explicitly", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    const page = new WorkflowSettingsPage(testPage);
+    await page.goto(seedData.workspaceId);
+
+    // Find the seeded "E2E Workflow" card
+    const card = await page.findWorkflowCard("E2E Workflow");
+    await expect(card).toBeVisible();
+
+    // The "Default Agent Profile" select should initially show "None (use task default)"
+    const profileSelect = page.workflowAgentProfileSelect(card);
+    await expect(profileSelect).toBeVisible();
+
+    // Get the available agent profiles from the API so we know the label to select
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+    const profileLabel = `${agentProfile.agentDisplayName} \u2022 ${agentProfile.name}`;
+
+    // Open the select and pick the agent profile
+    await profileSelect.click();
+    await testPage.getByRole("option", { name: profileLabel }).click();
+
+    expect(
+      (await apiClient.listWorkflows(seedData.workspaceId)).workflows.find(
+        (workflow) => workflow.id === seedData.workflowId,
+      )?.agent_profile_id,
+    ).not.toBe(agentProfile.id);
+    await page.saveChanges();
+
+    // Reload and verify the selection persists
+    await page.goto(seedData.workspaceId);
+    const reloadedCard = await page.findWorkflowCard("E2E Workflow");
+    await expect(reloadedCard).toBeVisible();
+    const reloadedSelect = page.workflowAgentProfileSelect(reloadedCard);
+    await expect(reloadedSelect).toContainText(profileLabel);
+  });
+
+  test("set per-step agent profile override in settings", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    const page = new WorkflowSettingsPage(testPage);
+    await page.goto(seedData.workspaceId);
+
+    // Find the seeded workflow card
+    const card = await page.findWorkflowCard("E2E Workflow");
+    await expect(card).toBeVisible();
+
+    // Click on the first step to open the config panel
+    const firstStepName = seedData.steps[0]?.name;
+    const firstStepId = seedData.steps[0]?.id;
+    expect(firstStepName).toBeDefined();
+    expect(firstStepId).toBeDefined();
+    const stepNode = page.stepNodeByName(card, firstStepName!);
+    await stepNode.click();
+
+    // The step config panel should be visible with the "Agent Profile Override" select
+    const stepProfileSelect = page.stepAgentProfileSelect(card);
+    await expect(stepProfileSelect).toBeVisible();
+
+    // Get agent profile info
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+    // Select an agent profile for this step
+    await testPage.addStyleTag({
+      content: '[data-slot="tooltip-content"] { display: none !important; }',
+    });
+    await stepProfileSelect.click();
+    await testPage.getByTestId(`${firstStepId}-profile-option-${agentProfile.id}`).click();
+
+    expect(
+      (await apiClient.listWorkflowSteps(seedData.workflowId)).steps[0]?.agent_profile_id,
+    ).not.toBe(agentProfile.id);
+    await page.saveChanges();
+
+    // Reload and verify - the step should now show the agent profile icon (IconUserCog)
+    await page.goto(seedData.workspaceId);
+    const reloadedCard = await page.findWorkflowCard("E2E Workflow");
+    await expect(reloadedCard).toBeVisible();
+
+    // The step node should have a UserCog icon indicating a custom agent profile
+    const reloadedStepNode = page.stepNodeByName(reloadedCard, firstStepName!);
+    await expect(reloadedStepNode.locator(".tabler-icon-user-cog")).toBeVisible();
+  });
+
+  test("task creation dialog locks agent selector when workflow has agent profile", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    // Set an agent profile on the seeded workflow via API
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+    await apiClient.updateWorkflow(seedData.workflowId, {
+      agent_profile_id: agentProfile.id,
+    });
+
+    let noProfileWorkflowId: string | undefined;
+    try {
+      // Create a second workflow without an agent profile for comparison
+      const noProfileWorkflow = await apiClient.createWorkflow(
+        seedData.workspaceId,
+        "No Profile Workflow",
+        "simple",
+      );
+      noProfileWorkflowId = noProfileWorkflow.id;
+
+      // Open the kanban page — reload to pick up the updated workflow agent_profile_id
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await testPage.reload();
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      // Fill title so the selectors become visible
+      await testPage.getByTestId("task-title-input").fill("Agent Lock Test");
+      await testPage.getByTestId("task-description-input").fill("testing agent lock");
+
+      // The seeded workflow should be selected by default (from user settings).
+      // The agent selector should be disabled because the workflow has an agent profile.
+      const agentSelector = testPage.getByTestId("agent-profile-selector");
+      await expect(agentSelector).toBeVisible({ timeout: 15_000 });
+
+      // "Agent set by workflow" text confirms the selector is locked — sufficient verification
+      await expect(testPage.getByText("Agent set by workflow")).toBeVisible({ timeout: 10_000 });
+    } finally {
+      // Always clean up, even if assertions fail
+      if (noProfileWorkflowId) {
+        await apiClient.deleteWorkflow(noProfileWorkflowId).catch(() => {});
+      }
+      await apiClient.updateWorkflow(seedData.workflowId, {
+        agent_profile_id: "",
+      });
+    }
+  });
+
+  test("single workflow with agent override enables Start task button and submits with that profile", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    // Set an agent profile on the only workflow
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+    await apiClient.updateWorkflow(seedData.workflowId, {
+      agent_profile_id: agentProfile.id,
+    });
+
+    try {
+      // Verify the API actually has the agent_profile_id set
+      const { workflows: wfList } = await apiClient.listWorkflows(seedData.workspaceId);
+      const updatedWf = wfList.find((w) => w.id === seedData.workflowId);
+      expect(updatedWf?.agent_profile_id).toBe(agentProfile.id);
+
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      // Reload to pick up the updated workflow; wait for network to settle
+      await testPage.reload({ waitUntil: "networkidle" });
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      const taskTitle = "Single Workflow Test";
+      await testPage.getByTestId("task-title-input").fill(taskTitle);
+      await testPage.getByTestId("task-description-input").fill("testing single workflow");
+
+      // The selector should be disabled with "Agent set by workflow" text
+      await expect(testPage.getByText("Agent set by workflow")).toBeVisible({ timeout: 10_000 });
+
+      // The agent selector should be disabled (locked by workflow)
+      const agentSelector = testPage.getByTestId("agent-profile-selector");
+      await expect(agentSelector).toBeDisabled({ timeout: 10_000 });
+
+      // Start task must be enabled: the workflow provides the agent even though
+      // the in-dialog agent selector is empty.
+      const startButton = testPage.getByTestId("submit-start-agent");
+      await expect(startButton).toBeEnabled({ timeout: 10_000 });
+
+      // Submit and verify the task + session are created with the workflow's profile.
+      await startButton.click();
+      await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+      let createdTaskId: string | undefined;
+      await expect
+        .poll(
+          async () => {
+            const { tasks } = await apiClient.listTasks(seedData.workspaceId);
+            const created = tasks.find((t) => t.title === taskTitle);
+            createdTaskId = created?.id;
+            return createdTaskId;
+          },
+          { timeout: 15_000 },
+        )
+        .toBeDefined();
+
+      await expect
+        .poll(
+          async () => {
+            const { sessions } = await apiClient.listTaskSessions(createdTaskId!);
+            return sessions[0]?.agent_profile_id;
+          },
+          { timeout: 15_000 },
+        )
+        .toBe(agentProfile.id);
+    } finally {
+      await apiClient.updateWorkflow(seedData.workflowId, {
+        agent_profile_id: "",
+      });
+    }
+  });
+
+  test("Start task stays enabled after closing and re-opening the dialog", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    // Same setup: a single workflow with an agent override.
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+    await apiClient.updateWorkflow(seedData.workflowId, {
+      agent_profile_id: agentProfile.id,
+    });
+
+    try {
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await testPage.reload({ waitUntil: "networkidle" });
+
+      const startButton = testPage.getByTestId("submit-start-agent");
+      const dialog = testPage.getByTestId("create-task-dialog");
+
+      // First open: fill and confirm enabled.
+      await kanban.createTaskButton.first().click();
+      await expect(dialog).toBeVisible();
+      await testPage.getByTestId("task-title-input").fill("Reopen Test 1");
+      await testPage.getByTestId("task-description-input").fill("first open");
+      await expect(testPage.getByText("Agent set by workflow")).toBeVisible({ timeout: 10_000 });
+      await expect(startButton).toBeEnabled({ timeout: 10_000 });
+
+      // Cancel and re-open.
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(dialog).toBeHidden({ timeout: 10_000 });
+
+      await kanban.createTaskButton.first().click();
+      await expect(dialog).toBeVisible();
+
+      // Second open: fill content; workflow override must still enable Start.
+      await testPage.getByTestId("task-title-input").fill("Reopen Test 2");
+      await testPage.getByTestId("task-description-input").fill("second open");
+      await expect(testPage.getByText("Agent set by workflow")).toBeVisible({ timeout: 10_000 });
+      await expect(startButton).toBeEnabled({ timeout: 10_000 });
+    } finally {
+      await apiClient.updateWorkflow(seedData.workflowId, {
+        agent_profile_id: "",
+      });
+    }
+  });
+
+  test("workflow selector shows agent icon for workflow-level override", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+
+    // Set agent profile on seeded workflow
+    await apiClient.updateWorkflow(seedData.workflowId, {
+      agent_profile_id: agentProfile.id,
+    });
+
+    let noProfileWorkflowId: string | undefined;
+    try {
+      // Create second workflow without agent profile so selector is visible
+      const noProfileWorkflow = await apiClient.createWorkflow(
+        seedData.workspaceId,
+        "Plain Workflow",
+        "simple",
+      );
+      noProfileWorkflowId = noProfileWorkflow.id;
+
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await testPage.reload({ waitUntil: "networkidle" });
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      await testPage.getByTestId("task-title-input").fill("Icon Test");
+
+      // Open workflow selector
+      const workflowButton = dialog.locator("button", { hasText: "E2E Workflow" });
+      await expect(workflowButton).toBeVisible({ timeout: 10_000 });
+      await workflowButton.click();
+
+      // The workflow with agent override should have an agent logo
+      const agentLogo = testPage.getByTestId("workflow-agent-logo");
+      await expect(agentLogo.first()).toBeVisible();
+    } finally {
+      if (noProfileWorkflowId) {
+        await apiClient.deleteWorkflow(noProfileWorkflowId).catch(() => {});
+      }
+      await apiClient.updateWorkflow(seedData.workflowId, {
+        agent_profile_id: "",
+      });
+    }
+  });
+
+  test("step-level agent override shown in workflow selector", async ({
+    testPage,
+    seedData,
+    apiClient,
+  }) => {
+    const { agents } = await apiClient.listAgents();
+    const agentProfile = agents.flatMap((a) => a.profiles ?? [])[0];
+    expect(agentProfile).toBeDefined();
+
+    // Set agent profile on the first step
+    const firstStep = seedData.steps[0];
+    expect(firstStep).toBeDefined();
+    await apiClient.updateWorkflowStep(firstStep.id, {
+      agent_profile_id: agentProfile.id,
+    });
+
+    let extraWorkflowId: string | undefined;
+    try {
+      // Create second workflow so selector is visible
+      const extraWorkflow = await apiClient.createWorkflow(
+        seedData.workspaceId,
+        "Extra Workflow",
+        "simple",
+      );
+      extraWorkflowId = extraWorkflow.id;
+
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await testPage.reload({ waitUntil: "networkidle" });
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      await testPage.getByTestId("task-title-input").fill("Step Override Test");
+
+      // Open workflow selector
+      const workflowButton = dialog.locator("button", { hasText: "E2E Workflow" });
+      await expect(workflowButton).toBeVisible({ timeout: 10_000 });
+      await workflowButton.click();
+
+      // The step with agent override should show an agent logo
+      const stepAgentLogo = testPage.getByTestId("step-agent-logo");
+      await expect(stepAgentLogo.first()).toBeVisible({ timeout: 10_000 });
+    } finally {
+      if (extraWorkflowId) {
+        await apiClient.deleteWorkflow(extraWorkflowId).catch(() => {});
+      }
+      await apiClient.updateWorkflowStep(firstStep.id, {
+        agent_profile_id: "",
+      });
+    }
+  });
+});

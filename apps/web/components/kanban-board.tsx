@@ -1,0 +1,639 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useRouter, useSearchParams } from "@/lib/routing/client-router";
+import { Button } from "@kandev/ui/button";
+import { Task } from "./kanban-card";
+import { TaskCreateDialog } from "./task-create-dialog";
+import { useAppStore, useAppStoreApi } from "@/components/state-provider";
+import type { Task as BackendTask } from "@/lib/types/http";
+import type { WorkflowsState } from "@/lib/state/slices";
+import { type MoveTaskError } from "@/hooks/use-drag-and-drop";
+import { SwimlaneContainer } from "./kanban/swimlane-container";
+import { KanbanHeader } from "./kanban/kanban-header";
+import { MobileFab } from "./kanban/mobile-fab";
+import { PullToRefresh } from "./mobile/pull-to-refresh";
+import { MobileSearchBar } from "./kanban/mobile-search-bar";
+import { TaskMultiSelectToolbar } from "./kanban/task-multi-select-toolbar";
+import { useKanbanData, useKanbanActions, useKanbanNavigation } from "@/hooks/domains/kanban";
+import { useAllWorkflowSnapshots } from "@/hooks/domains/kanban/use-all-workflow-snapshots";
+import {
+  resolveBoardWorkflowId,
+  resolveBoardWorkflowSteps,
+  resolveDesiredWorkflowId,
+} from "@/lib/kanban/resolve-workflow";
+import { useWorkspacePRs } from "@/hooks/domains/github/use-task-pr";
+import { useWorkspaceMRs } from "@/hooks/domains/gitlab/use-task-mr";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import { useTaskMultiSelect } from "@/hooks/use-task-multi-select";
+import { usePluginTaskFilters } from "@/hooks/use-plugin-task-filters";
+import { HomepageCommands } from "./homepage-commands";
+import { linkToTask } from "@/lib/links";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from "@kandev/ui/alert-dialog";
+import { IconAlertTriangle } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
+
+function useWorkflowSelection({
+  store,
+  userSettings,
+  workspaceState,
+  workflowsState,
+  commitSettings,
+  setActiveWorkflow,
+  setWorkflows,
+}: {
+  store: ReturnType<typeof useAppStoreApi>;
+  userSettings: { workflowId?: string | null };
+  workspaceState: { activeId: string | null };
+  workflowsState: WorkflowsState;
+  commitSettings: unknown;
+  setActiveWorkflow: (id: string | null) => void;
+  setWorkflows: (workflows: WorkflowsState["items"]) => void;
+}) {
+  const searchParams = useSearchParams();
+  const routeWorkflowId = searchParams.get("workflowId");
+  const userSettingsRef = useRef(userSettings);
+  useEffect(() => {
+    userSettingsRef.current = userSettings;
+  });
+
+  useEffect(() => {
+    const workspaceId = workspaceState.activeId;
+    if (!workspaceId) {
+      if (workflowsState.items.length || workflowsState.activeId) {
+        setWorkflows([]);
+        setActiveWorkflow(null);
+      }
+      return;
+    }
+    const settings = userSettingsRef.current;
+    const workspaceWorkflows = workflowsState.items.filter(
+      (workflow: WorkflowsState["items"][number]) => workflow.workspaceId === workspaceId,
+    );
+
+    const desiredWorkflowId = resolveDesiredWorkflowId({
+      activeWorkflowId: routeWorkflowId ?? workflowsState.activeId,
+      settingsWorkflowId: settings.workflowId,
+      workspaceWorkflows,
+    });
+    setActiveWorkflow(desiredWorkflowId);
+    if (!desiredWorkflowId) {
+      store.getState().hydrate({
+        kanban: { workflowId: null, steps: [], tasks: [] },
+      });
+    }
+  }, [
+    workflowsState.activeId,
+    workflowsState.items,
+    commitSettings,
+    setActiveWorkflow,
+    setWorkflows,
+    store,
+    routeWorkflowId,
+    workspaceState.activeId,
+  ]);
+}
+
+function useMoveErrorState(router: ReturnType<typeof useRouter>) {
+  const [moveError, setMoveError] = useState<MoveTaskError | null>(null);
+
+  const handleMoveError = useCallback((error: MoveTaskError) => {
+    setMoveError(error);
+  }, []);
+
+  const handleGoToTask = useCallback(() => {
+    if (moveError?.taskId) {
+      router.push(linkToTask(moveError.taskId));
+    }
+    setMoveError(null);
+  }, [moveError, router]);
+
+  return {
+    moveError,
+    setMoveError,
+    handleMoveError,
+    handleGoToTask,
+  };
+}
+
+function useKanbanBoardStore() {
+  const store = useAppStoreApi();
+  const kanbanViewMode = useAppStore((state) => state.userSettings.kanbanViewMode);
+  const kanban = useAppStore((state) => state.kanban);
+  const workspaceState = useAppStore((state) => state.workspaces);
+  const workflowsState = useAppStore((state) => state.workflows);
+  const setActiveWorkflow = useAppStore((state) => state.setActiveWorkflow);
+  const setWorkflows = useAppStore((state) => state.setWorkflows);
+  return {
+    store,
+    kanbanViewMode,
+    kanban,
+    workspaceState,
+    workflowsState,
+    setActiveWorkflow,
+    setWorkflows,
+  };
+}
+
+interface KanbanBoardProps {
+  onPreviewTask?: (task: Task) => void;
+  onOpenTask?: (task: Task) => void;
+  /** Fired before the edit dialog opens so the preview panel can close itself. */
+  onBeforeEdit?: () => void;
+}
+
+function useKanbanBoardHooks(
+  searchQuery: string,
+  workspaceState: ReturnType<typeof useKanbanBoardStore>["workspaceState"],
+  workflowsState: ReturnType<typeof useKanbanBoardStore>["workflowsState"],
+) {
+  const {
+    isDialogOpen,
+    editingTask,
+    setIsDialogOpen,
+    setEditingTask,
+    handleCreate,
+    handleEdit,
+    handleDelete,
+    handleArchive,
+    handleDialogOpenChange,
+    handleDialogSuccess,
+    handleWorkspaceChange,
+    handleWorkflowChange,
+    deletingTaskId,
+    archivingTaskId,
+  } = useKanbanActions({ workspaceState, workflowsState });
+  const { enablePreviewOnClick, userSettings, commitSettings, activeSteps, isMounted } =
+    useKanbanData({
+      onWorkspaceChange: handleWorkspaceChange,
+      onWorkflowChange: handleWorkflowChange,
+      searchQuery,
+    });
+  const handlePersistedWorkflowChange = useCallback(
+    (workflowId: string | null) => {
+      commitSettings({
+        workspaceId: userSettings.workspaceId,
+        workflowId,
+        repositoryIds: userSettings.repositoryIds,
+      });
+      handleWorkflowChange(workflowId);
+    },
+    [commitSettings, handleWorkflowChange, userSettings.repositoryIds, userSettings.workspaceId],
+  );
+  return {
+    isDialogOpen,
+    editingTask,
+    setIsDialogOpen,
+    setEditingTask,
+    handleCreate,
+    handleEdit,
+    handleDelete,
+    handleArchive,
+    handleWorkflowChange: handlePersistedWorkflowChange,
+    handleDialogOpenChange,
+    handleDialogSuccess,
+    deletingTaskId,
+    archivingTaskId,
+    enablePreviewOnClick,
+    userSettings,
+    commitSettings,
+    activeSteps,
+    isMounted,
+  };
+}
+
+type SnapEntry = {
+  tasks: { id: string }[];
+  steps: { id: string; title: string; color?: string | null }[];
+};
+
+export function useMultiSelectDerived(
+  selectedIds: Set<string>,
+  snapshots: Record<string, SnapEntry>,
+  activeSteps: { id: string; title: string; color?: string | null }[],
+  hiddenWorkflowStepIds: Record<string, string[]>,
+) {
+  const isMixedWorkflowSelection = useMemo(() => {
+    if (selectedIds.size === 0) return false;
+    const taskToWorkflow = new Map<string, string>();
+    for (const [wfId, snap] of Object.entries(snapshots)) {
+      for (const task of snap.tasks) taskToWorkflow.set(task.id, wfId);
+    }
+    const wfIds = new Set<string>();
+    for (const id of selectedIds) {
+      const wfId = taskToWorkflow.get(id);
+      if (wfId) wfIds.add(wfId);
+    }
+    return wfIds.size > 1;
+  }, [selectedIds, snapshots]);
+
+  const multiSelectSteps = useMemo(() => {
+    if (selectedIds.size > 0) {
+      for (const [wfId, snap] of Object.entries(snapshots)) {
+        if (snap.tasks.some((t) => selectedIds.has(t.id))) {
+          const hidden = new Set(hiddenWorkflowStepIds[wfId] ?? []);
+          return snap.steps
+            .filter((s) => !hidden.has(s.id))
+            .map((s) => ({ id: s.id, title: s.title, color: s.color ?? "" }));
+        }
+      }
+    }
+    return activeSteps.map((s) => ({ id: s.id, title: s.title, color: s.color ?? "" }));
+  }, [selectedIds, snapshots, activeSteps, hiddenWorkflowStepIds]);
+
+  return { isMixedWorkflowSelection, multiSelectSteps };
+}
+
+function useEffectiveWorkflowContext({
+  isMobile,
+  selectedWorkflowId,
+  hydratedWorkflowId,
+  activeSteps,
+}: {
+  isMobile: boolean;
+  selectedWorkflowId: string | null;
+  hydratedWorkflowId: string | null;
+  activeSteps: ReturnType<typeof useKanbanBoardHooks>["activeSteps"];
+}) {
+  const snapshots = useAppStore((state) => state.kanbanMulti.snapshots);
+  const hiddenWorkflowStepIds = useAppStore((state) => state.userSettings.hiddenWorkflowStepIds);
+  const mobileWorkflowFocusId = useAppStore((state) => state.mobileKanban.focusedWorkflowId);
+  const effectiveWorkflowId = resolveBoardWorkflowId({
+    isMobile,
+    selectedWorkflowId,
+    focusedWorkflowId: mobileWorkflowFocusId,
+    hydratedWorkflowId,
+  });
+  const effectiveSteps = useMemo(
+    () =>
+      resolveBoardWorkflowSteps({
+        effectiveWorkflowId,
+        hydratedWorkflowId,
+        snapshots,
+        activeSteps,
+      }),
+    [activeSteps, effectiveWorkflowId, hydratedWorkflowId, snapshots],
+  );
+  const multiSelect = useTaskMultiSelect(effectiveWorkflowId);
+  const selection = useMultiSelectDerived(
+    multiSelect.selectedIds,
+    snapshots,
+    effectiveSteps,
+    hiddenWorkflowStepIds,
+  );
+
+  return {
+    effectiveWorkflowId,
+    effectiveSteps,
+    multiSelect,
+    ...selection,
+  };
+}
+
+function useKanbanBoardSetup(
+  onPreviewTask: KanbanBoardProps["onPreviewTask"],
+  onOpenTask: KanbanBoardProps["onOpenTask"],
+  onBeforeEdit: KanbanBoardProps["onBeforeEdit"],
+) {
+  const router = useRouter();
+  const { isMobile } = useResponsiveBreakpoint();
+  const [searchQuery, setSearchQuery] = useState("");
+  const {
+    store,
+    kanbanViewMode,
+    kanban,
+    workspaceState,
+    workflowsState,
+    setActiveWorkflow,
+    setWorkflows,
+  } = useKanbanBoardStore();
+
+  const { refresh } = useAllWorkflowSnapshots(workspaceState.activeId);
+  useWorkspacePRs(workspaceState.activeId);
+  useWorkspaceMRs(workspaceState.activeId);
+
+  const hooks = useKanbanBoardHooks(searchQuery, workspaceState, workflowsState);
+  const { handleOpenTask, handleCardClick } = useKanbanNavigation({
+    enablePreviewOnClick: hooks.enablePreviewOnClick,
+    isMobile,
+    onPreviewTask,
+    onOpenTask,
+  });
+  // Close preview before the edit dialog opens; destructure for stable useCallback dep.
+  const { handleEdit } = hooks;
+  const handleEditWithCleanup = useCallback(
+    (task: Task) => {
+      onBeforeEdit?.();
+      handleEdit(task);
+    },
+    [onBeforeEdit, handleEdit],
+  );
+
+  const {
+    effectiveWorkflowId,
+    effectiveSteps,
+    multiSelect,
+    isMixedWorkflowSelection,
+    multiSelectSteps,
+  } = useEffectiveWorkflowContext({
+    isMobile,
+    selectedWorkflowId: workflowsState.activeId,
+    hydratedWorkflowId: kanban.workflowId,
+    activeSteps: hooks.activeSteps,
+  });
+  const { isMultiSelectMode, toggleSelect } = multiSelect;
+
+  const handleCardClickOrSelect = useCallback(
+    (task: Task) => {
+      if (isMultiSelectMode) {
+        toggleSelect(task.id);
+        return;
+      }
+      handleCardClick(task);
+    },
+    [isMultiSelectMode, toggleSelect, handleCardClick],
+  );
+
+  const automation = useMoveErrorState(router);
+
+  useWorkflowSelection({
+    store,
+    userSettings: hooks.userSettings,
+    workspaceState,
+    workflowsState,
+    commitSettings: hooks.commitSettings,
+    setActiveWorkflow,
+    setWorkflows,
+  });
+
+  return {
+    isMobile,
+    kanbanViewMode,
+    kanban,
+    workspaceState,
+    workflowsState,
+    searchQuery,
+    setSearchQuery,
+    ...hooks,
+    handleEdit: handleEditWithCleanup,
+    ...automation,
+    handleOpenTask,
+    handleCardClick: handleCardClickOrSelect,
+    multiSelect,
+    isMixedWorkflowSelection,
+    multiSelectSteps,
+    effectiveWorkflowId,
+    effectiveSteps,
+    refresh,
+  };
+}
+
+export function KanbanBoard({ onPreviewTask, onOpenTask, onBeforeEdit }: KanbanBoardProps = {}) {
+  const s = useKanbanBoardSetup(onPreviewTask, onOpenTask, onBeforeEdit);
+  const isMobileSearchOpen = useAppStore((state) => state.mobileKanban.isSearchOpen);
+  const setMobileSearchOpen = useAppStore((state) => state.setMobileKanbanSearchOpen);
+  const { taskMatchesPluginFilters } = usePluginTaskFilters();
+  const matchesPluginTaskFilters = useCallback(
+    (taskId: string) => taskMatchesPluginFilters({ taskId }),
+    [taskMatchesPluginFilters],
+  );
+
+  // Collapse search on unmount so the global flag doesn't auto-open (and focus)
+  // the search bar after navigating to another route.
+  useEffect(() => () => setMobileSearchOpen(false), [setMobileSearchOpen]);
+
+  // Memoized so the dialog/child components don't see a new array identity on
+  // every board re-render. Declared before the early return to keep hook order
+  // stable.
+  const stepOptions = useMemo(
+    () =>
+      s.effectiveSteps.map((step) => ({
+        id: step.id,
+        title: step.title,
+        events: step.events,
+      })),
+    [s.effectiveSteps],
+  );
+
+  if (!s.isMounted) {
+    return <div className="h-full min-h-0 w-full bg-background" />;
+  }
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-col" data-testid="kanban-board">
+      <HomepageCommands onCreateTask={s.handleCreate} />
+      <KanbanHeader
+        workspaceId={s.workspaceState.activeId ?? undefined}
+        searchQuery={s.searchQuery}
+        onSearchChange={s.setSearchQuery}
+      />
+      {s.isMobile && isMobileSearchOpen && (
+        <MobileSearchBar searchQuery={s.searchQuery} onSearchChange={s.setSearchQuery} />
+      )}
+      <KanbanBoardDialogs
+        isDialogOpen={s.isDialogOpen}
+        handleDialogOpenChange={s.handleDialogOpenChange}
+        workspaceId={s.workspaceState.activeId}
+        workflowId={s.effectiveWorkflowId}
+        defaultStepId={s.effectiveSteps[0]?.id ?? null}
+        stepOptions={stepOptions}
+        editingTask={s.editingTask}
+        handleDialogSuccess={s.handleDialogSuccess}
+        moveError={s.moveError}
+        setMoveError={s.setMoveError}
+        handleGoToTask={s.handleGoToTask}
+      />
+      {s.isMobile && (
+        <MobileSelectionToggle
+          active={s.multiSelect.isMultiSelectMode}
+          onToggle={s.multiSelect.toggleMultiSelect}
+        />
+      )}
+      <KanbanSwimlanes
+        viewMode={s.kanbanViewMode || ""}
+        workflowFilter={s.workflowsState.activeId}
+        onPreviewTask={s.handleCardClick}
+        onOpenTask={s.handleOpenTask}
+        onEditTask={s.handleEdit}
+        onDeleteTask={s.handleDelete}
+        onArchiveTask={s.handleArchive}
+        onMoveError={s.handleMoveError}
+        deletingTaskId={s.deletingTaskId}
+        archivingTaskId={s.archivingTaskId}
+        showMaximizeButton={s.enablePreviewOnClick}
+        searchQuery={s.searchQuery}
+        selectedRepositoryIds={s.userSettings.repositoryIds}
+        matchesPluginTaskFilters={matchesPluginTaskFilters}
+        selectedIds={s.multiSelect.selectedIds}
+        onToggleSelect={s.multiSelect.toggleSelect}
+        onSelectRange={s.multiSelect.selectRange}
+        isMultiSelectMode={s.multiSelect.isMultiSelectMode}
+        onToggleMultiSelect={s.multiSelect.toggleMultiSelect}
+        onWorkflowChange={s.handleWorkflowChange}
+        isMobile={s.isMobile}
+        onRefresh={s.refresh}
+      />
+      <TaskMultiSelectToolbar
+        selectedIds={s.multiSelect.selectedIds}
+        steps={s.multiSelectSteps}
+        isProcessing={s.multiSelect.isProcessing}
+        canMove={!s.isMixedWorkflowSelection}
+        getEligibleSelectedIds={s.multiSelect.getEligibleSelectedIds}
+        onClearSelection={s.multiSelect.clearSelection}
+        onBulkDelete={s.multiSelect.bulkDelete}
+        onBulkArchive={s.multiSelect.bulkArchive}
+        onBulkMove={s.multiSelect.bulkMove}
+      />
+      {s.isMobile && <MobileFab onClick={s.handleCreate} />}
+    </div>
+  );
+}
+
+type KanbanSwimlanesProps = ComponentProps<typeof SwimlaneContainer> & {
+  isMobile: boolean;
+  onRefresh: () => Promise<void>;
+};
+
+function KanbanSwimlanes({ isMobile, onRefresh, ...props }: KanbanSwimlanesProps) {
+  const swimlanes = <SwimlaneContainer {...props} />;
+  return isMobile ? <PullToRefresh onRefresh={onRefresh}>{swimlanes}</PullToRefresh> : swimlanes;
+}
+
+type KanbanBoardDialogsProps = {
+  isDialogOpen: boolean;
+  handleDialogOpenChange: (open: boolean) => void;
+  workspaceId: string | null;
+  workflowId: string | null;
+  defaultStepId: string | null;
+  stepOptions: Array<{
+    id: string;
+    title: string;
+    events?: {
+      on_enter?: Array<{ type: string; config?: Record<string, unknown> }>;
+      on_turn_complete?: Array<{ type: string; config?: Record<string, unknown> }>;
+    };
+  }>;
+  editingTask: Task | null;
+  handleDialogSuccess: (task: BackendTask, mode: "create" | "edit") => void;
+  moveError: MoveTaskError | null;
+  setMoveError: (error: MoveTaskError | null) => void;
+  handleGoToTask: () => void;
+};
+
+function KanbanBoardDialogs({
+  isDialogOpen,
+  handleDialogOpenChange,
+  workspaceId,
+  workflowId,
+  defaultStepId,
+  stepOptions,
+  editingTask,
+  handleDialogSuccess,
+  moveError,
+  setMoveError,
+  handleGoToTask,
+}: KanbanBoardDialogsProps) {
+  return (
+    <>
+      <TaskCreateDialog
+        open={isDialogOpen}
+        onOpenChange={handleDialogOpenChange}
+        workspaceId={workspaceId}
+        workflowId={workflowId}
+        defaultStepId={defaultStepId}
+        steps={stepOptions}
+        editingTask={
+          editingTask
+            ? {
+                id: editingTask.id,
+                title: editingTask.title,
+                description: editingTask.description,
+                workflowStepId: editingTask.workflowStepId,
+                state: editingTask.state as BackendTask["state"],
+                repositoryId: editingTask.repositoryId,
+                repositories: editingTask.repositories,
+                primaryExecutorProfileId: editingTask.primaryExecutorProfileId ?? undefined,
+                runnerEditable: editingTask.runnerEditable,
+                runnerIneligibleReason: editingTask.runnerIneligibleReason,
+              }
+            : null
+        }
+        onSuccess={handleDialogSuccess}
+        initialValues={
+          editingTask
+            ? {
+                title: editingTask.title,
+                description: editingTask.description,
+                state: editingTask.state as BackendTask["state"],
+                repositoryId: editingTask.repositoryId,
+                repositories: editingTask.repositories,
+              }
+            : undefined
+        }
+        mode={editingTask ? "edit" : "create"}
+      />
+      <ApprovalWarningDialog
+        moveError={moveError}
+        setMoveError={setMoveError}
+        handleGoToTask={handleGoToTask}
+      />
+    </>
+  );
+}
+
+function ApprovalWarningDialog({
+  moveError,
+  setMoveError,
+  handleGoToTask,
+}: {
+  moveError: MoveTaskError | null;
+  setMoveError: (error: MoveTaskError | null) => void;
+  handleGoToTask: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <AlertDialog open={!!moveError} onOpenChange={(open) => !open && setMoveError(null)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle className="flex items-center gap-2">
+            <IconAlertTriangle className="h-5 w-5 text-amber-500" />
+            {t("kanban:approvalRequired")}
+          </AlertDialogTitle>
+          <AlertDialogDescription>{moveError?.message}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{t("kanban:dismiss")}</AlertDialogCancel>
+          {moveError?.taskId && (
+            <AlertDialogAction onClick={handleGoToTask}>{t("kanban:goToTask")}</AlertDialogAction>
+          )}
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function MobileSelectionToggle({ active, onToggle }: { active: boolean; onToggle: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div className="px-2 py-1">
+      <Button
+        variant="outline"
+        className="cursor-pointer"
+        aria-pressed={active}
+        onClick={onToggle}
+        data-testid="mobile-select-tasks"
+      >
+        {t(active ? "kanban:cancelTaskSelection" : "kanban:selectTasks")}
+      </Button>
+    </div>
+  );
+}

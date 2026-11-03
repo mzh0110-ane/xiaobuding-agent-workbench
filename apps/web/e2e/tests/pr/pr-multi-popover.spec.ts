@@ -1,0 +1,440 @@
+import { test, expect } from "../../fixtures/test-base";
+import { KanbanPage } from "../../pages/kanban-page";
+import { SessionPage } from "../../pages/session-page";
+import type { ApiClient } from "../../helpers/api-client";
+
+const OWNER = "acme";
+
+type SeedResult = {
+  workflowId: string;
+  workingStepId: string;
+  doneStepId: string;
+  taskId: string;
+};
+
+async function mutedBackgroundColor(page: import("@playwright/test").Page): Promise<string> {
+  return page.evaluate(() => {
+    const sample = document.createElement("div");
+    sample.className = "bg-muted";
+    document.body.append(sample);
+    const color = getComputedStyle(sample).backgroundColor;
+    sample.remove();
+    return color;
+  });
+}
+
+async function foregroundColor(page: import("@playwright/test").Page): Promise<string> {
+  return page.evaluate(() => {
+    const sample = document.createElement("div");
+    sample.className = "text-foreground";
+    document.body.append(sample);
+    const color = getComputedStyle(sample).color;
+    sample.remove();
+    return color;
+  });
+}
+
+async function computedStyle(
+  locator: import("@playwright/test").Locator,
+  property: "backgroundColor" | "color",
+): Promise<string> {
+  return locator.evaluate(
+    (element, styleProperty) => getComputedStyle(element)[styleProperty],
+    property,
+  );
+}
+
+/**
+ * Stand up a workspace + workflow + task that reaches the Done column
+ * immediately (auto-start + on_turn_complete moves it), mirroring
+ * pr-topbar-popover.spec.ts.
+ */
+async function seedTask(
+  apiClient: ApiClient,
+  workspaceId: string,
+  agentProfileId: string,
+  repositoryId: string,
+  title: string,
+): Promise<SeedResult> {
+  const workflow = await apiClient.createWorkflow(workspaceId, `${title} Workflow`);
+  const inbox = await apiClient.createWorkflowStep(workflow.id, "Inbox", 0);
+  const working = await apiClient.createWorkflowStep(workflow.id, "Working", 1);
+  const done = await apiClient.createWorkflowStep(workflow.id, "Done", 2);
+
+  await apiClient.updateWorkflowStep(working.id, {
+    prompt: 'e2e:message("done")\n{{task_prompt}}',
+    events: {
+      on_enter: [{ type: "auto_start_agent" }],
+      on_turn_complete: [{ type: "move_to_step", config: { step_id: done.id } }],
+    },
+  });
+
+  await apiClient.saveUserSettings({
+    workspace_id: workspaceId,
+    workflow_filter_id: workflow.id,
+    enable_preview_on_click: false,
+  });
+
+  await apiClient.mockGitHubReset();
+  await apiClient.mockGitHubSetUser("test-user");
+
+  const task = await apiClient.createTask(workspaceId, title, {
+    workflow_id: workflow.id,
+    workflow_step_id: inbox.id,
+    agent_profile_id: agentProfileId,
+    repository_ids: [repositoryId],
+  });
+
+  return {
+    workflowId: workflow.id,
+    workingStepId: working.id,
+    doneStepId: done.id,
+    taskId: task.id,
+  };
+}
+
+/** Associate two open PRs with the task: web#42 failing, api#77 all green. */
+async function associateTwoPRs(apiClient: ApiClient, workspaceId: string, taskId: string) {
+  await apiClient.mockGitHubAssociateTaskPR({
+    workspace_id: workspaceId,
+    task_id: taskId,
+    owner: OWNER,
+    repo: "web",
+    pr_number: 42,
+    pr_url: `https://github.com/${OWNER}/web/pull/42`,
+    pr_title: "Failing web PR",
+    head_branch: "feat/web",
+    base_branch: "main",
+    author_login: "test-user",
+    state: "open",
+    checks_state: "failure",
+    checks_total: 6,
+    checks_passing: 4,
+    review_state: "changes_requested",
+    review_count: 1,
+  });
+  await apiClient.mockGitHubAssociateTaskPR({
+    workspace_id: workspaceId,
+    task_id: taskId,
+    owner: OWNER,
+    repo: "api",
+    pr_number: 77,
+    pr_url: `https://github.com/${OWNER}/api/pull/77`,
+    pr_title: "Green api PR",
+    head_branch: "feat/api",
+    base_branch: "main",
+    author_login: "test-user",
+    state: "open",
+    checks_state: "success",
+    checks_total: 4,
+    checks_passing: 4,
+    review_state: "approved",
+    review_count: 2,
+    required_reviews: 2,
+    mergeable_state: "clean",
+  });
+}
+
+async function openTaskAndWait(
+  testPage: import("@playwright/test").Page,
+  apiClient: ApiClient,
+  seed: SeedResult,
+  title: string,
+): Promise<SessionPage> {
+  const kanban = new KanbanPage(testPage);
+  await kanban.goto();
+  await apiClient.moveTask(seed.taskId, seed.workflowId, seed.workingStepId);
+  await expect(kanban.taskCardInColumn(title, seed.doneStepId)).toBeVisible({ timeout: 45_000 });
+  await kanban.taskCardInColumn(title, seed.doneStepId).click();
+  await expect(testPage).toHaveURL(/\/[st]\//, { timeout: 15_000 });
+  const session = new SessionPage(testPage);
+  await session.waitForLoad();
+  await expect(session.prTopbarButton()).toBeVisible({ timeout: 15_000 });
+  return session;
+}
+
+async function selectOnlyMissingPRFromAddPanel(
+  testPage: import("@playwright/test").Page,
+  session: SessionPage,
+  itemTestId: string,
+  openItemTestId: string,
+) {
+  const item = testPage.getByTestId(itemTestId);
+  await expect(async () => {
+    if ((await session.prDetailTab().count()) >= 2) return;
+
+    // Linked-review refreshes can replace Radix menu content between the
+    // visibility check and the click. Reopen the short-lived menu for each
+    // bounded attempt and force the click once the missing row is visible.
+    await testPage.keyboard.press("Escape").catch(() => undefined);
+    await session.addPanelButton().click({ force: true });
+    await expect(testPage.getByTestId("add-panel-pr-submenu")).toHaveCount(0);
+    await expect(testPage.getByTestId(openItemTestId)).toHaveCount(0);
+    await expect(item).toBeVisible({ timeout: 2_000 });
+    await item.click({ force: true });
+    // Dockview adds the keyed panel asynchronously after the menu closes. On
+    // a loaded CI shard that can take longer than the menu interaction itself.
+    // Keep the bounded menu retry, but give the panel its full readiness window
+    // before retrying the click.
+    await expect(session.prDetailTab()).toHaveCount(2, { timeout: 10_000 });
+  }).toPass({ timeout: 30_000, intervals: [100, 250, 500] });
+}
+
+test.describe("Multi-PR CI popover", () => {
+  test("aggregate warning and menu rows identify only the conflicted open PR", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi PR conflict warning";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    await apiClient.mockGitHubAssociateTaskPR({
+      workspace_id: seedData.workspaceId,
+      task_id: seed.taskId,
+      owner: OWNER,
+      repo: "web",
+      pr_number: 42,
+      pr_url: `https://github.com/${OWNER}/web/pull/42`,
+      pr_title: "Failing web PR",
+      head_branch: "feat/web",
+      base_branch: "main",
+      author_login: "test-user",
+      state: "open",
+      checks_state: "failure",
+      review_state: "changes_requested",
+      mergeable_state: "dirty",
+      has_merge_conflicts: true,
+    });
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+    const badge = session.prTopbarButton();
+    await expect(badge).toHaveAttribute("data-pr-count", "2");
+    await expect(badge.getByTestId("pr-merge-conflict-warning")).toBeVisible();
+    await expect(badge.locator("svg")).toHaveCount(3);
+
+    await badge.click();
+    const conflicted = testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-web-42`);
+    const passing = testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-api-77`);
+    await expect(conflicted.getByTestId("pr-merge-conflict-warning")).toBeVisible();
+    await expect(passing.getByTestId("pr-merge-conflict-warning")).toHaveCount(0);
+    await passing.click();
+    await expect(session.prDetailPanel()).toBeVisible();
+  });
+
+  test("hover opens tabbed popover defaulting to the worst-status PR; tab switch swaps CI detail", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Tabs";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    await expect(session.prTopbarButton()).toHaveAttribute("data-pr-count", "2");
+    await session.hoverPRTopbar();
+    await expect(session.prTopbarPopoverAggregate()).toBeVisible({ timeout: 10_000 });
+
+    // Default tab = worst status: failing web#42, not first-created green api#77.
+    await expect(session.prMultiPopoverTab(OWNER, "web", 42)).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    await expect(session.prMultiPopoverTab(OWNER, "api", 77)).toHaveAttribute(
+      "data-active",
+      "false",
+    );
+    // Body shows the failing PR's bucket groups (failed group present).
+    await expect(session.prCheckGroup("failed")).toBeVisible();
+
+    // Switch to the green PR: failed group disappears, passed shows 4.
+    await session.prMultiPopoverTab(OWNER, "api", 77).click();
+    await expect(session.prMultiPopoverTab(OWNER, "api", 77)).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    await expect(session.prCheckGroup("failed")).toHaveCount(0);
+    await expect(session.prCheckGroupCount("passed")).toHaveText("4");
+  });
+
+  test("chat-input chip aggregates multiple PRs and opens the tabbed popover", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Chip";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    const chip = session.prStatusChip();
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveAttribute("data-pr-count", "2");
+    // web#42 is failing, so the aggregate (worst-of) status is failed.
+    await expect(chip).toHaveAttribute("data-status", "failed");
+
+    await chip.hover();
+    await expect(session.prTopbarPopoverAggregate()).toBeVisible({ timeout: 10_000 });
+    await expect(session.prMultiPopoverTab(OWNER, "web", 42)).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+  });
+
+  test("unlinks one PR tab and keeps the association detached after reload", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Unlink";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    await session.hoverPRTopbar();
+    await prCapture.screenshot("desktop-pr-unlink-popover", {
+      caption: "Desktop multi-PR popover with per-tab unlink controls",
+    });
+    const removeWeb = session.prMultiPopoverRemove(OWNER, "web", 42);
+    await expect(removeWeb).toBeVisible();
+    await removeWeb.click();
+
+    // Removing the first association collapses the multi-PR control to the
+    // remaining single PR without touching the remote PR itself.
+    await expect(session.prTopbarButton()).toHaveAttribute("data-pr-number", "77");
+    await expect(session.prTopbarButton()).toBeFocused();
+    await expect(session.prMultiPopoverRemove(OWNER, "web", 42)).toHaveCount(0);
+
+    // The tombstone is persisted in Kandev, so a fresh page load does not
+    // resurrect the older merged/follow-up PR association.
+    await testPage.reload();
+    const reloaded = new SessionPage(testPage);
+    await reloaded.waitForLoad();
+    await expect(reloaded.prTopbarButton()).toHaveAttribute("data-pr-number", "77");
+  });
+
+  test("clicking the multi-PR button still opens the dropdown with per-PR rows", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Dropdown";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    await session.prTopbarButton().click();
+    await expect(testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-web-42`)).toBeVisible();
+    await expect(testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-api-77`)).toBeVisible();
+  });
+
+  test("uses neutral hover surfaces without recoloring PR status icons", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Neutral States";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+    const expectedMuted = await mutedBackgroundColor(testPage);
+    const expectedForeground = await foregroundColor(testPage);
+
+    await session.hoverPRTopbar();
+    const inactiveChip = session.prMultiPopoverTab(OWNER, "api", 77);
+    const inactiveChipIcon = inactiveChip.locator("svg");
+    const chipIconColor = await computedStyle(inactiveChipIcon, "color");
+    await inactiveChip.hover();
+    await expect.poll(() => computedStyle(inactiveChip, "backgroundColor")).toBe(expectedMuted);
+    expect(await computedStyle(inactiveChipIcon, "color")).toBe(chipIconColor);
+
+    await session.prTopbarButton().click();
+    const dropdownRow = testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-web-42`);
+    const dropdownIcon = dropdownRow.locator("svg").first();
+    const dropdownSecondaryCopy = dropdownRow.getByText("Failing web PR");
+    const dropdownIconColor = await computedStyle(dropdownIcon, "color");
+    await dropdownRow.focus();
+    await expect.poll(() => computedStyle(dropdownRow, "backgroundColor")).toBe(expectedMuted);
+    await expect.poll(() => computedStyle(dropdownSecondaryCopy, "color")).toBe(expectedForeground);
+    expect(await computedStyle(dropdownIcon, "color")).toBe(dropdownIconColor);
+  });
+
+  test('selecting a different PR from the "+" add-panel menu opens its own tab', async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Multi Popover Add Panel Tabs";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associateTwoPRs(apiClient, seedData.workspaceId, seed.taskId);
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    // The layout-owned canonical panel follows the primary/first-associated PR (web#42).
+    await expect(session.prDetailTab()).toHaveCount(1, { timeout: 15_000 });
+
+    // The canonical web PR is already open, so the picker hides it and renders
+    // the sole missing API PR inline. Selecting that row opens a second tab.
+    await selectOnlyMissingPRFromAddPanel(
+      testPage,
+      session,
+      `add-panel-pr-item-${OWNER}-api-77`,
+      `add-panel-pr-item-${OWNER}-web-42`,
+    );
+    await expect(session.prDetailTab()).toHaveCount(2, { timeout: 15_000 });
+
+    // Both linked PRs now have exact panels, leaving no PR entry to add again.
+    await session.addPanelButton().click();
+    await expect(testPage.getByTestId(/^add-panel-pr-item-/)).toHaveCount(0);
+    await expect(testPage.getByTestId("add-panel-pr-submenu")).toHaveCount(0);
+  });
+});

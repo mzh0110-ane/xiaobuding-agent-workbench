@@ -1,0 +1,387 @@
+package worktree
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+const (
+	defaultGitFetchTimeout = 90 * time.Second
+	defaultGitPullTimeout  = 60 * time.Second
+	// defaultGitInspectTimeout bounds cheap local git ref-inspection
+	// commands (rev-parse --verify, rev-parse --abbrev-ref HEAD).
+	// Normally <100ms, but on CrowdStrike-instrumented macOS every
+	// fork+exec is intercepted by syspolicyd so a single spawn can take
+	// 1–3s under load. 30s gives ~100x headroom over normal operation
+	// while still surfacing true hangs (credential prompts, stuck
+	// filters, filesystem stalls) in a reasonable window.
+	defaultGitInspectTimeout = 30 * time.Second
+	gitNoTags                = "--no-tags"
+)
+
+// ArchivedBranchMaintenanceBatchLimit bounds one storage-maintenance revisit.
+const ArchivedBranchMaintenanceBatchLimit = 100
+
+// repoLockEntry tracks a repository lock and its reference count.
+type repoLockEntry struct {
+	mu       *sync.Mutex
+	refCount int
+}
+
+// Manager handles Git worktree operations for concurrent agent execution.
+type Manager struct {
+	config Config
+	logger *logger.Logger
+	store  Store
+	// worktrees is the in-memory cache keyed by cacheKey(sessionID, repositoryID).
+	// For legacy single-repo writes the repositoryID may be empty, in which
+	// case the cache key collapses to "{sessionID}|" — still distinct from
+	// any per-repo entry the same session might gain later.
+	worktrees     map[string]*Worktree
+	mu            sync.RWMutex // Protects worktrees map
+	repoLocks     map[string]*repoLockEntry
+	repoLockMu    sync.Mutex
+	recoveryLocks sync.Map // map[worktreeID]*sync.Mutex
+
+	// Optional dependencies for script execution
+	repoProvider      RepositoryProvider
+	scriptMsgHandler  ScriptMessageHandler
+	scriptEnvProvider ScriptEnvironmentProvider
+
+	// Timeouts for best-effort remote sync before creating a worktree.
+	fetchTimeout time.Duration
+	pullTimeout  time.Duration
+	// Bound for cheap git ref-inspection commands (branchExists, currentBranch).
+	inspectTimeout time.Duration
+}
+
+// ScriptEnvironmentProvider supplies install-managed environment variables to
+// repository setup and cleanup scripts.
+type ScriptEnvironmentProvider interface {
+	ExecutionEnvironment(ctx context.Context) (map[string]string, error)
+}
+
+// SetScriptEnvironmentProvider wires managed script environment settings.
+func (m *Manager) SetScriptEnvironmentProvider(provider ScriptEnvironmentProvider) {
+	m.scriptEnvProvider = provider
+}
+
+// ScriptMessageHandler provides script execution and message streaming.
+type ScriptMessageHandler interface {
+	ExecuteSetupScript(ctx context.Context, req ScriptExecutionRequest) error
+	ExecuteCleanupScript(ctx context.Context, req ScriptExecutionRequest) error
+}
+
+// Store is the interface for worktree persistence.
+type Store interface {
+	// CreateWorktree persists a new worktree record.
+	CreateWorktree(ctx context.Context, wt *Worktree) error
+	// GetWorktreeByID retrieves a worktree by its unique ID.
+	GetWorktreeByID(ctx context.Context, id string) (*Worktree, error)
+	// GetWorktreeBySessionID retrieves a single active worktree by session ID.
+	// For multi-repo sessions, returns the first one found (typically the
+	// primary/first-created). Use GetWorktreesBySessionID when the caller
+	// needs all of them.
+	GetWorktreeBySessionID(ctx context.Context, sessionID string) (*Worktree, error)
+	// GetWorktreesByTaskID retrieves all worktrees for a task (used for cleanup on task deletion).
+	GetWorktreesByTaskID(ctx context.Context, taskID string) ([]*Worktree, error)
+	// GetWorktreesByRepositoryID retrieves all worktrees for a repository.
+	GetWorktreesByRepositoryID(ctx context.Context, repoID string) ([]*Worktree, error)
+	// UpdateWorktree updates an existing worktree record.
+	UpdateWorktree(ctx context.Context, wt *Worktree) error
+	// DeleteWorktree removes a worktree record.
+	DeleteWorktree(ctx context.Context, id string) error
+	// ListActiveWorktrees returns all active worktrees.
+	ListActiveWorktrees(ctx context.Context) ([]*Worktree, error)
+	// ListActiveWorktreePaths returns the worktree_path of every active,
+	// non-deleted worktree row that has a non-empty path.
+	ListActiveWorktreePaths(ctx context.Context) ([]string, error)
+	// CountActiveWorktreeReferences counts non-deleted session associations
+	// for a physical worktree, excluding associations owned by the caller.
+	CountActiveWorktreeReferences(ctx context.Context, worktreeID string, excludeSessionIDs []string) (int, error)
+}
+
+// RecoverySelectionSnapshotReader reads the complete selected environment
+// identity and active repository inventory used to reject stale preflight.
+type RecoverySelectionSnapshotReader interface {
+	ReadRecoverySelectionSnapshot(
+		ctx context.Context,
+		expected models.WorkspaceRecoverySelectionSnapshot,
+	) (models.WorkspaceRecoverySelectionSnapshot, error)
+}
+
+// MultiRepoStore is an optional capability some stores implement to support
+// multi-repo task sessions (one worktree per repository per session). The
+// Manager checks at runtime whether its Store satisfies this interface and
+// uses the multi-repo lookups when available.
+type MultiRepoStore interface {
+	// GetWorktreesBySessionID returns all active worktrees for the session.
+	GetWorktreesBySessionID(ctx context.Context, sessionID string) ([]*Worktree, error)
+	// GetWorktreeBySessionAndRepository returns the active worktree for the
+	// given (session, repository, branchSlug) triple, or nil if none exists.
+	// branchSlug scopes the lookup for multi-branch tasks; empty matches the
+	// legacy single-branch persistence shape.
+	GetWorktreeBySessionAndRepository(ctx context.Context, sessionID, repositoryID, branchSlug string) (*Worktree, error)
+}
+
+// BranchMetadataStore is the fail-closed persistence capability required for
+// managed-branch compaction. Stores without it retain every branch.
+type BranchMetadataStore interface {
+	CountWorktreeBranchOwners(ctx context.Context, repositoryPath, branch string) (int, error)
+	PersistBranchRecoveryHead(ctx context.Context, worktreeID, expected, recoveryHead string) (bool, error)
+	PersistBranchCompactionComplete(ctx context.Context, worktreeID, expectedRecoveryHead string) (bool, error)
+	PersistBranchRecoveryRestored(ctx context.Context, worktreeID, expectedRecoveryHead string) (bool, error)
+}
+
+// ArchivedBranchMaintenanceStore supplies only durable archived worktree
+// candidates. The Manager remains responsible for every Git safety check and
+// mutation after selection.
+type ArchivedBranchMaintenanceStore interface {
+	ListArchivedBranchCandidates(ctx context.Context, limit int) ([]*Worktree, error)
+	IsArchivedBranchCandidate(ctx context.Context, worktreeID string) (bool, error)
+	PersistArchivedBranchRecoveryHead(
+		ctx context.Context, worktreeID, expected, recoveryHead string,
+	) (bool, error)
+	PersistArchivedBranchCompactionComplete(
+		ctx context.Context, worktreeID, expectedRecoveryHead string,
+	) (bool, error)
+	TouchArchivedBranchCandidate(ctx context.Context, worktreeID string) error
+}
+
+// NewManager creates a new worktree manager.
+func NewManager(cfg Config, store Store, log *logger.Logger) (*Manager, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	if log == nil {
+		log = logger.Default()
+	}
+
+	// Ensure tasks base directory exists (if configured)
+	if cfg.TasksBasePath != "" {
+		tasksBase, err := cfg.ExpandedTasksBasePath()
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand tasks base path: %w", err)
+		}
+		if err := os.MkdirAll(tasksBase, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create tasks base directory: %w", err)
+		}
+	}
+
+	fetchTimeout := defaultGitFetchTimeout
+	if cfg.FetchTimeoutSeconds > 0 {
+		fetchTimeout = time.Duration(cfg.FetchTimeoutSeconds) * time.Second
+	}
+
+	pullTimeout := defaultGitPullTimeout
+	if cfg.PullTimeoutSeconds > 0 {
+		pullTimeout = time.Duration(cfg.PullTimeoutSeconds) * time.Second
+	}
+
+	return &Manager{
+		config:         cfg,
+		logger:         log.WithFields(zap.String("component", "worktree-manager")),
+		store:          store,
+		worktrees:      make(map[string]*Worktree),
+		repoLocks:      make(map[string]*repoLockEntry),
+		fetchTimeout:   fetchTimeout,
+		pullTimeout:    pullTimeout,
+		inspectTimeout: defaultGitInspectTimeout,
+	}, nil
+}
+
+// SetRepositoryProvider sets the repository provider for fetching repository information.
+func (m *Manager) SetRepositoryProvider(provider RepositoryProvider) {
+	m.repoProvider = provider
+}
+
+// SetScriptMessageHandler sets the script message handler for executing setup/cleanup scripts.
+func (m *Manager) SetScriptMessageHandler(handler ScriptMessageHandler) {
+	m.scriptMsgHandler = handler
+}
+
+// ListActiveWorktreePaths returns the absolute on-disk paths of all
+// currently active, non-deleted worktrees.
+func (m *Manager) ListActiveWorktreePaths(ctx context.Context) ([]string, error) {
+	return m.store.ListActiveWorktreePaths(ctx)
+}
+
+// CountActiveWorktreeReferences returns the number of non-deleted session
+// associations for a physical worktree outside the supplied sessions.
+func (m *Manager) CountActiveWorktreeReferences(
+	ctx context.Context,
+	worktreeID string,
+	excludeSessionIDs []string,
+) (int, error) {
+	return m.store.CountActiveWorktreeReferences(ctx, worktreeID, excludeSessionIDs)
+}
+
+// IsEnabled returns whether worktree mode is enabled.
+func (m *Manager) IsEnabled() bool {
+	return m.config.Enabled
+}
+
+// TasksBasePath returns the configured task-worktree root with home expansion.
+func (m *Manager) TasksBasePath() (string, error) {
+	if m == nil {
+		return "", nil
+	}
+	return m.config.ExpandedTasksBasePath()
+}
+
+// AdmitTaskRecovery prevents a task from creating a session while one of its
+// persisted checkouts is present but no longer has trustworthy linked-worktree
+// metadata. Missing paths remain eligible for ordinary materialization.
+//
+//nolint:cyclop // Admission keeps the integrity decision and recovery claim in one boundary.
+func (m *Manager) AdmitTaskRecovery(ctx context.Context, taskID string) error {
+	if m == nil || taskID == "" || m.store == nil {
+		return nil
+	}
+	worktrees, err := m.store.GetWorktreesByTaskID(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("inspect task worktrees for recovery: %w", err)
+	}
+	for _, wt := range worktrees {
+		if wt == nil || wt.Status != StatusActive || wt.Path == "" {
+			continue
+		}
+		if err := m.admitPersistedWorktreeRecovery(ctx, taskID, wt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) admitPersistedWorktreeRecovery(ctx context.Context, taskID string, stale *Worktree) error {
+	lockValue, _ := m.recoveryLocks.LoadOrStore(stale.ID, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	wt, err := m.currentRecoveryWorktree(ctx, stale)
+	if err != nil {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: stale.Path, Reason: err.Error()}
+	}
+	if wt == nil {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: stale.Path, Reason: "durable worktree identity changed during recovery admission"}
+	}
+	if _, statErr := os.Lstat(wt.Path); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		return &WorktreeRecoveryError{
+			TaskID: taskID, Checkout: wt.Path, State: string(linkedWorktreeAmbiguous),
+			Reason: fmt.Sprintf("cannot inspect persisted checkout: %v", statErr),
+		}
+	}
+	handle, err := m.validateWorktreePathSafe(wt.Path)
+	if err != nil || handle == nil {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: wt.Path, State: string(linkedWorktreeAmbiguous), Reason: fmt.Sprintf("cannot pin persisted checkout: %v", err)}
+	}
+	defer func() { _ = handle.Close() }()
+	if err := m.validateExistingWorktreePathOwner(wt.Path, wt); err != nil {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: wt.Path, State: string(linkedWorktreeAmbiguous), Reason: err.Error()}
+	}
+	inspection := m.inspectCheckout(ctx, wt.Path, handle)
+	if inspection.operationalErr != nil {
+		return fmt.Errorf("inspect persisted checkout: %w", inspection.operationalErr)
+	}
+	if inspection.class == checkoutLinkedHealthy || inspection.class == checkoutMainHealthy {
+		return handle.VerifyPath(filepath.Clean(wt.Path))
+	}
+	if inspection.class != checkoutLinkedMissingAdmin {
+		return &WorktreeRecoveryError{
+			TaskID: taskID, Checkout: wt.Path, PointerTarget: inspection.linked.adminPath,
+			ExpectedBacklink: inspection.linked.expectedBacklink, ActualBacklink: inspection.linked.actualBacklink,
+			State: string(linkedWorktreeAmbiguous), Reason: inspection.reason,
+		}
+	}
+	if err := validateMissingLinkedWorktreeAdmin(wt.RepositoryPath, inspection.linked.adminPath); err != nil {
+		return &WorktreeRecoveryError{
+			TaskID: taskID, Checkout: wt.Path, PointerTarget: inspection.linked.adminPath,
+			State: string(linkedWorktreeAmbiguous), Reason: err.Error(),
+		}
+	}
+	if err := handle.VerifyPath(filepath.Clean(wt.Path)); err != nil {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: wt.Path, State: string(linkedWorktreeAmbiguous), Reason: err.Error()}
+	}
+	recovered, err := m.RecoverWorktree(ctx, wt, CreateRequest{
+		TaskID: taskID, RepositoryID: wt.RepositoryID,
+		RepositoryPath: wt.RepositoryPath, BaseBranch: wt.BaseBranch,
+	})
+	if err != nil {
+		return err
+	}
+	if recovered == nil || !m.IsValid(recovered.Path) {
+		return &WorktreeRecoveryError{TaskID: taskID, Checkout: wt.Path, Reason: "rematerialized checkout failed integrity validation"}
+	}
+	return nil
+}
+
+func (m *Manager) currentRecoveryWorktree(ctx context.Context, stale *Worktree) (*Worktree, error) {
+	worktrees, err := m.store.GetWorktreesByTaskID(ctx, stale.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("refresh durable worktree identity: %w", err)
+	}
+	for _, current := range worktrees {
+		if current != nil && current.ID == stale.ID {
+			return current, nil
+		}
+	}
+	for _, current := range worktrees {
+		if current != nil && current.Status == StatusActive &&
+			current.TaskEnvironmentID == stale.TaskEnvironmentID &&
+			current.RepositoryID == stale.RepositoryID && current.BranchSlug == stale.BranchSlug {
+			return current, nil
+		}
+	}
+	return nil, nil
+}
+
+// getRepoLock returns a mutex for the given repository path and increments its reference count.
+func (m *Manager) getRepoLock(repoPath string) *sync.Mutex {
+	m.repoLockMu.Lock()
+	defer m.repoLockMu.Unlock()
+
+	if entry, exists := m.repoLocks[repoPath]; exists {
+		entry.refCount++
+		return entry.mu
+	}
+
+	entry := &repoLockEntry{
+		mu:       &sync.Mutex{},
+		refCount: 1,
+	}
+	m.repoLocks[repoPath] = entry
+	return entry.mu
+}
+
+// releaseRepoLock decrements the reference count for a repository lock.
+// If the count reaches zero, the lock is removed from the map to prevent memory leaks.
+func (m *Manager) releaseRepoLock(repoPath string) {
+	m.repoLockMu.Lock()
+	defer m.repoLockMu.Unlock()
+
+	entry, exists := m.repoLocks[repoPath]
+	if !exists {
+		return
+	}
+
+	entry.refCount--
+	if entry.refCount <= 0 {
+		delete(m.repoLocks, repoPath)
+		m.logger.Debug("released repository lock",
+			zap.String("repository_path", repoPath))
+	}
+}

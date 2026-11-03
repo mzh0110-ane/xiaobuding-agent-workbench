@@ -1,0 +1,761 @@
+import path from "node:path";
+import fs from "node:fs";
+import { execSync } from "node:child_process";
+import { test, expect } from "../../fixtures/test-base";
+import { expectWebkitDialogMotion } from "../../helpers/dialog-webkit-metrics";
+import { useRegularMode } from "../../helpers/regular-mode";
+import { KanbanPage } from "../../pages/kanban-page";
+import { makeGitEnv } from "../../helpers/git-helper";
+
+function escapeRe(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Exercises the regular task-create dialog (New Task in the sidebar); run with office off.
+useRegularMode();
+
+test.describe("Branch selector behavior with executor types", () => {
+  test.describe.configure({ retries: 1 });
+
+  test("branch selector is editable for local executor (user can switch existing branches)", async ({
+    testPage,
+    apiClient,
+  }) => {
+    // Local executor task creation now allows the user to switch to a
+    // different existing branch from the chip directly (the chip is no longer
+    // locked when local executor is selected). The backend's LocalPreparer
+    // skips git ops when the picked branch matches the workspace's current
+    // branch and runs `git checkout <branch>` only when the user explicitly
+    // picks something different. Creating a NEW branch from a base remains a
+    // separate flow gated by the "Fork a new branch" toggle.
+    const { executors } = await apiClient.listExecutors();
+    const localExec = executors.find((e) => e.type === "local");
+    if (!localExec) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    const profile = await apiClient.createExecutorProfile(localExec.id, "E2E Local Profile");
+
+    try {
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      await testPage.getByTestId("task-title-input").fill("Branch Selector Test");
+      await testPage
+        .getByTestId("task-description-input")
+        .fill("local exec branch chip is editable");
+
+      const executorSelector = testPage.getByTestId("executor-profile-selector");
+      await executorSelector.click();
+      await testPage.getByRole("option", { name: /E2E Local Profile/i }).click();
+
+      const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+    } finally {
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+
+  test("branch selector stays editable when switching from local to worktree executor", async ({
+    testPage,
+    apiClient,
+  }) => {
+    // Both executors allow branch picking now; the test verifies neither side
+    // disables the chip and the user can complete a pick on each.
+    const { executors } = await apiClient.listExecutors();
+    const localExec = executors.find((e) => e.type === "local");
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    if (!localExec || !worktreeExec) {
+      test.skip(true, "Need both local and worktree executors");
+      return;
+    }
+    const profile = await apiClient.createExecutorProfile(localExec.id, "E2E Local");
+    const worktreeProfile = worktreeExec.profiles?.[0];
+    if (!worktreeProfile) {
+      test.skip(true, "No worktree profile available");
+      return;
+    }
+
+    try {
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      await testPage.getByTestId("task-title-input").fill("Switch Executor Test");
+      await testPage.getByTestId("task-description-input").fill("testing executor switch");
+
+      const executorSelector = testPage.getByTestId("executor-profile-selector");
+      await executorSelector.click();
+      await testPage.getByRole("option", { name: /^E2E Local Local$/i }).click();
+
+      const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+
+      await executorSelector.click();
+      await testPage.getByRole("option", { name: worktreeProfile.name }).click();
+
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+    } finally {
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+
+  test("branch selector stays enabled for local executor with GitHub URL", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    const fs = await import("fs");
+    const { execSync } = await import("child_process");
+    const gitEnv = {
+      ...process.env,
+      HOME: backend.tmpDir,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+
+    // Find local executor and create profile
+    const { executors } = await apiClient.listExecutors();
+    const localExec = executors.find((e) => e.type === "local");
+    if (!localExec) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    const profile = await apiClient.createExecutorProfile(localExec.id, "E2E Local GitHub URL");
+
+    try {
+      // Create a unique repo for this test
+      const repoDir = `${backend.tmpDir}/repos/e2e-branch-gh`;
+      fs.mkdirSync(repoDir, { recursive: true });
+      execSync("git init -b main", { cwd: repoDir, env: gitEnv });
+      execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env: gitEnv });
+
+      // Seed mock GitHub branches
+      await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+        name: "branch-test-owner/branch-test-repo",
+        provider: "github",
+        provider_owner: "branch-test-owner",
+        provider_name: "branch-test-repo",
+      });
+      await apiClient.mockGitHubAddBranches("branch-test-owner", "branch-test-repo", [
+        { name: "main" },
+        { name: "develop" },
+      ]);
+
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+
+      // Switch to Remote tab and paste via the chip popover.
+      await testPage.getByTestId("source-mode-remote").click();
+      await testPage.getByTestId("remote-repo-chip-trigger").first().click();
+      const pasteInput = testPage.getByTestId("remote-repo-input");
+      await pasteInput.fill("https://github.com/branch-test-owner/branch-test-repo");
+      await pasteInput.press("Enter");
+
+      // Select local executor profile
+      const executorSelector = testPage.getByTestId("executor-profile-selector");
+      await executorSelector.click();
+      await testPage.getByRole("option", { name: /E2E Local GitHub URL/i }).click();
+
+      // Branch selector should NOT be disabled (Remote mode overrides).
+      // The per-chip branch pill uses `remote-branch-chip-trigger`.
+      const branchSelector = testPage.getByTestId("remote-branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 10_000 });
+    } finally {
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+});
+
+/**
+ * Fresh-branch flow tests.
+ *
+ * Each test seeds an isolated repo inside backend.tmpDir so the discovery roots
+ * check passes, then opens the create-task dialog and exercises the toggle path.
+ *
+ * Important: the seedData repo is shared across the worker, so we mutate or
+ * inspect a NEW repo per test to avoid cross-test interference. We register the
+ * repo via apiClient.createRepository so it shows up in the workspace selector.
+ */
+test.describe("Fresh-branch flow", () => {
+  test.describe.configure({ retries: 1 });
+
+  type Setup = {
+    repoDir: string;
+    repositoryId: string;
+    profileId: string;
+    profileName: string;
+  };
+
+  type ApiClientType = import("../../helpers/api-client").ApiClient;
+
+  async function waitForBackendAgentProfile(apiClient: ApiClientType): Promise<void> {
+    await expect
+      .poll(
+        async () => {
+          const { agents } = await apiClient.listAgents();
+          return agents.some((agent) => (agent.profiles ?? []).length > 0);
+        },
+        { timeout: 30_000, message: "seeded agent profile available from the backend" },
+      )
+      .toBe(true);
+  }
+
+  async function waitForCreateDialogAgent(
+    testPage: import("@playwright/test").Page,
+    kanban: KanbanPage,
+    apiClient: ApiClientType,
+  ): Promise<void> {
+    const selector = testPage.getByTestId("agent-profile-selector");
+    const emptyState = testPage.getByTestId("agent-profile-empty-state");
+    const status = async () => {
+      if (await selector.isVisible().catch(() => false)) return "selector";
+      if (await emptyState.isVisible().catch(() => false)) return "empty";
+      return "loading";
+    };
+
+    // The browser can finish its first settings request before the seeded
+    // mock agent is visible during backend startup. Reopen the dialog after
+    // the API confirms the profile exists so the empty state is not terminal.
+    await waitForBackendAgentProfile(apiClient);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let currentStatus = "loading";
+      try {
+        await expect.poll(status, { timeout: 20_000 }).toMatch(/selector|empty/);
+        currentStatus = await status();
+      } catch {
+        // Reload below to re-drive the settings fetch.
+      }
+      if (currentStatus === "selector") {
+        await expect(selector).toBeEnabled({ timeout: 30_000 });
+        return;
+      }
+      if (attempt < 2) {
+        await waitForBackendAgentProfile(apiClient);
+        await testPage.reload();
+        await kanban.goto();
+        await kanban.createTaskButton.first().click();
+        await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+      }
+    }
+
+    await expect(selector).toBeVisible({ timeout: 30_000 });
+    await expect(selector).toBeEnabled({ timeout: 30_000 });
+  }
+
+  async function setupLocalRepo(
+    apiClient: ApiClientType,
+    backendTmpDir: string,
+    workspaceId: string,
+    suffix: string,
+  ): Promise<(Setup & { repoName: string }) | null> {
+    const { executors } = await apiClient.listExecutors();
+    const localExec = executors.find((e) => e.type === "local");
+    if (!localExec) return null;
+    const profileName = `E2E Fresh Branch ${suffix}`;
+    const profile = await apiClient.createExecutorProfile(localExec.id, profileName);
+
+    const repoName = `E2E Fresh Repo ${suffix}`;
+    const repoDir = path.join(backendTmpDir, "repos", `e2e-fresh-branch-${suffix}`);
+    fs.mkdirSync(repoDir, { recursive: true });
+    const env = makeGitEnv(backendTmpDir);
+    execSync("git init -b main", { cwd: repoDir, env });
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env });
+    execSync("git checkout -b develop", { cwd: repoDir, env });
+    execSync('git commit --allow-empty -m "develop"', { cwd: repoDir, env });
+    execSync("git checkout main", { cwd: repoDir, env });
+    const repo = await apiClient.createRepository(workspaceId, repoDir, "main", { name: repoName });
+    return { repoDir, repositoryId: repo.id, profileId: profile.id, profileName, repoName };
+  }
+
+  async function openDialogWithLocalProfile(
+    testPage: import("@playwright/test").Page,
+    profileName: string,
+    repoName: string,
+    apiClient: ApiClientType,
+  ) {
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await kanban.createTaskButton.first().click();
+    await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+    await waitForCreateDialogAgent(testPage, kanban, apiClient);
+    await testPage.getByTestId("task-title-input").fill("Fresh Branch Test");
+    await testPage.getByTestId("task-description-input").fill("testing fresh branch");
+    await testPage.getByTestId("repo-chip-trigger").first().click();
+    await testPage
+      .getByRole("option", { name: new RegExp(`^${escapeRe(repoName)}\\b`, "i") })
+      .first()
+      .click();
+    await testPage.getByTestId("executor-profile-selector").click();
+    await testPage
+      .getByRole("option", { name: new RegExp(`^${escapeRe(profileName)}\\b`, "i") })
+      .first()
+      .click();
+  }
+
+  test("toggle off (default) — branch selector editable, defaults to current branch", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    // The fresh-branch toggle is OFF by default. The branch chip is now
+    // editable for local executor and seeds with the workspace's actual
+    // current branch (main) — the user can keep it (no git ops on submit)
+    // or pick a different existing branch (triggers `git checkout` server-side).
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "default");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      await openDialogWithLocalProfile(testPage, setup.profileName, setup.repoName, apiClient);
+      const toggle = testPage.getByTestId("fresh-branch-toggle");
+      await expect(toggle).toBeVisible();
+      await expect(toggle).toHaveAttribute("aria-pressed", "false");
+      const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+      await expect(branchSelector).toContainText("main", { timeout: 5_000 });
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+
+  test("toggle on, clean working tree — selector enabled, no discard modal on submit", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "clean");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      await openDialogWithLocalProfile(testPage, setup.profileName, setup.repoName, apiClient);
+      await testPage.getByTestId("fresh-branch-toggle").click();
+      const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 30_000 });
+      // Pick the develop base branch so the new branch will fork from it.
+      await branchSelector.click();
+      const developOption = testPage.getByRole("option", { name: /develop/ }).first();
+      await expect(developOption).toBeVisible({ timeout: 30_000 });
+      await developOption.click();
+
+      // Selecting a branch updates the form asynchronously. Clicking while
+      // the profile/branch compatibility state is still settling is a
+      // no-op, which made this test time out waiting for a create request.
+      await expect(testPage.getByTestId("submit-start-agent")).toBeEnabled({
+        timeout: 30_000,
+      });
+
+      // Submit and assert the discard modal never appears (clean tree).
+      // Wait for the create-task request to fire so we know the submit path
+      // really executed and didn't short-circuit before the modal would render.
+      const submit = testPage.getByTestId("submit-start-agent");
+      await expect(submit).toBeEnabled({ timeout: 10_000 });
+      const createTaskRequest = testPage.waitForRequest(
+        (req) => req.url().endsWith("/api/v1/tasks") && req.method() === "POST",
+      );
+      await submit.click();
+      await createTaskRequest;
+      await expect(testPage.getByTestId("discard-local-changes-dialog")).toHaveCount(0);
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+
+  test("toggle on, dirty working tree — confirm modal lists files; cancel keeps form state", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "dirty");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      // Add an untracked file so `git status` reports it as dirty.
+      fs.writeFileSync(path.join(setup.repoDir, "WIP.txt"), "draft");
+
+      await openDialogWithLocalProfile(testPage, setup.profileName, setup.repoName, apiClient);
+      await testPage.locator("html").evaluate((root) => {
+        root.setAttribute("data-rendering-engine", "webkit");
+      });
+      await testPage.getByTestId("fresh-branch-toggle").click();
+      // Submit triggers the dirty preflight; the modal lists WIP.txt.
+      await testPage.getByTestId("submit-start-agent").click();
+
+      const modal = testPage.getByTestId("discard-local-changes-dialog");
+      await expect(modal).toBeVisible({ timeout: 5_000 });
+      await expect(testPage.getByTestId("discard-local-changes-files")).toContainText("WIP.txt");
+      await expectWebkitDialogMotion(modal, {
+        overlaySelector: '[data-slot="alert-dialog-overlay"]',
+        contentZIndex: "53",
+        overlayZIndex: "52",
+      });
+
+      // Cancel returns to the form with the toggle still on.
+      await testPage.getByTestId("discard-local-changes-cancel").click();
+      await expect(modal).toBeHidden();
+      await expect(testPage.getByTestId("fresh-branch-toggle")).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+
+      // Untracked file must still exist (we didn't confirm).
+      expect(fs.existsSync(path.join(setup.repoDir, "WIP.txt"))).toBe(true);
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+
+  test("dirty working tree — confirm overwrite removes the file and proceeds", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "confirm");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      const wipPath = path.join(setup.repoDir, "WIP-confirm.txt");
+      fs.writeFileSync(wipPath, "draft");
+
+      await openDialogWithLocalProfile(testPage, setup.profileName, setup.repoName, apiClient);
+      await testPage.getByTestId("fresh-branch-toggle").click();
+      await testPage.getByTestId("submit-start-agent").click();
+
+      await expect(testPage.getByTestId("discard-local-changes-dialog")).toBeVisible({
+        timeout: 5_000,
+      });
+      await testPage.getByTestId("discard-local-changes-confirm").click();
+
+      // After confirm the backend runs reset --hard + clean -fd: the untracked
+      // file must be gone.
+      await expect.poll(() => fs.existsSync(wipPath), { timeout: 10_000 }).toBe(false);
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+
+  test("truncated dirty list — many dirty files show '+N more'", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "many");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      // Seed 25 untracked files so the modal cap (20) kicks in.
+      for (let i = 0; i < 25; i++) {
+        fs.writeFileSync(path.join(setup.repoDir, `f${i}.txt`), "x");
+      }
+      await openDialogWithLocalProfile(testPage, setup.profileName, setup.repoName, apiClient);
+      await testPage.getByTestId("fresh-branch-toggle").click();
+      await testPage.getByTestId("submit-start-agent").click();
+
+      await expect(testPage.getByTestId("discard-local-changes-dialog")).toBeVisible({
+        timeout: 5_000,
+      });
+      await expect(testPage.getByTestId("discard-local-changes-overflow")).toContainText("+5 more");
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+
+  test("GitHub URL flow hides fresh-branch toggle", async ({ testPage, apiClient }) => {
+    const { executors } = await apiClient.listExecutors();
+    const localExec = executors.find((e) => e.type === "local");
+    if (!localExec) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    const profile = await apiClient.createExecutorProfile(localExec.id, "E2E Fresh Branch GH");
+    try {
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await kanban.createTaskButton.first().click();
+      await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+      await testPage.getByTestId("task-title-input").fill("Hide toggle");
+      await testPage.getByTestId("task-description-input").fill("github url");
+      // Switch to Remote tab and paste via the chip popover.
+      await testPage.getByTestId("source-mode-remote").click();
+      await testPage.getByTestId("remote-repo-chip-trigger").first().click();
+      const pasteInput = testPage.getByTestId("remote-repo-input");
+      await pasteInput.fill("https://github.com/branch-test-owner/branch-test-repo");
+      await pasteInput.press("Enter");
+      await testPage.getByTestId("executor-profile-selector").click();
+      await testPage.getByRole("option", { name: /E2E Fresh Branch GH/i }).click();
+
+      // Toggle is gated behind isLocalExecutor && !useRemote, so it must not render.
+      await expect(testPage.getByTestId("fresh-branch-toggle")).toHaveCount(0);
+    } finally {
+      await apiClient.deleteExecutorProfile(profile.id).catch(() => {});
+    }
+  });
+
+  test("non-local executor (worktree) hides fresh-branch toggle", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    if (!seedData.worktreeExecutorProfileId) {
+      test.skip(true, "No worktree executor profile in seed data");
+      return;
+    }
+    // Look up the actual profile name so the option matcher doesn't depend on
+    // the seed naming containing "worktree".
+    const { executors } = await apiClient.listExecutors();
+    const worktreeProfileName = executors
+      .flatMap((e) => e.profiles ?? [])
+      .find((p) => p.id === seedData.worktreeExecutorProfileId)?.name;
+    if (!worktreeProfileName) {
+      test.skip(true, "Could not resolve worktree profile name");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await kanban.createTaskButton.first().click();
+    await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+    await testPage.getByTestId("task-title-input").fill("No toggle for worktree");
+    await testPage.getByTestId("task-description-input").fill("worktree mode");
+    const executorSelector = testPage.getByTestId("executor-profile-selector");
+    await executorSelector.click();
+    await testPage.getByRole("option", { name: worktreeProfileName }).click();
+    await expect(testPage.getByTestId("fresh-branch-toggle")).toHaveCount(0);
+  });
+
+  test("switching worktree → local resets the chip to the workspace's current branch", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    // Regression for the "leftover branch" hazard: under the old chip-locked
+    // model, picking "develop" on the worktree executor and switching to
+    // local would leave row.branch="develop" but display the locked override
+    // ("main"). Submit then sent develop and the backend ran `git checkout
+    // develop` against the user's working tree.
+    //
+    // Now the chip is editable for local mode AND switching to local
+    // explicitly resets row.branch (useResetBranchOnLocalSwitchEffect) so
+    // autoselect re-fires and prefers the workspace's current branch. The
+    // displayed value matches the submitted value matches the user's
+    // current state — no hidden destructive checkout.
+    const setup = await setupLocalRepo(apiClient, backend.tmpDir, seedData.workspaceId, "switch");
+    if (!setup) {
+      test.skip(true, "No local executor available");
+      return;
+    }
+    try {
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await kanban.createTaskButton.first().click();
+      await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+      await testPage.getByTestId("task-title-input").fill("Switcheroo");
+      await testPage.getByTestId("task-description-input").fill("repro the leftover-branch bug");
+      await testPage.getByTestId("repo-chip-trigger").first().click();
+      await testPage
+        .getByRole("option", { name: new RegExp(`^${setup.repoName}\\b`, "i") })
+        .first()
+        .click();
+
+      const executorSelector = testPage.getByTestId("executor-profile-selector");
+      await executorSelector.click();
+      await testPage
+        .getByRole("option")
+        .filter({ hasText: /worktree/i })
+        .first()
+        .click();
+      const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+      await branchSelector.click();
+      await testPage
+        .getByRole("option", { name: /develop/ })
+        .first()
+        .click();
+      await expect(branchSelector).toContainText("develop");
+
+      await executorSelector.click();
+      await testPage
+        .getByRole("option", { name: new RegExp(`^${setup.profileName}\\b`, "i") })
+        .first()
+        .click();
+      await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+      await expect(branchSelector).toContainText("main", { timeout: 5_000 });
+    } finally {
+      await apiClient.deleteExecutorProfile(setup.profileId).catch(() => {});
+    }
+  });
+});
+
+test.describe("Branch refresh + filter", () => {
+  test.describe.configure({ retries: 1 });
+
+  test("refresh button in branch dropdown triggers ?refresh=true request", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    if (!seedData.worktreeExecutorProfileId) {
+      test.skip(true, "No worktree executor profile in seed data");
+      return;
+    }
+    const { executors } = await apiClient.listExecutors();
+    const worktreeProfileName = executors
+      .flatMap((e) => e.profiles ?? [])
+      .find((p) => p.id === seedData.worktreeExecutorProfileId)?.name;
+    if (!worktreeProfileName) {
+      test.skip(true, "Could not resolve worktree profile name");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await kanban.createTaskButton.first().click();
+    await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+    await testPage.getByTestId("task-title-input").fill("Refresh button test");
+    await testPage.getByTestId("task-description-input").fill("triggers git fetch");
+    await testPage.getByTestId("repo-chip-trigger").first().click();
+    // Repository names are not unique after earlier specs register additional
+    // worktrees. cmdk's stable data-value is the repository ID.
+    await testPage.locator(`[cmdk-item][data-value="${seedData.repositoryId}"]`).click();
+    // Worktree executor → branch selector enabled and refresh button visible.
+    await testPage.getByTestId("executor-profile-selector").click();
+    await testPage.getByRole("option", { name: worktreeProfileName }).click();
+
+    const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+    await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+    await branchSelector.click();
+
+    const refreshButton = testPage.getByTestId("branch-refresh-button");
+    await expect(refreshButton).toBeVisible({ timeout: 5_000 });
+
+    // Wait until the cold-load refresh request finishes so the button isn't
+    // disabled when we click it.
+    await expect(refreshButton).toBeEnabled({ timeout: 10_000 });
+
+    // The enabled button and a rendered option together establish that both
+    // the branch request and the popover's selected-repository state settled.
+    const branchListbox = testPage.getByRole("listbox");
+    // Branch policies intentionally appear before branch options. Select the
+    // stable main value instead of relying on whichever policy rows exist in
+    // the shared worker workspace.
+    const mainBranchOption = branchListbox.locator('[data-value="main"]');
+    await expect(mainBranchOption).toBeVisible({ timeout: 10_000 });
+    await expect(mainBranchOption).toHaveClass(/bg-card/);
+    await expect(mainBranchOption).toHaveClass(/border-primary\/50/);
+
+    await expect(testPage.getByTestId("repo-chip").first()).toHaveAttribute(
+      "data-repository-id",
+      seedData.repositoryId,
+    );
+    const requestPromise = testPage.waitForRequest(
+      (req) =>
+        req.url().includes(`/repositories/${seedData.repositoryId}/branches`) &&
+        req.url().includes("refresh=true") &&
+        req.method() === "GET",
+    );
+    // Dispatch through the rendered control after its options are ready. This
+    // exercises the React click handler once without a retry loop that can hide
+    // a wrong repository selection or issue several fetches.
+    await refreshButton.dispatchEvent("click");
+    await requestPromise;
+  });
+
+  test("branch filter ranks exact match above substring matches", async ({
+    testPage,
+    apiClient,
+    backend,
+    seedData,
+  }) => {
+    if (!seedData.worktreeExecutorProfileId) {
+      test.skip(true, "No worktree executor profile in seed data");
+      return;
+    }
+    const { executors } = await apiClient.listExecutors();
+    const worktreeProfileName = executors
+      .flatMap((e) => e.profiles ?? [])
+      .find((p) => p.id === seedData.worktreeExecutorProfileId)?.name;
+    if (!worktreeProfileName) {
+      test.skip(true, "Could not resolve worktree profile name");
+      return;
+    }
+
+    // Seed an isolated repo with branches that contain overlapping substrings
+    // so the filter has something interesting to rank.
+    const repoName = "E2E Filter Repo";
+    const repoDir = path.join(backend.tmpDir, "repos", "e2e-filter-branches");
+    fs.mkdirSync(repoDir, { recursive: true });
+    const env = makeGitEnv(backend.tmpDir);
+    execSync("git init -b main", { cwd: repoDir, env });
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env });
+    // -B creates or resets the branch so the test is idempotent across retries.
+    for (const name of ["develop", "feature/develop-helpers", "feature/auth-develop-flow"]) {
+      execSync(`git checkout -B ${name}`, { cwd: repoDir, env });
+      execSync(`git commit --allow-empty -m "${name}"`, { cwd: repoDir, env });
+      execSync("git checkout main", { cwd: repoDir, env });
+    }
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", { name: repoName });
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await kanban.createTaskButton.first().click();
+    await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+    await testPage.getByTestId("task-title-input").fill("Filter ranking test");
+    await testPage.getByTestId("task-description-input").fill("exact match wins");
+    await testPage.getByTestId("repo-chip-trigger").first().click();
+    await testPage
+      .getByRole("option", { name: new RegExp(`^${repoName}\\b`, "i") })
+      .first()
+      .click();
+    await testPage.getByTestId("executor-profile-selector").click();
+    await testPage.getByRole("option", { name: worktreeProfileName }).click();
+
+    const branchSelector = testPage.getByTestId("branch-chip-trigger").first();
+    await expect(branchSelector).toBeEnabled({ timeout: 5_000 });
+    await branchSelector.click();
+
+    // Wait for the cold-load fetch to populate the dropdown with our branches.
+    await expect(testPage.getByRole("option", { name: /feature\/develop-helpers/ })).toBeVisible({
+      timeout: 10_000,
+    });
+
+    await testPage.getByPlaceholder("Search branches...").fill("develop");
+
+    // After filtering, the exact match "develop" must rank first. cmdk renders
+    // matched options in descending score order, so the first [role="option"]
+    // in the DOM is the top-ranked branch. Options carry the branch name in
+    // data-value; the visible text also contains a "local" badge so we assert
+    // on the attribute rather than text content.
+    const firstOption = testPage.getByRole("option").first();
+    await expect(firstOption).toHaveAttribute("data-value", "develop", { timeout: 5_000 });
+  });
+});

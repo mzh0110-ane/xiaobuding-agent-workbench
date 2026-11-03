@@ -1,0 +1,129 @@
+"use client";
+
+import { useMemo, useSyncExternalStore } from "react";
+import { useAppStore } from "@/components/state-provider";
+import { useWorkflowSnapshot } from "@/hooks/use-workflow-snapshot";
+import { useUserDisplaySettings } from "@/hooks/use-user-display-settings";
+import { filterTasksByRepositories, taskMatchesRepositorySearch } from "@/lib/kanban/filters";
+import type { WorkflowStep } from "@/components/kanban-column";
+
+type KanbanDataOptions = {
+  onWorkspaceChange: (workspaceId: string | null) => void;
+  onWorkflowChange: (workflowId: string | null) => void;
+  searchQuery?: string;
+};
+
+export function useKanbanData({
+  onWorkspaceChange,
+  onWorkflowChange,
+  searchQuery = "",
+}: KanbanDataOptions) {
+  // Store selectors
+  const kanban = useAppStore((state) => state.kanban);
+  const workspaceState = useAppStore((state) => state.workspaces);
+  const workflowsState = useAppStore((state) => state.workflows);
+  const enablePreviewOnClick = useAppStore((state) => state.userSettings.enablePreviewOnClick);
+  const repositoriesByWorkspace = useAppStore((state) => state.repositories.itemsByWorkspaceId);
+
+  // Data fetching hooks. `state.workflows.items` is loaded by `AppSidebar` via
+  // `useEnsureWorkspaceWorkflows` (unconditional, above any collapsible), so
+  // the kanban page only needs the workflow snapshot here.
+  useWorkflowSnapshot(workflowsState.activeId);
+
+  // User settings hook
+  const {
+    settings: userSettings,
+    commitSettings,
+    selectedRepositoryIds,
+  } = useUserDisplaySettings({
+    workspaceId: workspaceState.activeId,
+    workflowId: workflowsState.activeId,
+    onWorkspaceChange,
+    onWorkflowChange,
+  });
+
+  // SSR safety check
+  const isMounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
+
+  // Derived data
+  const steps = useMemo<WorkflowStep[]>(
+    () =>
+      [...kanban.steps]
+        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+        .map((step) => ({
+          id: step.id,
+          title: step.title,
+          color: step.color || "bg-neutral-400",
+          events: step.events,
+        })),
+    [kanban.steps],
+  );
+
+  // Memoized so a fresh array of card objects isn't produced on every store
+  // change. Without this, `visibleTasks`/`filteredTasks` (which depend on
+  // `tasks`) and every downstream card re-render on any unrelated store update,
+  // pegging the CPU on large boards.
+  const tasks = useMemo(
+    () =>
+      kanban.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        workflowStepId: task.workflowStepId,
+        state: task.state,
+        description: task.description,
+        position: task.position,
+        repositoryId: task.repositoryId,
+        repositories: task.repositories,
+        primarySessionId: task.primarySessionId,
+      })),
+    [kanban.tasks],
+  );
+
+  const activeSteps = kanban.workflowId ? steps : [];
+
+  const visibleTasks = useMemo(
+    () => filterTasksByRepositories(tasks, selectedRepositoryIds),
+    [tasks, selectedRepositoryIds],
+  );
+
+  // Apply search filtering
+  const filteredTasks = useMemo(() => {
+    if (!searchQuery) return visibleTasks;
+
+    // Get repositories for the current workspace for search filtering
+    const repositories = workspaceState.activeId
+      ? (repositoriesByWorkspace[workspaceState.activeId] ?? [])
+      : [];
+
+    const repositoriesById = new Map(repositories.map((repository) => [repository.id, repository]));
+    const query = searchQuery.toLowerCase();
+    return visibleTasks.filter((task) => {
+      // Match task title or description
+      if (task.title.toLowerCase().includes(query)) return true;
+      if (task.description?.toLowerCase().includes(query)) return true;
+
+      // Match repository name/path
+      return taskMatchesRepositorySearch(task, query, repositoriesById);
+    });
+  }, [visibleTasks, searchQuery, workspaceState.activeId, repositoriesByWorkspace]);
+
+  return {
+    // State
+    kanban,
+    workspaceState,
+    workflowsState,
+    enablePreviewOnClick,
+    userSettings,
+    commitSettings,
+    selectedRepositoryIds,
+    isMounted,
+
+    // Derived data
+    activeSteps,
+    filteredTasks,
+  };
+}

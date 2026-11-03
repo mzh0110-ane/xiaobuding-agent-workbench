@@ -1,0 +1,348 @@
+package health
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+// --- GitHubChecker tests ---
+
+type mockGitHubProvider struct {
+	health GitHubConnectionHealth
+	err    error
+}
+
+func (m *mockGitHubProvider) GitHubConnectionHealth(context.Context) (GitHubConnectionHealth, error) {
+	return m.health, m.err
+}
+
+// expectedGitHubFixURL is the live route in apps/web/app/settings/integrations/github.
+// Kept here so a typo or accidental rename breaks a single test instead of
+// shipping a 404 to users.
+const expectedGitHubFixURL = "/settings/integrations/github"
+
+func TestGitHubChecker_NilProvider(t *testing.T) {
+	checker := NewGitHubChecker(nil)
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "github_unavailable" {
+		t.Errorf("issue ID = %q, want %q", issues[0].ID, "github_unavailable")
+	}
+	if issues[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityWarning)
+	}
+	if issues[0].Category != "github" {
+		t.Errorf("category = %q, want %q", issues[0].Category, "github")
+	}
+	if issues[0].FixURL != expectedGitHubFixURL {
+		t.Errorf("FixURL = %q, want %q", issues[0].FixURL, expectedGitHubFixURL)
+	}
+}
+
+func TestGitHubChecker_NotAuthenticated(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 0,
+	}})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "github_not_authenticated" {
+		t.Errorf("issue ID = %q, want %q", issues[0].ID, "github_not_authenticated")
+	}
+	if issues[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityWarning)
+	}
+	if issues[0].FixURL != expectedGitHubFixURL {
+		t.Errorf("FixURL = %q, want %q", issues[0].FixURL, expectedGitHubFixURL)
+	}
+}
+
+func TestGitHubChecker_Authenticated(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 2,
+	}})
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues, got %d", len(issues))
+	}
+}
+
+// The reported shape: GitHub in one workspace, a different code host in the
+// others. Workspaces with no connection row cannot reach this type at all now,
+// so the working connection is the whole picture and nothing is reported.
+// internal/github's store test guards the query that keeps them out.
+func TestGitHubChecker_WorkingConnectionReportsNothing(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 1,
+	}})
+	if issues := checker.Check(context.Background()); len(issues) != 0 {
+		t.Errorf("issues = %+v, want none when a connection works", issues)
+	}
+}
+
+// Every configured connection broken is not an advisory warning: the
+// credential resolver rejects non-active connections, so a flow that treats
+// "unhealthy" as passable would fail at the point of use. It must surface as
+// the same blocking issue as having configured nothing.
+func TestGitHubChecker_AllConnectionsBrokenIsNotAuthenticated(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Invalid: 1, Revoked: 1,
+	}})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 || issues[0].ID != "github_not_authenticated" {
+		t.Fatalf("issues = %+v, want github_not_authenticated", issues)
+	}
+	// The remedy differs from the never-configured case, so the copy must too.
+	if !strings.Contains(issues[0].Message, "all 2 configured connections") {
+		t.Errorf("message = %q, want it to name the broken connections", issues[0].Message)
+	}
+}
+
+// The degraded message counts connections, not workspaces: "1 of 2" is
+// actionable where "1 of 4" implied three more were broken.
+func TestGitHubChecker_DegradedCountsConfiguredConnectionsOnly(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 1, Invalid: 1,
+	}})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 || issues[0].ID != "github_workspace_connections_unhealthy" {
+		t.Fatalf("issues = %+v, want github_workspace_connections_unhealthy", issues)
+	}
+	if !strings.Contains(issues[0].Message, "1 of 2") {
+		t.Errorf("message = %q, want it to count only configured connections", issues[0].Message)
+	}
+	if strings.Contains(issues[0].Message, "disconnected") {
+		t.Errorf("message = %q, must not describe unconfigured workspaces as disconnected", issues[0].Message)
+	}
+}
+
+type stubRateLimitProvider struct {
+	exhausted []GitHubRateLimitStatus
+}
+
+func (s *stubRateLimitProvider) ExhaustedRateLimits() []GitHubRateLimitStatus {
+	return s.exhausted
+}
+
+func TestGitHubChecker_AuthenticatedButRateLimited(t *testing.T) {
+	rate := &stubRateLimitProvider{exhausted: []GitHubRateLimitStatus{
+		{Resource: "graphql", ResetAt: time.Now().Add(15 * time.Minute)},
+	}}
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 1,
+	}})
+	checker.WithRateLimitProvider(rate)
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "github_rate_limit_graphql" {
+		t.Errorf("ID = %q, want github_rate_limit_graphql", issues[0].ID)
+	}
+	if !strings.Contains(issues[0].Message, "resets in") {
+		t.Errorf("message should include reset countdown, got %q", issues[0].Message)
+	}
+	if issues[0].FixURL != expectedGitHubFixURL {
+		t.Errorf("FixURL = %q, want %q", issues[0].FixURL, expectedGitHubFixURL)
+	}
+}
+
+func TestGitHubChecker_AuthenticatedRateProviderEmpty(t *testing.T) {
+	rate := &stubRateLimitProvider{}
+	checker := NewGitHubChecker(&mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 1,
+	}})
+	checker.WithRateLimitProvider(rate)
+	if got := checker.Check(context.Background()); len(got) != 0 {
+		t.Errorf("expected 0 issues when rate provider empty, got %d", len(got))
+	}
+}
+
+func TestGitHubChecker_ReportsDegradedWorkspacesAndRateLimitsTogether(t *testing.T) {
+	provider := &mockGitHubProvider{health: GitHubConnectionHealth{
+		Active: 1, Invalid: 1, Suspended: 1,
+	}}
+	rate := &stubRateLimitProvider{exhausted: []GitHubRateLimitStatus{{Resource: "core"}}}
+	issues := NewGitHubChecker(provider).WithRateLimitProvider(rate).Check(context.Background())
+	if len(issues) != 2 {
+		t.Fatalf("issues = %+v, want connection and rate-limit issues", issues)
+	}
+	if issues[0].ID != "github_workspace_connections_unhealthy" ||
+		!strings.Contains(issues[0].Message, "2 of 3") {
+		t.Fatalf("connection issue = %+v", issues[0])
+	}
+	if issues[1].ID != "github_rate_limit_core" {
+		t.Fatalf("rate-limit issue = %+v", issues[1])
+	}
+}
+
+func TestGitHubChecker_StatusFailureDoesNotInspectAmbientAuth(t *testing.T) {
+	checker := NewGitHubChecker(&mockGitHubProvider{err: errors.New("database unavailable")})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 || issues[0].ID != "github_status_unavailable" {
+		t.Fatalf("issues = %+v", issues)
+	}
+}
+
+// --- WorkflowSyncChecker tests ---
+
+type mockWorkflowSyncProvider struct {
+	summary WorkflowSyncCircuitSummary
+	err     error
+}
+
+func (m *mockWorkflowSyncProvider) WorkflowSyncCircuitSummary(context.Context) (WorkflowSyncCircuitSummary, error) {
+	return m.summary, m.err
+}
+
+func TestWorkflowSyncChecker_NilProviderReportsNothing(t *testing.T) {
+	checker := NewWorkflowSyncChecker(nil)
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Fatalf("expected 0 issues for a nil (optional) provider, got %+v", issues)
+	}
+}
+
+func TestWorkflowSyncChecker_NoOpenCircuitsReportsNothing(t *testing.T) {
+	checker := NewWorkflowSyncChecker(&mockWorkflowSyncProvider{
+		summary: WorkflowSyncCircuitSummary{Total: 3},
+	})
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Fatalf("expected 0 issues when nothing is open, got %+v", issues)
+	}
+}
+
+func TestWorkflowSyncChecker_OpenAuthOrConfigReportsIssue(t *testing.T) {
+	checker := NewWorkflowSyncChecker(&mockWorkflowSyncProvider{
+		summary: WorkflowSyncCircuitSummary{Total: 3, OpenAuth: 1, OpenConfig: 1, OpenTransient: 1},
+	})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 || issues[0].ID != "workflow_sync_circuit_open" {
+		t.Fatalf("issues = %+v", issues)
+	}
+	if issues[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityWarning)
+	}
+	if !strings.Contains(issues[0].Message, "2 of 3") {
+		t.Errorf("message should count only auth+config as degraded, got %q", issues[0].Message)
+	}
+}
+
+func TestWorkflowSyncChecker_StatusFailureReportsIssue(t *testing.T) {
+	checker := NewWorkflowSyncChecker(&mockWorkflowSyncProvider{err: errors.New("db unavailable")})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 || issues[0].ID != "workflow_sync_status_unavailable" {
+		t.Fatalf("issues = %+v", issues)
+	}
+}
+
+// --- GitExecutableChecker tests ---
+
+func TestGitExecutableChecker_Found(t *testing.T) {
+	checker := &GitExecutableChecker{lookPath: func(name string) (string, error) {
+		if name != "git" {
+			t.Fatalf("lookPath name = %q, want git", name)
+		}
+		return "/usr/bin/git", nil
+	}}
+
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues, got %d", len(issues))
+	}
+}
+
+func TestGitExecutableChecker_Missing(t *testing.T) {
+	checker := &GitExecutableChecker{lookPath: func(name string) (string, error) {
+		if name != "git" {
+			t.Fatalf("lookPath name = %q, want git", name)
+		}
+		return "", fmt.Errorf("not found")
+	}}
+
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "git_executable_missing" {
+		t.Errorf("issue ID = %q, want %q", issues[0].ID, "git_executable_missing")
+	}
+	if issues[0].Category != "system_requirements" {
+		t.Errorf("category = %q, want %q", issues[0].Category, "system_requirements")
+	}
+	if issues[0].Severity != SeverityError {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityError)
+	}
+	if !strings.Contains(issues[0].Message, "available on PATH") {
+		t.Errorf("message should mention PATH, got %q", issues[0].Message)
+	}
+	if issues[0].FixURL != "/settings/system/status" {
+		t.Errorf("FixURL = %q, want %q", issues[0].FixURL, "/settings/system/status")
+	}
+}
+
+// --- AgentChecker tests ---
+
+type mockAgentProvider struct {
+	available bool
+	err       error
+}
+
+func (m *mockAgentProvider) HasAvailableAgents(_ context.Context) (bool, error) {
+	return m.available, m.err
+}
+
+func TestAgentChecker_Available(t *testing.T) {
+	checker := NewAgentChecker(&mockAgentProvider{available: true})
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues, got %d", len(issues))
+	}
+}
+
+func TestAgentChecker_NotAvailable(t *testing.T) {
+	checker := NewAgentChecker(&mockAgentProvider{available: false})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "no_agents" {
+		t.Errorf("issue ID = %q, want %q", issues[0].ID, "no_agents")
+	}
+	if issues[0].Category != "agents" {
+		t.Errorf("category = %q, want %q", issues[0].Category, "agents")
+	}
+	if issues[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityWarning)
+	}
+}
+
+func TestAgentChecker_Error(t *testing.T) {
+	checker := NewAgentChecker(&mockAgentProvider{err: fmt.Errorf("discovery failed")})
+	issues := checker.Check(context.Background())
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue on error, got %d", len(issues))
+	}
+	if issues[0].ID != "agent_detection_failed" {
+		t.Errorf("issue ID = %q, want %q", issues[0].ID, "agent_detection_failed")
+	}
+	if issues[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", issues[0].Severity, SeverityWarning)
+	}
+}
+
+func TestAgentChecker_NilProvider(t *testing.T) {
+	checker := NewAgentChecker(nil)
+	issues := checker.Check(context.Background())
+	if len(issues) != 0 {
+		t.Errorf("expected 0 issues for nil provider, got %d", len(issues))
+	}
+}

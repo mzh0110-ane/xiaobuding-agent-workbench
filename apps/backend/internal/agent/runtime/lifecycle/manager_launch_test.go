@@ -1,0 +1,2526 @@
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	storageworkspaces "github.com/kandev/kandev/internal/system/storage/workspaces"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/executor"
+	"github.com/kandev/kandev/internal/agent/runtime/activity"
+	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	runtimeenv "github.com/kandev/kandev/internal/agent/runtime/environment"
+	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/secrets"
+	"github.com/kandev/kandev/internal/task/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// resumeTestAgent is a minimal agent with a BuildCommand that respects the
+// Resume helper (--resume <session_id>) so we can verify buildAgentCommand
+// correctly gates the flag based on CanRecover.
+type resumeTestAgent struct {
+	testAgent
+	canRecover *bool
+}
+
+func (a *resumeTestAgent) BuildCommand(opts agents.CommandOptions) agents.Command {
+	return agents.Cmd("test-agent", "--acp").
+		Resume(agents.NewParam("--resume"), opts.SessionID, false).
+		Build()
+}
+
+func (a *resumeTestAgent) Runtime() *agents.RuntimeConfig {
+	return &agents.RuntimeConfig{
+		Cmd: agents.NewCommand("test-agent", "--acp"),
+		SessionConfig: agents.SessionConfig{
+			CanRecover: a.canRecover,
+		},
+	}
+}
+
+func TestBuildEnvPrepareRequest_CarriesTopLevelBranchIdentity(t *testing.T) {
+	req := &LaunchRequest{
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		RepositoryID:       "repo-1",
+		RepositoryPath:     "/repos/repo-1",
+		RepoName:           "repo-1",
+		BaseBranch:         "feature/x",
+		BranchSlug:         "feature-x",
+		BranchIdentitySlug: "feature-x",
+		UseWorktree:        true,
+	}
+
+	prepReq := buildEnvPrepareRequest(req, "/workspace", executor.NameStandalone)
+
+	if prepReq.BranchSlug != "feature-x" {
+		t.Fatalf("BranchSlug = %q, want feature-x", prepReq.BranchSlug)
+	}
+	if prepReq.BranchIdentitySlug != "feature-x" {
+		t.Fatalf("BranchIdentitySlug = %q, want feature-x", prepReq.BranchIdentitySlug)
+	}
+	specs := prepReq.RepoSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("RepoSpecs length = %d, want 1", len(specs))
+	}
+	if specs[0].BranchIdentitySlug != "feature-x" || specs[0].BranchSlug != "feature-x" {
+		t.Fatalf("repo spec branch fields = identity %q path %q, want feature-x/feature-x",
+			specs[0].BranchIdentitySlug, specs[0].BranchSlug)
+	}
+}
+
+func TestBuildAgentCommand_ResumeFlag(t *testing.T) {
+	mgr := newTestManager(t)
+	canRecoverTrue := true
+	canRecoverFalse := false
+
+	t.Run("CanRecover=true with ACPSessionID includes --resume", func(t *testing.T) {
+		ag := &resumeTestAgent{canRecover: &canRecoverTrue}
+		req := &LaunchRequest{ACPSessionID: "sess-123"}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), req, nil, ag, false)
+		require.NoError(t, err)
+		require.Contains(t, cmds.initial, "--resume")
+		require.Contains(t, cmds.initial, "sess-123")
+	})
+
+	t.Run("CanRecover=false with ACPSessionID omits --resume", func(t *testing.T) {
+		ag := &resumeTestAgent{canRecover: &canRecoverFalse}
+		req := &LaunchRequest{ACPSessionID: "sess-123"}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), req, nil, ag, false)
+		require.NoError(t, err)
+		require.False(t, strings.Contains(cmds.initial, "--resume"),
+			"expected no --resume flag, got: %s", cmds.initial)
+		require.False(t, strings.Contains(cmds.initial, "sess-123"),
+			"expected no session ID in command, got: %s", cmds.initial)
+	})
+
+	t.Run("CanRecover=true with empty ACPSessionID omits --resume", func(t *testing.T) {
+		ag := &resumeTestAgent{canRecover: &canRecoverTrue}
+		req := &LaunchRequest{ACPSessionID: ""}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), req, nil, ag, false)
+		require.NoError(t, err)
+		require.False(t, strings.Contains(cmds.initial, "--resume"),
+			"expected no --resume flag when ACPSessionID is empty, got: %s", cmds.initial)
+	})
+
+	t.Run("CanRecover=nil (default true) with ACPSessionID includes --resume", func(t *testing.T) {
+		ag := &resumeTestAgent{canRecover: nil}
+		req := &LaunchRequest{ACPSessionID: "sess-456"}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), req, nil, ag, false)
+		require.NoError(t, err)
+		require.Contains(t, cmds.initial, "--resume")
+		require.Contains(t, cmds.initial, "sess-456")
+	})
+}
+
+func TestBuildAgentCommand_UsesManagedNPMRuntimes(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	mgr := newTestManager(t)
+	tests := []struct {
+		name  string
+		agent agents.Agent
+	}{
+		{
+			name:  "claude",
+			agent: agents.NewClaudeACP(),
+		},
+		{
+			name:  "codex",
+			agent: agents.NewCodexACP(),
+		},
+		{
+			name:  "opencode",
+			agent: agents.NewOpenCodeACP(),
+		},
+		{
+			name:  "copilot",
+			agent: agents.NewCopilotACP(),
+		},
+		{
+			name:  "gemini",
+			agent: agents.NewGemini(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := strings.Join(tt.agent.(agents.ManagedNPMRuntimeAgent).ManagedNPMRuntime().CachedACPCommand().Args(), " ")
+			if tt.name == "opencode" {
+				want = strings.Join(tt.agent.(agents.ManagedNPMRuntimeAgent).ManagedNPMRuntime().NativeCommand().Args(), " ")
+			}
+			cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, tt.agent, true)
+			require.NoError(t, err)
+			require.Equal(t, want, cmds.initial)
+		})
+	}
+
+	// opencode-acp opts into NativeBinaryAgent: when the lifecycle probe finds
+	// the standalone binary on PATH the launch uses it directly (the same
+	// binary-first pattern as CodeNomad), and falls back to the managed npx
+	// runtime when it is absent (containers, remotes, fresh hosts).
+	t.Run("opencode-native", func(t *testing.T) {
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, agents.NewOpenCodeACP(), true)
+		require.NoError(t, err)
+		require.Equal(t, "opencode acp --print-logs --log-level ERROR", cmds.initial)
+	})
+	t.Run("opencode-npx-fallback", func(t *testing.T) {
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, agents.NewOpenCodeACP(), false)
+		require.NoError(t, err)
+		want := strings.Join(agents.NewOpenCodeACP().ManagedNPMRuntime().CachedACPCommand().Args(), " ")
+		require.Equal(t, want, cmds.initial)
+	})
+}
+
+// cliFlagTestAgent is a minimal BuildCommand that produces a stable prefix
+// so tests can assert CLI flag tokens are appended after the agent's own
+// argv by CommandBuilder.BuildCommand (not by the agent itself).
+type cliFlagTestAgent struct{ testAgent }
+
+func (a *cliFlagTestAgent) BuildCommand(_ agents.CommandOptions) agents.Command {
+	return agents.Cmd("copilot", "--acp").Build()
+}
+
+type invalidCommandTestAgent struct {
+	testAgent
+	command agents.Command
+}
+
+func (a *invalidCommandTestAgent) BuildCommand(_ agents.CommandOptions) agents.Command {
+	return a.command
+}
+
+func TestBuildAgentCommand_CLIFlagsAppended(t *testing.T) {
+	mgr := newTestManager(t)
+	ag := &cliFlagTestAgent{}
+
+	t.Run("enabled entries reach argv, disabled do not", func(t *testing.T) {
+		profile := &AgentProfileInfo{
+			ProfileID: "p1",
+			CLIFlags: []settingsmodels.CLIFlag{
+				{Flag: "--allow-all-tools", Enabled: true},
+				{Flag: "--allow-all-paths", Enabled: false}, // must be skipped
+				{Flag: "--add-dir /shared", Enabled: true},  // must be split
+			},
+		}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.NoError(t, err)
+
+		require.Contains(t, cmds.initial, "--allow-all-tools")
+		require.NotContains(t, cmds.initial, "--allow-all-paths")
+		// The tokeniser splits "--add-dir /shared" into two argv elements,
+		// not one — confirm both are present.
+		require.Contains(t, cmds.initial, "--add-dir")
+		require.Contains(t, cmds.initial, "/shared")
+	})
+
+	t.Run("malformed flag does not abort launch — falls back to empty tokens", func(t *testing.T) {
+		profile := &AgentProfileInfo{
+			ProfileID: "p2",
+			CLIFlags: []settingsmodels.CLIFlag{
+				{Flag: `--broken "unterminated`, Enabled: true},
+			},
+		}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.NoError(t, err)
+		// The bad flag is dropped entirely; the launch still produces the
+		// agent's base command so a user with a typo still gets their task
+		// to run, just without the flag they intended.
+		require.Equal(t, "copilot --acp", cmds.initial)
+	})
+
+	t.Run("nil profile produces bare command", func(t *testing.T) {
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, ag, false)
+		require.NoError(t, err)
+		require.Equal(t, "copilot --acp", cmds.initial)
+	})
+}
+
+func TestBuildAgentCommand_CommandPrefix(t *testing.T) {
+	mgr := newTestManager(t)
+	ag := &cliFlagTestAgent{}
+
+	t.Run("prefix is prepended before the agent command", func(t *testing.T) {
+		profile := &AgentProfileInfo{
+			ProfileID:     "p1",
+			CommandPrefix: "greywall --",
+		}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.NoError(t, err)
+		require.Equal(t, "greywall -- copilot --acp", cmds.initial)
+	})
+
+	t.Run("prefix precedes appended cli flags", func(t *testing.T) {
+		profile := &AgentProfileInfo{
+			ProfileID:     "p2",
+			CommandPrefix: "greywall --",
+			CLIFlags:      []settingsmodels.CLIFlag{{Flag: "--allow-all-tools", Enabled: true}},
+		}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.NoError(t, err)
+		require.Equal(t, "greywall -- copilot --acp --allow-all-tools", cmds.initial)
+	})
+
+	t.Run("empty prefix leaves the command unwrapped", func(t *testing.T) {
+		profile := &AgentProfileInfo{ProfileID: "p3"}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.NoError(t, err)
+		require.Equal(t, "copilot --acp", cmds.initial)
+	})
+
+	t.Run("malformed prefix fails closed instead of launching unwrapped", func(t *testing.T) {
+		profile := &AgentProfileInfo{
+			ProfileID:     "p4",
+			CommandPrefix: `greywall "unterminated`,
+		}
+		_, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, ag, false)
+		require.Error(t, err, "a configured prefix that cannot be resolved must abort the launch")
+	})
+
+	t.Run("prefix also wraps the continue-session command", func(t *testing.T) {
+		// One-shot agents (e.g. Amp) build a separate continue command; it must
+		// carry the launcher prefix too, after any cli flags.
+		continueAgent := &cliFlagTestAgent{testAgent{runtimeConfig: &agents.RuntimeConfig{
+			SessionConfig: agents.SessionConfig{
+				ContinueSessionCmd: agents.NewCommand("amp", "threads", "continue"),
+			},
+		}}}
+		profile := &AgentProfileInfo{
+			ProfileID:     "p5",
+			CommandPrefix: "greywall --",
+			CLIFlags:      []settingsmodels.CLIFlag{{Flag: "--allow-all-tools", Enabled: true}},
+		}
+		cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, profile, continueAgent, false)
+		require.NoError(t, err)
+		require.Equal(t, "greywall -- amp threads continue --allow-all-tools", cmds.continue_)
+	})
+}
+
+func TestCollectContributionDestinationsRejectsDistinctIdentitiesWithSamePath(t *testing.T) {
+	first := lifecycleTestContributionDestination("200")
+	second := lifecycleTestContributionDestination("201")
+	req := &LaunchRequest{Repositories: []RepoLaunchSpec{
+		{RepoName: "primary"},
+		{RepoName: "shared", BaseBranch: "main", ContributionDestination: &first},
+		{RepoName: "shared", BaseBranch: "main", ContributionDestination: &second},
+	}}
+
+	_, err := collectContributionDestinations(req)
+	if err == nil {
+		t.Fatal("collectContributionDestinations accepted distinct target identities with the same path")
+	}
+}
+
+func lifecycleTestContributionDestination(providerID string) models.ContributionDestination {
+	return models.ContributionDestination{
+		Version:  models.ContributionDestinationVersion,
+		Provider: models.ContributionDestinationProviderGitHub,
+		SourceRepository: models.ContributionDestinationRepository{
+			Host: "github.com", Path: "kdlbs/kandev", ProviderID: "100", RemoteURL: "https://github.com/kdlbs/kandev.git",
+		},
+		TargetRepository: models.ContributionDestinationRepository{
+			Host: "github.com", Path: "alice/kandev", ProviderID: providerID, RemoteURL: "https://github.com/alice/kandev.git",
+		},
+	}
+}
+
+func TestBuildAgentCommand_RejectsInvalidBuiltArgv(t *testing.T) {
+	mgr := newTestManager(t)
+	tests := []struct {
+		name  string
+		agent *invalidCommandTestAgent
+	}{
+		{
+			name:  "initial executable is a flag",
+			agent: &invalidCommandTestAgent{command: agents.NewCommand("--not-an-executable")},
+		},
+		{
+			name: "continue executable is whitespace",
+			agent: &invalidCommandTestAgent{
+				command: agents.NewCommand("agent"),
+				testAgent: testAgent{runtimeConfig: &agents.RuntimeConfig{SessionConfig: agents.SessionConfig{
+					ContinueSessionCmd: agents.NewCommand("   "),
+				}}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, tt.agent, false)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestManager_LaunchRejectsInvalidBuiltArgvBeforeRegistration(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent *invalidCommandTestAgent
+	}{
+		{
+			name: "initial executable is a flag",
+			agent: &invalidCommandTestAgent{
+				testAgent: testAgent{id: "invalid-command", enabled: true},
+				command:   agents.NewCommand("--not-an-executable"),
+			},
+		},
+		{
+			name: "continue executable is whitespace",
+			agent: &invalidCommandTestAgent{
+				testAgent: testAgent{
+					id:      "invalid-command",
+					enabled: true,
+					runtimeConfig: &agents.RuntimeConfig{SessionConfig: agents.SessionConfig{
+						ContinueSessionCmd: agents.NewCommand("   "),
+					}},
+				},
+				command: agents.NewCommand("agent"),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &countingProfileResolver{info: &AgentProfileInfo{
+				ProfileID: "profile-invalid-command",
+				AgentName: tt.agent.ID(),
+			}}
+			mgr, backend := newEnvironmentExecutionTestManagerWithProfileResolver(t, nil, resolver)
+			require.NoError(t, mgr.registry.Register(tt.agent))
+			var configureCalls, startCalls atomic.Int32
+			backend.client = newLaunchRollbackAgentctlClient(t, mgr.logger, &configureCalls, &startCalls)
+
+			execution, err := mgr.Launch(context.Background(), &LaunchRequest{
+				TaskID:         "task-invalid-command",
+				SessionID:      "session-invalid-command",
+				AgentProfileID: "profile-invalid-command",
+				ExecutorType:   string(models.ExecutorTypeLocal),
+				IsEphemeral:    true,
+			})
+			require.Nil(t, execution)
+			require.ErrorContains(t, err, "validate")
+			require.Equal(t, int32(1), backend.createCount.Load())
+			require.Equal(t, int32(1), backend.stopCount.Load())
+			require.True(t, backend.forceStopped.Load())
+			_, found := mgr.executionStore.GetBySessionID("session-invalid-command")
+			require.False(t, found)
+			require.Zero(t, configureCalls.Load())
+			require.Zero(t, startCalls.Load())
+		})
+	}
+}
+
+func TestManager_LaunchBuildExecutionFailureRollsBackCreatedInstance(t *testing.T) {
+	resolver := &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID:     "profile-1",
+		AgentName:     "auggie",
+		CommandPrefix: `greywall "unterminated`,
+	}}
+	mgr, backend := newEnvironmentExecutionTestManagerWithProfileResolver(t, nil, resolver)
+	var configureCalls, startCalls atomic.Int32
+	backend.client = newLaunchRollbackAgentctlClient(t, mgr.logger, &configureCalls, &startCalls)
+
+	execution, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         "task-launch-rollback",
+		SessionID:      "session-launch-rollback",
+		AgentProfileID: "profile-1",
+		ExecutorType:   string(models.ExecutorTypeLocal),
+		IsEphemeral:    true,
+	})
+	require.Nil(t, execution)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "resolve command_prefix")
+	require.Equal(t, int32(1), backend.createCount.Load(), "instance must be created before command construction fails")
+	require.Equal(t, int32(1), backend.stopCount.Load(), "created instance must be stopped exactly once")
+	require.True(t, backend.forceStopped.Load(), "failed instance cleanup must force runtime teardown")
+	_, found := mgr.executionStore.GetBySessionID("session-launch-rollback")
+	require.False(t, found, "failed execution must never be registered")
+	require.Zero(t, configureCalls.Load(), "command construction failure must not configure agentctl")
+	require.Zero(t, startCalls.Load(), "command construction failure must not start agentctl")
+}
+
+func newLaunchRollbackAgentctlClient(t *testing.T, log *logger.Logger, configureCalls, startCalls *atomic.Int32) *agentctl.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/agent/configure":
+			configureCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case "/api/v1/start":
+			startCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":true}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return newTestAgentctlClient(t, server.URL, log)
+}
+
+func TestBuildEnvForExecution_ResolvesSecretBackedProfileEnv(t *testing.T) {
+	store := newInMemorySecretStore()
+	if err := store.Create(context.Background(), &secrets.SecretWithValue{
+		Secret: secrets.Secret{ID: "sec-1", Name: "token"},
+		Value:  "revealed",
+	}); err != nil {
+		t.Fatalf("seed secret: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	mgr.secretStore = store
+	profileInfo := &AgentProfileInfo{
+		EnvVars: []settingsmodels.ProfileEnvVar{{Key: "FROM_SECRET", SecretID: "sec-1"}},
+	}
+
+	env, err := mgr.buildEnvForExecution(
+		context.Background(),
+		"exec-1",
+		&LaunchRequest{AgentProfileID: "profile-1"},
+		nil,
+		profileInfo,
+	)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution: %v", err)
+	}
+	if env["FROM_SECRET"] != "revealed" {
+		t.Fatalf("FROM_SECRET: got %q want revealed", env["FROM_SECRET"])
+	}
+}
+
+// A broken secret reference on one profile env var must not blank the agent's
+// whole launch environment: the bad var is dropped, the rest are delivered
+// (AC-AGENTS-OPENAI-COMPATIBLE-PROVIDERS-004.1).
+func TestBuildEnvForExecution_DropsOnlyTheUnresolvableProfileSecretVar(t *testing.T) {
+	mgr := newTestManager(t)
+	store := newInMemorySecretStore()
+	_ = store.Create(context.Background(), &secrets.SecretWithValue{
+		Secret: secrets.Secret{ID: "sec-ok", Name: "ok"},
+		Value:  "revealed",
+	})
+	mgr.secretStore = store
+
+	env, err := mgr.buildEnvForExecution(
+		context.Background(),
+		"exec-1",
+		&LaunchRequest{AgentProfileID: "profile-1"},
+		nil,
+		&AgentProfileInfo{EnvVars: []settingsmodels.ProfileEnvVar{
+			{Key: "GOOD_TOKEN", SecretID: "sec-ok"},
+			{Key: "BROKEN_TOKEN", SecretID: "missing-secret"},
+		}},
+	)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution: %v", err)
+	}
+	if env["GOOD_TOKEN"] != "revealed" {
+		t.Errorf("GOOD_TOKEN = %q, want revealed", env["GOOD_TOKEN"])
+	}
+	if _, present := env["BROKEN_TOKEN"]; present {
+		t.Errorf("BROKEN_TOKEN should have been dropped, got %q", env["BROKEN_TOKEN"])
+	}
+}
+
+func TestBuildEnvForExecution_SeparatesOfficeAndExecutionProfiles(t *testing.T) {
+	mgr := newTestManager(t)
+	profileInfo := &AgentProfileInfo{
+		ProfileID: "claude-profile",
+		EnvVars: []settingsmodels.ProfileEnvVar{
+			{Key: "CLAUDE_CONFIG_DIR", Value: "/accounts/claude"},
+			{Key: "KANDEV_AGENT_PROFILE_ID", Value: "must-not-win"},
+		},
+	}
+
+	env, err := mgr.buildEnvForExecution(
+		context.Background(),
+		"exec-1",
+		&LaunchRequest{
+			AgentProfileID:     "office-cto",
+			ExecutionProfileID: "claude-profile",
+			TaskID:             "task-1",
+			SessionID:          "session-1",
+		},
+		nil,
+		profileInfo,
+	)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution: %v", err)
+	}
+	if env["CLAUDE_CONFIG_DIR"] != "/accounts/claude" {
+		t.Fatalf("execution profile env missing: %+v", env)
+	}
+	if env["KANDEV_AGENT_PROFILE_ID"] != "office-cto" {
+		t.Fatalf("KANDEV_AGENT_PROFILE_ID = %q, want office-cto", env["KANDEV_AGENT_PROFILE_ID"])
+	}
+	if env["KANDEV_EXECUTION_PROFILE_ID"] != "claude-profile" {
+		t.Fatalf("KANDEV_EXECUTION_PROFILE_ID = %q, want claude-profile", env["KANDEV_EXECUTION_PROFILE_ID"])
+	}
+}
+
+func TestBuildEnvForExecutionHostGHBridge(t *testing.T) {
+	mgr := newTestManager(t)
+	profileInfo := &AgentProfileInfo{
+		EnvVars: []settingsmodels.ProfileEnvVar{{Key: "GH_TOKEN", Value: "late-profile-token"}},
+	}
+	req := &LaunchRequest{
+		TaskID:    "task-1",
+		SessionID: "session-1",
+		Env: map[string]string{
+			"GIT_CONFIG_COUNT":   "2",
+			"GIT_CONFIG_KEY_0":   "notes.augment.mergeStrategy",
+			"GIT_CONFIG_VALUE_0": "union",
+			"GIT_CONFIG_KEY_1":   "credential.https://github.com.helper",
+			"GIT_CONFIG_VALUE_1": "!'host tools/gh' auth git-credential",
+		},
+	}
+
+	env, err := mgr.buildEnvForExecution(context.Background(), "exec-1", req, nil, profileInfo)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution() error = %v", err)
+	}
+	if got := env["GH_TOKEN"]; got != "late-profile-token" {
+		t.Fatalf("GH_TOKEN = %q, want late profile token", got)
+	}
+	if got := env["GIT_CONFIG_COUNT"]; got != "2" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 2", got)
+	}
+	if got := env["GIT_CONFIG_KEY_0"]; got != "notes.augment.mergeStrategy" || env["GIT_CONFIG_VALUE_0"] != "union" {
+		t.Fatalf("inherited Git config entry 0 = (%q, %q)", got, env["GIT_CONFIG_VALUE_0"])
+	}
+	if got := env["GIT_CONFIG_KEY_1"]; got != "credential.https://github.com.helper" || env["GIT_CONFIG_VALUE_1"] == "" {
+		t.Fatalf("host Git config entry 1 = (%q, %q)", got, env["GIT_CONFIG_VALUE_1"])
+	}
+}
+
+func TestBuildEnvForExecutionHostGHBridge_ComposesStrictProfileBlocks(t *testing.T) {
+	mgr := newTestManager(t)
+	req := &LaunchRequest{
+		TaskID:                        "task-1",
+		SessionID:                     "session-1",
+		EnvironmentResolutionRequired: true,
+		Env: map[string]string{
+			"GIT_CONFIG_COUNT":   "1",
+			"GIT_CONFIG_KEY_0":   "credential.https://github.com.helper",
+			"GIT_CONFIG_VALUE_0": "!f() { : kandev-host-gh-bridge; gh auth git-credential \"$@\"; }; f",
+		},
+		EnvironmentDefinitions: []runtimeenv.Definition{
+			{Key: "GIT_CONFIG_COUNT", Literal: "2", Origin: runtimeenv.OriginExecutorProfile},
+			{Key: "GIT_CONFIG_KEY_0", Literal: "notes.augment.mergeStrategy", Origin: runtimeenv.OriginExecutorProfile},
+			{Key: "GIT_CONFIG_VALUE_0", Literal: "union", Origin: runtimeenv.OriginExecutorProfile},
+			{Key: "GIT_CONFIG_KEY_1", Literal: "core.hooksPath", Origin: runtimeenv.OriginExecutorProfile},
+			{Key: "GIT_CONFIG_VALUE_1", Literal: "/profile/hooks", Origin: runtimeenv.OriginExecutorProfile},
+		},
+	}
+	profileInfo := &AgentProfileInfo{EnvVars: []settingsmodels.ProfileEnvVar{
+		{Key: "GIT_CONFIG_COUNT", Value: "1"},
+		{Key: "GIT_CONFIG_KEY_0", Value: "core.autocrlf"},
+		{Key: "GIT_CONFIG_VALUE_0", Value: "input"},
+	}}
+
+	env, err := mgr.buildEnvForExecution(context.Background(), "exec-1", req, nil, profileInfo)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution() error = %v", err)
+	}
+	if got := env["GIT_CONFIG_COUNT"]; got != "4" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 4", got)
+	}
+	wantEntries := []struct{ key, value string }{
+		{"core.autocrlf", "input"},
+		{"notes.augment.mergeStrategy", "union"},
+		{"core.hooksPath", "/profile/hooks"},
+		{"credential.https://github.com.helper", "!f() { : kandev-host-gh-bridge; gh auth git-credential \"$@\"; }; f"},
+	}
+	for index, want := range wantEntries {
+		key := env["GIT_CONFIG_KEY_"+strconv.Itoa(index)]
+		value := env["GIT_CONFIG_VALUE_"+strconv.Itoa(index)]
+		if key != want.key || value != want.value {
+			t.Errorf("Git config entry %d = (%q, %q), want (%q, %q)", index, key, value, want.key, want.value)
+		}
+	}
+}
+
+func TestBuildEnvForExecution_RejectsLateManagedValuesThatConflictWithRepositorySecrets(t *testing.T) {
+	store := newInMemorySecretStore()
+	for _, key := range []string{"AGENT_MODEL", "AGENTCTL_AUTO_APPROVE_PERMISSIONS", "GOCACHE", "ANTHROPIC_API_KEY"} {
+		if err := store.Create(context.Background(), &secrets.SecretWithValue{
+			Secret: secrets.Secret{ID: "secret-" + key, Name: key, Scope: secrets.ScopeWorkspace, WorkspaceID: "workspace-1"},
+			Value:  "repository-value",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		key        string
+		profile    *AgentProfileInfo
+		cachePath  string
+		required   []string
+		credential string
+	}{
+		{name: "model", key: "AGENT_MODEL", profile: &AgentProfileInfo{Model: "managed-model"}},
+		{name: "auto approve", key: "AGENTCTL_AUTO_APPROVE_PERMISSIONS", profile: &AgentProfileInfo{AutoApprove: true}},
+		{name: "go cache", key: "GOCACHE", cachePath: "/managed/cache"},
+		{name: "required credential", key: "ANTHROPIC_API_KEY", required: []string{"ANTHROPIC_API_KEY"}, credential: "managed-credential"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := newTestManager(t)
+			mgr.secretStore = store
+			mgr.credsMgr = fixedCredentialManager{value: tc.credential}
+			req := &LaunchRequest{
+				TaskID: "task-1", WorkspaceID: "workspace-1", SessionID: "session-1",
+				EnvironmentResolutionRequired: true,
+				EnvironmentDefinitions: []runtimeenv.Definition{{
+					Key: tc.key, SecretID: "secret-" + tc.key, Origin: "repository app", WorkspaceID: "workspace-1",
+				}},
+			}
+			req.managedGoCachePath = tc.cachePath
+			_, err := mgr.buildEnvForExecution(context.Background(), "exec-1", req, &testAgent{runtimeConfig: &agents.RuntimeConfig{RequiredEnv: tc.required}}, tc.profile)
+			if err == nil {
+				t.Fatal("buildEnvForExecution succeeded, want conflict")
+			}
+			var conflictErr *runtimeenv.ConflictError
+			if !errors.As(err, &conflictErr) {
+				t.Fatalf("error = %T %v, want environment conflict", err, err)
+			}
+			if len(conflictErr.Origins) != 2 {
+				t.Fatalf("conflict origins = %#v, want repository and managed origin", conflictErr.Origins)
+			}
+		})
+	}
+}
+
+type fixedCredentialManager struct{ value string }
+
+func (m fixedCredentialManager) GetCredentialValue(context.Context, string) (string, error) {
+	return m.value, nil
+}
+
+type recordingEnvProfileResolver struct {
+	profileID string
+}
+
+func (r *recordingEnvProfileResolver) ResolveProfile(
+	_ context.Context, profileID string,
+) (*AgentProfileInfo, error) {
+	r.profileID = profileID
+	return &AgentProfileInfo{
+		ProfileID: profileID,
+		EnvVars:   []settingsmodels.ProfileEnvVar{{Key: "PROFILE_ENV", Value: profileID}},
+	}, nil
+}
+
+func TestBuildEnvForExecution_NilSnapshotResolvesExecutionProfile(t *testing.T) {
+	mgr := newTestManager(t)
+	resolver := &recordingEnvProfileResolver{}
+	mgr.profileResolver = resolver
+	env, err := mgr.buildEnvForExecution(context.Background(), "exec-1", &LaunchRequest{
+		AgentProfileID: "office-cto", ExecutionProfileID: "claude-profile",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("build env: %v", err)
+	}
+	if resolver.profileID != "claude-profile" || env["PROFILE_ENV"] != "claude-profile" {
+		t.Fatalf("resolved profile=%q env=%q, want execution profile",
+			resolver.profileID, env["PROFILE_ENV"])
+	}
+}
+
+func TestExecutionProfileIDFallsBackToOfficeProfile(t *testing.T) {
+	req := &LaunchRequest{AgentProfileID: "profile-1"}
+	if got := executionProfileID(req); got != "profile-1" {
+		t.Fatalf("executionProfileID = %q, want profile-1", got)
+	}
+	req.ExecutionProfileID = "profile-2"
+	if got := executionProfileID(req); got != "profile-2" {
+		t.Fatalf("executionProfileID = %q, want profile-2", got)
+	}
+}
+
+func TestConcreteExecutionProfileIgnoresLegacyRouteFlagsAndEnv(t *testing.T) {
+	req := &LaunchRequest{
+		ExecutionProfileID: "claude-profile",
+		Env:                map[string]string{"PROFILE_ENV": "profile"},
+		RouteOverride: &RouteOverride{
+			ExecutionProfileID: "claude-profile",
+			Flags:              []string{"--legacy-route-flag"},
+			Env:                map[string]string{"PROFILE_ENV": "route", "ROUTE_ONLY": "value"},
+		},
+	}
+
+	flags := appendRouteOverrideFlags([]string{"--profile-flag"}, req)
+	if len(flags) != 1 || flags[0] != "--profile-flag" {
+		t.Fatalf("flags = %v, want execution profile flags only", flags)
+	}
+	if err := mergeRouteOverrideEnv(req); err != nil {
+		t.Fatalf("mergeRouteOverrideEnv() error = %v", err)
+	}
+	if req.Env["PROFILE_ENV"] != "profile" {
+		t.Fatalf("PROFILE_ENV = %q, want execution profile value", req.Env["PROFILE_ENV"])
+	}
+	if _, ok := req.Env["ROUTE_ONLY"]; ok {
+		t.Fatalf("legacy route env leaked into concrete execution profile: %v", req.Env)
+	}
+}
+
+func TestLegacyRouteStillAppliesFlagsAndEnv(t *testing.T) {
+	req := &LaunchRequest{
+		Env: map[string]string{"BASE": "value"},
+		RouteOverride: &RouteOverride{
+			Flags: []string{"--legacy-route-flag"},
+			Env:   map[string]string{"ROUTE_ONLY": "value"},
+		},
+	}
+
+	flags := appendRouteOverrideFlags([]string{"--profile-flag"}, req)
+	if len(flags) != 2 || flags[1] != "--legacy-route-flag" {
+		t.Fatalf("flags = %v, want legacy route flag appended", flags)
+	}
+	if err := mergeRouteOverrideEnv(req); err != nil {
+		t.Fatalf("mergeRouteOverrideEnv() error = %v", err)
+	}
+	if req.Env["ROUTE_ONLY"] != "value" {
+		t.Fatalf("legacy route env missing: %v", req.Env)
+	}
+}
+
+func TestLegacyRouteComposesIndexedGitConfig(t *testing.T) {
+	req := &LaunchRequest{
+		Env: map[string]string{
+			"GIT_CONFIG_COUNT":   "1",
+			"GIT_CONFIG_KEY_0":   "core.hooksPath",
+			"GIT_CONFIG_VALUE_0": "/opt/locstat/hooks",
+		},
+		RouteOverride: &RouteOverride{Env: map[string]string{
+			"GIT_CONFIG_COUNT":   "1",
+			"GIT_CONFIG_KEY_0":   gitHubCredentialHelperConfigKey,
+			"GIT_CONFIG_VALUE_0": "!agentctl git-credential",
+		}},
+	}
+
+	if err := mergeRouteOverrideEnv(req); err != nil {
+		t.Fatalf("mergeRouteOverrideEnv() error = %v", err)
+	}
+
+	if got := req.Env["GIT_CONFIG_COUNT"]; got != "2" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 2", got)
+	}
+	if got := req.Env["GIT_CONFIG_KEY_0"]; got != "core.hooksPath" {
+		t.Fatalf("GIT_CONFIG_KEY_0 = %q, want base entry", got)
+	}
+	if got := req.Env["GIT_CONFIG_VALUE_0"]; got != "/opt/locstat/hooks" {
+		t.Fatalf("GIT_CONFIG_VALUE_0 = %q, want base value", got)
+	}
+	if got := req.Env["GIT_CONFIG_KEY_1"]; got != gitHubCredentialHelperConfigKey {
+		t.Fatalf("GIT_CONFIG_KEY_1 = %q, want route entry", got)
+	}
+	if got := req.Env["GIT_CONFIG_VALUE_1"]; got != "!agentctl git-credential" {
+		t.Fatalf("GIT_CONFIG_VALUE_1 = %q, want route value", got)
+	}
+}
+
+func TestLegacyRouteRejectsMalformedIndexedGitConfig(t *testing.T) {
+	req := &LaunchRequest{RouteOverride: &RouteOverride{Env: map[string]string{
+		"GIT_CONFIG_COUNT": "1",
+		"GIT_CONFIG_KEY_0": "core.hooksPath",
+	}}}
+
+	if err := mergeRouteOverrideEnv(req); err == nil {
+		t.Fatal("mergeRouteOverrideEnv() error = nil, want malformed Git config error")
+	}
+}
+
+func TestBuildEnvForExecution_DoesNotCopyTaskDescriptionToEnv(t *testing.T) {
+	mgr := newTestManager(t)
+	env, err := mgr.buildEnvForExecution(
+		context.Background(),
+		"exec-1",
+		&LaunchRequest{
+			TaskID:          "task-1",
+			SessionID:       "session-1",
+			AgentProfileID:  "profile-1",
+			TaskDescription: strings.Repeat("large prompt\n", 1000),
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution: %v", err)
+	}
+
+	if _, exists := env["TASK_DESCRIPTION"]; exists {
+		t.Fatalf("TASK_DESCRIPTION must not be copied into subprocess env")
+	}
+	if env["KANDEV_TASK_ID"] != "task-1" {
+		t.Fatalf("KANDEV_TASK_ID = %q, want task-1", env["KANDEV_TASK_ID"])
+	}
+}
+
+func TestBuildEnvForExecution_SpillsLargeWakePayloadToWorkspaceFile(t *testing.T) {
+	mgr := newTestManager(t)
+	workspace := t.TempDir()
+	payload := strings.Repeat("x", envWakePayloadInlineMax+1)
+
+	env, err := mgr.buildEnvForExecution(
+		context.Background(),
+		"exec-1",
+		&LaunchRequest{
+			TaskID:         "task-1",
+			SessionID:      "session-1",
+			AgentProfileID: "profile-1",
+			WorkspacePath:  workspace,
+			Env: map[string]string{
+				"KANDEV_RUN_ID":            "run-1",
+				"KANDEV_WAKE_PAYLOAD_JSON": payload,
+			},
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution: %v", err)
+	}
+	if _, exists := env["KANDEV_WAKE_PAYLOAD_JSON"]; exists {
+		t.Fatalf("large wake payload must not remain inline in env")
+	}
+	relPath := env["KANDEV_WAKE_PAYLOAD_PATH"]
+	if relPath == "" {
+		t.Fatalf("KANDEV_WAKE_PAYLOAD_PATH missing from env: %+v", env)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(relPath)))
+	if err != nil {
+		t.Fatalf("read spilled payload: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("spilled payload mismatch")
+	}
+}
+
+func TestConfigureAndStartAgent_DoesNotSendTaskDescriptionEnv(t *testing.T) {
+	mgr := newTestManager(t)
+	var configuredEnv map[string]string
+	client := newConfigureCaptureAgentctlClient(t, newTestLogger(), &configuredEnv)
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "npx -y @agentclientprotocol/codex-acp",
+		WorkspacePath:  t.TempDir(),
+		metadata: map[string]interface{}{
+			"runtime_env":      map[string]string{"KEEP_ME": "yes"},
+			"task_description": strings.Repeat("large prompt\n", 1000),
+		},
+		agentctl: client,
+	}
+
+	bootCommand, err := mgr.configureAndStartAgent(context.Background(), execution)
+	if err != nil {
+		t.Fatalf("configureAndStartAgent() error = %v", err)
+	}
+	if bootCommand != "npx -y @agentclientprotocol/codex-acp" {
+		t.Fatalf("bootCommand = %q, want agent command", bootCommand)
+	}
+	if configuredEnv["KEEP_ME"] != "yes" {
+		t.Fatalf("runtime_env was not preserved: %+v", configuredEnv)
+	}
+	if _, exists := configuredEnv["TASK_DESCRIPTION"]; exists {
+		t.Fatalf("TASK_DESCRIPTION must not be sent to agentctl configure env")
+	}
+}
+
+func TestConfigureAndStartAgentUsesRuntimeSnapshotWhenProfileSecretIsUnavailable(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockPassthroughProfileResolver{
+		envVars: []settingsmodels.ProfileEnvVar{{Key: "PROFILE_ONLY", SecretID: "deleted-secret"}},
+	}
+	var configuredEnv map[string]string
+	client := newConfigureCaptureAgentctlClient(t, newTestLogger(), &configuredEnv)
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "npx -y @agentclientprotocol/codex-acp",
+		WorkspacePath:  t.TempDir(),
+		agentctl:       client,
+	}
+	execution.setRuntimeEnvironment(map[string]string{"PROFILE_ONLY": "captured-value"})
+
+	if _, err := mgr.configureAndStartAgent(context.Background(), execution); err != nil {
+		t.Fatalf("configureAndStartAgent() error = %v", err)
+	}
+	if configuredEnv["PROFILE_ONLY"] != "captured-value" {
+		t.Fatalf("configured profile env = %q, want captured runtime value", configuredEnv["PROFILE_ONLY"])
+	}
+}
+
+func TestConfigureAndStartAgentSendsComposedRuntimeEnvironmentAsOverlay(t *testing.T) {
+	mgr := newTestManager(t)
+	var configuredEnv map[string]string
+	var replaced bool
+	client := newConfigureCaptureAgentctlClient(t, newTestLogger(), &configuredEnv, &replaced)
+	execution := &AgentExecution{
+		ID:            "exec-1",
+		TaskID:        "task-1",
+		SessionID:     "session-1",
+		AgentCommand:  "npx -y @agentclientprotocol/codex-acp",
+		WorkspacePath: t.TempDir(),
+		metadata: map[string]interface{}{
+			"runtime_env": map[string]string{
+				"GIT_CONFIG_COUNT":   "1",
+				"GIT_CONFIG_KEY_0":   "credential.https://github.com.helper",
+				"GIT_CONFIG_VALUE_0": "!f() { : kandev-host-gh-bridge; '/new/gh' auth git-credential \"$@\"; }; f",
+			},
+		},
+		agentctl: client,
+	}
+	execution.setRuntimeEnvironment(map[string]string{
+		"GIT_CONFIG_COUNT":   "3",
+		"GIT_CONFIG_KEY_0":   "notes.augment.mergeStrategy",
+		"GIT_CONFIG_VALUE_0": "union",
+		"GIT_CONFIG_KEY_1":   "core.hooksPath",
+		"GIT_CONFIG_VALUE_1": "/user/hooks",
+		"GIT_CONFIG_KEY_2":   "credential.https://github.com.helper",
+		"GIT_CONFIG_VALUE_2": "!f() { : kandev-host-gh-bridge; '/old/gh' auth git-credential \"$@\"; }; f",
+	})
+
+	if _, err := mgr.configureAndStartAgent(context.Background(), execution); err != nil {
+		t.Fatalf("configureAndStartAgent() error = %v", err)
+	}
+	if replaced {
+		t.Fatal("runtime snapshot was sent through complete replacement mode, want overlay mode")
+	}
+	if configuredEnv["GIT_CONFIG_COUNT"] != "3" ||
+		configuredEnv["GIT_CONFIG_KEY_0"] != "notes.augment.mergeStrategy" ||
+		configuredEnv["GIT_CONFIG_KEY_1"] != "core.hooksPath" ||
+		configuredEnv["GIT_CONFIG_KEY_2"] != "credential.https://github.com.helper" ||
+		!strings.Contains(configuredEnv["GIT_CONFIG_VALUE_2"], "'/new/gh'") {
+		t.Fatalf("configured runtime environment = %#v, want one composed replacement block", configuredEnv)
+	}
+}
+
+func TestConfigureAndStartAgent_SendsStructuredArgv(t *testing.T) {
+	mgr := newTestManager(t)
+	var captured []string
+	client := newConfigureArgsCaptureAgentctlClient(t, newTestLogger(), &captured)
+	execution := &AgentExecution{
+		ID:             "exec-argv",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "runner two words  C:\\tools\\agent.exe",
+		AgentArgs:      []string{"runner", "two words", "", `C:\tools\agent.exe`},
+		WorkspacePath:  t.TempDir(),
+		agentctl:       client,
+	}
+
+	if _, err := mgr.configureAndStartAgent(context.Background(), execution); err != nil {
+		t.Fatalf("configure and start agent: %v", err)
+	}
+	want := []string{"runner", "two words", "", `C:\tools\agent.exe`}
+	if !reflect.DeepEqual(captured, want) {
+		t.Fatalf("configured argv = %#v, want %#v", captured, want)
+	}
+}
+
+func TestConfigureAndStartAgent_SpillsLargeWakePayloadEnv(t *testing.T) {
+	mgr := newTestManager(t)
+	var configuredEnv map[string]string
+	workspace := t.TempDir()
+	client := newConfigureCaptureAgentctlClient(t, newTestLogger(), &configuredEnv)
+	payload := strings.Repeat("x", envWakePayloadInlineMax+1)
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "npx -y @agentclientprotocol/codex-acp",
+		WorkspacePath:  workspace,
+		metadata: map[string]interface{}{
+			"runtime_env": map[string]string{
+				"KANDEV_RUN_ID":            "run-2",
+				"KANDEV_WAKE_PAYLOAD_JSON": payload,
+			},
+		},
+		agentctl: client,
+	}
+
+	if _, err := mgr.configureAndStartAgent(context.Background(), execution); err != nil {
+		t.Fatalf("configureAndStartAgent() error = %v", err)
+	}
+	if _, exists := configuredEnv["KANDEV_WAKE_PAYLOAD_JSON"]; exists {
+		t.Fatalf("large wake payload must not be sent inline to agentctl configure env")
+	}
+	relPath := configuredEnv["KANDEV_WAKE_PAYLOAD_PATH"]
+	if relPath == "" {
+		t.Fatalf("KANDEV_WAKE_PAYLOAD_PATH missing from env: %+v", configuredEnv)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(relPath)))
+	if err != nil {
+		t.Fatalf("read spilled payload: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("spilled payload mismatch")
+	}
+}
+
+func TestSetExecutionEnv_DoesNotSnapshotProfileEnvVars(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockPassthroughProfileResolver{
+		envVars: []settingsmodels.ProfileEnvVar{{Key: "PROFILE_ONLY", Value: "new-value"}},
+	}
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		metadata:       map[string]interface{}{},
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	if err := mgr.SetExecutionEnv(context.Background(), execution.ID, map[string]string{"EXECUTOR_ONLY": "executor"}); err != nil {
+		t.Fatalf("SetExecutionEnv: %v", err)
+	}
+
+	rawEnv, _ := execution.metadataValue("runtime_env")
+	runtimeEnv, ok := rawEnv.(map[string]string)
+	if !ok {
+		t.Fatalf("runtime_env missing or wrong type: %#v", rawEnv)
+	}
+	if runtimeEnv["EXECUTOR_ONLY"] != "executor" {
+		t.Fatalf("executor env missing: %+v", runtimeEnv)
+	}
+	if _, exists := runtimeEnv["PROFILE_ONLY"]; exists {
+		t.Fatalf("profile env vars must not be snapshotted into runtime_env: %+v", runtimeEnv)
+	}
+}
+
+func newConfigureCaptureAgentctlClient(t *testing.T, log *logger.Logger, captured *map[string]string, replaced ...*bool) *agentctl.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agent/configure":
+			var req struct {
+				Env        map[string]string `json:"env"`
+				ReplaceEnv bool              `json:"replace_env"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode configure request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			*captured = req.Env
+			if len(replaced) > 0 && replaced[0] != nil {
+				*replaced[0] = req.ReplaceEnv
+			}
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case "/api/v1/start":
+			_, _ = w.Write([]byte(`{"success":true,"command":"npx -y @agentclientprotocol/codex-acp"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return newTestAgentctlClient(t, server.URL, log)
+}
+
+func newConfigureArgsCaptureAgentctlClient(t *testing.T, log *logger.Logger, captured *[]string) *agentctl.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agent/configure":
+			var req struct {
+				AgentArgs []string `json:"agent_args"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode configure request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			*captured = req.AgentArgs
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case "/api/v1/start":
+			_, _ = w.Write([]byte(`{"success":true,"command":"runner"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return newTestAgentctlClient(t, server.URL, log)
+}
+
+func newTestAgentctlClient(t *testing.T, serverURL string, log *logger.Logger) *agentctl.Client {
+	t.Helper()
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	host, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split test server host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("parse test server port: %v", err)
+	}
+	return agentctl.NewClient(host, port, log)
+}
+
+// trackingPreparer records whether Prepare was called.
+type trackingPreparer struct {
+	called bool
+}
+
+func (p *trackingPreparer) Name() string { return "tracking" }
+
+func (p *trackingPreparer) Prepare(_ context.Context, _ *EnvPrepareRequest, _ PrepareProgressCallback) (*EnvPrepareResult, error) {
+	p.called = true
+	return &EnvPrepareResult{Success: true, WorkspacePath: "/tmp/ws"}, nil
+}
+
+type progressPreparer struct{}
+
+func (p *progressPreparer) Name() string { return "docker" }
+
+func (p *progressPreparer) Prepare(_ context.Context, _ *EnvPrepareRequest, onProgress PrepareProgressCallback) (*EnvPrepareResult, error) {
+	step := beginStep("Validate Docker")
+	reportProgress(onProgress, step, 0, 1)
+	completeStepSuccess(&step)
+	reportProgress(onProgress, step, 0, 1)
+	return &EnvPrepareResult{Success: true, Steps: []PrepareStep{step}, WorkspacePath: "/tmp/ws"}, nil
+}
+
+type staticManagedGoCacheEnvironment struct {
+	path string
+}
+
+func (p staticManagedGoCacheEnvironment) ExecutionEnvironment(context.Context) (map[string]string, error) {
+	return map[string]string{"GOCACHE": p.path}, nil
+}
+
+func TestPrepareManagedGoCacheEnvironmentPreservesRequestUntilComposition(t *testing.T) {
+	mgr := newTestManager(t)
+	managedPath := filepath.Join(t.TempDir(), "cache", "go-build")
+	mgr.SetManagedGoCacheEnvironmentProvider(staticManagedGoCacheEnvironment{path: managedPath})
+	requestedPath := "/home/user/.cache/go-build"
+	req := &LaunchRequest{
+		ExecutorType: "local_pc",
+		Env:          map[string]string{"GOCACHE": requestedPath},
+	}
+
+	err := mgr.prepareManagedGoCacheEnvironment(context.Background(), req)
+	if err != nil {
+		t.Fatalf("prepareManagedGoCacheEnvironment() error = %v", err)
+	}
+	if got := req.Env["GOCACHE"]; got != requestedPath {
+		t.Fatalf("request GOCACHE = %q, want preserved input %q", got, requestedPath)
+	}
+	if req.managedGoCachePath != managedPath {
+		t.Fatalf("managedGoCachePath = %q, want %q", req.managedGoCachePath, managedPath)
+	}
+	if got, _ := req.Metadata[managedGoCacheMetadataKey].(string); got != managedPath {
+		t.Fatalf("managed cache metadata = %q, want %q", got, managedPath)
+	}
+	resolved, err := mgr.buildEnvForExecution(context.Background(), "exec-1", req, nil, nil)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution() error = %v", err)
+	}
+	if got := resolved["GOCACHE"]; got != managedPath {
+		t.Fatalf("resolved GOCACHE = %q, want managed path %q", got, managedPath)
+	}
+}
+
+func TestManagedGoCacheEnvironmentPropagatesToPrepareAndRuntime(t *testing.T) {
+	mgr := newTestManager(t)
+	managedPath := filepath.Join(t.TempDir(), "cache", "go-build")
+	mgr.SetManagedGoCacheEnvironmentProvider(staticManagedGoCacheEnvironment{path: managedPath})
+	req := &LaunchRequest{
+		ExecutorType:   "worktree",
+		AgentProfileID: "profile-1",
+		Env:            map[string]string{"GOCACHE": "/tmp/user-cache"},
+	}
+	if err := mgr.prepareManagedGoCacheEnvironment(context.Background(), req); err != nil {
+		t.Fatalf("prepareManagedGoCacheEnvironment() error = %v", err)
+	}
+
+	runtimeEnv, err := mgr.buildEnvForExecution(context.Background(), "exec-1", req, nil, nil)
+	if err != nil {
+		t.Fatalf("buildEnvForExecution() error = %v", err)
+	}
+	preparedReq := *req
+	preparedReq.Env = runtimeEnv
+	prepareEnv := buildEnvPrepareRequest(&preparedReq, "/tmp/workspace", executor.NameStandalone).Env
+	if prepareEnv["GOCACHE"] != managedPath || runtimeEnv["GOCACHE"] != managedPath {
+		t.Fatalf("GOCACHE diverged: prepare=%q runtime=%q want=%q",
+			prepareEnv["GOCACHE"], runtimeEnv["GOCACHE"], managedPath)
+	}
+}
+
+func TestManagedGoCacheEnvironmentSkipsRemoteExecution(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.SetManagedGoCacheEnvironmentProvider(staticManagedGoCacheEnvironment{path: "/tmp/managed-cache"})
+	req := &LaunchRequest{
+		ExecutorType: "local_docker",
+		Env:          map[string]string{"GOCACHE": "/container/cache"},
+	}
+
+	if err := mgr.prepareManagedGoCacheEnvironment(context.Background(), req); err != nil {
+		t.Fatalf("prepareManagedGoCacheEnvironment() error = %v", err)
+	}
+	if got := req.Env["GOCACHE"]; got != "/container/cache" {
+		t.Fatalf("remote GOCACHE = %q, want existing container value", got)
+	}
+}
+
+func TestLaunchKeepsInitialExecutionActivityAfterReturning(t *testing.T) {
+	log := newTestLogger()
+	execRegistry := NewExecutorRegistry(log)
+	execRegistry.Register(&createInstanceExecutor{
+		MockExecutor: MockExecutor{name: executor.NameDocker},
+		client:       newReadyAgentctlClient(t, log),
+	})
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	cleanupManagerStopCh(t, mgr)
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+
+	execution, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID: "task-activity", SessionID: "session-activity", AgentProfileID: "profile-1",
+		ExecutorType: "local_docker", IsEphemeral: true, StartAgent: true,
+		TaskDescription: "initial prompt",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if execution.Status != v1.AgentStatusStarting {
+		t.Fatalf("execution status after start-owning Launch = %s, want %s", execution.Status, v1.AgentStatusStarting)
+	}
+	maintenance, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if maintenance != nil {
+		maintenance.Release()
+	}
+	if !errors.Is(err, activity.ErrBusy) {
+		t.Fatalf("maintenance after Launch error = %v, want activity.ErrBusy", err)
+	}
+
+	mgr.RemoveExecution(execution.ID)
+	maintenance, _, err = coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("maintenance after RemoveExecution: %v", err)
+	}
+	maintenance.Release()
+}
+
+func TestLaunch_PublishesPrepareCompletedAfterRuntimeProgress(t *testing.T) {
+	log := newTestLogger()
+	execRegistry := NewExecutorRegistry(log)
+	entered := make(chan struct{}, 1)
+	barrier := make(chan struct{})
+	backend := &createInstanceExecutor{
+		MockExecutor: MockExecutor{name: executor.NameDocker},
+		client:       newReadyAgentctlClient(t, log),
+		entered:      entered,
+		barrier:      barrier,
+		progressStep: "Waiting for Docker container",
+	}
+	execRegistry.Register(backend)
+
+	eventBus := &MockEventBusWithTracking{}
+	mgr := NewManager(
+		newTestRegistry(), eventBus, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.preparerRegistry = NewPreparerRegistry(log)
+	mgr.preparerRegistry.Register(models.ExecutorTypeLocalDocker, &progressPreparer{})
+	cleanupManagerStopCh(t, mgr)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(context.Background(), &LaunchRequest{
+			TaskID:         "task-1",
+			SessionID:      "session-1",
+			AgentProfileID: "profile-1",
+			ExecutorType:   "local_docker",
+			RepositoryPath: "/tmp/repo",
+			BaseBranch:     "main",
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for runtime CreateInstance")
+	}
+
+	if completed := prepareCompletedPayloads(eventBus); len(completed) != 0 {
+		t.Fatalf("PrepareCompleted published before runtime finished: %#v", completed)
+	}
+
+	close(barrier)
+	if err := <-errCh; err != nil {
+		t.Fatalf("Launch returned error: %v", err)
+	}
+
+	if backend.lastRequest == nil {
+		t.Fatal("runtime did not receive a create request")
+	}
+	require.Equal(t, "/tmp/ws", backend.lastRequest.WorkspacePath,
+		"runtime must receive the workspace path returned by environment preparation")
+
+	completed := prepareCompletedPayloads(eventBus)
+	require.NotEmpty(t, completed)
+	final := completed[len(completed)-1]
+	require.True(t, final.Success)
+	requirePrepareStep(t, final.Steps, "Validate Docker")
+	requirePrepareStep(t, final.Steps, "Waiting for Docker container")
+}
+
+func TestLaunch_UsesPreparedWorkspacePathForWorktree(t *testing.T) {
+	profileResolver := &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID: "profile-worktree",
+		AgentName: "auggie",
+	}}
+	mgr, backend := newEnvironmentExecutionTestManagerWithProfileResolver(t, nil, profileResolver)
+	mgr.preparerRegistry = NewPreparerRegistry(mgr.logger)
+	mgr.preparerRegistry.Register(models.ExecutorTypeWorktree, &progressPreparer{})
+
+	_, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         "task-worktree-path",
+		SessionID:      "session-worktree-path",
+		AgentProfileID: "profile-worktree",
+		ExecutorType:   string(models.ExecutorTypeWorktree),
+		RepositoryPath: "/tmp/repo",
+		UseWorktree:    true,
+		BaseBranch:     "main",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, backend.lastRequest)
+	require.Equal(t, "/tmp/ws", backend.lastRequest.WorkspacePath,
+		"worktree runtime must receive the path returned by preparation")
+}
+
+func TestLaunch_PublishesPrepareCompletionOnLegacyRouteEnvError(t *testing.T) {
+	log := newTestLogger()
+	eventBus := &MockEventBusWithTracking{}
+	mgr := NewManager(
+		newTestRegistry(), eventBus, nil,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	cleanupManagerStopCh(t, mgr)
+
+	_, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         "task-route-env-error",
+		SessionID:      "session-route-env-error",
+		AgentProfileID: "profile-1",
+		ExecutorType:   string(models.ExecutorTypeLocal),
+		IsEphemeral:    true,
+		RouteOverride: &RouteOverride{Env: map[string]string{
+			"GIT_CONFIG_COUNT": "1",
+			"GIT_CONFIG_KEY_0": "core.hooksPath",
+		}},
+	})
+	require.ErrorContains(t, err, "compose legacy route environment")
+
+	completed := prepareCompletedPayloads(eventBus)
+	require.Len(t, completed, 1)
+	require.False(t, completed[0].Success)
+	require.Contains(t, completed[0].ErrorMessage, "compose legacy route environment")
+}
+
+func prepareCompletedPayloads(eventBus *MockEventBusWithTracking) []*PrepareCompletedEventPayload {
+	eventBus.mu.Lock()
+	defer eventBus.mu.Unlock()
+	var out []*PrepareCompletedEventPayload
+	for _, tracked := range eventBus.PublishedEvents {
+		payload, ok := tracked.Event.Data.(*PrepareCompletedEventPayload)
+		if ok {
+			out = append(out, payload)
+		}
+	}
+	return out
+}
+
+func requirePrepareStep(t *testing.T, steps []PrepareStep, name string) {
+	t.Helper()
+	for _, step := range steps {
+		if step.Name == name {
+			return
+		}
+	}
+	t.Fatalf("expected prepare step %q in %#v", name, steps)
+}
+
+func TestRunEnvironmentPreparer_CalledOnFreshLaunch(t *testing.T) {
+	mgr := newTestManager(t)
+	preparer := &trackingPreparer{}
+	mgr.preparerRegistry = NewPreparerRegistry(mgr.logger)
+	mgr.preparerRegistry.Register(models.ExecutorTypeLocal, preparer)
+
+	req := &LaunchRequest{
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		ExecutorType:   string(models.ExecutorTypeLocal),
+		RepositoryPath: "/tmp/repo",
+	}
+
+	result := mgr.runEnvironmentPreparer(context.Background(), req, "/tmp/repo")
+	require.True(t, preparer.called, "preparer should be called on fresh launch")
+	require.NotNil(t, result)
+	require.True(t, result.Success)
+}
+
+func TestRunEnvironmentPreparer_SkippedWithoutRepoPath(t *testing.T) {
+	mgr := newTestManager(t)
+	preparer := &trackingPreparer{}
+	mgr.preparerRegistry = NewPreparerRegistry(mgr.logger)
+	mgr.preparerRegistry.Register(models.ExecutorTypeLocal, preparer)
+
+	req := &LaunchRequest{
+		TaskID:       "task-1",
+		SessionID:    "session-1",
+		ExecutorType: string(models.ExecutorTypeLocal),
+		// No RepositoryPath — preparer should be skipped
+	}
+
+	result := mgr.runEnvironmentPreparer(context.Background(), req, "")
+	require.False(t, preparer.called, "preparer should be skipped when no repository path")
+	require.Nil(t, result)
+}
+
+func TestLaunchResolveWorkspacePath_EphemeralCreatesQuickChatDir(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+
+	req := &LaunchRequest{
+		SessionID:   "session-abc",
+		IsEphemeral: true,
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	require.NotEmpty(t, workspacePath, "ephemeral task should get a quick-chat workspace")
+	require.Contains(t, workspacePath, "quick-chat")
+	require.Contains(t, workspacePath, "session-abc")
+}
+
+func TestLaunchResolveWorkspacePath_NonEphemeralRepoLessGetsScratchDir(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+
+	req := &LaunchRequest{
+		SessionID:   "session-xyz",
+		TaskID:      "task-xyz",
+		WorkspaceID: "ws-xyz",
+		IsEphemeral: false,
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	require.NotEmpty(t, workspacePath, "non-ephemeral task without repo should still get a scratch workspace")
+	// New layout: <homeDir>/tasks/<workspaceID>/<taskID> (sibling to worktree task dirs).
+	require.Contains(t, workspacePath, filepath.Join("tasks", "ws-xyz", "task-xyz"))
+	require.NotContains(t, workspacePath, "quick-chat")
+	marker, found, err := storageworkspaces.ReadOwnershipMarker(workspacePath)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "task-xyz", marker.TaskID)
+	require.Equal(t, "ws-xyz", marker.WorkspaceID)
+	require.Equal(t, storageworkspaces.LayoutVersionScratch, marker.LayoutVersion)
+
+	statusCmd := exec.Command("git", "status", "--porcelain", "--", storageworkspaces.OwnershipMarkerFilename)
+	statusCmd.Dir = workspacePath
+	status, err := statusCmd.CombinedOutput()
+	require.NoError(t, err, "git status failed: %s", status)
+	require.Empty(t, status, "workspace ownership marker should be excluded from git status")
+}
+
+func TestInitGitRepoPreservesExistingLocalExcludes(t *testing.T) {
+	mgr := newTestManager(t)
+	workspacePath := t.TempDir()
+	require.NoError(t, mgr.initGitRepo(context.Background(), workspacePath))
+
+	excludePath := filepath.Join(workspacePath, ".git", "info", "exclude")
+	require.NoError(t, os.WriteFile(excludePath, []byte("custom.cache"), 0644))
+	require.NoError(t, mgr.initGitRepo(context.Background(), workspacePath))
+	require.NoError(t, mgr.initGitRepo(context.Background(), workspacePath))
+
+	exclude, err := os.ReadFile(excludePath)
+	require.NoError(t, err)
+	require.Contains(t, string(exclude), "custom.cache\n")
+	require.Equal(t, 1, strings.Count(string(exclude), "/"+storageworkspaces.OwnershipMarkerFilename))
+}
+
+func TestInitGitRepoRejectsSymlinkedGitDirectory(t *testing.T) {
+	mgr := newTestManager(t)
+	workspacePath := t.TempDir()
+	require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(workspacePath, ".git")))
+
+	err := mgr.initGitRepo(context.Background(), workspacePath)
+	require.ErrorContains(t, err, "invalid git directory")
+}
+
+func TestInitGitRepoRejectsSymlinkedExcludeFile(t *testing.T) {
+	mgr := newTestManager(t)
+	workspacePath := t.TempDir()
+	require.NoError(t, mgr.initGitRepo(context.Background(), workspacePath))
+
+	excludePath := filepath.Join(workspacePath, ".git", "info", "exclude")
+	require.NoError(t, os.Remove(excludePath))
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "external"), excludePath))
+
+	err := mgr.initGitRepo(context.Background(), workspacePath)
+	require.ErrorContains(t, err, "invalid git exclude file")
+}
+
+func TestLaunchResolveWorkspacePath_NonEphemeralWithoutWorkspaceIDReturnsEmpty(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+
+	// Non-ephemeral repo-less task missing workspace_id should not get a path
+	// (scratch path requires workspace + task IDs to namespace correctly).
+	req := &LaunchRequest{
+		SessionID:   "session-no-ws",
+		TaskID:      "task-1",
+		IsEphemeral: false,
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	require.Empty(t, workspacePath)
+}
+
+func TestLaunchResolveWorkspacePathRejectsDotTaskID(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+	req := &LaunchRequest{
+		SessionID: "session-dot-task", TaskID: ".", WorkspaceID: "ws-1",
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	if workspacePath != "" {
+		t.Fatalf("workspace path = %q, want empty for dot task ID", workspacePath)
+	}
+}
+
+func TestLaunchResolveWorkspacePath_PickedFolderUsedDirectly(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+	picked := t.TempDir() // some existing folder the user picked
+
+	req := &LaunchRequest{
+		SessionID:     "session-pick",
+		WorkspacePath: picked,
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	require.Equal(t, picked, workspacePath, "picked workspace_path should be used as-is, not replaced by scratch")
+}
+
+func TestLaunchResolveWorkspacePath_WorktreeWithoutRepoFallsBackToScratch(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.dataDir = t.TempDir()
+
+	// UseWorktree=true but no RepositoryPath — should not return empty,
+	// should fall through to the scratch workspace path.
+	req := &LaunchRequest{
+		SessionID:   "session-wt",
+		TaskID:      "task-wt",
+		WorkspaceID: "ws-wt",
+		UseWorktree: true,
+	}
+
+	workspacePath, _, _, _ := mgr.launchResolveWorkspacePath(context.Background(), req)
+	require.NotEmpty(t, workspacePath, "worktree-mode task without repo should fall through to scratch")
+	require.Contains(t, workspacePath, filepath.Join("tasks", "ws-wt", "task-wt"))
+}
+
+// TestLaunch_PromotesWorkspaceOnlyExecution verifies that when Launch finds an
+// existing workspace-only execution in the store (created by a peer
+// EnsureWorkspaceExecutionForSession / GetOrEnsureExecution call), it promotes
+// it in place by populating AgentCommand instead of returning an
+// "already has an agent running" error. This regression test covers the
+// singleflight-collision bug that surfaced as "Task failed to start" toasts on
+// backend restart, where a workspace-only execution was returned to the resume
+// path and StartAgentProcess() then failed with "no agent command configured".
+func TestLaunch_PromotesWorkspaceOnlyExecution(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID:     "profile-1",
+		AgentName:     "auggie",
+		CommandPrefix: `"/opt/wrapper dir/wrapper" --`,
+	}}
+
+	// Inject a workspace-only execution: AgentCommand is intentionally empty,
+	// matching what createExecution produces when called from
+	// ensureWorkspaceExecutionLocked.
+	existing := &AgentExecution{
+		ID:             "exec-workspace-only",
+		SessionID:      "session-1",
+		TaskID:         "task-1",
+		AgentProfileID: "profile-1",
+	}
+	require.NoError(t, mgr.executionStore.Add(existing))
+
+	req := &LaunchRequest{
+		TaskID:                "task-1",
+		SessionID:             "session-1",
+		AgentProfileID:        "profile-1",
+		ACPSessionID:          "acp-session-abc",
+		PreviousExecutionID:   "exec-prev",
+		TaskScope:             TaskLaunchScopeTask,
+		SessionSettingsPolicy: SessionSettingsPolicyProviderRestored,
+	}
+
+	got, err := mgr.Launch(context.Background(), req)
+	require.NoError(t, err)
+	require.Same(t, existing, got, "Launch must reuse the workspace-only execution, not create a new one")
+	require.Equal(t, TaskLaunchScopeTask, got.TaskScope)
+	require.Equal(t, SessionSettingsPolicyProviderRestored, got.sessionSettingsStartupPolicy())
+	require.Equal(t, SessionSettingsPolicyProviderRestored, got.sessionSettingsProjectionPolicy())
+	require.NotEmpty(t, got.AgentCommand, "AgentCommand must be populated by promotion")
+	require.GreaterOrEqual(t, len(got.AgentArgs), 2, "promotion must populate structured argv")
+	require.Equal(t, []string{"/opt/wrapper dir/wrapper", "--"}, got.AgentArgs[:2],
+		"promotion must preserve the prefix argv token containing spaces")
+	require.Equal(t, "acp-session-abc", got.ACPSessionID, "ACPSessionID must be carried over from the request")
+	require.True(t, got.isResumedSession, "isResumedSession must be set when PreviousExecutionID is non-empty")
+}
+
+func TestLaunch_DoesNotPromoteWorkspaceExecutionAfterSessionTerminalizes(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID: "profile-terminal",
+		AgentName: "auggie",
+	}}
+	mgr.SetExecutorProfileReader(&staleLaunchAdmissionReader{})
+
+	existing := &AgentExecution{
+		ID:             "exec-terminal",
+		SessionID:      "session-terminalization-race",
+		TaskID:         "task-terminalization-race",
+		AgentProfileID: "profile-terminal",
+	}
+	require.NoError(t, mgr.executionStore.Add(existing))
+
+	_, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         existing.TaskID,
+		SessionID:      existing.SessionID,
+		AgentProfileID: existing.AgentProfileID,
+	})
+	require.ErrorIs(t, err, ErrSessionTerminal)
+	require.Empty(t, existing.AgentCommand, "terminal session must not be promoted")
+}
+
+func TestLaunch_PromotesWorkspaceOnlyExecutionAppliesMCPProviders(t *testing.T) {
+	var gotProviders []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/mcp/providers" {
+			t.Errorf("request = %s %s, want PUT /api/v1/mcp/providers", r.Method, r.URL.Path)
+		}
+		var payload struct {
+			Providers []string `json:"mcp_providers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode MCP provider payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		gotProviders = payload.Providers
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	parsed, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(parsed.Port())
+	require.NoError(t, err)
+
+	mgr := newTestManager(t)
+	mgr.profileResolver = &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID: "profile-1",
+		AgentName: "auggie",
+	}}
+	existing := &AgentExecution{
+		ID:        "exec-workspace-provider",
+		SessionID: "session-provider",
+		TaskID:    "task-provider",
+		agentctl:  agentctl.NewClient(parsed.Hostname(), port, mgr.logger),
+	}
+	require.NoError(t, mgr.executionStore.Add(existing))
+
+	wantProviders := []string{"github", "gitlab"}
+	got, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         existing.TaskID,
+		SessionID:      existing.SessionID,
+		AgentProfileID: existing.AgentProfileID,
+		IsPassthrough:  true,
+		McpProviders:   wantProviders,
+	})
+	require.NoError(t, err)
+	require.Same(t, existing, got)
+	require.Equal(t, wantProviders, gotProviders,
+		"promotion must apply provider capabilities to the existing agentctl instance")
+}
+
+func TestLaunch_PromotesWorkspaceOnlyExecutionFailsWhenMCPProviderApplyFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/api/v1/mcp/providers" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	parsed, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(parsed.Port())
+	require.NoError(t, err)
+
+	mgr := newTestManager(t)
+	mgr.profileResolver = &countingProfileResolver{info: &AgentProfileInfo{
+		ProfileID: "profile-1",
+		AgentName: "auggie",
+	}}
+	existing := &AgentExecution{
+		ID:        "exec-workspace-provider-failure",
+		SessionID: "session-provider-failure",
+		TaskID:    "task-provider-failure",
+		agentctl:  agentctl.NewClient(parsed.Hostname(), port, mgr.logger),
+	}
+	require.NoError(t, mgr.executionStore.Add(existing))
+
+	_, err = mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:        existing.TaskID,
+		SessionID:     existing.SessionID,
+		IsPassthrough: true,
+		McpProviders:  []string{"github"},
+	})
+	require.Error(t, err, "promotion must fail when the live provider endpoint rejects the update")
+	require.Empty(t, existing.AgentCommand, "failed provider application must not promote the execution")
+}
+
+// TestLaunch_RejectsWhenAgentAlreadyRunning verifies the original "already has
+// an agent running" guard still fires when the existing execution is a real
+// agent-equipped one (AgentCommand populated), preventing duplicate launches.
+func TestLaunch_RejectsWhenAgentAlreadyRunning(t *testing.T) {
+	mgr := newTestManager(t)
+
+	existing := &AgentExecution{
+		ID:             "exec-running",
+		SessionID:      "session-2",
+		TaskID:         "task-2",
+		AgentProfileID: "profile-2",
+		AgentCommand:   "auggie --acp",
+	}
+	require.NoError(t, mgr.executionStore.Add(existing))
+
+	req := &LaunchRequest{
+		TaskID:         "task-2",
+		SessionID:      "session-2",
+		AgentProfileID: "profile-2",
+	}
+
+	_, err := mgr.Launch(context.Background(), req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "already has an agent running")
+}
+
+func TestLaunchDeadlineDoesNotAbortLiveEnsureFollower(t *testing.T) {
+	provider := &notifyingWorkspaceInfoProvider{
+		mockWorkspaceInfoProvider: &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-mixed": {
+					TaskID: "task-1", SessionID: "session-mixed", TaskEnvironmentID: "env-1",
+					WorkspacePath: "/workspace/task-1", AgentID: "auggie",
+				},
+			},
+		},
+		environmentReached: make(chan struct{}),
+	}
+	mgr, backend := newEnvironmentExecutionTestManager(t, provider)
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+	backend.entered = make(chan struct{}, 1)
+	backend.barrier = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(backend.barrier)
+		}
+	}()
+
+	launchCtx, cancelLaunch := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancelLaunch()
+	launchResult := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(launchCtx, &LaunchRequest{
+			TaskID: "task-1", SessionID: "session-mixed", TaskEnvironmentID: "env-1",
+			AgentProfileID: "profile-1", WorkspacePath: "/workspace/task-1",
+		})
+		launchResult <- err
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Launch did not reach CreateInstance")
+	}
+
+	ensureResult := make(chan error, 1)
+	go func() {
+		_, err := mgr.GetOrEnsureExecutionForEnvironment(context.Background(), "env-1")
+		ensureResult <- err
+	}()
+	<-provider.environmentReached
+	select {
+	case err := <-ensureResult:
+		t.Fatalf("ensure follower returned before shared launch completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := <-launchResult; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Launch error = %v, want caller deadline", err)
+	}
+	if _, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0); !errors.Is(err, activity.ErrBusy) {
+		t.Fatalf("maintenance error = %v, want shared launch activity after leader deadline", err)
+	}
+	close(backend.barrier)
+	released = true
+	if err := <-ensureResult; err != nil {
+		t.Fatalf("live ensure follower failed after Launch deadline: %v", err)
+	}
+}
+
+func TestEnsureLeaderDoesNotHideLaunchWaiterDeadline(t *testing.T) {
+	mgr, backend := newEnvironmentExecutionTestManager(t, &mockWorkspaceInfoProvider{
+		infos: map[string]*WorkspaceInfo{
+			"session-mixed": {
+				TaskID: "task-1", SessionID: "session-mixed", TaskEnvironmentID: "env-1",
+				WorkspacePath: "/workspace/task-1", AgentID: "auggie",
+			},
+		},
+	})
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+	backend.entered = make(chan struct{}, 1)
+	backend.barrier = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(backend.barrier)
+		}
+	}()
+
+	ensureResult := make(chan error, 1)
+	go func() {
+		_, err := mgr.GetOrEnsureExecution(context.Background(), "session-mixed")
+		ensureResult <- err
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ensure did not reach CreateInstance")
+	}
+
+	launchCtx, cancelLaunch := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelLaunch()
+	launchResult := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(launchCtx, &LaunchRequest{
+			TaskID: "task-1", SessionID: "session-mixed", TaskEnvironmentID: "env-1",
+			AgentProfileID: "profile-1", WorkspacePath: "/workspace/task-1",
+		})
+		launchResult <- err
+	}()
+	select {
+	case err := <-launchResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Launch error = %v, want caller deadline", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		close(backend.barrier)
+		released = true
+		<-ensureResult
+		<-launchResult
+		t.Fatal("Launch waiter did not observe its own deadline")
+	}
+	if _, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0); !errors.Is(err, activity.ErrBusy) {
+		t.Fatalf("maintenance error = %v, want shared ensure activity", err)
+	}
+	close(backend.barrier)
+	released = true
+	if err := <-ensureResult; err != nil {
+		t.Fatalf("ensure leader failed after Launch waiter deadline: %v", err)
+	}
+}
+
+// TestLaunch_RaceRollback exercises the race window between the step-3 duplicate
+// session pre-check and the step-8 executionStore.Add in Launch. A barrier inside
+// CreateInstance keeps the goroutine in the race window; the test injects a
+// conflicting execution into the store and then releases the barrier. Launch must
+// roll back the runtime instance it created (StopInstance called once) and return
+// a "race resolved during register" error instead of leaking an orphaned subprocess.
+func TestLaunch_RaceRollback(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+
+	entered := make(chan struct{}, 1)
+	barrier := make(chan struct{})
+	backend := &createInstanceExecutor{
+		MockExecutor: MockExecutor{name: executor.NameStandalone},
+		client:       (*agentctl.Client)(nil),
+		entered:      entered,
+		barrier:      barrier,
+	}
+	execRegistry.Register(backend)
+
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+
+	req := &LaunchRequest{
+		TaskID:         "task-1",
+		SessionID:      "session-race",
+		AgentProfileID: "profile-1",
+		IsEphemeral:    true, // gives Launch a workspace path without a real repo
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(context.Background(), req)
+		errCh <- err
+	}()
+
+	// Wait for CreateInstance to begin (the goroutine is now past the step-3
+	// pre-check and inside the race window).
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for CreateInstance to start")
+	}
+
+	// Inject a conflicting execution for the same session.
+	_ = mgr.executionStore.Add(&AgentExecution{
+		ID:        "exec-injected",
+		SessionID: "session-race",
+		TaskID:    "task-1",
+	})
+
+	// Release CreateInstance — Launch will now proceed to Add and discover
+	// the conflict, triggering rollbackRacedExecution.
+	close(barrier)
+
+	err := <-errCh
+	if err == nil {
+		t.Fatal("expected error from race rollback, got nil")
+	}
+	if !strings.Contains(err.Error(), "race resolved during register") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+	if got := backend.stopCount.Load(); got != 1 {
+		t.Errorf("StopInstance called %d times, want 1 (runtime instance must be stopped on rollback)", got)
+	}
+}
+
+func TestLaunch_RollsBackRuntimeWhenSessionEndsDuringCreate(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+	entered := make(chan struct{}, 1)
+	barrier := make(chan struct{})
+	backend := &createInstanceExecutor{
+		MockExecutor: MockExecutor{name: executor.NameStandalone},
+		entered:      entered,
+		barrier:      barrier,
+	}
+	execRegistry.Register(backend)
+
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+	session := &models.TaskSession{ID: "session-deleted", State: models.TaskSessionStateStarting}
+	mgr.SetExecutorProfileReader(&fakeExecutorProfileReader{session: session})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(context.Background(), &LaunchRequest{
+			TaskID:         "task-deleted",
+			SessionID:      session.ID,
+			AgentProfileID: "profile-1",
+			IsEphemeral:    true,
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for CreateInstance to start")
+	}
+	session.State = models.TaskSessionStateCancelled
+	close(barrier)
+
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "session-deleted") || !strings.Contains(err.Error(), "CANCELLED") {
+		t.Fatalf("Launch error = %v, want terminal-session validation", err)
+	}
+	if got := backend.stopCount.Load(); got != 1 {
+		t.Fatalf("StopInstance called %d times, want 1", got)
+	}
+	if _, exists := mgr.executionStore.GetBySessionID(session.ID); exists {
+		t.Fatal("terminal session runtime must not be registered")
+	}
+}
+
+type launchRegistrationGateReader struct {
+	reads            atomic.Int32
+	cleanupReads     atomic.Int32
+	cleanupActive    atomic.Bool
+	finalState       models.TaskSessionState
+	blockRead        int32
+	blockCleanupRead int32
+	secondRead       chan struct{}
+	release          chan struct{}
+}
+
+func (r *launchRegistrationGateReader) GetTask(_ context.Context, id string) (*models.Task, error) {
+	return &models.Task{ID: id}, nil
+}
+
+type launchRegistrationWriter struct {
+	upserted  chan struct{}
+	deleted   atomic.Int32
+	repaired  atomic.Int32
+	upsertErr error
+	running   *models.ExecutorRunning
+}
+
+func (w *launchRegistrationWriter) GetExecutorRunningBySessionID(context.Context, string) (*models.ExecutorRunning, error) {
+	if w.running == nil {
+		return nil, models.ErrExecutorRunningNotFound
+	}
+	return w.running, nil
+}
+
+func (w *launchRegistrationWriter) UpsertExecutorRunning(_ context.Context, running *models.ExecutorRunning) error {
+	close(w.upserted)
+	if w.upsertErr != nil {
+		return w.upsertErr
+	}
+	w.running = running
+	return nil
+}
+
+func (w *launchRegistrationWriter) DeleteExecutorRunningBySessionID(context.Context, string) error {
+	w.deleted.Add(1)
+	w.running = nil
+	return nil
+}
+func (w *launchRegistrationWriter) RepairExecutorRunningDead(context.Context, string) error {
+	w.repaired.Add(1)
+	if w.running != nil {
+		w.running.Status = models.ExecutorRunningStatusStopped
+	}
+	return nil
+}
+
+func (r *launchRegistrationGateReader) GetTaskSession(_ context.Context, id string) (*models.TaskSession, error) {
+	read := r.reads.Add(1)
+	if read < r.blockRead {
+		return &models.TaskSession{ID: id, TaskID: "task-registration-race", State: models.TaskSessionStateStarting}, nil
+	}
+	if read == r.blockRead {
+		close(r.secondRead)
+		<-r.release
+	}
+	state := r.finalState
+	if state == "" {
+		state = models.TaskSessionStateCancelled
+	}
+	return &models.TaskSession{ID: id, TaskID: "task-registration-race", State: state}, nil
+}
+
+func (r *launchRegistrationGateReader) HasActiveTaskResourceCleanupJob(context.Context, string) (bool, error) {
+	if read := r.cleanupReads.Add(1); read == r.blockCleanupRead {
+		close(r.secondRead)
+		<-r.release
+	}
+	return r.cleanupActive.Load(), nil
+}
+
+func (*launchRegistrationGateReader) GetTaskEnvironment(context.Context, string) (*models.TaskEnvironment, error) {
+	return nil, nil
+}
+
+func (*launchRegistrationGateReader) GetExecutorProfile(context.Context, string) (*models.ExecutorProfile, error) {
+	return nil, nil
+}
+
+func TestLaunch_RollsBackWhenSessionEndsDuringRegistration(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+	backend := &createInstanceExecutor{MockExecutor: MockExecutor{name: executor.NameStandalone}}
+	execRegistry.Register(backend)
+
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+	reader := &launchRegistrationGateReader{
+		blockRead:  4,
+		secondRead: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	mgr.SetExecutorProfileReader(reader)
+	writer := &launchRegistrationWriter{upserted: make(chan struct{})}
+	mgr.SetExecutorRunningWriter(writer)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(context.Background(), &LaunchRequest{
+			TaskID:         "task-registration-race",
+			SessionID:      "session-registration-race",
+			AgentProfileID: "profile-1",
+			IsEphemeral:    true,
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-reader.secondRead:
+	case err := <-errCh:
+		t.Fatalf("Launch returned before post-registration validation: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for post-registration session validation")
+	}
+	if _, exists := mgr.executionStore.GetBySessionID("session-registration-race"); !exists {
+		t.Fatal("execution must be registered before the final session validation")
+	}
+	select {
+	case <-writer.upserted:
+	default:
+		t.Fatal("executor-running row must be durable before the final session validation")
+	}
+	close(reader.release)
+
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "CANCELLED") {
+		t.Fatalf("Launch error = %v, want terminal-session validation", err)
+	}
+	if got := backend.stopCount.Load(); got != 1 {
+		t.Fatalf("StopInstance called %d times, want 1", got)
+	}
+	if _, exists := mgr.executionStore.GetBySessionID("session-registration-race"); exists {
+		t.Fatal("terminal session runtime must be removed after registration race")
+	}
+	if got := writer.deleted.Load(); got != 1 {
+		t.Fatalf("executor-running delete count = %d, want 1", got)
+	}
+}
+
+func TestLaunch_RollsBackWhenTaskCleanupBeginsDuringRegistration(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+	backend := &createInstanceExecutor{MockExecutor: MockExecutor{name: executor.NameStandalone}}
+	execRegistry.Register(backend)
+
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+	reader := &launchRegistrationGateReader{
+		finalState:       models.TaskSessionStateStarting,
+		blockCleanupRead: 2,
+		secondRead:       make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	mgr.SetExecutorProfileReader(reader)
+	writer := &launchRegistrationWriter{
+		upserted: make(chan struct{}),
+		running: &models.ExecutorRunning{
+			SessionID: "session-cleanup-race", ExecutionProfileID: "profile-1", ResumeToken: "resume-token",
+		},
+	}
+	mgr.SetExecutorRunningWriter(writer)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := mgr.Launch(context.Background(), &LaunchRequest{
+			TaskID:         "task-registration-race",
+			SessionID:      "session-cleanup-race",
+			AgentProfileID: "profile-1",
+			IsEphemeral:    true,
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-reader.secondRead:
+	case err := <-errCh:
+		t.Fatalf("Launch returned before post-registration validation: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for post-registration session validation")
+	}
+	reader.cleanupActive.Store(true)
+	close(reader.release)
+
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "cleanup is active") {
+		t.Fatalf("Launch error = %v, want active-cleanup validation", err)
+	}
+	if got := backend.stopCount.Load(); got != 1 {
+		t.Fatalf("StopInstance called %d times, want 1", got)
+	}
+	if _, exists := mgr.executionStore.GetBySessionID("session-cleanup-race"); exists {
+		t.Fatal("runtime must be removed when task cleanup wins registration race")
+	}
+	if got := writer.deleted.Load(); got != 0 {
+		t.Fatalf("executor-running delete count = %d, want 0 for resumable row", got)
+	}
+	if got := writer.repaired.Load(); got != 1 {
+		t.Fatalf("executor-running repair count = %d, want 1", got)
+	}
+	if writer.running == nil || writer.running.ResumeToken != "resume-token" || writer.running.Status != models.ExecutorRunningStatusStopped {
+		t.Fatalf("resumable row was not preserved and stopped: %#v", writer.running)
+	}
+}
+
+func TestLaunch_RollsBackWhenExecutionRegistrationCannotPersist(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+	backend := &createInstanceExecutor{MockExecutor: MockExecutor{name: executor.NameStandalone}}
+	execRegistry.Register(backend)
+
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+	mgr.SetExecutorProfileReader(&fakeExecutorProfileReader{session: &models.TaskSession{
+		ID: "session-persist-failure", TaskID: "task-persist-failure", State: models.TaskSessionStateStarting,
+	}})
+	writer := &launchRegistrationWriter{
+		upserted:  make(chan struct{}),
+		upsertErr: errors.New("database is locked"),
+	}
+	mgr.SetExecutorRunningWriter(writer)
+
+	_, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         "task-persist-failure",
+		SessionID:      "session-persist-failure",
+		AgentProfileID: "profile-1",
+		IsEphemeral:    true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist execution registration") {
+		t.Fatalf("Launch error = %v, want persistence failure", err)
+	}
+	if got := backend.stopCount.Load(); got != 1 {
+		t.Fatalf("StopInstance called %d times, want 1", got)
+	}
+	if _, exists := mgr.executionStore.GetBySessionID("session-persist-failure"); exists {
+		t.Fatal("runtime must be removed when durable registration fails")
+	}
+	if got := writer.deleted.Load(); got != 0 {
+		t.Fatalf("executor-running delete count = %d, want 0 for an uncommitted upsert", got)
+	}
+}
+
+type staleLaunchAdmissionReader struct {
+	reads atomic.Int32
+}
+
+func (*staleLaunchAdmissionReader) GetTask(_ context.Context, id string) (*models.Task, error) {
+	return &models.Task{ID: id}, nil
+}
+
+func (r *staleLaunchAdmissionReader) GetTaskSession(_ context.Context, id string) (*models.TaskSession, error) {
+	state := models.TaskSessionStateStarting
+	if r.reads.Add(1) > 1 {
+		state = models.TaskSessionStateCancelled
+	}
+	return &models.TaskSession{ID: id, TaskID: "task-terminalization-race", State: state}, nil
+}
+
+func (*staleLaunchAdmissionReader) HasActiveTaskResourceCleanupJob(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (*staleLaunchAdmissionReader) GetTaskEnvironment(context.Context, string) (*models.TaskEnvironment, error) {
+	return nil, nil
+}
+
+func (*staleLaunchAdmissionReader) GetExecutorProfile(context.Context, string) (*models.ExecutorProfile, error) {
+	return nil, nil
+}
+
+func TestEnsureLaunchSessionStillActiveRereadsAfterCleanupAdmission(t *testing.T) {
+	mgr := newTestManager(t)
+	reader := &staleLaunchAdmissionReader{}
+	mgr.SetExecutorProfileReader(reader)
+
+	err := mgr.ensureLaunchSessionStillActive(context.Background(), "session-terminalization-race", executionAdmissionAgent)
+	if err == nil || !strings.Contains(err.Error(), "CANCELLED") {
+		t.Fatalf("ensureLaunchSessionStillActive error = %v, want terminal-session validation", err)
+	}
+	if !errors.Is(err, ErrSessionTerminal) {
+		t.Fatalf("ensureLaunchSessionStillActive error = %v, want wrapped ErrSessionTerminal", err)
+	}
+	if got := reader.reads.Load(); got != 2 {
+		t.Fatalf("session reads = %d, want 2", got)
+	}
+}
+
+type failOnceStopExecutor struct {
+	MockExecutor
+	attempts     atomic.Int32
+	retryEntered chan struct{}
+	releaseRetry chan struct{}
+	succeeded    chan struct{}
+}
+
+func (e *failOnceStopExecutor) StopInstance(context.Context, *ExecutorInstance, bool) error {
+	if e.attempts.Add(1) == 1 {
+		return errors.New("transient stop failure")
+	}
+	close(e.retryEntered)
+	<-e.releaseRetry
+	close(e.succeeded)
+	return nil
+}
+
+func TestRegisteredLaunchRollbackRetainsOwnershipUntilStopRetrySucceeds(t *testing.T) {
+	for _, taskCleanupActive := range []bool{false, true} {
+		name := "persistence_failure"
+		if taskCleanupActive {
+			name = "task_cleanup"
+		}
+		t.Run(name, func(t *testing.T) {
+			mgr := newTestManager(t)
+			execution := &AgentExecution{ID: "exec-stop-retry", SessionID: "session-stop-retry"}
+			if err := mgr.executionStore.Add(execution); err != nil {
+				t.Fatalf("Add execution: %v", err)
+			}
+			writer := &invariantWriter{prior: &models.ExecutorRunning{
+				AgentExecutionID: execution.ID,
+				SessionID:        execution.SessionID,
+				ResumeToken:      "resume-token",
+				Status:           models.ExecutorRunningStatusStarting,
+			}}
+			mgr.SetExecutorRunningWriter(writer)
+			backend := &failOnceStopExecutor{
+				MockExecutor: MockExecutor{name: executor.NameStandalone},
+				retryEntered: make(chan struct{}),
+				releaseRetry: make(chan struct{}),
+				succeeded:    make(chan struct{}),
+			}
+
+			mgr.rollbackRegisteredLaunchWithRetry(
+				backend, &ExecutorInstance{InstanceID: execution.ID}, execution,
+				taskCleanupActive, "test rollback",
+			)
+
+			select {
+			case <-backend.retryEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for detached stop retry")
+			}
+			if _, exists := mgr.executionStore.Get(execution.ID); !exists {
+				t.Fatal("failed stop retired in-memory cleanup ownership")
+			}
+			if writer.deleted || writer.repaired {
+				t.Fatal("failed stop retired durable cleanup ownership")
+			}
+			close(backend.releaseRetry)
+			select {
+			case <-backend.succeeded:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for detached stop retry")
+			}
+			require.Eventually(t, func() bool {
+				_, exists := mgr.executionStore.Get(execution.ID)
+				return !exists
+			}, time.Second, 10*time.Millisecond)
+			if writer.deleted || !writer.repaired || writer.prior == nil || writer.prior.ResumeToken != "resume-token" {
+				t.Fatalf("successful retry did not preserve resume state: %#v", writer)
+			}
+		})
+	}
+}
+
+func TestLaunch_PersistsDockerRuntimeSecrets(t *testing.T) {
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json"})
+	execRegistry := NewExecutorRegistry(log)
+	backend := &createInstanceExecutor{
+		MockExecutor: MockExecutor{name: executor.NameDocker},
+		client:       newReadyAgentctlClient(t, log),
+		authToken:    "agentctl-token",
+		nonce:        "bootstrap-nonce",
+	}
+	execRegistry.Register(backend)
+
+	store := newInMemorySecretStore()
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry,
+		&MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	mgr.SetSecretStore(store)
+	mgr.dataDir = t.TempDir()
+	cleanupManagerStopCh(t, mgr)
+
+	execution, err := mgr.Launch(context.Background(), &LaunchRequest{
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		ExecutorType:   "local_docker",
+		IsEphemeral:    true,
+	})
+	if err != nil {
+		t.Fatalf("Launch returned error: %v", err)
+	}
+
+	if got := mgr.revealRuntimeSecret(context.Background(), execution.MetadataSnapshot(), MetadataKeyAuthTokenSecret); got != "agentctl-token" {
+		t.Fatalf("revealed auth token = %q, want agentctl-token", got)
+	}
+	if got := mgr.revealRuntimeSecret(context.Background(), execution.MetadataSnapshot(), MetadataKeyBootstrapNonceSecret); got != "bootstrap-nonce" {
+		t.Fatalf("revealed bootstrap nonce = %q, want bootstrap-nonce", got)
+	}
+}

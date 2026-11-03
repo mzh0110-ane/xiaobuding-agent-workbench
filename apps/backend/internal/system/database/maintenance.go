@@ -1,0 +1,115 @@
+package database
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/kandev/kandev/internal/system/maintenance"
+)
+
+// Vacuum runs VACUUM via a tracked job and returns the job ID. The job
+// result includes "size_before" and "size_after" bytes; "reclaimed_bytes"
+// is the difference (>= 0). Accepted jobs outlive the caller context.
+func (s *Service) Vacuum(ctx context.Context) string {
+	return s.jobs.Start(context.WithoutCancel(ctx), "vacuum", func(jobCtx context.Context) (map[string]interface{}, error) {
+		return s.runVacuum(jobCtx)
+	})
+}
+
+func (s *Service) runVacuum(ctx context.Context) (map[string]interface{}, error) {
+	release, err := maintenance.ForPool(s.pool).Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := s.requireSQLiteMaintenance("vacuum"); err != nil {
+		return nil, err
+	}
+	before, _ := readDatabaseSize(s.pool.Reader())
+	if _, err := s.pool.Writer().ExecContext(ctx, "VACUUM"); err != nil {
+		return nil, fmt.Errorf("vacuum: %w", err)
+	}
+	s.logicalStats.Invalidate(false)
+	after, _ := readDatabaseSize(s.pool.Reader())
+	reclaimed := before - after
+	if reclaimed < 0 {
+		reclaimed = 0
+	}
+	return map[string]interface{}{
+		"size_before":     before,
+		"size_after":      after,
+		"reclaimed_bytes": reclaimed,
+	}, nil
+}
+
+// Optimize runs PRAGMA optimize via a tracked job. PRAGMA optimize is
+// cheap and idempotent; we still track it so the UI can show progress
+// consistently with VACUUM. Accepted jobs outlive the caller context.
+func (s *Service) Optimize(ctx context.Context) string {
+	return s.jobs.Start(context.WithoutCancel(ctx), "optimize", func(jobCtx context.Context) (map[string]interface{}, error) {
+		return s.runOptimize(jobCtx)
+	})
+}
+
+func (s *Service) runOptimize(ctx context.Context) (map[string]interface{}, error) {
+	release, err := maintenance.ForPool(s.pool).Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := s.requireSQLiteMaintenance("optimize"); err != nil {
+		return nil, err
+	}
+	if _, err := s.pool.Writer().ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		return nil, fmt.Errorf("pragma optimize: %w", err)
+	}
+	s.logicalStats.Invalidate(false)
+	return map[string]interface{}{"status": "ok"}, nil
+}
+
+func (s *Service) requireSQLiteMaintenance(operation string) error {
+	if s.pool == nil || s.pool.Writer() == nil {
+		return fmt.Errorf("%s: no database pool", operation)
+	}
+	driver := s.databaseDriver()
+	if driver != databaseDriverSQLite {
+		return fmt.Errorf("%s: not supported for %s driver", operation, driver)
+	}
+	return nil
+}
+
+// HandleVacuum returns a gin handler for POST /api/v1/system/database/vacuum.
+func HandleVacuum(s *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		respondAccepted(c, s.Vacuum(ctxOrBackground(c)))
+	}
+}
+
+// HandleOptimize returns a gin handler for POST /api/v1/system/database/optimize.
+func HandleOptimize(s *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		respondAccepted(c, s.Optimize(ctxOrBackground(c)))
+	}
+}
+
+// resetRequest is the JSON body for POST /api/v1/system/database/reset.
+type resetRequest struct {
+	Confirm string `json:"confirm"`
+}
+
+// HandleReset returns a gin handler for POST /api/v1/system/database/reset.
+// Validates the body's confirm == "RESET" before spawning the reset job.
+func HandleReset(s *Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req resetRequest
+		_ = c.ShouldBindJSON(&req)
+		jobID, err := s.FactoryReset(ctxOrBackground(c), req.Confirm)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		respondAccepted(c, jobID)
+	}
+}

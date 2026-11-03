@@ -1,0 +1,155 @@
+"use client";
+
+import Link from "@/components/routing/app-link";
+import { usePathname } from "@/lib/routing/client-router";
+import type { DestinationIcon } from "@/lib/navigation/types";
+import { Badge } from "@kandev/ui/badge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { cn } from "@/lib/utils";
+import { QuickChatActivityIndicator } from "@/components/quick-chat/quick-chat-activity-indicator";
+import type { QuickChatActivityState } from "@/lib/state/slices/ui/quick-chat-activity-selectors";
+import { SIDEBAR_ITEM_ACTIVE, SIDEBAR_ITEM_INACTIVE } from "./app-sidebar-constants";
+
+type AppSidebarNavItemProps = {
+  icon: DestinationIcon;
+  label: string;
+  href?: string;
+  badge?: number;
+  badgeVariant?: "primary" | "muted";
+  /** Appended after the number, e.g. "+" for a capped/truncated count. */
+  badgeSuffix?: string;
+  activity?: QuickChatActivityState;
+  onClick?: () => void;
+  collapsed: boolean;
+  /** Override the auto-derived active-state from pathname. */
+  isActive?: boolean;
+  /** Suppress the default href-startsWith activation (use for "Home"). */
+  exactMatch?: boolean;
+  /** Render as visually disabled and ignore clicks. */
+  disabled?: boolean;
+  /** Optional data-testid placed on the button/link element. */
+  testId?: string;
+  /** Optional extra classes for surface-specific spacing. */
+  className?: string;
+};
+
+type TriggerProps = {
+  onClick?: () => void;
+  disabled: boolean;
+  baseClass: string;
+  label: string;
+  href?: string;
+  inner: React.ReactNode;
+  testId?: string;
+};
+
+function renderTrigger({ onClick, disabled, baseClass, label, href, inner, testId }: TriggerProps) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={disabled ? undefined : onClick}
+        className={baseClass}
+        aria-label={label}
+        aria-disabled={disabled || undefined}
+        disabled={disabled}
+        data-testid={testId}
+      >
+        {inner}
+      </button>
+    );
+  }
+  if (disabled) {
+    return (
+      <span className={baseClass} aria-label={label} aria-disabled="true" data-testid={testId}>
+        {inner}
+      </span>
+    );
+  }
+  return (
+    <Link href={href ?? "#"} className={baseClass} aria-label={label} data-testid={testId}>
+      {inner}
+    </Link>
+  );
+}
+
+function isPathActive(pathname: string, href: string | undefined, exactMatch: boolean): boolean {
+  if (!href) return false;
+  const hrefPathname = href.split(/[?#]/, 1)[0] || "/";
+  if (exactMatch) return pathname === hrefPathname;
+  if (pathname === hrefPathname) return true;
+  return hrefPathname !== "/" && pathname.startsWith(`${hrefPathname}/`);
+}
+
+function sidebarBadgeClass(variant: NonNullable<AppSidebarNavItemProps["badgeVariant"]>) {
+  return cn(
+    "rounded-full px-1.5 py-0.5 text-xs",
+    variant === "primary" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground",
+  );
+}
+
+// Absent for a zero/absent badge; a truncated count carries `badgeSuffix`
+// (e.g. "+") appended after the number, both on the visible badge and the
+// collapsed-rail tooltip.
+function badgeText(badge: number | undefined, suffix: string | undefined): string | null {
+  if (typeof badge !== "number" || badge <= 0) return null;
+  return `${badge}${suffix ?? ""}`;
+}
+
+export function AppSidebarNavItem({
+  icon: Icon,
+  label,
+  href,
+  badge,
+  badgeVariant = "primary",
+  badgeSuffix,
+  onClick,
+  collapsed,
+  isActive,
+  exactMatch = false,
+  disabled = false,
+  testId,
+  className,
+  activity = null,
+}: AppSidebarNavItemProps) {
+  const pathname = usePathname();
+  const active = isActive ?? isPathActive(pathname, href, exactMatch);
+  const badgeLabel = badgeText(badge, badgeSuffix);
+
+  const baseClass = cn(
+    "flex items-center rounded-md text-[13px] font-medium transition-colors",
+    collapsed ? "h-9 w-9 justify-center mx-auto" : "h-9 px-2.5 gap-2.5 w-full text-left",
+    disabled
+      ? "cursor-not-allowed text-foreground/40"
+      : cn("cursor-pointer", active ? SIDEBAR_ITEM_ACTIVE : SIDEBAR_ITEM_INACTIVE),
+    className,
+  );
+
+  const inner = (
+    <>
+      <span className="relative flex">
+        <Icon className="h-4 w-4 shrink-0" />
+        <QuickChatActivityIndicator activity={activity} />
+      </span>
+      {!collapsed && (
+        <>
+          <span className="flex-1 truncate sidebar-fade-in">{label}</span>
+          {badgeLabel && <Badge className={sidebarBadgeClass(badgeVariant)}>{badgeLabel}</Badge>}
+        </>
+      )}
+    </>
+  );
+
+  const buttonOrLink = renderTrigger({ onClick, disabled, baseClass, label, href, inner, testId });
+
+  if (!collapsed) return buttonOrLink;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{buttonOrLink}</TooltipTrigger>
+      <TooltipContent side="right">
+        {label}
+        {badgeLabel ? ` (${badgeLabel})` : ""}
+      </TooltipContent>
+    </Tooltip>
+  );
+}

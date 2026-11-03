@@ -1,0 +1,612 @@
+// Package agents defines the Agent interface and supporting types.
+// Each agent (Auggie, Claude Code, Codex, etc.) implements this interface
+// in its own file, consolidating identity, discovery, models, protocol,
+// execution, and runtime configuration in one place.
+package agents
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/usage"
+	"github.com/kandev/kandev/internal/agentruntime"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+// ErrNotSupported is returned when an agent does not support an operation.
+var ErrNotSupported = errors.New("not supported by this agent")
+
+// Agent is the core interface for all coding agents.
+//
+// Models are no longer part of this interface — they come from the host utility
+// capability cache (which probes each ACP agent at boot to learn its models and
+// modes via session/new). See internal/agent/hostutility.
+type Agent interface {
+	// --- Identity ---
+	ID() string
+	Name() string
+	DisplayName() string
+	Description() string
+	Enabled() bool
+	DisplayOrder() int // lower = higher priority in listings
+
+	// --- Assets ---
+	Logo(variant LogoVariant) []byte // nil if unavailable
+
+	// --- Discovery ---
+	IsInstalled(ctx context.Context) (*DiscoveryResult, error)
+
+	// --- Execution ---
+	BuildCommand(opts CommandOptions) Command
+
+	// --- Permissions ---
+	PermissionSettings() map[string]PermissionSetting
+
+	// --- Runtime ---
+	Runtime() *RuntimeConfig
+
+	// --- Billing ---
+	// BillingType returns how this agent is billed: api_key or subscription.
+	// Computed at call time from credential files, not stored in the DB.
+	BillingType() usage.BillingType
+
+	// --- Remote Auth ---
+	// RemoteAuth returns the auth methods this agent supports in remote environments.
+	// Returns nil if the agent has no remote auth configuration.
+	RemoteAuth() *RemoteAuth
+
+	// --- Installation ---
+	// InstallScript returns shell commands to pre-install the agent CLI in remote environments.
+	// Returns empty string if no installation is needed.
+	InstallScript() string
+}
+
+// VirtualAgent marks an agent family that is visible to settings and profile
+// configuration but cannot launch an inference process itself.
+type VirtualAgent interface {
+	Agent
+	IsVirtual() bool
+}
+
+// StoredProfilePreserver marks a disabled optional agent whose saved profiles
+// remain valid historical configuration and must not be orphan-cleaned.
+type StoredProfilePreserver interface {
+	PreserveStoredProfilesWhenDisabled() bool
+}
+
+// IsVirtualAgent reports whether an agent is a non-launchable virtual family.
+// Keeping this as an optional capability lets existing concrete agents remain
+// unchanged while callers can fail closed at launch and discovery boundaries.
+func IsVirtualAgent(agent Agent) bool {
+	virtual, ok := agent.(VirtualAgent)
+	return ok && virtual.IsVirtual()
+}
+
+// InferenceAgent is an optional capability marker for agents that support
+// one-shot LLM inference via the host utility manager. The actual model list
+// is populated dynamically from the ACP probe — agents no longer declare a
+// static model list.
+type InferenceAgent interface {
+	// InferenceConfig returns the configuration for one-shot inference.
+	InferenceConfig() *InferenceConfig
+}
+
+// HostUtilityInferenceAgent is an optional capability for agents whose host
+// utility command differs from the command used by a task executor. The
+// default InferenceConfig remains executor-safe; host utility callers can use
+// this capability when they run on the backend host.
+type HostUtilityInferenceAgent interface {
+	HostUtilityInferenceConfig() *InferenceConfig
+}
+
+// ManagedNPMRuntimeAgent is an optional capability for built-in agents whose
+// ACP runtime is resolved through npm. Package names and ACP arguments are
+// defined by the agent implementation rather than caller-provided input.
+type ManagedNPMRuntimeAgent interface {
+	ManagedNPMRuntime() ManagedNPMRuntimeSpec
+}
+
+// PassthroughAgent is an optional capability for agents that support CLI passthrough mode.
+type PassthroughAgent interface {
+	PassthroughConfig() PassthroughConfig
+	BuildPassthroughCommand(opts PassthroughOptions) Command
+}
+
+// NativeBinaryAgent is an optional capability for agents whose npm package also
+// ships a standalone CLI binary that behaves identically to `npx -y <pkg>`.
+// When that binary is present in the execution environment, the lifecycle
+// prefers it (BuildCommand receives CommandOptions.PreferNativeBinary=true) to
+// skip the per-launch npm registry round-trip — which is slow behind a private
+// registry. Containerized runtimes ship a controlled image and keep npx.
+type NativeBinaryAgent interface {
+	// NativeBinaryName is the executable to look for on PATH (e.g. "copilot").
+	// An empty string disables native-binary preference.
+	NativeBinaryName() string
+}
+
+// LoginCommand describes an interactive CLI command for authenticating with
+// an agent. The kandev backend runs this under a PTY so the UI can render a
+// terminal and route keystrokes to the underlying process.
+type LoginCommand struct {
+	// Cmd is the command + args to spawn, e.g. []string{"claude", "auth", "login"}.
+	Cmd []string
+	// Variants are server-owned command choices selected by opaque identifiers.
+	Variants map[string][]string
+	// Description renders above the terminal as a one-line hint, e.g.
+	// "Authenticate with your Anthropic account."
+	Description string
+}
+
+// LoginAgent is an optional capability for agents that need an interactive
+// login flow (browser OAuth callback, token prompt, etc.). Implement it to
+// surface a "Login" button in the UI that opens a PTY-backed terminal running
+// LoginCommand().
+type LoginAgent interface {
+	LoginCommand() *LoginCommand
+}
+
+// IsPassthroughOnly returns true if the agent only supports passthrough mode
+// (a raw CLI under a PTY, no ACP protocol mode). It governs execution mode —
+// notably seeding the agent's default profile as CLI passthrough — and is true
+// for every TUI agent regardless of MCP configuration.
+//
+// For "should interactive MCP tools be registered?", use
+// SupportsInteractiveMCPTools instead. The two questions used to share this one
+// predicate, which is why a custom TUI agent could never get ask_user_question.
+func IsPassthroughOnly(a Agent) bool {
+	_, ok := a.(*TUIAgent)
+	return ok
+}
+
+// SupportsInteractiveMCPTools reports whether interactive MCP tools (notably
+// ask_user_question) should be registered for the agent's session.
+//
+// A TUI agent with no MCP injection strategy is a plain terminal tool that
+// never speaks MCP: registering a tool it cannot call just means a question
+// that hangs forever. A TUI agent *with* a strategy wraps a real MCP-capable
+// CLI that kandev points at the per-session server, so it should get the same
+// tools as the built-in claude-acp agent running in passthrough mode. Every
+// non-TUI agent supports them.
+func SupportsInteractiveMCPTools(a Agent) bool {
+	tui, ok := a.(*TUIAgent)
+	if !ok {
+		return true
+	}
+	return tui.MCPStrategy() != nil
+}
+
+// LogoVariant selects light or dark logo.
+type LogoVariant int
+
+const (
+	LogoLight LogoVariant = iota
+	LogoDark
+)
+
+// DiscoveryResult is the result of checking if an agent is installed.
+type DiscoveryResult struct {
+	Available         bool
+	MatchedPath       string
+	SupportsMCP       bool
+	MCPConfigPaths    []string
+	InstallationPaths []string
+	Capabilities      DiscoveryCapabilities
+}
+
+// DiscoveryCapabilities describes what the agent supports.
+type DiscoveryCapabilities struct {
+	SupportsSessionResume bool
+	SupportsShell         bool
+	SupportsWorkspaceOnly bool
+}
+
+// CommandOptions are passed to BuildCommand.
+type CommandOptions struct {
+	Model               string
+	SessionID           string // for --resume flag
+	ResumeAtMessageUUID string // for --resume-session-at flag (truncate conversation)
+	AutoApprove         bool
+	PermissionPolicy    string          // "autonomous", "supervised", "plan"
+	PermissionValues    map[string]bool // e.g. {"allow_indexing": true}
+	AgentType           string          // for --agent flag (e.g. "task" for subagent)
+	// CLIFlagTokens are user-configured CLI flag argv tokens derived from
+	// AgentProfile.CLIFlags (only Enabled entries, shell-tokenised). Appended
+	// verbatim by lifecycle.CommandBuilder after the agent builds its command.
+	CLIFlagTokens []string
+	// CommandPrefixTokens are user-configured launcher tokens derived from
+	// AgentProfile.CommandPrefix (shell-tokenised). Prepended to the built
+	// command so the agent subprocess runs wrapped in a sandbox launcher
+	// (e.g. ["greywall", "--"] → "greywall -- npx -y <pkg> …").
+	CommandPrefixTokens []string
+	// Runtime is the execution backend hosting the agent subprocess.
+	// Agents whose binary lives in a different place inside a container
+	// than on the host (currently only MockAgent) consult
+	// Runtime.IsContainerized() to pick a host absolute path vs. a bare
+	// name resolved via the container's PATH.
+	Runtime agentruntime.Runtime
+	// PreferNativeBinary is set by the lifecycle when a NativeBinaryAgent's
+	// standalone CLI was found in the execution environment. Such agents emit
+	// the native binary (e.g. "copilot --acp") instead of "npx -y <pkg>".
+	PreferNativeBinary bool
+	// ManagedRuntimeVersion is an internal exact version override for trusted
+	// managed npm ACP runtimes. Empty uses the built-in exact version pin.
+	ManagedRuntimeVersion string
+}
+
+// PassthroughOptions are passed to BuildPassthroughCommand.
+type PassthroughOptions struct {
+	Model            string
+	SessionID        string          // ACP session ID; resumes a specific session via --resume <id>
+	Prompt           string          // initial prompt for new sessions
+	Resume           bool            // generic "continue last session" (e.g. -c, --resume latest)
+	PermissionValues map[string]bool // e.g. {"auto_approve": true}
+	WorkDir          string
+	// MCPArgs are extra argv tokens produced by the agent's MCP passthrough
+	// strategy (e.g. claude's "--mcp-config <path>", codex's repeated "-c
+	// mcp_servers.…" overrides). Appended to the built command.
+	MCPArgs []string
+	// CLIFlagTokens are user-configured CLI flag argv tokens derived from
+	// AgentProfile.CLIFlags (only Enabled entries, shell-tokenised). Unlike ACP
+	// commands, which lifecycle.CommandBuilder appends centrally, passthrough
+	// agents opt in by appending these tokens in BuildPassthroughCommand.
+	CLIFlagTokens []string
+}
+
+// RuntimeConfig holds Docker / standalone runtime settings.
+type RuntimeConfig struct {
+	// ContainerEnv provides agent-specific environment required only when the
+	// process runs inside a container runtime. These values are independent of
+	// session mode and never reach host or SSH processes.
+	Image          string
+	Tag            string
+	Cmd            Command
+	Entrypoint     Command
+	WorkingDir     string
+	Env            map[string]string
+	ContainerEnv   map[string]string
+	RequiredEnv    []string
+	Mounts         []MountTemplate
+	ResourceLimits ResourceLimits
+	SessionConfig  SessionConfig
+	Protocol       agent.Protocol
+	ModelFlag      Param  // e.g. NewParam("--model", "{model}")
+	WorkspaceFlag  string // e.g. "--workspace-root"
+	AssumeMcpSse   bool   // Override: assume agent supports SSE MCP servers even if not advertised
+	AssumeMcpHttp  bool   // Override: assume agent supports HTTP MCP servers even if not advertised
+	// SupportsManagedToolPolicy is true only when this adapter can disable all
+	// native and ambient tool paths for managed conversations.
+	SupportsManagedToolPolicy bool
+	ProjectSkillDir           string // CWD-relative path for project-level skills (e.g. ".claude/skills")
+	UserSkillDir              string // home-relative path for user-level skills (e.g. ".claude/skills")
+	// ProjectMCPStrategy materializes resolved MCP servers into a project-local
+	// config file before a protocol-mode agent subprocess starts. Use this for
+	// agents whose ACP adapter does not wire session/new mcpServers through to
+	// the underlying CLI.
+	ProjectMCPStrategy mcpconfig.PassthroughMCPStrategy
+	// RequiresProcessKill is true for agents whose subprocess should skip the
+	// graceful stdin-close wait because it is known not to exit on EOF (e.g.
+	// OpenCode's ACP runtime, which keeps its HTTP server and MCP child tree
+	// alive). Agentctl still reaps the process group for every agent after
+	// graceful shutdown or timeout; this flag only makes that reap immediate.
+	RequiresProcessKill bool
+	// StripEnv lists environment variables to remove from the agent's child
+	// process environment entirely (not just set to empty). Some programs
+	// distinguish unset from empty string and change behavior based on
+	// presence rather than value. The process manager strips these from the
+	// final child env after adapter merge; the inference executor strips
+	// them from the one-shot probe/inference subprocess env.
+	StripEnv []string
+	// NamespacesMCPToolsByServer is true for clients that add the MCP server
+	// name to every tool before presenting it to the model. The per-instance
+	// Kandev MCP server removes that presentation suffix before the client adds
+	// it back, so the model sees the canonical tool name.
+	NamespacesMCPToolsByServer bool
+}
+
+// MountTemplate defines a mount with template variables.
+type MountTemplate struct {
+	Source   string `json:"source"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"read_only"`
+}
+
+// ResourceLimits defines resource constraints.
+type ResourceLimits struct {
+	MemoryMB int64         `json:"memory_mb"`
+	CPUCores float64       `json:"cpu_cores"`
+	Timeout  time.Duration `json:"timeout"`
+}
+
+// SessionConfig defines session resumption behaviour.
+type SessionConfig struct {
+	NativeSessionResume     bool
+	HistoryContextInjection bool // Opt-in: inject conversation history on session resume for agents without native resume
+	// NewSessionOnWorkspaceRebind forces session/new when an idle execution's
+	// working directory changes. Some providers accept session/load with a new
+	// cwd but keep tool execution pinned to the session's original directory.
+	NewSessionOnWorkspaceRebind bool
+	ResumeFlag                  Param
+	CanRecover                  *bool
+	SessionDirTemplate          string
+	SessionDirTarget            string
+	ForkSessionCmd              Command
+	ContinueSessionCmd          Command
+}
+
+// SupportsRecovery returns whether the agent supports session recovery.
+// Returns true by default if CanRecover is not explicitly set.
+func (c SessionConfig) SupportsRecovery() bool {
+	if c.CanRecover == nil {
+		return true
+	}
+	return *c.CanRecover
+}
+
+// PermissionApplyMethodCLIFlag is the PermissionSetting.ApplyMethod sentinel
+// for permission flags that map to a CLI argument on the agent subprocess.
+// A typo in any one caller (e.g. "cli-flag") silently breaks the seed and
+// filter chain across agents, so the literal lives in exactly one place.
+const PermissionApplyMethodCLIFlag = "cli_flag"
+
+// PermissionApplyMethodAgentctlAutoApprove maps the profile auto_approve column
+// to AGENTCTL_AUTO_APPROVE_PERMISSIONS at launch (all ACP agents).
+const PermissionApplyMethodAgentctlAutoApprove = "agentctl_auto_approve"
+
+// PermissionKeyAutoApprove is the PermissionSettings map key wired to the
+// profile "Auto approve" toggle (see PermissionValues in buildAgentCommand).
+// Centralised for the same reason as PermissionApplyMethodCLIFlag: a typo in
+// any one agent silently disables its auto-approve flag.
+const PermissionKeyAutoApprove = "auto_approve"
+
+// PermissionKeyCursorForce is the Cursor-specific CLI --force toggle (unsandboxed
+// run-everything). Separate from PermissionKeyAutoApprove (agentctl ACP approval).
+const PermissionKeyCursorForce = "cursor_force"
+
+// PermissionKeyDangerouslySkipPermissions is wired to the profile's
+// DangerouslySkipPermissions column (a dedicated bool, not the cli_flags list).
+// Agents whose CLI accepts --dangerously-skip-permissions (or equivalent)
+// declare a PermissionSetting under this key with ApplyMethod=cli_flag so the
+// passthrough Settings() pass emits the flag from the profile bool. The
+// catalog seeder excludes this key to avoid duplicating the toggle into the
+// curated cli_flags list (which would also double-emit the flag at launch).
+const PermissionKeyDangerouslySkipPermissions = "dangerously_skip_permissions"
+
+// PermissionSetting defines metadata for a permission setting option.
+type PermissionSetting struct {
+	Supported    bool   `json:"supported"`
+	Default      bool   `json:"default"`
+	Label        string `json:"label"`
+	Description  string `json:"description"`
+	ApplyMethod  string `json:"apply_method,omitempty"`
+	CLIFlag      string `json:"cli_flag,omitempty"`
+	CLIFlagValue string `json:"cli_flag_value,omitempty"`
+
+	// PassthroughOnly marks a CLI flag that only reaches the agent in CLI
+	// passthrough mode. Over ACP the launched process is the bridge, which
+	// forwards no unrecognized argument to the CLI it wraps, so the flag is
+	// appended to a process that ignores it while the UI reports it as
+	// enabled.
+	PassthroughOnly bool `json:"passthrough_only,omitempty"`
+
+	// ACPEquivalent names the control that achieves the same thing over ACP.
+	// It is the actionable half of refusing a passthrough-only flag: a message
+	// that only says "not available here" leaves the user with no next step.
+	ACPEquivalent string `json:"acp_equivalent,omitempty"`
+}
+
+// PassthroughConfig defines configuration for CLI passthrough mode.
+type PassthroughConfig struct {
+	Supported         bool
+	Label             string
+	Description       string
+	PassthroughCmd    Command
+	ModelFlag         Param
+	PromptFlag        Param
+	PromptPattern     string
+	IdleTimeout       time.Duration
+	BufferMaxBytes    int64
+	StatusDetector    string
+	CheckInterval     time.Duration
+	StabilityWindow   time.Duration
+	ResumeFlag        Param // generic "continue last session" (e.g. NewParam("-c"), NewParam("--resume", "latest"))
+	SessionResumeFlag Param // resume a specific session by ID (e.g. NewParam("--resume"))
+	// MCPStrategy materializes resolved MCP servers into this CLI's passthrough
+	// shape (config file + flag, repeated -c overrides, project file, or env var)
+	// without touching the user's global config. Nil means no MCP injection.
+	MCPStrategy     mcpconfig.PassthroughMCPStrategy
+	WaitForTerminal bool
+	// AutoInjectPrompt is retained in discovered passthrough metadata for
+	// compatibility. Initial prompt delivery is selected by PromptFlag: when it
+	// is empty, the lifecycle manager writes the task description to PTY stdin.
+	// The value no longer gates that delivery.
+	AutoInjectPrompt bool
+	// SubmitSequence is appended after the prompt text when auto-injecting
+	// and when routing chat-compose messages to the PTY. "\r" for most TUIs.
+	// Empty inherits DefaultPassthroughSubmitSequence at PTY write sites.
+	SubmitSequence string
+	// DisableBracketedPaste sends the prompt body without ESC[200~…ESC[201~
+	// delimiters. The planner then paces the body in writes that each fit within
+	// one terminal read, because a TUI can drop whole reads of a larger unframed
+	// burst. Set it only for a TUI that does not accept bracketed-paste input;
+	// framed bodies arrive whole at any length.
+	DisableBracketedPaste bool
+	// SubmitDelay is the wait inserted before the separate submit chunk when
+	// writing a prompt to PTY stdin. Ink-based TUIs (Claude Code) detect a
+	// "paste burst" when many stdin bytes arrive in one read and absorb the
+	// trailing \r into the pasted content instead of dispatching it as Enter.
+	// Writing the submit byte on its own after a small delay makes it arrive as
+	// a discrete keystroke. 0 appends the submit sequence to the final body
+	// write (other TUIs handle prompt and submit in one read).
+	SubmitDelay time.Duration
+}
+
+// DefaultBufferMaxBytes is the default maximum buffer size for passthrough mode (2 MB).
+const DefaultBufferMaxBytes int64 = 2 * 1024 * 1024
+
+// DefaultResourceLimits is the standard resource limit set shared by most agents.
+var DefaultResourceLimits = ResourceLimits{
+	MemoryMB: 4096, CPUCores: 2.0, Timeout: time.Hour,
+}
+
+// DefaultProjectSkillDir is the fallback CWD-relative skill directory used when
+// an agent type does not declare a ProjectSkillDir in its RuntimeConfig.
+const DefaultProjectSkillDir = ".agents/skills"
+
+// ProjectSkillDirFromRuntime returns the CWD-relative skill directory for the
+// agent. Falls back to DefaultProjectSkillDir if the agent's RuntimeConfig does
+// not set one.
+func ProjectSkillDirFromRuntime(a Agent) string {
+	if rt := a.Runtime(); rt != nil && rt.ProjectSkillDir != "" {
+		return rt.ProjectSkillDir
+	}
+	return DefaultProjectSkillDir
+}
+
+// UserSkillDirFromRuntime returns the home-relative user skill directory for the
+// agent. An empty string means the agent does not expose a user-home skill dir.
+func UserSkillDirFromRuntime(a Agent) string {
+	if rt := a.Runtime(); rt != nil {
+		return rt.UserSkillDir
+	}
+	return ""
+}
+
+// InferenceConfig describes how an agent executes one-shot prompts via ACP.
+type InferenceConfig struct {
+	// Supported indicates the agent can do one-shot inference.
+	Supported bool
+	// Protocol selects the agentctl one-shot inference transport. Empty keeps
+	// the historical ACP transport.
+	Protocol agent.Protocol
+	// Command is the protocol command for one-shot inference.
+	// e.g., ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+	Command Command
+	// ModelFlag is the flag template for specifying the model (e.g., ["--model", "{model}"]).
+	ModelFlag Param
+	// OperatorDefined marks a Command that the install operator registered in
+	// Settings rather than one compiled into this binary. The host utility's
+	// probe allow-list is built from literals, which a command that does not
+	// exist until it is typed can never join.
+	OperatorDefined bool
+}
+
+// InferenceModel describes a model available for inference.
+type InferenceModel struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	IsDefault   bool   `json:"is_default"`
+}
+
+// RemoteAuth describes all auth methods an agent supports for remote environments.
+type RemoteAuth struct {
+	Methods []RemoteAuthMethod `json:"methods"`
+}
+
+// RemoteAuthFileConflictPolicy defines how a credential transfer handles an existing target.
+type RemoteAuthFileConflictPolicy string
+
+// RemoteAuthFileConflictPolicyMergeJSONObject preserves target-only keys and replaces collisions with source values.
+const RemoteAuthFileConflictPolicyMergeJSONObject RemoteAuthFileConflictPolicy = "merge_json_object"
+
+const (
+	remoteAuthMethodTypeFiles = "files"
+	remoteAuthLabelCopyFiles  = "Copy auth files"
+)
+
+// RemoteAuthMethod describes one way an agent can authenticate in a remote environment.
+type RemoteAuthMethod struct {
+	// Type is "env" (set env var via secret) or "files" (copy local files to remote).
+	Type string `json:"type"`
+	// EnvVar is the environment variable name (for type="env").
+	EnvVar string `json:"env_var,omitempty"`
+	// SetupHint is a UI hint for the user (for type="env").
+	SetupHint string `json:"setup_hint,omitempty"`
+	// SourceFiles maps OS name to relative paths from home dir (for type="files").
+	// Keys: "darwin", "linux", "windows".
+	SourceFiles map[string][]string `json:"source_files,omitempty"`
+	// TargetRelDir is the target directory relative to the remote user home (for type="files").
+	TargetRelDir string `json:"target_rel_dir,omitempty"`
+	// Label is a UI label for the file copy option (for type="files").
+	Label string `json:"label,omitempty"`
+	// FileConflictPolicy controls how an existing target file is handled. It is
+	// an internal transfer contract and is not part of the remote-auth API.
+	FileConflictPolicy RemoteAuthFileConflictPolicy `json:"-"`
+	// SetupScript is an optional shell script that runs on the remote after the
+	// env var is resolved. Used to bootstrap credential files from env vars.
+	// Only meaningful for type="env". Can reference the env var by name.
+	SetupScript string `json:"setup_script,omitempty"`
+}
+
+// PortableConfigAgent is an optional capability for agents that have a small,
+// explicitly allowlisted set of user configuration files that can be copied
+// into an isolated executor. It is intentionally separate from RemoteAuth.
+type PortableConfigAgent interface {
+	PortableConfig() *PortableConfig
+}
+
+// PortableConfig declares safe configuration bundles for an agent.
+type PortableConfig struct {
+	Bundles []PortableConfigBundle `json:"bundles"`
+}
+
+// PortableConfigBundle is one stable, user-selectable configuration unit.
+type PortableConfigBundle struct {
+	ID    string               `json:"id"`
+	Label string               `json:"label"`
+	Files []PortableConfigFile `json:"files"`
+}
+
+// PortableConfigFile maps an OS-specific host path relative to the host home
+// directory to a relative path below the executor user's home directory.
+type PortableConfigFile struct {
+	SourcePaths map[string]string `json:"source_paths"`
+	TargetPath  string            `json:"target_path"`
+}
+
+// Command is a domain value type representing a CLI command with arguments.
+// Serialize to []string only at system boundaries (process exec, Docker API, JSON DTOs).
+type Command struct {
+	args []string
+}
+
+// NewCommand creates a Command from the given arguments.
+func NewCommand(args ...string) Command {
+	return Command{args: append([]string{}, args...)}
+}
+
+// Args returns the raw string slice for serialization at system boundaries.
+func (c Command) Args() []string {
+	return c.args
+}
+
+// IsEmpty reports whether the command has no arguments.
+func (c Command) IsEmpty() bool {
+	return len(c.args) == 0
+}
+
+// With returns a CmdBuilder seeded with this command's arguments,
+// allowing fluent extension without mutating the original.
+func (c Command) With() *CmdBuilder {
+	return &CmdBuilder{args: append([]string{}, c.args...)}
+}
+
+// Param is a command fragment — one or more pre-split CLI arguments
+// (flags, flag+value pairs, templates with placeholders).
+// Composed into a Command via CmdBuilder methods.
+type Param struct {
+	args []string
+}
+
+// NewParam creates a Param from the given arguments.
+func NewParam(args ...string) Param {
+	return Param{args: append([]string{}, args...)}
+}
+
+// Args returns the raw string slice.
+func (p Param) Args() []string { return p.args }
+
+// IsEmpty reports whether the param has no arguments.
+func (p Param) IsEmpty() bool { return len(p.args) == 0 }

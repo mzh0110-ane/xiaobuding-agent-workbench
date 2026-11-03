@@ -1,0 +1,450 @@
+package lifecycle
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/kandev/kandev/internal/agent/registry"
+	"github.com/kandev/kandev/internal/agent/settings/models"
+	"github.com/kandev/kandev/internal/agent/settings/store"
+	"github.com/kandev/kandev/internal/agentctl/acpcompat"
+	"github.com/kandev/kandev/internal/common/logger"
+)
+
+// Note: testAgent is defined in manager_test.go (same package)
+
+// MockRepository implements store.Repository for testing
+type MockRepository struct {
+	GetAgentFn                        func(ctx context.Context, id string) (*models.Agent, error)
+	GetAgentByNameFn                  func(ctx context.Context, name string) (*models.Agent, error)
+	GetAgentProfileFn                 func(ctx context.Context, id string) (*models.AgentProfile, error)
+	GetAgentProfileIncludingDeletedFn func(ctx context.Context, id string) (*models.AgentProfile, error)
+	ListAgentsFn                      func(ctx context.Context) ([]*models.Agent, error)
+	ListAgentProfilesFn               func(ctx context.Context, agentID string) ([]*models.AgentProfile, error)
+	HasDeletedAgentProfilesFn         func(ctx context.Context, agentID string) (bool, error)
+	updateAgentProfileFn              func(ctx context.Context, profile *models.AgentProfile) error
+}
+
+var _ store.Repository = (*MockRepository)(nil)
+
+func (m *MockRepository) CreateAgent(ctx context.Context, agent *models.Agent) error {
+	return nil
+}
+
+func (m *MockRepository) GetAgent(ctx context.Context, id string) (*models.Agent, error) {
+	if m.GetAgentFn != nil {
+		return m.GetAgentFn(ctx, id)
+	}
+	return nil, errors.New("agent not found")
+}
+
+func (m *MockRepository) GetAgentByName(ctx context.Context, name string) (*models.Agent, error) {
+	if m.GetAgentByNameFn != nil {
+		return m.GetAgentByNameFn(ctx, name)
+	}
+	return nil, errors.New("agent not found")
+}
+
+func (m *MockRepository) UpdateAgent(ctx context.Context, agent *models.Agent) error {
+	return nil
+}
+
+func (m *MockRepository) DeleteAgent(ctx context.Context, id string) error {
+	return nil
+}
+
+func (m *MockRepository) ListAgents(ctx context.Context) ([]*models.Agent, error) {
+	if m.ListAgentsFn != nil {
+		return m.ListAgentsFn(ctx)
+	}
+	return []*models.Agent{}, nil
+}
+
+func (m *MockRepository) GetAgentProfileMcpConfig(ctx context.Context, profileID string) (*models.AgentProfileMcpConfig, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *MockRepository) UpsertAgentProfileMcpConfig(ctx context.Context, config *models.AgentProfileMcpConfig) error {
+	return nil
+}
+
+func (m *MockRepository) CreateAgentProfile(ctx context.Context, profile *models.AgentProfile) error {
+	return nil
+}
+
+// DuplicateAgentProfile implements the settings store interface for the resolver test fakes.
+func (m *MockRepository) DuplicateAgentProfile(ctx context.Context, input store.DuplicateAgentProfileInput) error {
+	return nil
+}
+
+func (m *MockRepository) UpdateAgentProfile(ctx context.Context, profile *models.AgentProfile) error {
+	if m.updateAgentProfileFn != nil {
+		return m.updateAgentProfileFn(ctx, profile)
+	}
+	return nil
+}
+
+func (m *MockRepository) UpdateAgentProfileEnabled(_ context.Context, _ string, _ bool) (time.Time, error) {
+	return time.Time{}, nil
+}
+
+func (m *MockRepository) DeleteAgentProfile(ctx context.Context, id string) error {
+	return nil
+}
+
+func (m *MockRepository) GetAgentProfile(ctx context.Context, id string) (*models.AgentProfile, error) {
+	if m.GetAgentProfileFn != nil {
+		return m.GetAgentProfileFn(ctx, id)
+	}
+	return nil, errors.New("profile not found")
+}
+
+// GetAgentProfileTx is not exercised by this package's tests; it exists only
+// to satisfy store.Repository.
+func (m *MockRepository) GetAgentProfileTx(_ context.Context, _ *sqlx.Tx, _ string) (*models.AgentProfile, bool, error) {
+	return nil, false, errors.New("GetAgentProfileTx not implemented")
+}
+
+func (m *MockRepository) GetAgentProfileIncludingDeleted(ctx context.Context, id string) (*models.AgentProfile, error) {
+	if m.GetAgentProfileIncludingDeletedFn != nil {
+		return m.GetAgentProfileIncludingDeletedFn(ctx, id)
+	}
+	return nil, errors.New("profile not found")
+}
+
+func (m *MockRepository) ListAgentProfiles(ctx context.Context, agentID string) ([]*models.AgentProfile, error) {
+	if m.ListAgentProfilesFn != nil {
+		return m.ListAgentProfilesFn(ctx, agentID)
+	}
+	return []*models.AgentProfile{}, nil
+}
+
+func (m *MockRepository) HasDeletedAgentProfiles(ctx context.Context, agentID string) (bool, error) {
+	if m.HasDeletedAgentProfilesFn != nil {
+		return m.HasDeletedAgentProfilesFn(ctx, agentID)
+	}
+	return false, nil
+}
+
+func (m *MockRepository) ListTUIAgents(ctx context.Context) ([]*models.Agent, error) {
+	return []*models.Agent{}, nil
+}
+
+func (m *MockRepository) Close() error {
+	return nil
+}
+
+func TestNewStoreProfileResolver(t *testing.T) {
+	mockRepo := &MockRepository{}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+
+	if resolver == nil {
+		t.Fatal("expected non-nil resolver")
+	}
+	if resolver.store != mockRepo {
+		t.Error("expected resolver to use the provided store")
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_Success(t *testing.T) {
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return &models.AgentProfile{
+				ID:                         "profile-123",
+				AgentID:                    "agent-456",
+				Name:                       "My Profile",
+				Model:                      "claude-3.5-sonnet",
+				CursorMCPAuthEnabled:       true,
+				MCPSelectionMode:           "selected",
+				MCPSelectedServers:         []string{"plugin-atlassian-atlassian"},
+				AutoApprove:                true,
+				DangerouslySkipPermissions: false,
+			}, nil
+		},
+		GetAgentFn: func(ctx context.Context, id string) (*models.Agent, error) {
+			return &models.Agent{
+				ID:   "agent-456",
+				Name: "claude",
+			}, nil
+		},
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+	ctx := context.Background()
+
+	info, err := resolver.ResolveProfile(ctx, "profile-123")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected non-nil profile info")
+	}
+	if info.ProfileID != "profile-123" {
+		t.Errorf("expected ProfileID 'profile-123', got '%s'", info.ProfileID)
+	}
+	if info.ProfileName != "My Profile" {
+		t.Errorf("expected ProfileName 'My Profile', got '%s'", info.ProfileName)
+	}
+	if !info.CursorMCPAuthEnabled {
+		t.Error("Cursor MCP auth preference was not resolved")
+	}
+	if info.MCPSelectionMode != "selected" || len(info.MCPSelectedServers) != 1 || info.MCPSelectedServers[0] != "plugin-atlassian-atlassian" {
+		t.Errorf("MCP selection = %q / %#v, want selected / exact server ID", info.MCPSelectionMode, info.MCPSelectedServers)
+	}
+	if info.AgentID != "agent-456" {
+		t.Errorf("expected AgentID 'agent-456', got '%s'", info.AgentID)
+	}
+	if info.AgentName != "claude" {
+		t.Errorf("expected AgentName 'claude', got '%s'", info.AgentName)
+	}
+	if info.Model != "claude-3.5-sonnet" {
+		t.Errorf("expected Model 'claude-3.5-sonnet', got '%s'", info.Model)
+	}
+	if info.AutoApprove != true {
+		t.Error("expected AutoApprove to be true")
+	}
+	if info.DangerouslySkipPermissions != false {
+		t.Error("expected DangerouslySkipPermissions to be false")
+	}
+}
+
+func TestStoreProfileResolver_MigratesCursorVariantModel(t *testing.T) {
+	profile := &models.AgentProfile{
+		ID:      "profile-cursor",
+		AgentID: "agent-cursor",
+		Model:   "grok-4.5[effort=high,fast=true]",
+		ConfigOptions: map[string]string{
+			"effort": "low",
+		},
+	}
+	var updated *models.AgentProfile
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(context.Context, string) (*models.AgentProfile, error) {
+			return profile, nil
+		},
+		GetAgentFn: func(context.Context, string) (*models.Agent, error) {
+			return &models.Agent{ID: "agent-cursor", Name: acpcompat.CursorAgentID}, nil
+		},
+	}
+	// Capture the write without changing the profile returned by the fake read.
+	mockRepo.updateAgentProfileFn = func(_ context.Context, got *models.AgentProfile) error {
+		updated = got
+		return nil
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+	info, err := resolver.ResolveProfile(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatalf("ResolveProfile: %v", err)
+	}
+
+	if info.Model != "grok-4.5" {
+		t.Fatalf("resolved model = %q, want bare Cursor model", info.Model)
+	}
+	if got := info.ConfigOptions["effort"]; got != "low" {
+		t.Errorf("resolved effort = %q, want existing profile value low", got)
+	}
+	if got := info.ConfigOptions["fast"]; got != "true" {
+		t.Errorf("resolved fast = %q, want migrated value true", got)
+	}
+	if updated == nil {
+		t.Fatal("expected migrated profile to be persisted")
+	}
+	if updated.Model != "grok-4.5" || updated.ConfigOptions["fast"] != "true" {
+		t.Fatalf("persisted profile = %+v, want bare model and fast option", updated)
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_SoftDeletedReturnsTypedError(t *testing.T) {
+	deletedAt := time.Date(2026, 5, 22, 21, 28, 12, 0, time.UTC)
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return nil, sql.ErrNoRows
+		},
+		GetAgentProfileIncludingDeletedFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return &models.AgentProfile{
+				ID:        "deleted-profile",
+				AgentID:   "agent-456",
+				Name:      "Removed Kilo Profile",
+				DeletedAt: &deletedAt,
+			}, nil
+		},
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+
+	info, err := resolver.ResolveProfile(context.Background(), "deleted-profile")
+
+	if info != nil {
+		t.Fatalf("expected nil profile info, got %+v", info)
+	}
+	if !errors.Is(err, store.ErrAgentProfileDeleted) {
+		t.Fatalf("expected ErrAgentProfileDeleted, got %v", err)
+	}
+	var detail *DeletedProfileError
+	if !errors.As(err, &detail) {
+		t.Fatalf("expected DeletedProfileError detail, got %T: %v", err, err)
+	}
+	if detail.ProfileID != "deleted-profile" {
+		t.Errorf("expected ProfileID 'deleted-profile', got %q", detail.ProfileID)
+	}
+	if detail.ProfileName != "Removed Kilo Profile" {
+		t.Errorf("expected ProfileName 'Removed Kilo Profile', got %q", detail.ProfileName)
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_ProfileNotFound(t *testing.T) {
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return nil, errors.New("profile not found")
+		},
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+	ctx := context.Background()
+
+	info, err := resolver.ResolveProfile(ctx, "non-existent-profile")
+
+	if err == nil {
+		t.Fatal("expected error for non-existent profile")
+	}
+	if info != nil {
+		t.Error("expected nil profile info on error")
+	}
+	if !errors.Is(err, errors.Unwrap(err)) && err.Error() == "" {
+		t.Error("expected error to contain message")
+	}
+	// Verify the error message contains "profile not found"
+	expectedMsg := "profile not found"
+	if err.Error()[:len(expectedMsg)] != expectedMsg {
+		t.Errorf("expected error message to start with '%s', got '%s'", expectedMsg, err.Error())
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_AgentNotFound(t *testing.T) {
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return &models.AgentProfile{
+				ID:      "profile-123",
+				AgentID: "non-existent-agent",
+				Name:    "My Profile",
+				Model:   "gpt-4",
+			}, nil
+		},
+		GetAgentFn: func(ctx context.Context, id string) (*models.Agent, error) {
+			return nil, errors.New("agent not found")
+		},
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+	ctx := context.Background()
+
+	info, err := resolver.ResolveProfile(ctx, "profile-123")
+
+	if err == nil {
+		t.Fatal("expected error when agent not found")
+	}
+	if info != nil {
+		t.Error("expected nil profile info on error")
+	}
+	// Verify the error message contains "agent not found for profile"
+	expectedMsg := "agent not found for profile"
+	if err.Error()[:len(expectedMsg)] != expectedMsg {
+		t.Errorf("expected error message to start with '%s', got '%s'", expectedMsg, err.Error())
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_FallbackToRegistryDefaultModel(t *testing.T) {
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return &models.AgentProfile{
+				ID:          "profile-123",
+				AgentID:     "agent-456",
+				Name:        "Default Profile",
+				Model:       "", // Empty model - should fallback to registry
+				AutoApprove: false,
+			}, nil
+		},
+		GetAgentFn: func(ctx context.Context, id string) (*models.Agent, error) {
+			return &models.Agent{
+				ID:   "agent-456",
+				Name: "claude-code", // Agent name matches registry key
+			}, nil
+		},
+	}
+
+	// Create a registry with a default model for claude-code
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	reg := registry.NewRegistry(log)
+	err := reg.Register(&testAgent{
+		id:           "claude-code",
+		name:         "claude-code",
+		enabled:      true,
+		defaultModel: "claude-sonnet-4-20250514",
+	})
+	if err != nil {
+		t.Fatalf("failed to register agent: %v", err)
+	}
+
+	resolver := NewStoreProfileResolver(mockRepo, reg)
+	ctx := context.Background()
+
+	info, err := resolver.ResolveProfile(ctx, "profile-123")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected non-nil profile info")
+	}
+	// Static per-agent default models have been removed; an empty profile
+	// model stays empty until the host utility probe fills it in via the
+	// reconciler. The session-start hook applies model selection only when
+	// a model is set, otherwise the agent uses its own default.
+	if info.Model != "" {
+		t.Errorf("expected Model '' (no static fallback), got '%s'", info.Model)
+	}
+}
+
+func TestStoreProfileResolver_ResolveProfile_EmptyModelNoRegistry(t *testing.T) {
+	mockRepo := &MockRepository{
+		GetAgentProfileFn: func(ctx context.Context, id string) (*models.AgentProfile, error) {
+			return &models.AgentProfile{
+				ID:      "profile-123",
+				AgentID: "agent-456",
+				Name:    "Default Profile",
+				Model:   "", // Empty model
+			}, nil
+		},
+		GetAgentFn: func(ctx context.Context, id string) (*models.Agent, error) {
+			return &models.Agent{
+				ID:   "agent-456",
+				Name: "custom-agent",
+			}, nil
+		},
+	}
+
+	// No registry provided
+	resolver := NewStoreProfileResolver(mockRepo, nil)
+	ctx := context.Background()
+
+	info, err := resolver.ResolveProfile(ctx, "profile-123")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected non-nil profile info")
+	}
+	if info.Model != "" {
+		// Model should remain empty since no registry fallback available
+		t.Errorf("expected empty Model when no registry fallback, got '%s'", info.Model)
+	}
+}

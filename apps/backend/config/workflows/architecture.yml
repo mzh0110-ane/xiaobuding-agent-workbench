@@ -1,0 +1,79 @@
+# Internal workflow TEMPLATE definition — NOT the portable import/export format.
+# Steps here reference each other by string `step_id`; the importable YAML uses a
+# `version`/`type`/`workflows` envelope and `step_position`. Don't paste this file
+# (or its `step_id` transitions) into the workflow import endpoint.
+# Format reference: docs/workflow-import-export.md
+id: architecture
+name: Architecture
+description: >-
+  Focus on architecture and design. The agent creates technical designs
+  for your review before any implementation begins.
+
+steps:
+  - id: backlog
+    name: Ideas
+    position: 0
+    color: bg-neutral-400
+    allow_manual_move: true
+
+  - id: planning
+    name: Planning
+    position: 1
+    color: bg-purple-500
+    is_start_step: true
+    show_in_command_panel: true
+    allow_manual_move: true
+    prompt: |
+      [ARCHITECTURE PHASE]
+      Analyze and design the architecture for this task. Do NOT write any code.
+
+      {{task_prompt}}
+
+      STEP 0: CREATE A TASK LIST
+      Before anything else, create a task list tracking the substeps below (use your todo/task tracking tool if available). Mark each task in_progress when you begin it and completed when you finish. Do not skip ahead — each step feeds the next.
+
+      STEP 1: UNDERSTAND THE REQUIREMENTS
+      If anything is unclear or ambiguous, ask the user clarifying questions using the ask_user_question_kandev tool before proceeding.
+
+      STEP 2: EXPLORE THE CODEBASE
+      - Find similar features and understand how they are architected.
+      - Identify existing patterns, abstractions, and conventions.
+      - Map integration points, data flow, and system boundaries.
+
+      STEP 3: DESIGN THE ARCHITECTURE
+      Create a design that includes:
+      1. Component overview — what each component does and how they interact
+      2. Interfaces and contracts — how components communicate (APIs, events, shared types)
+      3. Data flow — how data moves through the system from input to output
+      4. File structure — which files will be created or modified
+      5. Trade-offs — alternative approaches considered and why the recommended one was chosen
+      6. Risks and open questions — what could go wrong, what needs further investigation
+
+      When including diagrams (architecture, sequence, flowcharts, etc.), always use mermaid syntax in code blocks.
+
+      IMPORTANT: Save your design using the create_task_plan_kandev MCP tool with the task_id provided in the session context.
+      After saving the plan, STOP and wait for user review. The user will review your design in the UI and may edit it.
+      Do not create any other files during this phase — only use the MCP tool to save the plan.
+    events:
+      on_enter:
+        - type: enable_plan_mode
+        - type: auto_start_agent
+
+  - id: review
+    name: Review
+    position: 2
+    color: bg-yellow-500
+    show_in_command_panel: true
+    allow_manual_move: true
+    events:
+      on_enter:
+        - type: enable_plan_mode
+      on_turn_start:
+        - type: move_to_previous
+
+  - id: done
+    name: Approved
+    position: 3
+    color: bg-green-500
+    complete_task_on_enter: true
+    allow_manual_move: true

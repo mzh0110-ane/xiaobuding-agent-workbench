@@ -1,0 +1,2090 @@
+/* eslint-disable max-lines -- comprehensive session-state handler tests */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { registerTaskSessionHandlers } from "./agent-session";
+import type { StoreApi } from "zustand";
+import type { AppState } from "@/lib/state/store";
+import { createAppStore } from "@/lib/state/store";
+import { deriveSessionInputMode } from "@/hooks/domains/session/session-input-mode";
+import { sessionId as toSessionId, type TaskSession } from "@/lib/types/http";
+import type {
+  TaskSessionActivityChangedPayload,
+  TaskSessionCancellationChangedPayload,
+  TaskSessionStateChangedPayload,
+} from "@/lib/types/backend";
+const QUEUE_STATUS_ACTION = `message.queue.status_changed`;
+const CURRENT_INCARNATION = `incarnation-2`;
+const CURRENT_STATUS_EPOCH = `status-epoch-1`;
+
+function makeStore(overrides: Record<string, unknown> = {}) {
+  const state: Record<string, unknown> = {
+    tasks: {
+      activeTaskId: null,
+      activeSessionId: null,
+      pinnedSessionId: null,
+      lastSessionByTaskId: {},
+      resumeSkippedSessionIds: {},
+    },
+    taskSessions: { items: {} },
+    taskSessionsByTask: { itemsByTaskId: {} },
+    setTaskSession: vi.fn(),
+    setTaskSessionsForTask: vi.fn(),
+    upsertTaskSessionFromEvent: vi.fn(),
+    setActiveSession: vi.fn(),
+    setActiveSessionAuto: vi.fn(),
+    setSessionAgentctlStatus: vi.fn(),
+    setResumeSkipped: vi.fn(),
+    clearLaunchWarning: vi.fn(),
+    setSessionFailureNotification: vi.fn(),
+    setContextWindow: vi.fn(),
+    clearContextWindow: vi.fn(),
+    queue: { bySessionId: {}, metaBySessionId: {} },
+    setQueueEntries: vi.fn(),
+    clearLegacyGitStatusEntry: vi.fn(),
+    bumpSessionGitCheckoutGeneration: vi.fn(),
+    bumpSessionCommitsRefetch: vi.fn(),
+    bumpWorkspaceFilesRefresh: vi.fn(),
+    reconcileWorkspaceSourcesAdopted: vi.fn(),
+    ...overrides,
+  };
+  return {
+    getState: () => state as unknown as AppState,
+    setState: vi.fn(),
+    subscribe: vi.fn(),
+    destroy: vi.fn(),
+    getInitialState: vi.fn(),
+  } as unknown as StoreApi<AppState>;
+}
+
+describe("message.queue.status_changed handler", () => {
+  it("stores the backend-owned Auto-run policy", () => {
+    const setQueueEntries = vi.fn();
+    const store = makeStore({ setQueueEntries });
+    const handler = registerTaskSessionHandlers(store)[QUEUE_STATUS_ACTION]!;
+
+    handler({
+      id: "queue-status-1",
+      type: "notification",
+      action: QUEUE_STATUS_ACTION,
+      payload: {
+        session_id: "s-1",
+        entries: [],
+        count: 0,
+        max: 10,
+        merge_enabled: true,
+        auto_run: false,
+      },
+    } as never);
+
+    expect(setQueueEntries).toHaveBeenCalledWith("s-1", [], {
+      count: 0,
+      max: 10,
+      mergeEnabled: true,
+      autoRun: false,
+    });
+  });
+
+  it("preserves a known OFF policy when an older publisher omits policy fields", () => {
+    const setQueueEntries = vi.fn();
+    const store = makeStore({
+      setQueueEntries,
+      queue: {
+        bySessionId: { "s-1": [] },
+        metaBySessionId: {
+          "s-1": { count: 1, max: 10, mergeEnabled: false, autoRun: false },
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[QUEUE_STATUS_ACTION]!;
+
+    handler({
+      id: "queue-status-compat",
+      type: "notification",
+      action: QUEUE_STATUS_ACTION,
+      payload: { session_id: "s-1", entries: [], count: 0, max: 10 },
+    } as never);
+
+    expect(setQueueEntries).toHaveBeenCalledWith("s-1", [], {
+      count: 0,
+      max: 10,
+      mergeEnabled: false,
+      autoRun: false,
+    });
+  });
+
+  it("preserves the known queue capacity when an older publisher omits max", () => {
+    const setQueueEntries = vi.fn();
+    const store = makeStore({
+      setQueueEntries,
+      queue: {
+        bySessionId: { "s-1": [] },
+        metaBySessionId: {
+          "s-1": { count: 1, max: 10, mergeEnabled: true, autoRun: true },
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)["message.queue.status_changed"]!;
+
+    handler({
+      id: "queue-status-capacity-compat",
+      type: "notification",
+      action: "message.queue.status_changed",
+      payload: { session_id: "s-1", entries: [], count: 0 },
+    } as never);
+
+    expect(setQueueEntries).toHaveBeenCalledWith("s-1", [], {
+      count: 0,
+      max: 10,
+      mergeEnabled: true,
+      autoRun: true,
+    });
+  });
+});
+function makeIncarnationPolicyStore(setQueueEntries: ReturnType<typeof vi.fn>) {
+  return makeStore({
+    setQueueEntries,
+    taskSessions: {
+      items: {
+        "s-1": {
+          id: "s-1",
+          task_id: "task-1",
+          queue_incarnation_id: CURRENT_INCARNATION,
+        },
+      },
+    },
+    queue: {
+      bySessionId: { "s-1": [] },
+      metaBySessionId: {
+        "s-1": {
+          count: 0,
+          max: 10,
+          mergeEnabled: true,
+          autoRun: true,
+          taskId: "task-1",
+          sessionIncarnationId: CURRENT_INCARNATION,
+          statusEpoch: CURRENT_STATUS_EPOCH,
+          statusGeneration: 4,
+          autoMergeAvailable: true,
+          autoMergeEnabled: false,
+          autoMergeSource: "session",
+          autoMergeRevision: 1,
+        },
+      },
+    },
+  });
+}
+
+it("rejects delayed legacy queue status after an incarnated session refetch", () => {
+  const setQueueEntries = vi.fn();
+  const store = makeStore({
+    setQueueEntries,
+    taskSessions: {
+      items: {
+        "s-1": {
+          id: "s-1",
+          task_id: "task-1",
+          queue_incarnation_id: CURRENT_INCARNATION,
+        },
+      },
+    },
+    queue: { bySessionId: {}, metaBySessionId: {} },
+  });
+  const handler = registerTaskSessionHandlers(store)[QUEUE_STATUS_ACTION]!;
+
+  handler({
+    id: "delayed-legacy-status",
+    type: "notification",
+    action: QUEUE_STATUS_ACTION,
+    payload: {
+      session_id: "s-1",
+      entries: [{ id: "stale-entry", content: "stale" }],
+      count: 1,
+      max: 10,
+      auto_run: false,
+    },
+  } as never);
+
+  expect(setQueueEntries).not.toHaveBeenCalled();
+});
+
+it("applies only the current incarnation's newest Auto-merge policy", () => {
+  const setQueueEntries = vi.fn();
+  const store = makeIncarnationPolicyStore(setQueueEntries);
+  const handler = registerTaskSessionHandlers(store)[QUEUE_STATUS_ACTION]!;
+
+  handler({
+    id: "stale-incarnation",
+    type: "notification",
+    action: QUEUE_STATUS_ACTION,
+    payload: {
+      task_id: "task-1",
+      session_id: "s-1",
+      session_incarnation_id: "incarnation-1",
+      status_epoch: "incarnation-1",
+      status_generation: 99,
+      entries: [],
+      count: 0,
+      max: 10,
+      auto_merge_available: true,
+      auto_merge_enabled: true,
+      auto_merge_source: "global",
+      auto_merge_revision: 8,
+    },
+  } as never);
+  expect(setQueueEntries).not.toHaveBeenCalled();
+
+  handler({
+    id: "new-status",
+    type: "notification",
+    action: QUEUE_STATUS_ACTION,
+    payload: {
+      task_id: "task-1",
+      session_id: "s-1",
+      session_incarnation_id: CURRENT_INCARNATION,
+      status_epoch: CURRENT_STATUS_EPOCH,
+      status_generation: 5,
+      entries: [],
+      count: 0,
+      max: 10,
+      merge_enabled: true,
+      auto_run: true,
+      auto_merge_available: true,
+      auto_merge_enabled: true,
+      auto_merge_source: "session",
+      auto_merge_revision: 2,
+    },
+  } as never);
+  expect(setQueueEntries).toHaveBeenCalledWith(
+    "s-1",
+    [],
+    expect.objectContaining({
+      sessionIncarnationId: CURRENT_INCARNATION,
+      statusGeneration: 5,
+      autoMergeAvailable: true,
+      autoMergeEnabled: true,
+      autoMergeSource: "session",
+      autoMergeRevision: 2,
+    }),
+  );
+});
+
+it("establishes a new backend status epoch and rejects delayed retired events", () => {
+  const setQueueEntries = vi.fn();
+  const store = makeIncarnationPolicyStore(setQueueEntries);
+  const handler = registerTaskSessionHandlers(store)[QUEUE_STATUS_ACTION]!;
+
+  handler({
+    id: "new-backend-epoch",
+    type: "notification",
+    action: QUEUE_STATUS_ACTION,
+    payload: {
+      task_id: "task-1",
+      session_id: "s-1",
+      session_incarnation_id: CURRENT_INCARNATION,
+      status_epoch: "status-epoch-2",
+      status_generation: 1,
+      entries: [{ id: "current-entry", content: "current" }],
+      count: 1,
+      max: 10,
+      merge_enabled: true,
+      auto_run: false,
+      auto_merge_available: true,
+      auto_merge_enabled: true,
+      auto_merge_source: "session",
+      auto_merge_revision: 2,
+    },
+  } as never);
+  expect(setQueueEntries).toHaveBeenCalledWith(
+    "s-1",
+    [{ id: "current-entry", content: "current" }],
+    expect.objectContaining({
+      statusEpoch: "status-epoch-2",
+      statusGeneration: 1,
+      retiredStatusEpochs: [CURRENT_STATUS_EPOCH],
+    }),
+    { establishStatusEpoch: true },
+  );
+
+  store.getState().queue.metaBySessionId["s-1"] = {
+    ...store.getState().queue.metaBySessionId["s-1"],
+    statusEpoch: "status-epoch-2",
+    statusGeneration: 1,
+    retiredStatusEpochs: [CURRENT_STATUS_EPOCH],
+  };
+  handler({
+    id: "delayed-retired-backend-epoch",
+    type: "notification",
+    action: QUEUE_STATUS_ACTION,
+    payload: {
+      task_id: "task-1",
+      session_id: "s-1",
+      session_incarnation_id: CURRENT_INCARNATION,
+      status_epoch: CURRENT_STATUS_EPOCH,
+      status_generation: 99,
+      entries: [{ id: "stale-entry", content: "stale" }],
+      count: 1,
+      max: 10,
+      merge_enabled: true,
+      auto_run: false,
+      auto_merge_available: true,
+      auto_merge_enabled: true,
+      auto_merge_source: "session",
+      auto_merge_revision: 2,
+    },
+  } as never);
+
+  expect(setQueueEntries).toHaveBeenCalledTimes(1);
+});
+
+const STATE_CHANGED_EVENT = "session.state_changed";
+const ACTIVITY_EVENT = "session.activity_changed";
+const CANCELLATION_EVENT = "session.cancellation_changed";
+const RECOVERABLE_ERROR_MESSAGE = "peer disconnected before response";
+const RECOVERABLE_ERROR_AT = "2026-06-14T14:06:40Z";
+const TASK_ROOT = "/task-root";
+const IDLE_AT = "2026-08-17T07:00:00Z";
+
+function makeMessage(payload: TaskSessionStateChangedPayload) {
+  return {
+    id: "msg-1",
+    type: "notification" as const,
+    action: "session.state_changed" as const,
+    payload,
+  };
+}
+
+function makeActivityMessage(payload: TaskSessionActivityChangedPayload) {
+  return {
+    id: "m",
+    type: "notification" as const,
+    action: "session.activity_changed" as const,
+    payload: { ...payload, active_subagent_count: payload.active_subagent_count ?? 0 },
+  };
+}
+
+function makeCancellationMessage(payload: TaskSessionCancellationChangedPayload) {
+  return {
+    id: "m-cancel",
+    type: "notification" as const,
+    action: "session.cancellation_changed" as const,
+    payload,
+  };
+}
+
+function makeRealActivityStore(state: TaskSession["state"] = "WAITING_FOR_INPUT") {
+  const selected = {
+    id: "s-1",
+    task_id: "t-1",
+    state,
+    foreground_activity: "background",
+    started_at: RECOVERABLE_ERROR_AT,
+    updated_at: RECOVERABLE_ERROR_AT,
+  } as TaskSession;
+  const peer = { ...selected, id: "s-2" } as TaskSession;
+  const store = createAppStore();
+  store.getState().setTaskSession(selected);
+  store.getState().setTaskSession(peer);
+  return store;
+}
+
+function assertRealStoreActivityRouting() {
+  const selected = {
+    id: "s-1",
+    task_id: "t-1",
+    state: "RUNNING",
+    foreground_activity: "generating",
+    started_at: RECOVERABLE_ERROR_AT,
+    updated_at: RECOVERABLE_ERROR_AT,
+  } as TaskSession;
+  const peer = { ...selected, id: "s-2", foreground_activity: "background" } as TaskSession;
+  const store = createAppStore();
+  store.getState().setTaskSession(selected);
+  store.getState().setTaskSession(peer);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+  expect(deriveSessionInputMode(store.getState().taskSessions.items["s-1"])).toBe("queue");
+  handler(
+    makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "background" }),
+  );
+  expect(store.getState().taskSessions.items["s-1"].foreground_activity).toBe("background");
+  expect(deriveSessionInputMode(store.getState().taskSessions.items["s-1"])).toBe("direct");
+  expect(store.getState().taskSessions.items["s-2"].foreground_activity).toBe("background");
+
+  handler(
+    makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "generating" }),
+  );
+  expect(deriveSessionInputMode(store.getState().taskSessions.items["s-1"])).toBe("queue");
+  expect(deriveSessionInputMode(store.getState().taskSessions.items["s-2"])).toBe("direct");
+}
+
+// eslint-disable-next-line max-lines-per-function -- state transition contracts use the shared store fixture.
+describe("session.state_changed handler", () => {
+  let store: ReturnType<typeof makeStore>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let handler: (msg: any) => void;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("sets failure notification on first FAILED event", () => {
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "FAILED",
+        error_message: "container crashed",
+      }),
+    );
+
+    expect(store.getState().setSessionFailureNotification).toHaveBeenCalledWith({
+      sessionId: "s-1",
+      taskId: "t-1",
+      message: "container crashed",
+    });
+  });
+
+  it("classifies stamped typed failures as launch failures without actions", () => {
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "FAILED",
+        error_message: "pull request is closed",
+        session_metadata: {
+          last_agent_error: {
+            message: "pull request is closed",
+            code: "pr_already_closed",
+            stamp: "closed-pr-stamp",
+          },
+        },
+      }),
+    );
+
+    expect(store.getState().setSessionFailureNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ isLaunchFailure: true }),
+    );
+  });
+
+  it("does not set failure notification when session is already FAILED", () => {
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "FAILED" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "FAILED",
+        error_message: "container crashed",
+      }),
+    );
+
+    expect(store.getState().setSessionFailureNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not set failure notification for unknown session (snapshot replay)", () => {
+    // When a session is replayed on reconnect/page-load, it lands in the FE
+    // store for the first time already in FAILED state. This is not a real
+    // transition we just observed, so no toast should fire.
+    store = makeStore();
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-new",
+        new_state: "FAILED",
+        error_message: "timeout",
+      }),
+    );
+
+    expect(store.getState().setSessionFailureNotification).not.toHaveBeenCalled();
+  });
+
+  it("respects suppress_toast flag", () => {
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "FAILED",
+        error_message: "missing branch",
+        suppress_toast: true,
+      }),
+    );
+
+    expect(store.getState().setSessionFailureNotification).not.toHaveBeenCalled();
+  });
+
+  it("marks a closed quick chat from an active-to-settled event using old_state", () => {
+    const markQuickChatUnseenIdle = vi.fn();
+    const recordQuickChatSettled = vi.fn(() => true);
+    store = makeStore({
+      quickChat: {
+        isOpen: false,
+        activeSessionId: null,
+        sessions: [{ sessionId: "s-1", workspaceId: "workspace-1" }],
+      },
+      markQuickChatUnseenIdle,
+      recordQuickChatSettled,
+      taskSessions: { items: {} },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        old_state: "RUNNING",
+        new_state: "IDLE",
+        updated_at: IDLE_AT,
+      }),
+    );
+
+    expect(recordQuickChatSettled).toHaveBeenCalledWith("s-1", IDLE_AT);
+    expect(markQuickChatUnseenIdle).toHaveBeenCalledWith("s-1", "workspace-1");
+  });
+
+  it("does not mark an active-to-settled event for a session outside quick chat", () => {
+    const markQuickChatUnseenIdle = vi.fn();
+    const recordQuickChatSettled = vi.fn(() => true);
+    store = makeStore({
+      quickChat: { isOpen: false, activeSessionId: null, sessions: [] },
+      markQuickChatUnseenIdle,
+      recordQuickChatSettled,
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "IDLE",
+        updated_at: IDLE_AT,
+      }),
+    );
+
+    expect(recordQuickChatSettled).toHaveBeenCalledWith("s-1", IDLE_AT);
+    expect(markQuickChatUnseenIdle).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed cancellation snapshot", () => {
+  it("merges an explicit cancellation false from the authoritative snapshot", () => {
+    const store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": {
+            id: "s-1",
+            task_id: "t-1",
+            state: "RUNNING",
+            cancellation_pending: true,
+          },
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "RUNNING",
+        cancellation_pending: false,
+        cancellation_revision: 2,
+      }),
+    );
+
+    expect(store.getState().upsertTaskSessionFromEvent).toHaveBeenCalledWith(
+      "t-1",
+      expect.objectContaining({ cancellation_pending: false, cancellation_revision: 2 }),
+    );
+  });
+});
+
+describe("session.cancellation_changed handler", () => {
+  it("updates only the addressed session in the real store", () => {
+    const store = createAppStore();
+    const selected = {
+      id: "s-1",
+      task_id: "t-1",
+      state: "RUNNING",
+      cancellation_pending: false,
+      started_at: RECOVERABLE_ERROR_AT,
+      updated_at: RECOVERABLE_ERROR_AT,
+    } as TaskSession;
+    const peer = { ...selected, id: toSessionId("s-2") };
+    store.getState().setTaskSession(selected);
+    store.getState().setTaskSession(peer);
+
+    const handler = registerTaskSessionHandlers(store)[CANCELLATION_EVENT]!;
+    handler(
+      makeCancellationMessage({
+        session_id: "s-1",
+        cancellation_pending: true,
+        cancellation_revision: 1,
+      }),
+    );
+
+    expect(store.getState().taskSessions.items["s-1"].cancellation_pending).toBe(true);
+    expect(store.getState().taskSessions.items["s-1"].cancellation_revision).toBe(1);
+    expect(store.getState().taskSessions.items["s-2"].cancellation_pending).toBe(false);
+  });
+
+  it("ignores an event for a session that has not been loaded", () => {
+    const store = makeStore();
+    const handler = registerTaskSessionHandlers(store)[CANCELLATION_EVENT]!;
+
+    handler(
+      makeCancellationMessage({
+        session_id: "unknown",
+        cancellation_pending: true,
+        cancellation_revision: 1,
+      }),
+    );
+
+    expect(store.getState().upsertTaskSessionFromEvent).not.toHaveBeenCalled();
+  });
+
+  it("rejects a lower-revision live event", () => {
+    const store = createAppStore();
+    store.getState().setTaskSession({
+      id: "s-1",
+      task_id: "t-1",
+      state: "RUNNING",
+      cancellation_pending: false,
+      cancellation_revision: 2,
+      started_at: RECOVERABLE_ERROR_AT,
+      updated_at: RECOVERABLE_ERROR_AT,
+    } as TaskSession);
+
+    const handler = registerTaskSessionHandlers(store)[CANCELLATION_EVENT]!;
+    handler(
+      makeCancellationMessage({
+        session_id: "s-1",
+        cancellation_pending: true,
+        cancellation_revision: 1,
+      }),
+    );
+
+    expect(store.getState().taskSessions.items["s-1"].cancellation_pending).toBe(false);
+    expect(store.getState().taskSessions.items["s-1"].cancellation_revision).toBe(2);
+  });
+});
+
+describe("session.workspace_sources.updated handler", () => {
+  it("adopts the workspace root and bumps the Files refresh key", () => {
+    const setTaskSession = vi.fn();
+    const bumpWorkspaceFilesRefresh = vi.fn();
+    const bumpSessionGitCheckoutGeneration = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "IDLE", worktree_path: "/old" } },
+      },
+      setTaskSession,
+      bumpWorkspaceFilesRefresh,
+      bumpSessionGitCheckoutGeneration,
+    });
+
+    const handler = registerTaskSessionHandlers(store)["session.workspace_sources.updated"]!;
+    handler({
+      id: "msg-workspace-sources",
+      type: "notification",
+      action: "session.workspace_sources.updated",
+      timestamp: "2026-07-23T10:03:00.000Z",
+      payload: { task_id: "t-1", session_id: "s-1", workspace_path: "/new" },
+    } as never);
+
+    expect(setTaskSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "s-1", worktree_path: "/old", workspace_path: "/new" }),
+    );
+    expect(bumpWorkspaceFilesRefresh).toHaveBeenCalledWith("s-1");
+    expect(bumpSessionGitCheckoutGeneration).toHaveBeenCalledWith("s-1");
+    // The server-issued envelope timestamp is forwarded as the adoption
+    // boundary so the client clock can never retire legitimate turns.
+    expect(store.getState().reconcileWorkspaceSourcesAdopted).toHaveBeenCalledWith(
+      ["s-1"],
+      "2026-07-23T10:03:00.000Z",
+    );
+  });
+
+  it("does not clear the workspace root when a partial event omits it", () => {
+    const setTaskSession = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": {
+            id: "s-1",
+            task_id: "t-1",
+            state: "IDLE",
+            worktree_path: "/task-root/kandev",
+            workspace_path: TASK_ROOT,
+          },
+        },
+      },
+      setTaskSession,
+    });
+
+    const handler = registerTaskSessionHandlers(store)["session.workspace_sources.updated"]!;
+    handler({
+      id: "msg-workspace-sources-partial",
+      type: "notification",
+      action: "session.workspace_sources.updated",
+      payload: { task_id: "t-1", session_id: "s-1" },
+    } as never);
+
+    expect(setTaskSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed name propagation", () => {
+  let store: ReturnType<typeof makeStore>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let handler: (msg: any) => void;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("applies a session name from rename broadcasts, including clearing", () => {
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING", started_at: "" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "RUNNING", name: "reviewer" }),
+    );
+    expect(store.getState().upsertTaskSessionFromEvent).toHaveBeenCalledWith(
+      "t-1",
+      expect.objectContaining({ id: "s-1", name: "reviewer" }),
+    );
+
+    // Rename-to-clear carries name: "" and must still apply.
+    handler(makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "RUNNING", name: "" }));
+    expect(store.getState().upsertTaskSessionFromEvent).toHaveBeenLastCalledWith(
+      "t-1",
+      expect.objectContaining({ id: "s-1", name: "" }),
+    );
+  });
+
+  it("does not touch the name when the event omits it", () => {
+    store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING", started_at: "", name: "reviewer" },
+        },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "COMPLETED" }));
+    const call = vi.mocked(store.getState().upsertTaskSessionFromEvent).mock.calls.at(-1);
+    expect(call?.[1]).not.toHaveProperty("name");
+  });
+});
+
+describe("session.state_changed context window provenance", () => {
+  it("retains the backend context-window source", () => {
+    const setContextWindow = vi.fn();
+    const store = makeStore({ setContextWindow });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        metadata: {
+          context_window: {
+            size: 258_400,
+            used: 95_100,
+            remaining: 163_300,
+            efficiency: 36.8,
+            source: "acp",
+          },
+          context_compaction_count: 3,
+        },
+      }),
+    );
+
+    expect(setContextWindow).toHaveBeenCalledWith(
+      "s-1",
+      expect.objectContaining({ source: "acp", compactionCount: 3 }),
+    );
+  });
+
+  it("clears the cached reading when a full session snapshot explicitly clears it", () => {
+    const clearContextWindow = vi.fn();
+    const store = makeStore({ clearContextWindow });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        session_metadata: { context_window: null },
+      }),
+    );
+
+    expect(clearContextWindow).toHaveBeenCalledWith("s-1");
+  });
+
+  it("clears the cached reading when a partial metadata patch explicitly clears it", () => {
+    const clearContextWindow = vi.fn();
+    const store = makeStore({ clearContextWindow });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        metadata: { context_window: null },
+      }),
+    );
+
+    expect(clearContextWindow).toHaveBeenCalledWith("s-1");
+  });
+
+  it("does not clear usage for unrelated metadata patches", () => {
+    const clearContextWindow = vi.fn();
+    const store = makeStore({ clearContextWindow });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        metadata: { plan_mode: true },
+      }),
+    );
+
+    expect(clearContextWindow).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed recoverable errors", () => {
+  it("upserts recoverable error metadata for non-failed session states", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } },
+      },
+      upsertTaskSessionFromEvent,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "WAITING_FOR_INPUT",
+        error_message: RECOVERABLE_ERROR_MESSAGE,
+        session_metadata: {
+          last_agent_error: {
+            message: RECOVERABLE_ERROR_MESSAGE,
+            occurred_at: RECOVERABLE_ERROR_AT,
+          },
+        },
+      }),
+    );
+
+    expect(upsertTaskSessionFromEvent).toHaveBeenCalledWith(
+      "t-1",
+      expect.objectContaining({
+        state: "WAITING_FOR_INPUT",
+        error_message: RECOVERABLE_ERROR_MESSAGE,
+        metadata: {
+          last_agent_error: {
+            message: RECOVERABLE_ERROR_MESSAGE,
+            occurred_at: RECOVERABLE_ERROR_AT,
+          },
+        },
+      }),
+    );
+  });
+});
+
+describe("session.state_changed stale guard", () => {
+  let store: ReturnType<typeof makeStore>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let handler: (msg: any) => void;
+
+  it("ignores older state events before upserting the session", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": {
+            id: "s-1",
+            task_id: "t-1",
+            state: "WAITING_FOR_INPUT",
+            updated_at: "2026-01-02T00:00:00.000Z",
+          },
+        },
+      },
+      upsertTaskSessionFromEvent,
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "RUNNING",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    expect(upsertTaskSessionFromEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed → active session switching", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("adopts a newly-created session for the active task", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: null,
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-new", new_state: "STARTING" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).toHaveBeenCalledWith("t-1", "s-new");
+    expect(store.getState().setActiveSession).not.toHaveBeenCalled();
+  });
+
+  it("does not adopt a new session for a task that is not active", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "other-task",
+        activeSessionId: null,
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-new", new_state: "STARTING" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+
+  it("does not adopt while the current active session is still running", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-new", new_state: "STARTING" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed → active session switching with pins", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("adopts the replacement when the pinned active session is already terminal", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: "s-old",
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "COMPLETED" } },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-new", new_state: "STARTING" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).toHaveBeenCalledWith("t-1", "s-new");
+  });
+
+  it("does not adopt another session when a non-terminal pin was orphaned by active-session drift", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-drifted",
+        pinnedSessionId: "s-pinned",
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: {
+          "s-drifted": { id: "s-drifted", task_id: "t-1", state: "COMPLETED" },
+          "s-pinned": { id: "s-pinned", task_id: "t-1", state: "RUNNING" },
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-background", new_state: "STARTING" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed → active session handoff on terminal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("hands off when the current active session transitions to terminal", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-old", task_id: "t-1", state: "RUNNING", started_at: "", updated_at: "" },
+            { id: "s-new", task_id: "t-1", state: "STARTING", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).toHaveBeenCalledWith("t-1", "s-new");
+    expect(store.getState().setActiveSession).not.toHaveBeenCalled();
+  });
+
+  // The per-task list here still shows s-old as RUNNING (pre-event state), so
+  // pickReplacementSessionId returns s-old itself. This exercises the
+  // `replacement !== sessionId` guard — without it, we'd set activeSessionId
+  // to the same session that just became terminal.
+  it("does not hand off when the only candidate is the terminating session itself", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-old", task_id: "t-1", state: "RUNNING", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+
+  it("does not hand off when all other sessions for the task are terminal", () => {
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: null,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-done", task_id: "t-1", state: "COMPLETED", started_at: "", updated_at: "" },
+            { id: "s-old", task_id: "t-1", state: "RUNNING", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed → respects user-pinned session", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("hands off when the pinned active session reaches a terminal state", () => {
+    // Genuine RUNNING→COMPLETED transition: previousState is non-terminal,
+    // so the workflow handoff should still fire even though the session
+    // is pinned.
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: "s-old",
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-old", task_id: "t-1", state: "RUNNING", started_at: "", updated_at: "" },
+            { id: "s-new", task_id: "t-1", state: "STARTING", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).toHaveBeenCalledWith("t-1", "s-new");
+    expect(store.getState().setActiveSession).not.toHaveBeenCalled();
+  });
+
+  it("hands off to the promoted primary when the new session is not yet in the per-task list", () => {
+    // Race that produced the reported bug: a workflow step switch to a step
+    // with a different agent profile promotes the new primary via task.updated
+    // (reflected on the kanban task) BEFORE the old session's terminal
+    // state_changed arrives, so s-new is not yet present in taskSessionsByTask.
+    // pickReplacementSessionId finds no in-list successor, so focus must follow
+    // the switch by falling back to the task's authoritative primary session.
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: "s-old",
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "RUNNING" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-old", task_id: "t-1", state: "COMPLETED", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+      kanban: { tasks: [{ id: "t-1", primarySessionId: "s-new" }] },
+      kanbanMulti: { snapshots: {} },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).toHaveBeenCalledWith("t-1", "s-new");
+  });
+
+  it("does not hand off when a pinned terminal session receives a replay state_changed", () => {
+    // Replay: the session was already COMPLETED (previousState terminal) and
+    // the backend re-emits the same terminal state. The user clicked this
+    // session open to review it, so the pin must be honored — no handoff.
+    const store = makeStore({
+      tasks: {
+        activeTaskId: "t-1",
+        activeSessionId: "s-old",
+        pinnedSessionId: "s-old",
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: { "s-old": { id: "s-old", task_id: "t-1", state: "COMPLETED" } },
+      },
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          "t-1": [
+            { id: "s-old", task_id: "t-1", state: "COMPLETED", started_at: "", updated_at: "" },
+            { id: "s-new", task_id: "t-1", state: "STARTING", started_at: "", updated_at: "" },
+          ],
+        },
+      },
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      payload: { task_id: "t-1", session_id: "s-old", new_state: "COMPLETED" },
+    });
+
+    expect(store.getState().setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+});
+
+// eslint-disable-next-line max-lines-per-function -- test describe block, splitting hurts readability
+describe("session.state_changed → agentctl ready fallback", () => {
+  const TS = "2026-05-04T00:00:00Z";
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("promotes agentctl status to 'ready' when session enters RUNNING and ready event was missed", () => {
+    const setSessionAgentctlStatus = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+      sessionAgentctl: { itemsBySessionId: { "s-1": { status: "starting" } } },
+      setSessionAgentctlStatus,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      timestamp: TS,
+      payload: { task_id: "t-1", session_id: "s-1", new_state: "RUNNING" },
+    });
+
+    expect(setSessionAgentctlStatus).toHaveBeenCalledWith(
+      "s-1",
+      expect.objectContaining({ status: "ready" }),
+    );
+  });
+
+  it("promotes agentctl status to 'ready' on WAITING_FOR_INPUT even when no prior entry exists", () => {
+    const setSessionAgentctlStatus = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+      sessionAgentctl: { itemsBySessionId: {} },
+      setSessionAgentctlStatus,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      timestamp: TS,
+      payload: { task_id: "t-1", session_id: "s-1", new_state: "WAITING_FOR_INPUT" },
+    });
+
+    expect(setSessionAgentctlStatus).toHaveBeenCalledWith(
+      "s-1",
+      expect.objectContaining({ status: "ready" }),
+    );
+  });
+
+  it("does not re-set 'ready' when the session is already ready", () => {
+    const setSessionAgentctlStatus = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } },
+      },
+      sessionAgentctl: { itemsBySessionId: { "s-1": { status: "ready" } } },
+      setSessionAgentctlStatus,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: STATE_CHANGED_EVENT,
+      timestamp: TS,
+      payload: { task_id: "t-1", session_id: "s-1", new_state: "WAITING_FOR_INPUT" },
+    });
+
+    expect(setSessionAgentctlStatus).not.toHaveBeenCalled();
+  });
+
+  it("seeds env mapping and workspace path from agentctl_starting payload", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "CREATED" } },
+      },
+      sessionAgentctl: { itemsBySessionId: {} },
+      setSessionAgentctlStatus: vi.fn(),
+      upsertTaskSessionFromEvent,
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_starting"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_starting",
+      timestamp: TS,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        agent_execution_id: "ae-1",
+        task_environment_id: "env-1",
+        worktree_path: "/tmp/kandev/tasks/ws/task-1",
+      },
+    });
+
+    expect(upsertTaskSessionFromEvent).toHaveBeenCalledWith(
+      "t-1",
+      expect.objectContaining({
+        id: "s-1",
+        task_environment_id: "env-1",
+        worktree_path: "/tmp/kandev/tasks/ws/task-1",
+        workspace_path: "/tmp/kandev/tasks/ws/task-1",
+      }),
+    );
+  });
+
+  it("seeds env mapping from agentctl_ready payload", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: {} },
+      sessionAgentctl: { itemsBySessionId: {} },
+      setSessionAgentctlStatus: vi.fn(),
+      upsertTaskSessionFromEvent,
+      setWorktree: vi.fn(),
+      sessionWorktreesBySessionId: { itemsBySessionId: {} },
+      setSessionWorktrees: vi.fn(),
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_ready"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_ready",
+      timestamp: TS,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        agent_execution_id: "ae-1",
+        task_environment_id: "env-1",
+      },
+    });
+
+    expect(upsertTaskSessionFromEvent).toHaveBeenCalledWith(
+      "t-1",
+      expect.objectContaining({ id: "s-1", task_environment_id: "env-1" }),
+    );
+  });
+
+  it("settles the matching workspace restore when agentctl becomes ready", () => {
+    const attempt = {
+      taskId: "t-1",
+      sessionId: "s-1",
+      environmentId: "env-1",
+      revision: 2,
+      status: "pending",
+    };
+    const completeWorkspaceRestoration = vi.fn(() => true);
+    const bumpWorkspaceFilesRefresh = vi.fn();
+    const store = makeStore({
+      environmentIdBySessionId: { "s-1": "env-1" },
+      workspaceRestoration: { byEnvironmentId: { "env-1": attempt } },
+      completeWorkspaceRestoration,
+      bumpWorkspaceFilesRefresh,
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_ready"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_ready",
+      timestamp: TS,
+      payload: { task_id: "t-1", session_id: "s-1", task_environment_id: "env-1" },
+    });
+
+    expect(completeWorkspaceRestoration).toHaveBeenCalledWith(attempt);
+    expect(bumpWorkspaceFilesRefresh).toHaveBeenCalledWith("s-1");
+  });
+
+  it("settles the matching workspace restore with sanitized agentctl error details", () => {
+    const attempt = {
+      taskId: "t-1",
+      sessionId: "s-1",
+      environmentId: "env-1",
+      revision: 2,
+      status: "pending",
+    };
+    const failWorkspaceRestoration = vi.fn();
+    const store = makeStore({
+      environmentIdBySessionId: { "s-1": "env-1" },
+      workspaceRestoration: { byEnvironmentId: { "env-1": attempt } },
+      failWorkspaceRestoration,
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_error"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_error",
+      timestamp: TS,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        task_environment_id: "env-1",
+        error_message: "backend\u0000failure",
+      },
+    });
+
+    expect(failWorkspaceRestoration).toHaveBeenCalledWith(attempt, "backendfailure");
+  });
+
+  it("preserves the primary worktree when a sibling agentctl_ready arrives", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    const setTaskSession = vi.fn();
+    const bumpSessionGitCheckoutGeneration = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": {
+            id: "s-1",
+            task_id: "t-1",
+            state: "RUNNING",
+            repository_id: "primary-repo",
+            worktree_id: "primary-worktree",
+            worktree_path: "/task-root/kandev",
+            worktree_branch: "main",
+          },
+        },
+      },
+      sessionAgentctl: { itemsBySessionId: {} },
+      sessionWorktreesBySessionId: { itemsBySessionId: { "s-1": ["primary-worktree"] } },
+      setSessionAgentctlStatus: vi.fn(),
+      setTaskSession,
+      bumpSessionGitCheckoutGeneration,
+      upsertTaskSessionFromEvent,
+      setWorktree: vi.fn(),
+      setSessionWorktrees: vi.fn(),
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_ready"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_ready",
+      timestamp: TS,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        agent_execution_id: "ae-sibling",
+        task_environment_id: "env-1",
+        worktree_id: "sibling-worktree",
+        worktree_path: "/task-root/second-repository-main",
+        worktree_branch: "main",
+        workspace_path: TASK_ROOT,
+      },
+    });
+
+    const upsertPayload = upsertTaskSessionFromEvent.mock.calls[0]?.[1];
+    expect(upsertPayload).toEqual(
+      expect.objectContaining({
+        id: "s-1",
+        task_environment_id: "env-1",
+        workspace_path: TASK_ROOT,
+      }),
+    );
+    expect(upsertPayload).not.toHaveProperty("worktree_id");
+    expect(upsertPayload).not.toHaveProperty("worktree_path");
+    expect(upsertPayload).not.toHaveProperty("worktree_branch");
+    expect(setTaskSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        worktree_id: "primary-worktree",
+        worktree_path: "/task-root/kandev",
+        worktree_branch: "main",
+        workspace_path: TASK_ROOT,
+      }),
+    );
+    expect(bumpSessionGitCheckoutGeneration).toHaveBeenCalledWith("s-1");
+  });
+
+  it("does not call upsertTaskSessionFromEvent when agentctl payload omits task_environment_id", () => {
+    const upsertTaskSessionFromEvent = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: {} },
+      sessionAgentctl: { itemsBySessionId: {} },
+      setSessionAgentctlStatus: vi.fn(),
+      upsertTaskSessionFromEvent,
+    });
+    const handler = registerTaskSessionHandlers(store)["session.agentctl_starting"]!;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: "session.agentctl_starting",
+      timestamp: TS,
+      payload: { task_id: "t-1", session_id: "s-1", agent_execution_id: "ae-1" },
+    });
+
+    expect(upsertTaskSessionFromEvent).not.toHaveBeenCalled();
+  });
+
+  it("does not promote on non-live states (STARTING, COMPLETED, FAILED)", () => {
+    const setSessionAgentctlStatus = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "CREATED" } },
+      },
+      sessionAgentctl: { itemsBySessionId: {} },
+      setSessionAgentctlStatus,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    for (const newState of ["STARTING", "COMPLETED", "FAILED", "CANCELLED"]) {
+      handler({
+        id: "m",
+        type: "notification",
+        action: STATE_CHANGED_EVENT,
+        timestamp: TS,
+        payload: { task_id: "t-1", session_id: "s-1", new_state: newState },
+      });
+    }
+
+    expect(setSessionAgentctlStatus).not.toHaveBeenCalled();
+  });
+});
+
+function applyActivityCount(existingCount: number, nextCount?: number) {
+  const upsert = vi.fn();
+  const store = makeStore({
+    taskSessions: {
+      items: {
+        "s-1": {
+          id: "s-1",
+          task_id: "t-1",
+          state: "RUNNING",
+          active_subagent_count: existingCount,
+        },
+      },
+    },
+    upsertTaskSessionFromEvent: upsert,
+  });
+  const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (
+    msg: ReturnType<typeof makeActivityMessage>,
+  ) => void;
+  const payload: Record<string, unknown> = {
+    task_id: "t-1",
+    session_id: "s-1",
+    foreground_activity: "background",
+  };
+  if (nextCount !== undefined) payload.active_subagent_count = nextCount;
+  handler({
+    id: "m",
+    type: "notification",
+    action: "session.activity_changed",
+    payload,
+  } as ReturnType<typeof makeActivityMessage>);
+  return upsert.mock.calls[0][1];
+}
+
+describe("session.activity_changed handler — fine-grained busy signal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("annotates an existing RUNNING session with the background substate", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } } },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler(
+      makeActivityMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        foreground_activity: "background",
+        active_subagent_count: 2,
+      }),
+    );
+
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      id: "s-1",
+      state: "RUNNING",
+      foreground_activity: "background",
+      active_subagent_count: 2,
+    });
+  });
+
+  it("preserves the known count when an older activity event omits it", () => {
+    expect(applyActivityCount(4)).toMatchObject({ active_subagent_count: 4 });
+  });
+
+  it("clears the known count when an activity event explicitly sends zero", () => {
+    expect(applyActivityCount(4, 0)).toMatchObject({ active_subagent_count: 0 });
+  });
+
+  it("keeps accepting detached activity updates after the foreground settles", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "WAITING_FOR_INPUT" } },
+      },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler(
+      makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "background" }),
+    );
+
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      state: "WAITING_FOR_INPUT",
+      foreground_activity: "background",
+    });
+  });
+
+  it("flips back to generating on the next activity event", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } } },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler(
+      makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "generating" }),
+    );
+
+    expect(upsert.mock.calls[0][1]).toMatchObject({ foreground_activity: "generating" });
+  });
+
+  it("does nothing until the session row exists (state_changed seeds it first)", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: {} },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler(
+      makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "background" }),
+    );
+
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it(
+    "drives the selected session queue→direct→queue in the real store without affecting peers",
+    assertRealStoreActivityRouting,
+  );
+
+  it("clears background activity from an input-capable session without affecting its peer", () => {
+    const store = makeRealActivityStore();
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT]!;
+
+    handler(makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: null }));
+
+    expect(store.getState().taskSessions.items["s-1"].foreground_activity).toBeNull();
+    expect(store.getState().taskSessions.items["s-2"].foreground_activity).toBe("background");
+  });
+});
+
+// task-05's publishParkedTransition shares this wire event but omits
+// `foreground_activity` entirely (unlike the ADR-0049 flip, which always
+// sends it, explicit null included). A naive `payload.foreground_activity
+// ?? null` default would clobber a live busy signal on every parked-only
+// event.
+describe("session.activity_changed handler — parked-only payload shape", () => {
+  it("does not clobber a live foreground_activity on a parked-only event", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING", foreground_activity: "generating" },
+        },
+      },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: ACTIVITY_EVENT,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        parked_on_background_work: true,
+        revision: 3,
+        parked_epoch: 100,
+      },
+    });
+
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      foreground_activity: "generating",
+      parked_on_background_work: true,
+      revision: 3,
+      parked_epoch: 100,
+    });
+  });
+
+  it("applies parked_on_background_work/revision/parked_epoch from a parked-only event", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "WAITING_FOR_INPUT" } },
+      },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: ACTIVITY_EVENT,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        parked_on_background_work: true,
+        revision: 1,
+        parked_epoch: 100,
+      },
+    });
+
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      parked_on_background_work: true,
+      revision: 1,
+      parked_epoch: 100,
+      foreground_activity: undefined,
+    });
+  });
+});
+
+// ResetAgentContext transitions a parked session WAITING_FOR_INPUT ->
+// STARTING before the backend's clearParkedOnSessionStateLeft publishes the
+// parked-only clear; the backend's own projection is already false by then,
+// so the later STARTING -> WAITING_FOR_INPUT settle never republishes.
+describe("session.activity_changed handler — parked-only clear during STARTING", () => {
+  it("applies a parked-only clear while the session reports STARTING", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: {
+          "s-1": {
+            id: "s-1",
+            task_id: "t-1",
+            state: "STARTING",
+            parked_on_background_work: true,
+          },
+        },
+      },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler({
+      id: "m",
+      type: "notification",
+      action: ACTIVITY_EVENT,
+      payload: {
+        task_id: "t-1",
+        session_id: "s-1",
+        parked_on_background_work: false,
+        revision: 2,
+        parked_epoch: 100,
+      },
+    });
+
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      parked_on_background_work: false,
+      revision: 2,
+    });
+  });
+
+  it("still rejects a foreground-activity event while the session reports STARTING", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } },
+      },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = registerTaskSessionHandlers(store)[ACTIVITY_EVENT] as (msg: any) => void;
+
+    handler(
+      makeActivityMessage({ task_id: "t-1", session_id: "s-1", foreground_activity: "background" }),
+    );
+
+    expect(upsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("session.state_changed carries and resets the busy substate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("merges foreground_activity from the state_changed payload", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: { "s-1": { id: "s-1", task_id: "t-1", state: "STARTING" } } },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "RUNNING",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        foreground_activity: "generating" as any,
+        active_subagent_count: 2,
+      }),
+    );
+
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      state: "RUNNING",
+      foreground_activity: "generating",
+      active_subagent_count: 2,
+    });
+  });
+
+  it("merges background activity when the foreground settles", () => {
+    const upsert = vi.fn();
+    const store = makeStore({
+      taskSessions: { items: { "s-1": { id: "s-1", task_id: "t-1", state: "RUNNING" } } },
+      upsertTaskSessionFromEvent: upsert,
+    });
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "WAITING_FOR_INPUT",
+        foreground_activity: "background",
+      }),
+    );
+
+    expect(upsert.mock.calls[0][1]).toMatchObject({
+      state: "WAITING_FOR_INPUT",
+      foreground_activity: "background",
+    });
+  });
+});
+
+describe("session activity explicit-null contract", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("clears stale background activity on a terminal state event without affecting its peer", () => {
+    const store = makeRealActivityStore("RUNNING");
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(
+      makeMessage({
+        task_id: "t-1",
+        session_id: "s-1",
+        new_state: "COMPLETED",
+        foreground_activity: null,
+      }),
+    );
+
+    expect(store.getState().taskSessions.items["s-1"]).toMatchObject({
+      state: "COMPLETED",
+      foreground_activity: null,
+    });
+    expect(store.getState().taskSessions.items["s-2"].foreground_activity).toBe("background");
+  });
+
+  it.each([
+    {
+      name: "terminal clear before delayed activity",
+      events: [
+        makeMessage({
+          task_id: "t-1",
+          session_id: "s-1",
+          new_state: "COMPLETED",
+          foreground_activity: null,
+        }),
+        makeActivityMessage({
+          task_id: "t-1",
+          session_id: "s-1",
+          foreground_activity: "background",
+        }),
+      ],
+    },
+    {
+      name: "activity clear before terminal clear",
+      events: [
+        makeActivityMessage({
+          task_id: "t-1",
+          session_id: "s-1",
+          foreground_activity: null,
+        }),
+        makeMessage({
+          task_id: "t-1",
+          session_id: "s-1",
+          new_state: "COMPLETED",
+          foreground_activity: null,
+        }),
+      ],
+    },
+  ])("keeps terminal activity cleared when $name", ({ events }) => {
+    const store = makeRealActivityStore();
+    const handlers = registerTaskSessionHandlers(store);
+
+    for (const event of events) {
+      if (event.action === STATE_CHANGED_EVENT) handlers[STATE_CHANGED_EVENT]!(event as never);
+      else handlers[ACTIVITY_EVENT]!(event as never);
+    }
+
+    expect(store.getState().taskSessions.items["s-1"]).toMatchObject({
+      state: "COMPLETED",
+      foreground_activity: null,
+    });
+    expect(store.getState().taskSessions.items["s-2"].foreground_activity).toBe("background");
+  });
+
+  it("preserves background activity when a state event omits the activity field", () => {
+    const store = makeRealActivityStore("RUNNING");
+    const handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+
+    handler(makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "WAITING_FOR_INPUT" }));
+
+    expect(store.getState().taskSessions.items["s-1"].foreground_activity).toBe("background");
+    expect(store.getState().taskSessions.items["s-2"].foreground_activity).toBe("background");
+  });
+});
+
+describe("session.state_changed resume-skipped clearing", () => {
+  let store: ReturnType<typeof makeStore>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let handler: (msg: any) => void;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store = makeStore({
+      taskSessions: {
+        items: { "s-1": { id: "s-1", task_id: "t-1", state: "WAITING_FOR_INPUT" } },
+      },
+    });
+    handler = registerTaskSessionHandlers(store)[STATE_CHANGED_EVENT]!;
+  });
+
+  it("clears the resume-skipped marker on a RUNNING transition", () => {
+    handler(makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "RUNNING" }));
+    expect(store.getState().setResumeSkipped).toHaveBeenCalledWith("s-1", false);
+    expect(store.getState().clearLaunchWarning).toHaveBeenCalledWith("s-1");
+  });
+
+  it("does NOT clear the marker on a STARTING transition (failed resumes keep the retry button)", () => {
+    handler(makeMessage({ task_id: "t-1", session_id: "s-1", new_state: "STARTING" }));
+    expect(store.getState().setResumeSkipped).not.toHaveBeenCalled();
+  });
+});

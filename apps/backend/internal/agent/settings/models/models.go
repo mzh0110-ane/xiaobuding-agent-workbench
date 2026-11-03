@@ -1,0 +1,263 @@
+package models
+
+import (
+	"time"
+
+	agentusage "github.com/kandev/kandev/internal/agent/usage"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+)
+
+// ProfileEnvVar is an environment variable entry on an agent profile.
+type ProfileEnvVar = taskmodels.ProfileEnvVar
+
+// Provider-kind values for AgentProfile.ProviderKind.
+const (
+	// ProviderKindNative keeps the agent CLI's own provider configuration.
+	// It is the zero value, so existing rows decode to it.
+	ProviderKindNative = ""
+	// ProviderKindOpenAICompatible routes the profile through a Kandev-injected
+	// OpenAI-compatible provider (base URL + bearer key).
+	ProviderKindOpenAICompatible = "openai_compatible"
+)
+
+type Agent struct {
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	WorkspaceID   *string        `json:"workspace_id,omitempty"`
+	SupportsMCP   bool           `json:"supports_mcp"`
+	MCPConfigPath string         `json:"mcp_config_path,omitempty"`
+	TUIConfig     *TUIConfigJSON `json:"tui_config,omitempty"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+}
+
+// TUIConfigJSON is the JSON schema stored in the tui_config column for custom TUI agents.
+type TUIConfigJSON struct {
+	Command         string   `json:"command"`
+	DisplayName     string   `json:"display_name"`
+	Model           string   `json:"model,omitempty"`
+	Description     string   `json:"description,omitempty"`
+	CommandArgs     []string `json:"command_args,omitempty"`
+	WaitForTerminal bool     `json:"wait_for_terminal"`
+	// MCPStrategy selects how kandev injects its per-session MCP server into
+	// the wrapped CLI (mcpconfig.StrategyKey*). Empty — the value every row
+	// written before this field existed decodes to — means no injection.
+	// Stored here rather than as an agent column because it is part of the
+	// user's CLI definition, and because tui_config is JSON: adding the field
+	// needs no migration.
+	MCPStrategy string `json:"mcp_strategy,omitempty"`
+	// Protocol selects the runtime kandev drives the command with
+	// (registry.CustomAgentProtocol*). Empty — the value every row written
+	// before this field existed decodes to — means terminal passthrough.
+	Protocol string `json:"protocol,omitempty"`
+	// DisableBracketedPaste selects paced unframed delivery for terminal TUIs
+	// that do not accept bracketed-paste delimiters.
+	DisableBracketedPaste bool `json:"disable_bracketed_paste,omitempty"`
+}
+
+type AgentProfile struct {
+	ID               string `json:"id" db:"id"`
+	AgentID          string `json:"agent_id" db:"agent_id"`
+	Name             string `json:"name" db:"name"`
+	AgentDisplayName string `json:"agent_display_name" db:"agent_display_name"`
+
+	// BillingType is computed at read time from credential files — not stored in the DB.
+	// Values: "api_key" | "subscription".
+	BillingType string `json:"billing_type,omitempty" db:"-"`
+
+	// Model is the ACP model ID applied through session model selection at session start.
+	// Validated against the host utility capability cache by the reconciler.
+	Model string `json:"model" db:"model"`
+
+	// FallbackModel is the optional ACP model ID the runtime switches to when
+	// the start model (Model) becomes unavailable. Empty means "no explicit
+	// fallback". Ignored at runtime when AutoFallback is enabled.
+	FallbackModel string `json:"fallback_model,omitempty" db:"fallback_model"`
+
+	// AutoFallback opts the profile into the legacy automatic-fallback
+	// behavior: session-start model application is best-effort and office
+	// post-start failures re-dispatch to the next provider candidate. When
+	// enabled, FallbackModel is ignored and the UI hides its field.
+	AutoFallback bool `json:"auto_fallback" db:"auto_fallback"`
+
+	// RequireExactModel makes the configured model an explicit per-profile
+	// identity requirement. False preserves compatible pre-PR behavior.
+	RequireExactModel bool `json:"require_exact_model" db:"require_exact_model"`
+
+	// Mode is the optional ACP session mode applied via session/set_mode at
+	// session start. Empty when the agent does not advertise modes.
+	// The DB column is nullable; the settings repo handles the empty-string ↔ NULL
+	// conversion via sql.NullString in scan/insert paths, so callers see a
+	// regular string here.
+	Mode string `json:"mode,omitempty" db:"-"`
+
+	// ConfigOptions are dynamic ACP session config options applied through
+	// session/set_config_option at session start. Model and mode stay in their
+	// dedicated fields.
+	ConfigOptions map[string]string `json:"config_options,omitempty" db:"-"`
+
+	// MigratedFrom records the agent_id this profile was migrated from, if any.
+	// Same db:"-" treatment as Mode (nullable column, settings repo handles).
+	MigratedFrom string `json:"migrated_from,omitempty" db:"-"`
+
+	// CLIPassthrough enables TUI-passthrough execution style. Orthogonal to ACP.
+	CLIPassthrough bool `json:"cli_passthrough" db:"cli_passthrough"`
+
+	// CursorMCPAuthEnabled shares local Cursor MCP auth files for Cursor launches.
+	CursorMCPAuthEnabled bool `json:"cursor_mcp_auth_enabled" db:"cursor_mcp_auth_enabled"`
+
+	// CursorPluginsMCPEnabled imports local Cursor plugin MCP servers for Cursor launches.
+	CursorPluginsMCPEnabled bool `json:"cursor_plugins_mcp_enabled" db:"cursor_plugins_mcp_enabled"`
+
+	// MCPSelectionMode controls automatic preparation of discovered native MCP
+	// servers. Empty is treated as inherit for legacy in-memory profile values.
+	MCPSelectionMode string `json:"mcp_selection_mode" db:"mcp_selection_mode"`
+
+	// MCPSelectedServers contains exact native server identities selected by the
+	// user. The store persists this slice as JSON in mcp_selected_servers.
+	MCPSelectedServers []string `json:"mcp_selected_servers" db:"-"`
+
+	// Enabled gates the profile from new-work selection: when false, the
+	// profile is hidden from task/session creation pickers but keeps serving
+	// existing sessions and remains editable in settings. Independent of
+	// DeletedAt (soft delete) and the office Status column.
+	Enabled bool `json:"enabled" db:"enabled"`
+
+	// CommandPrefix is an optional launcher prefix prepended to the agent
+	// subprocess command. It lets a user wrap the ACP agent in a sandbox
+	// launcher (e.g. "greywall --" produces "greywall -- npx -y <pkg> …").
+	// The raw string is shell-tokenised at launch time, mirroring CLIFlags.
+	// Empty means the agent command runs unwrapped.
+	CommandPrefix string `json:"command_prefix" db:"command_prefix"`
+
+	// ProviderKind selects how the profile routes model inference.
+	// "" / ProviderKindNative (default) keeps the agent CLI's own provider
+	// configuration untouched. ProviderKindOpenAICompatible makes Kandev
+	// inject an OpenAI-compatible provider (base URL + bearer key) into the
+	// agent it runs, for agents that advertise support. See
+	// docs/specs/agents/system-design/openai-compatible-providers.md.
+	ProviderKind string `json:"provider_kind,omitempty" db:"provider_kind"`
+	// ProviderBaseURL is the absolute http(s) endpoint root of the
+	// OpenAI-compatible provider, e.g. "http://localhost:20128/v1". Required
+	// when ProviderKind == ProviderKindOpenAICompatible; inert otherwise. When
+	// ProviderAPIKeySecretID is set the URL must be https or a loopback host so
+	// the bearer key is never sent in cleartext.
+	ProviderBaseURL string `json:"provider_base_url,omitempty" db:"provider_base_url"`
+	// ProviderAPIKeySecretID references a Kandev global secret holding the
+	// bearer key for the provider. The value itself is never stored on the
+	// profile or returned by any API.
+	ProviderAPIKeySecretID string `json:"provider_api_key_secret_id,omitempty" db:"provider_api_key_secret_id"`
+
+	// AllowIndexing is retained for backward compatibility with existing
+	// auggie profiles. The launch path no longer consults it — it is read
+	// only by the legacy migration shim that seeds CLIFlags on the first
+	// post-migration read. New code should use CLIFlags instead.
+	AllowIndexing bool `json:"allow_indexing" db:"allow_indexing"`
+
+	// CLIFlags is the user-configurable list of CLI flags passed to the agent
+	// subprocess. At profile creation the list is seeded from the agent's
+	// PermissionSettings(); users can toggle entries on/off, remove them, or
+	// add custom entries via the settings UI. Only entries with Enabled=true
+	// reach the subprocess argv. Stored as a JSON-encoded TEXT column;
+	// settings repo handles the conversion via manual scan.
+	CLIFlags []CLIFlag `json:"cli_flags" db:"-"`
+
+	// EnvVars are injected into the agent subprocess when this profile runs.
+	// Stored as a JSON-encoded TEXT column; settings repo handles conversion.
+	EnvVars []ProfileEnvVar `json:"env_vars,omitempty" db:"-"`
+
+	// AutoApprove enables Kandev agentctl-side ACP permission auto-approval at
+	// launch (AGENTCTL_AUTO_APPROVE_PERMISSIONS). DangerouslySkipPermissions is
+	// a deprecated legacy column retained so existing rows load cleanly.
+	AutoApprove                bool `json:"auto_approve" db:"auto_approve"`
+	DangerouslySkipPermissions bool `json:"-" db:"dangerously_skip_permissions"`
+
+	UserModified bool       `json:"user_modified" db:"user_modified"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
+	DeletedAt    *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+
+	// Office enrichment fields (ADR 0005 Wave A; collapsed with
+	// office.AgentInstance in Wave G). Empty / zero values mean the profile
+	// is a "shallow" kanban-flavour profile; populated values mark a "rich"
+	// office-flavour profile. Both flavours live in the same agent_profiles
+	// row, and office code references this struct via the
+	// office/models.AgentInstance type alias.
+	//
+	// WorkspaceID scopes the profile to a workspace. Empty = global / kanban-legacy.
+	WorkspaceID string `json:"workspace_id,omitempty" db:"workspace_id"`
+	// Role is the organisational role of an office agent. Empty for shallow
+	// kanban profiles. The DB column is TEXT NOT NULL DEFAULT ''.
+	Role AgentRole `json:"role,omitempty" db:"role"`
+	// Icon is an emoji or short string surfaced in the office UI.
+	Icon string `json:"icon,omitempty" db:"icon"`
+	// ReportsTo references another agent_profile.id (org chart).
+	ReportsTo string `json:"reports_to,omitempty" db:"reports_to"`
+	// SkillIDs is the JSON-array string of skill IDs (office.skills) the
+	// agent owns. Stored verbatim as a TEXT column to match the office
+	// repo's existing string-based handling.
+	SkillIDs string `json:"skill_ids,omitempty" db:"skill_ids"`
+	// DesiredSkills is the legacy office field listing skill slugs the
+	// agent wants when launched. JSON-array string (kept distinct from
+	// SkillIDs per the ADR — separate columns, separate semantics).
+	DesiredSkills string `json:"desired_skills,omitempty" db:"desired_skills"`
+	// CustomPrompt is deprecated: per-agent prompt addendums were removed in
+	// favour of multi-file instructions. The DB column remains for backward
+	// compatibility with existing rows but is never read or written by the
+	// UI/runtime. Slated for removal in a follow-up migration.
+	CustomPrompt string `json:"custom_prompt,omitempty" db:"custom_prompt"`
+	// Status is the runtime status of an office agent.
+	Status AgentStatus `json:"status,omitempty" db:"status"`
+	// PauseReason is a free-text explanation when Status == paused.
+	PauseReason string `json:"pause_reason,omitempty" db:"pause_reason"`
+	// LastRunFinishedAt is the wall-clock time of the most recent finished
+	// run. Used by cooldown gating.
+	LastRunFinishedAt *time.Time `json:"last_run_finished_at,omitempty" db:"last_run_finished_at"`
+	// MaxConcurrentSessions caps the number of in-flight sessions for the agent.
+	MaxConcurrentSessions int `json:"max_concurrent_sessions,omitempty" db:"max_concurrent_sessions"`
+	// CooldownSec is the minimum gap between successive runs.
+	CooldownSec int `json:"cooldown_sec,omitempty" db:"cooldown_sec"`
+	// SkipIdleRuns short-circuits scheduler ticks when the agent has nothing
+	// queued.
+	SkipIdleRuns bool `json:"skip_idle_runs,omitempty" db:"skip_idle_runs"`
+	// ConsecutiveFailures is the running count for auto-pause gating.
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty" db:"consecutive_failures"`
+	// FailureThreshold is the per-agent override for the workspace-level
+	// auto-pause threshold. nil → use workspace default. The DB column is
+	// INTEGER NOT NULL DEFAULT 3; the office repo round-trips nil ↔ 0 via
+	// NULLIF / failureThresholdToColumn.
+	FailureThreshold *int `json:"failure_threshold,omitempty" db:"failure_threshold"`
+	// ExecutorPreference is a hint for which executor backend to prefer
+	// (free-form JSON or a simple type name).
+	ExecutorPreference string `json:"executor_preference,omitempty" db:"executor_preference"`
+	// ExecutionAgentProfileID binds an Office identifier profile to the
+	// execution profile that owns its launches. The Office ID stays the
+	// logical session identity; the bound profile supplies the concrete or
+	// dynamic candidate set (see docs/specs/agents/system-design/
+	// dynamic-agent-routing-01.md, "Use in Office"). Empty for ordinary
+	// profiles, which keep selecting themselves.
+	ExecutionAgentProfileID string `json:"execution_agent_profile_id,omitempty" db:"execution_agent_profile_id"`
+	// BudgetMonthlyCents is the per-agent monthly budget cap.
+	BudgetMonthlyCents int `json:"budget_monthly_cents,omitempty" db:"budget_monthly_cents"`
+	// Settings is a free-form JSON object holding office fields not promoted
+	// to dedicated columns.
+	Settings string `json:"settings,omitempty" db:"settings"`
+	// Permissions is a free-form JSON object holding office permission
+	// flags (e.g. spawn_subagents, hire_agents, approve_budget). Stored as
+	// the raw JSON string so callers may unmarshal into their own shape.
+	// Empty / "{}" means "no special permissions".
+	Permissions string `json:"permissions,omitempty" db:"permissions"`
+
+	// Utilization is populated for subscription-billed agents only. nil
+	// for api_key billing. Computed at read time — not stored in the DB.
+	Utilization *agentusage.ProviderUsage `json:"utilization,omitempty" db:"-"`
+}
+
+// CLIFlag is a single user-configurable CLI argument on an AgentProfile.
+// The raw Flag string is shell-tokenised at launch time: a single entry
+// like "--add-dir /shared" becomes two argv tokens.
+type CLIFlag struct {
+	Description string `json:"description"`
+	Flag        string `json:"flag"`
+	Enabled     bool   `json:"enabled"`
+}

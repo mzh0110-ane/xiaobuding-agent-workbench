@@ -1,0 +1,780 @@
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/agent/runtime/activity"
+	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+// mockAgentProfileResolver returns a profile pointing to the mock-agent.
+// When err is non-nil, ResolveProfile returns that error and a nil profile —
+// simulating transient DB hiccups, network failures, or deleted profiles.
+type mockAgentProfileResolver struct {
+	cliPassthrough bool
+	err            error
+}
+
+type blockingAgentProfileResolver struct {
+	entered chan chan struct{}
+}
+
+type cancellableAgentProfileResolver struct {
+	entered   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+}
+
+func (r *cancellableAgentProfileResolver) ResolveProfile(
+	ctx context.Context,
+	_ string,
+) (*AgentProfileInfo, error) {
+	close(r.entered)
+	select {
+	case <-ctx.Done():
+		close(r.cancelled)
+		<-r.release
+		return nil, ctx.Err()
+	case <-r.release:
+		return &AgentProfileInfo{AgentID: "mock-agent"}, nil
+	}
+}
+
+func (r *blockingAgentProfileResolver) ResolveProfile(
+	_ context.Context,
+	profileID string,
+) (*AgentProfileInfo, error) {
+	release := make(chan struct{})
+	r.entered <- release
+	<-release
+	return &AgentProfileInfo{
+		ProfileID: profileID,
+		AgentID:   "mock-agent",
+	}, nil
+}
+
+func (m *mockAgentProfileResolver) ResolveProfile(_ context.Context, profileID string) (*AgentProfileInfo, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &AgentProfileInfo{
+		ProfileID:      profileID,
+		ProfileName:    "Test Profile",
+		AgentID:        "mock-agent",
+		AgentName:      "mock-agent",
+		Model:          "mock-fast",
+		CLIPassthrough: m.cliPassthrough,
+	}, nil
+}
+
+func TestStartAgentProcess_NotFound(t *testing.T) {
+	mgr := newTestManager(t)
+	err := mgr.StartAgentProcess(context.Background(), "non-existent")
+	if err == nil {
+		t.Fatal("expected error for non-existent execution")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestStartAgentProcess_NonPassthrough_NoAgentctl(t *testing.T) {
+	mgr := newTestManager(t)
+	// Use a resolver that returns CLIPassthrough=false
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: false}
+
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		SessionID:      "sess-1",
+		AgentProfileID: "profile-1",
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error for missing agentctl")
+	}
+	if !strings.Contains(err.Error(), "no agentctl client") {
+		t.Errorf("expected 'no agentctl client' error, got: %v", err)
+	}
+}
+
+func TestStartAgentProcessFailureAbortsInitialPromptDispatchHold(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: false}
+	execution := &AgentExecution{
+		ID:             "exec-initial-prompt-start-failure",
+		SessionID:      "session-initial-prompt-start-failure",
+		AgentProfileID: "profile-initial-prompt-start-failure",
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+	failureCalled := false
+	if err := mgr.RegisterInitialPromptDispatchCallbacks(execution.ID, nil, func() {
+		failureCalled = true
+	}); err != nil {
+		t.Fatalf("register initial prompt callbacks: %v", err)
+	}
+	if err := mgr.StartAgentProcess(context.Background(), execution.ID); err == nil {
+		t.Fatal("StartAgentProcess() succeeded without an agentctl client")
+	}
+	if !failureCalled {
+		t.Fatal("initial prompt failure callback was not called when agent startup failed")
+	}
+}
+
+func TestStartAgentProcess_RunsContributionPreflightBeforeAgentStart(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/git/push-preflight":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"error":   "source branch is read-only",
+			})
+		default:
+			t.Errorf("unexpected agentctl request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("parse agentctl test URL: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse agentctl test port: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	binding := models.RemoteContribution{
+		Version:      models.RemoteContributionVersion,
+		Provider:     models.RemoteContributionProviderGitHub,
+		Kind:         models.RemoteContributionKindPullRequest,
+		CanonicalURL: "https://github.com/acme/widget/pull/7",
+		Number:       7,
+		State:        models.RemoteContributionStateOpen,
+		BaseBranch:   "main",
+		HeadBranch:   "feature/remote",
+		HeadSHA:      strings.Repeat("a", 40),
+		SourceRepository: models.RemoteContributionRepository{
+			Host: "github.com", Path: "contributor/widget", RemoteURL: "https://github.com/contributor/widget.git",
+		},
+		CollaborationAllowed: true,
+	}
+	execution := &AgentExecution{
+		ID:             "exec-preflight",
+		SessionID:      "session-preflight",
+		AgentCommand:   "agent",
+		AgentProfileID: "profile-preflight",
+		metadata: map[string]interface{}{
+			MetadataKeyRemoteContributions: map[string]models.RemoteContribution{"": binding},
+		},
+		agentctl: agentctl.NewClient(host, port, newTestLogger()),
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err = mgr.StartAgentProcess(context.Background(), execution.ID)
+	if err == nil || !strings.Contains(err.Error(), "source branch is read-only") {
+		t.Fatalf("StartAgentProcess() error = %v, want preflight failure", err)
+	}
+	if len(paths) != 2 || paths[0] != "/health" || paths[1] != "/api/v1/git/push-preflight" {
+		t.Fatalf("agentctl request order = %v, want health then push-preflight only", paths)
+	}
+}
+
+func TestStartAgentProcessBoundsContributionPreflight(t *testing.T) {
+	if got := (&Manager{}).contributionPreflightTimeout(); got != 2*time.Minute {
+		t.Fatalf("default contribution preflight timeout = %s, want 2m", got)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/git/push-preflight":
+			close(started)
+			<-release
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("parse agentctl test URL: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse agentctl test port: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	mgr.remoteContributionPreflightTimeout = 10 * time.Millisecond
+	binding := models.RemoteContribution{
+		Version:      models.RemoteContributionVersion,
+		Provider:     models.RemoteContributionProviderGitHub,
+		Kind:         models.RemoteContributionKindPullRequest,
+		CanonicalURL: "https://github.com/acme/widget/pull/7",
+		Number:       7,
+		State:        models.RemoteContributionStateOpen,
+		BaseBranch:   "main",
+		HeadBranch:   "feature/remote",
+		HeadSHA:      strings.Repeat("a", 40),
+		SourceRepository: models.RemoteContributionRepository{
+			Host: "github.com", Path: "contributor/widget", RemoteURL: "https://github.com/contributor/widget.git",
+		},
+		CollaborationAllowed: true,
+	}
+	execution := &AgentExecution{
+		ID: "exec-preflight-timeout", SessionID: "session-preflight-timeout",
+		AgentCommand: "agent", AgentProfileID: "profile-preflight-timeout",
+		metadata: map[string]interface{}{
+			MetadataKeyRemoteContributions: map[string]models.RemoteContribution{"": binding},
+		},
+		agentctl: agentctl.NewClient(host, port, newTestLogger()),
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.StartAgentProcess(context.Background(), execution.ID) }()
+	<-started
+	startedAt := time.Now()
+	select {
+	case err := <-errCh:
+		close(release)
+		if err == nil {
+			t.Fatal("StartAgentProcess() succeeded after preflight timeout")
+		}
+		if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+			t.Fatalf("StartAgentProcess() returned after %s; want bounded preflight", elapsed)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("StartAgentProcess() did not return after preflight timeout")
+	}
+}
+
+func newContributionPreflightExecution(
+	t *testing.T,
+	serverURL, id, sessionID, agentCommand string,
+	contributions map[string]models.RemoteContribution,
+) *AgentExecution {
+	t.Helper()
+	host, portText, err := net.SplitHostPort(strings.TrimPrefix(serverURL, "http://"))
+	if err != nil {
+		t.Fatalf("parse agentctl test URL: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse agentctl test port: %v", err)
+	}
+	return &AgentExecution{
+		ID: id, SessionID: sessionID, AgentCommand: agentCommand,
+		metadata: map[string]interface{}{MetadataKeyRemoteContributions: contributions},
+		agentctl: agentctl.NewClient(host, port, newTestLogger()),
+	}
+}
+
+func TestPreflightRemoteContributionPushesBoundsDirectCaller(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/git/push-preflight":
+			close(started)
+			<-release
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	mgr := newTestManager(t)
+	mgr.remoteContributionPreflightTimeout = 10 * time.Millisecond
+	execution := newContributionPreflightExecution(t, server.URL, "exec-direct-preflight-timeout", "", "",
+		map[string]models.RemoteContribution{"": contributionPreflightTestBinding()})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.preflightRemoteContributionPushes(context.Background(), execution) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("direct contribution preflight did not start")
+	}
+	select {
+	case err := <-errCh:
+		close(release)
+		if err == nil {
+			t.Fatal("preflight unexpectedly succeeded after its direct budget expired")
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("direct preflight caller was not bounded")
+	}
+}
+
+func TestPreflightRemoteContributionPushesUsesOneBudgetForAllRepositories(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	firstReleased := false
+	releaseFirst := func() {
+		if !firstReleased {
+			firstReleased = true
+			close(firstRelease)
+		}
+	}
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/git/push-preflight" {
+			http.NotFound(w, r)
+			return
+		}
+		requestCount++
+		switch requestCount {
+		case 1:
+			close(firstStarted)
+			<-firstRelease
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		case 2:
+			close(secondStarted)
+			timer := time.NewTimer(650 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			case <-r.Context().Done():
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		releaseFirst()
+		server.Close()
+	})
+
+	mgr := newTestManager(t)
+	mgr.remoteContributionPreflightTimeout = time.Second
+	execution := newContributionPreflightExecution(t, server.URL, "exec-multi-preflight-timeout", "", "",
+		map[string]models.RemoteContribution{
+			"a": contributionPreflightTestBinding(),
+			"b": contributionPreflightTestBinding(),
+		})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.preflightRemoteContributionPushes(context.Background(), execution) }()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first contribution preflight did not start")
+	}
+	timer := time.NewTimer(650 * time.Millisecond)
+	<-timer.C
+	timer.Stop()
+	releaseFirst()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second contribution preflight did not start")
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("preflight succeeded after the shared budget expired")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("preflight did not finish at the shared budget")
+	}
+	if requestCount != 2 {
+		t.Fatalf("preflight request count = %d, want both repositories checked", requestCount)
+	}
+}
+
+func TestPreflightRemoteContributionPushesRejectsWhenAnyRepositoryFails(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/git/push-preflight" {
+			http.NotFound(w, r)
+			return
+		}
+		requestCount++
+		if requestCount == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "source branch is read-only"})
+	}))
+	t.Cleanup(server.Close)
+
+	mgr := newTestManager(t)
+	execution := newContributionPreflightExecution(t, server.URL, "exec-multi-preflight-rejected", "", "",
+		map[string]models.RemoteContribution{
+			"a": contributionPreflightTestBinding(),
+			"b": contributionPreflightTestBinding(),
+		})
+
+	err := mgr.preflightRemoteContributionPushes(context.Background(), execution)
+	if err == nil || !strings.Contains(err.Error(), "source branch is read-only") {
+		t.Fatalf("preflight error = %v, want the failing repository rejection", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("preflight request count = %d, want both repositories checked", requestCount)
+	}
+}
+
+func TestStartAgentProcessPreservesCallerCancellationDuringContributionPreflight(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	requests := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Path
+		switch r.URL.Path {
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/git/push-preflight":
+			close(started)
+			<-release
+		default:
+			t.Errorf("unexpected agentctl request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	mgr := newTestManager(t)
+	execution := newContributionPreflightExecution(t, server.URL, "exec-preflight-cancelled", "session-preflight-cancelled", "agent",
+		map[string]models.RemoteContribution{
+			"": contributionPreflightTestBinding(),
+		})
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- mgr.StartAgentProcess(ctx, execution.ID) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("contribution preflight did not start")
+	}
+	cancel()
+
+	var startErr error
+	select {
+	case startErr = <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("StartAgentProcess did not return after caller cancellation")
+	}
+	if !errors.Is(startErr, context.Canceled) {
+		t.Fatalf("StartAgentProcess() error = %v, want context cancellation", startErr)
+	}
+
+	gotRequests := []string{<-requests, <-requests}
+	if gotRequests[0] != "/health" || gotRequests[1] != "/api/v1/git/push-preflight" {
+		t.Fatalf("agentctl requests = %v, want readiness and preflight only", gotRequests)
+	}
+}
+
+func TestFailedConcurrentStartDoesNotReleaseLiveStartActivity(t *testing.T) {
+	mgr := newTestManager(t)
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+	resolver := &blockingAgentProfileResolver{entered: make(chan chan struct{}, 2)}
+	mgr.profileResolver = resolver
+	if err := mgr.executionStore.Add(&AgentExecution{
+		ID: "exec-shared", AgentProfileID: "profile-1",
+	}); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	results := make(chan error, 2)
+	go func() { results <- mgr.StartAgentProcess(context.Background(), "exec-shared") }()
+	releaseFirst := <-resolver.entered
+	go func() { results <- mgr.StartAgentProcess(context.Background(), "exec-shared") }()
+	releaseSecond := <-resolver.entered
+
+	close(releaseFirst)
+	if err := <-results; err == nil {
+		t.Fatal("first start returned nil, want missing agentctl error")
+	}
+	maintenance, _, maintenanceErr := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if maintenance != nil {
+		maintenance.Release()
+	}
+	close(releaseSecond)
+	if err := <-results; err == nil {
+		t.Fatal("second start returned nil, want missing agentctl error")
+	}
+	if !errors.Is(maintenanceErr, activity.ErrBusy) {
+		t.Fatalf("maintenance error = %v, want ErrBusy while second start is live", maintenanceErr)
+	}
+}
+
+func TestTerminalInvalidationCancelsAndDrainsAdmittedStart(t *testing.T) {
+	mgr := newTestManager(t)
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+	resolver := &cancellableAgentProfileResolver{
+		entered: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{}),
+	}
+	mgr.profileResolver = resolver
+	if err := mgr.executionStore.Add(&AgentExecution{
+		ID: "exec-invalidated", AgentProfileID: "profile-1",
+	}); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- mgr.StartAgentProcess(context.Background(), "exec-invalidated") }()
+	<-resolver.entered
+	mgr.releaseActivity(executionActivityKey("exec-invalidated"))
+	<-resolver.cancelled
+	maintenance, _, maintenanceErr := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if maintenance != nil {
+		maintenance.Release()
+	}
+	if !errors.Is(maintenanceErr, activity.ErrBusy) {
+		close(resolver.release)
+		<-result
+		t.Fatalf("maintenance error = %v, want ErrBusy until invalidated start drains", maintenanceErr)
+	}
+	close(resolver.release)
+	if err := <-result; !errors.Is(err, errExecutionActivityInvalidated) {
+		t.Fatalf("StartAgentProcess error = %v, want claim invalidation", err)
+	}
+	maintenance, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("maintenance after start drained: %v", err)
+	}
+	maintenance.Release()
+}
+
+func TestStartAgentProcess_Passthrough_NotResumed(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: true}
+
+	execution := &AgentExecution{
+		ID:               "exec-1",
+		SessionID:        "sess-1",
+		AgentProfileID:   "profile-1",
+		IsPassthrough:    true,
+		isResumedSession: false,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error (no interactive runner)")
+	}
+	// startPassthroughSession path errors with "interactive runner not available for passthrough mode"
+	if !strings.Contains(err.Error(), "interactive runner not available") {
+		t.Errorf("expected 'interactive runner not available' error from startPassthroughSession, got: %v", err)
+	}
+}
+
+func TestStartAgentProcess_Passthrough_Resumed(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: true}
+
+	execution := &AgentExecution{
+		ID:               "exec-1",
+		SessionID:        "sess-1",
+		AgentProfileID:   "profile-1",
+		IsPassthrough:    true,
+		isResumedSession: true,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error (no interactive runner)")
+	}
+	// ResumePassthroughSession returns "interactive runner not available" (without
+	// "for passthrough mode"), while startPassthroughSession includes the suffix.
+	// Assert we hit the resume path specifically.
+	if !strings.Contains(err.Error(), "interactive runner not available") {
+		t.Errorf("expected 'interactive runner not available' error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "for passthrough mode") {
+		t.Errorf("expected ResumePassthroughSession path (no 'for passthrough mode' suffix), got: %v", err)
+	}
+}
+
+// A session created in agent (ACP) mode must keep using the ACP launch path
+// even after its profile has been toggled to CLIPassthrough — the
+// session-snapshot wins so existing sessions don't get stranded.
+func TestStartAgentProcess_AgentSession_IgnoresProfileToggleToPassthrough(t *testing.T) {
+	mgr := newTestManager(t)
+	// Profile currently advertises passthrough — simulates the post-toggle state.
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: true}
+
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		SessionID:      "sess-1",
+		AgentProfileID: "profile-1",
+		// Session snapshot: false (session was created when profile was ACP).
+		IsPassthrough: false,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error (no agentctl client)")
+	}
+	// We must hit the ACP path, which errors on the missing agentctl client.
+	// Passthrough errors look like "interactive runner not available [...]"
+	// — seeing that here would mean the snapshot was ignored.
+	if !strings.Contains(err.Error(), "no agentctl client") {
+		t.Errorf("expected ACP path to fail on missing agentctl client, got: %v", err)
+	}
+}
+
+// Mirror of the bug fix in the opposite direction: a session created in
+// passthrough mode must keep using the passthrough path even if the profile
+// is later toggled back to ACP.
+func TestStartAgentProcess_PassthroughSession_IgnoresProfileToggleToAgent(t *testing.T) {
+	mgr := newTestManager(t)
+	// Profile currently advertises ACP — simulates a toggle away from passthrough.
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: false}
+
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		SessionID:      "sess-1",
+		AgentProfileID: "profile-1",
+		// Session snapshot: true (session was created when profile was passthrough).
+		IsPassthrough: true,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error (no interactive runner)")
+	}
+	if !strings.Contains(err.Error(), "interactive runner not available") {
+		t.Errorf("expected passthrough path to fail on missing interactive runner, got: %v", err)
+	}
+}
+
+// When ResolveProfile errors on a passthrough resume, the routing decision
+// must still honor the snapshot and stay on the passthrough branch. The
+// downstream command builder may then surface the resolve error explicitly —
+// what matters is that we do NOT silently fall through to the ACP path (the
+// bug that would otherwise strand the session in the wrong launch mode).
+func TestStartAgentProcess_PassthroughResume_SurvivesProfileResolveError(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{err: errors.New("transient DB error")}
+
+	execution := &AgentExecution{
+		ID:               "exec-1",
+		SessionID:        "sess-1",
+		AgentProfileID:   "profile-1",
+		IsPassthrough:    true,
+		isResumedSession: true,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error from the passthrough branch")
+	}
+	// ACP-path "no agentctl client" error would mean the snapshot was
+	// ignored and routing silently picked the wrong branch.
+	if strings.Contains(err.Error(), "no agentctl client") {
+		t.Errorf("snapshot must keep us on the passthrough branch, got ACP error: %v", err)
+	}
+}
+
+// A fresh passthrough launch (not a resume) needs the profile for command
+// building, so a profile-resolve error must surface as an explicit error
+// rather than silently falling through to ACP.
+func TestStartAgentProcess_FreshPassthrough_SurfacesProfileResolveError(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{err: errors.New("transient DB error")}
+
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		SessionID:      "sess-1",
+		AgentProfileID: "profile-1",
+		IsPassthrough:  true,
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected profile-resolve error to surface")
+	}
+	if !strings.Contains(err.Error(), "resolve profile") {
+		t.Errorf("expected resolve-profile error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "agentctl client") {
+		t.Errorf("snapshot must keep us on the passthrough branch, got ACP error: %v", err)
+	}
+}
+
+// Sessionless launches (e.g. the legacy controller.LaunchAgent path that
+// doesn't carry a SessionID) still fall back to live profile resolution so
+// first-time launches reflect the current mode.
+func TestStartAgentProcess_NoSession_FallsBackToLiveProfile(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &mockAgentProfileResolver{cliPassthrough: true}
+
+	execution := &AgentExecution{
+		ID:             "exec-1",
+		AgentProfileID: "profile-1",
+		// No SessionID, no snapshot → use live profile state.
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("seed execution: %v", err)
+	}
+
+	err := mgr.StartAgentProcess(context.Background(), "exec-1")
+	if err == nil {
+		t.Fatal("expected error (no interactive runner)")
+	}
+	if !strings.Contains(err.Error(), "interactive runner not available") {
+		t.Errorf("expected passthrough path via live fallback, got: %v", err)
+	}
+}

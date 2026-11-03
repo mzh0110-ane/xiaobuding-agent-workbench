@@ -1,0 +1,647 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+
+	"github.com/kandev/kandev/internal/orchestrator/executor"
+	"github.com/kandev/kandev/internal/task/models"
+	sqliterepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/workflow/engine"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	"github.com/stretchr/testify/require"
+)
+
+// --- Test table types ---
+
+// testEvent describes one trigger to fire and what to expect afterward.
+type testEvent struct {
+	Trigger            engine.Trigger
+	SetRunning         bool                    // set session to RUNNING before firing
+	ExpectStep         string                  // expected step name after event
+	ExpectTransitioned bool                    // whether a transition should occur
+	ExpectQueued       bool                    // auto-start message queued
+	ExpectResets       int                     // cumulative RestartAgentProcess calls
+	ExpectState        models.TaskSessionState // expected session state (zero value = skip check)
+}
+
+// workflowTestCase is one test table entry.
+type workflowTestCase struct {
+	Name          string
+	WorkflowJSON  string // raw JSON in WorkflowExport format
+	StartStep     string // step name to start at
+	IsPassthrough bool
+	ResetErr      error
+	Events        []testEvent
+}
+
+// --- Workflow JSON ---
+
+const developmentWorkflowJSON = `{
+  "version": 1,
+  "type": "kandev_workflow",
+  "workflows": [
+    {
+      "name": "Development",
+      "steps": [
+        {
+          "name": "Backlog",
+          "position": 0,
+          "color": "bg-neutral-400",
+          "events": {
+            "on_turn_start": [{"type": "move_to_next"}],
+            "on_turn_complete": [{"type": "move_to_step", "config": {"step_position": 1}}]
+          },
+          "is_start_step": true,
+          "allow_manual_move": true
+        },
+        {
+          "name": "In Progress",
+          "position": 1,
+          "color": "bg-blue-500",
+          "events": {
+            "on_enter": [{"type": "auto_start_agent"}],
+            "on_turn_complete": [{"type": "move_to_step", "config": {"step_position": 2}}]
+          },
+          "allow_manual_move": true
+        },
+        {
+          "name": "New Context",
+          "position": 2,
+          "color": "bg-yellow-500",
+          "events": {
+            "on_enter": [{"type": "auto_start_agent"}, {"type": "reset_agent_context"}],
+            "on_turn_start": [{"type": "move_to_previous"}],
+            "on_turn_complete": [{"type": "move_to_next"}]
+          },
+          "allow_manual_move": true
+        },
+        {
+          "name": "New Step",
+          "position": 3,
+          "color": "bg-slate-500",
+          "events": {
+            "on_enter": [{"type": "reset_agent_context"}],
+            "on_turn_complete": [{"type": "move_to_next"}]
+          },
+          "allow_manual_move": true
+        },
+        {
+          "name": "Done",
+          "position": 4,
+          "color": "bg-green-500",
+          "events": {
+            "on_turn_start": [{"type": "move_to_step", "config": {"step_position": 1}}]
+          },
+          "allow_manual_move": true
+        }
+      ]
+    }
+  ]
+}`
+
+// --- Test cases ---
+
+var workflowTestCases = []workflowTestCase{
+	{
+		Name:         "five_step_full_lifecycle",
+		WorkflowJSON: developmentWorkflowJSON,
+		StartStep:    "Backlog",
+		Events: []testEvent{
+			// Agent finishes at Backlog → In Progress (auto_start_agent on_enter).
+			// applyEngineTransition flips RUNNING → WAITING_FOR_INPUT before the
+			// async processOnEnter goroutine, so autoStartStepPrompt attempts a
+			// direct send instead of queueing. In this mock environment the send
+			// fails (no executor), so the message is NOT queued.
+			{Trigger: engine.TriggerOnTurnComplete, ExpectStep: "In Progress",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 0},
+			// Agent finishes at In Progress → New Context (reset + auto_start).
+			// After reset_agent_context, processOnEnter flips session state to
+			// WAITING_FOR_INPUT so auto_start sends directly instead of queueing
+			// against a stale RUNNING state. PromptTask then attempts the send —
+			// in this mock environment the executor has no running record for
+			// the session, so the send fails and autoStartStepPrompt's error
+			// path leaves the session at WAITING_FOR_INPUT. Crucially, the
+			// message is NOT sitting in the queue.
+			{Trigger: engine.TriggerOnTurnComplete, SetRunning: true, ExpectStep: "New Context",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 1},
+			// Agent starts at New Context → on_turn_start → back to In Progress
+			{Trigger: engine.TriggerOnTurnStart, SetRunning: true, ExpectStep: "In Progress",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 1, ExpectState: models.TaskSessionStateRunning},
+			// Agent finishes at In Progress → New Context again (same reset + auto_start path)
+			{Trigger: engine.TriggerOnTurnComplete, SetRunning: true, ExpectStep: "New Context",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 2},
+			// Agent finishes at New Context → New Step (reset, no auto_start)
+			{Trigger: engine.TriggerOnTurnComplete, SetRunning: true, ExpectStep: "New Step",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 3},
+			// Agent finishes at New Step → Done
+			{Trigger: engine.TriggerOnTurnComplete, SetRunning: true, ExpectStep: "Done",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 3},
+			// User sends message at Done → on_turn_start → In Progress
+			{Trigger: engine.TriggerOnTurnStart, SetRunning: true, ExpectStep: "In Progress",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 3, ExpectState: models.TaskSessionStateRunning},
+		},
+	},
+	{
+		Name:         "no_transition_at_terminal_step",
+		WorkflowJSON: developmentWorkflowJSON,
+		StartStep:    "Done",
+		Events: []testEvent{
+			{Trigger: engine.TriggerOnTurnComplete, ExpectStep: "Done",
+				ExpectTransitioned: false, ExpectQueued: false, ExpectResets: 0,
+				ExpectState: models.TaskSessionStateWaitingForInput},
+		},
+	},
+	{
+		Name:         "reset_failure_blocks_auto_start",
+		WorkflowJSON: developmentWorkflowJSON,
+		StartStep:    "In Progress",
+		ResetErr:     errors.New("restart failed"),
+		Events: []testEvent{
+			// Transition happens, reset is attempted (call count=1) but fails → auto_start not reached
+			{Trigger: engine.TriggerOnTurnComplete, ExpectStep: "New Context",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 1,
+				ExpectState: models.TaskSessionStateWaitingForInput},
+		},
+	},
+	{
+		Name:          "passthrough_auto_start_via_stdin",
+		WorkflowJSON:  developmentWorkflowJSON,
+		StartStep:     "In Progress",
+		IsPassthrough: true,
+		Events: []testEvent{
+			// Passthrough: reset fires, auto_start writes prompt to PTY stdin
+			// (not queued via message queue). Session is not set to WaitingForInput
+			// because the agent is processing the stdin prompt.
+			{Trigger: engine.TriggerOnTurnComplete, ExpectStep: "New Context",
+				ExpectTransitioned: true, ExpectQueued: false, ExpectResets: 1},
+		},
+	},
+}
+
+// --- Test runner ---
+
+func TestWorkflowE2E(t *testing.T) {
+	for _, tc := range workflowTestCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			runWorkflowTestCase(t, tc)
+		})
+	}
+}
+
+func TestWorkflowE2E_InitialCreatePrompt(t *testing.T) {
+	ctx := context.Background()
+	workflowJSON := `{
+  "version": 1,
+  "type": "kandev_workflow",
+  "workflows": [{
+    "name": "Initial create prompt",
+    "steps": [
+      {"name": "Backlog", "position": 0, "is_start_step": true,
+       "events": {"on_turn_start": [{"type": "move_to_next"}]}},
+      {"name": "Spec", "position": 1, "agent_profile": {"agent_name": "profile-destination"},
+       "events": {"on_enter": [{"type": "auto_start_agent"}],
+                  "on_turn_complete": [{"type": "move_to_next"}]}},
+      {"name": "Spec Review", "position": 2}
+    ]
+  }]
+}`
+
+	stepGetter, nameToID := buildWorkflowFromJSON(t, workflowJSON)
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "task-initial-create-e2e", "session-initial-create-e2e", nameToID["Backlog"])
+	require.NoError(t, repo.UpdateTaskSessionState(ctx, "session-initial-create-e2e", models.TaskSessionStateCreated, ""))
+	initialSession, err := repo.GetTaskSession(ctx, "session-initial-create-e2e")
+	require.NoError(t, err)
+	initialSession.AgentProfileID = "profile-source"
+	initialSession.ExecutorID = models.ExecutorIDLocal
+	initialSession.TaskEnvironmentID = "environment-initial-create-e2e"
+	require.NoError(t, repo.UpdateTaskSession(ctx, initialSession))
+	require.NoError(t, repo.CreateTaskEnvironment(ctx, &models.TaskEnvironment{
+		ID:           initialSession.TaskEnvironmentID,
+		TaskID:       initialSession.TaskID,
+		ExecutorType: string(models.ExecutorTypeLocal),
+		Status:       models.TaskEnvironmentStatusReady,
+	}))
+	seedExecutorRunning(t, repo, initialSession.ID, initialSession.TaskID, "execution-initial-create-source")
+
+	taskRepo := newMockTaskRepo()
+	taskRepo.tasks["task-initial-create-e2e"] = &v1.Task{
+		ID: "task-initial-create-e2e", Title: "Initial create", Description: "write the specification",
+		State: v1.TaskStateInProgress,
+	}
+	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: repo}
+	svc := createEngineServiceWithScheduler(t, repo, stepGetter, taskRepo, agentMgr)
+	messages := &mockMessageCreator{}
+	svc.messageCreator = messages
+	var launches []executor.LaunchAgentRequest
+	dispatchStarted := make(chan string, 1)
+	agentMgr.launchAgentFunc = func(_ context.Context, req *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+		launches = append(launches, *req)
+		observedTask, loadErr := repo.GetTask(ctx, req.TaskID)
+		require.NoError(t, loadErr)
+		require.Equal(t, nameToID["Spec"], observedTask.WorkflowStepID,
+			"the provider must see the destination workflow step")
+		observedSession, loadErr := repo.GetTaskSession(ctx, req.SessionID)
+		require.NoError(t, loadErr)
+		require.Equal(t, "profile-destination", req.AgentProfileID)
+		require.Equal(t, "profile-destination", observedSession.AgentProfileID,
+			"the session settings must be updated before provider launch")
+		require.Equal(t, string(models.ExecutorTypeLocal), req.ExecutorType,
+			"the prepared executor setting must reach provider launch")
+		return &executor.LaunchAgentResponse{AgentExecutionID: "execution-initial-create-dispatch"}, nil
+	}
+	agentMgr.startAgentProcessFunc = func(_ context.Context, executionID string) error {
+		dispatchStarted <- executionID
+		return nil
+	}
+
+	_, err = svc.LaunchSession(ctx, &LaunchSessionRequest{
+		TaskID:              "task-initial-create-e2e",
+		SessionID:           "session-initial-create-e2e",
+		Intent:              IntentStartCreated,
+		AgentProfileID:      "profile-initial-create-e2e",
+		Prompt:              "write the specification",
+		InitialCreatePrompt: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, launches, 2, "profile switching prepares the destination workspace once before the prompt launch")
+	var promptLaunches []executor.LaunchAgentRequest
+	for _, launch := range launches {
+		if launch.StartAgent {
+			promptLaunches = append(promptLaunches, launch)
+		}
+	}
+	require.Len(t, promptLaunches, 1, "the destination session must have one prompt-bearing provider launch")
+	require.Contains(t, promptLaunches[0].TaskDescription, "write the specification")
+	select {
+	case executionID := <-dispatchStarted:
+		require.Equal(t, "execution-initial-create-dispatch", executionID)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the initial process dispatch")
+	}
+	activeSession, err := repo.GetActiveTaskSessionByTaskID(ctx, "task-initial-create-e2e")
+	require.NoError(t, err)
+	require.NotNil(t, activeSession)
+	require.Equal(t, "profile-destination", activeSession.AgentProfileID,
+		"the destination step profile must own the first process dispatch")
+	require.Equal(t, models.ExecutorIDLocal, activeSession.ExecutorID,
+		"the active session must retain the prepared executor setting")
+
+	task, err := repo.GetTask(ctx, "task-initial-create-e2e")
+	require.NoError(t, err)
+	require.Equal(t, nameToID["Spec"], task.WorkflowStepID)
+	require.Len(t, messages.userMessages, 1)
+
+	require.NoError(t, repo.UpdateTaskSessionState(ctx, activeSession.ID, models.TaskSessionStateRunning, ""))
+	require.True(t, svc.processOnTurnCompleteViaEngine(ctx, "task-initial-create-e2e", activeSession))
+
+	task, err = repo.GetTask(ctx, "task-initial-create-e2e")
+	require.NoError(t, err)
+	require.Equal(t, nameToID["Spec Review"], task.WorkflowStepID)
+}
+
+func runWorkflowTestCase(t *testing.T, tc workflowTestCase) {
+	t.Helper()
+	ctx := context.Background()
+
+	sg, nameToID := buildWorkflowFromJSON(t, tc.WorkflowJSON)
+	repo := setupTestRepo(t)
+	startStepID := nameToID[tc.StartStep]
+	seedSession(t, repo, "t1", "s1", startStepID)
+	setSessionExecID(t, repo, "s1", "exec-1")
+
+	agentMgr := &mockAgentManager{
+		isPassthrough:          tc.IsPassthrough,
+		restartProcessErr:      tc.ResetErr,
+		repoForExecutionLookup: repo,
+	}
+	svc := createEngineService(t, repo, sg, agentMgr)
+
+	for i, ev := range tc.Events {
+		label := fmt.Sprintf("event[%d]_%s", i, ev.Trigger)
+		t.Run(label, func(t *testing.T) {
+			runSingleEvent(t, ctx, repo, svc, agentMgr, ev, nameToID)
+		})
+	}
+}
+
+func runSingleEvent(
+	t *testing.T,
+	ctx context.Context,
+	repo sessionExecutorStore,
+	svc *Service,
+	agentMgr *mockAgentManager,
+	ev testEvent,
+	nameToID map[string]string,
+) {
+	t.Helper()
+
+	if ev.SetRunning {
+		setSessionState(t, ctx, repo, "s1", models.TaskSessionStateRunning)
+	}
+	// Drain queue from previous event if needed
+	svc.messageQueue.TakeQueued(ctx, "s1")
+
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to load session: %v", err)
+	}
+
+	var transitioned bool
+	switch ev.Trigger {
+	case engine.TriggerOnTurnComplete:
+		transitioned = svc.processOnTurnCompleteViaEngine(ctx, "t1", session)
+	case engine.TriggerOnTurnStart:
+		transitioned = svc.processOnTurnStartViaEngine(ctx, "t1", session)
+	default:
+		t.Fatalf("unsupported trigger: %s", ev.Trigger)
+	}
+
+	// processOnEnter runs asynchronously (goroutine) after engine transitions.
+	// Give it time to complete before checking side effects.
+	if transitioned {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if transitioned != ev.ExpectTransitioned {
+		t.Errorf("transitioned = %v, want %v", transitioned, ev.ExpectTransitioned)
+	}
+
+	assertStepByName(t, ctx, repo, "s1", ev.ExpectStep, nameToID)
+	assertResetCalls(t, agentMgr, ev.ExpectResets)
+	assertQueueState(t, ctx, svc, "s1", ev.ExpectQueued)
+
+	if ev.ExpectState != "" {
+		assertSessionState(t, ctx, repo, "s1", ev.ExpectState)
+	}
+}
+
+// --- Helpers ---
+
+// buildWorkflowFromJSON parses WorkflowExport JSON and populates a mockStepGetter.
+// Returns the step getter and a name→stepID map.
+func buildWorkflowFromJSON(t *testing.T, jsonStr string) (*mockStepGetter, map[string]string) {
+	t.Helper()
+	var export wfmodels.WorkflowExport
+	if err := json.Unmarshal([]byte(jsonStr), &export); err != nil {
+		t.Fatalf("failed to unmarshal workflow JSON: %v", err)
+	}
+	if err := export.NormalizeCompletionPolicy(); err != nil {
+		t.Fatalf("failed to normalize workflow completion policy: %v", err)
+	}
+	if len(export.Workflows) == 0 {
+		t.Fatal("workflow JSON contains no workflows")
+	}
+
+	steps := export.Workflows[0].Steps
+	posToID := make(map[int]string, len(steps))
+	for _, sp := range steps {
+		posToID[sp.Position] = fmt.Sprintf("step-%d", sp.Position)
+	}
+
+	sg := newMockStepGetter()
+	nameToID := make(map[string]string, len(steps))
+	for _, sp := range steps {
+		id := posToID[sp.Position]
+		events := wfmodels.ConvertPositionToStepID(sp.Events, posToID)
+		agentProfileID := ""
+		if sp.AgentProfile != nil {
+			agentProfileID = sp.AgentProfile.AgentName
+		}
+		sg.steps[id] = &wfmodels.WorkflowStep{
+			ID: id, WorkflowID: "wf1", Name: sp.Name, Position: sp.Position,
+			AgentProfileID: agentProfileID, Prompt: sp.Prompt, Events: events,
+			CompleteTaskOnEnter: sp.CompleteTaskOnEnter,
+		}
+		nameToID[sp.Name] = id
+	}
+	return sg, nameToID
+}
+
+// createEngineService creates a Service with the workflow engine initialized.
+func createEngineService(t *testing.T, repo *sqliterepo.Repository, sg *mockStepGetter, agentMgr *mockAgentManager) *Service {
+	return createEngineServiceWithTaskRepo(t, repo, sg, newMockTaskRepo(), agentMgr)
+}
+
+// createEngineServiceWithScheduler keeps the scheduler/executor fixture used by
+// launch tests while making the production workflow engine explicit. The
+// lower-level scheduler helper assigns the getter directly for legacy tests;
+// this helper is for tests that must observe strict engine admission.
+func createEngineServiceWithScheduler(
+	t *testing.T,
+	repo *sqliterepo.Repository,
+	sg *mockStepGetter,
+	taskRepo *mockTaskRepo,
+	agentMgr *mockAgentManager,
+) *Service {
+	t.Helper()
+	svc := createTestServiceWithScheduler(repo, sg, taskRepo, agentMgr)
+	svc.SetWorkflowStepGetter(sg)
+	return svc
+}
+
+func createEngineServiceWithTaskRepo(t *testing.T, repo *sqliterepo.Repository, sg *mockStepGetter, taskRepo *mockTaskRepo, agentMgr *mockAgentManager) *Service {
+	t.Helper()
+	log := testLogger()
+	svc := &Service{
+		logger:       log,
+		repo:         repo,
+		taskRepo:     taskRepo,
+		agentManager: agentMgr,
+		messageQueue: newAuthoritativeMemoryQueue(repo, log),
+		executor:     executor.NewExecutor(agentMgr, repo, log, executor.ExecutorConfig{}),
+	}
+	svc.SetWorkflowStepGetter(sg)
+	return svc
+}
+
+// setSessionExecID seeds an executors_running row for a session with the given
+// execution ID. Pre-refactor this set session.AgentExecutionID directly on the
+// task_sessions row; that column is gone — see lifecycle/persistence.go for the
+// new ownership model.
+func setSessionExecID(t *testing.T, repo sessionExecutorStore, sessionID, execID string) {
+	t.Helper()
+	ctx := context.Background()
+	session, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("failed to get session %s: %v", sessionID, err)
+	}
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               sessionID,
+		SessionID:        sessionID,
+		TaskID:           session.TaskID,
+		AgentExecutionID: execID,
+		Status:           "ready",
+	}); err != nil {
+		t.Fatalf("failed to seed executors_running for session %s: %v", sessionID, err)
+	}
+}
+
+// setSessionState updates the session state in the database.
+func setSessionState(t *testing.T, ctx context.Context, repo sessionExecutorStore, sessionID string, state models.TaskSessionState) {
+	t.Helper()
+	if err := repo.UpdateTaskSessionState(ctx, sessionID, state, ""); err != nil {
+		t.Fatalf("failed to set session state to %s: %v", state, err)
+	}
+}
+
+// assertStepByName verifies the task's current workflow step matches the expected step name.
+func assertStepByName(t *testing.T, ctx context.Context, repo sessionExecutorStore, sessionID, expectName string, nameToID map[string]string) {
+	t.Helper()
+	session, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("failed to load session: %v", err)
+	}
+	task, err := repo.GetTask(ctx, session.TaskID)
+	if err != nil {
+		t.Fatalf("failed to load task: %v", err)
+	}
+	expectID := nameToID[expectName]
+	if task.WorkflowStepID != expectID {
+		t.Errorf("task step = %q (want %q for %q)", task.WorkflowStepID, expectID, expectName)
+	}
+}
+
+// assertResetCalls verifies the cumulative count of RestartAgentProcess calls.
+func assertResetCalls(t *testing.T, agentMgr *mockAgentManager, expectCount int) {
+	t.Helper()
+	agentMgr.mu.Lock()
+	got := len(agentMgr.restartProcessCalls)
+	agentMgr.mu.Unlock()
+	if got != expectCount {
+		t.Errorf("restart calls = %d, want %d", got, expectCount)
+	}
+}
+
+// assertQueueState verifies whether a message is queued for the session.
+func assertQueueState(t *testing.T, ctx context.Context, svc *Service, sessionID string, expectQueued bool) {
+	t.Helper()
+	status := svc.messageQueue.GetStatus(ctx, sessionID)
+	queued := status.Count > 0
+	if queued != expectQueued {
+		t.Errorf("queue is queued = %v, want %v (count=%d)", queued, expectQueued, status.Count)
+	}
+}
+
+// assertSessionState verifies the session's current state.
+// Polls briefly because processOnEnter runs asynchronously (goroutine) and
+// the state change may not be visible immediately after the trigger returns.
+func assertSessionState(t *testing.T, ctx context.Context, repo sessionExecutorStore, sessionID string, expect models.TaskSessionState) {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		session, err := repo.GetTaskSession(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("failed to load session: %v", err)
+		}
+		if session.State == expect {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("session state = %q, want %q (after polling)", session.State, expect)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A non-terminal on_turn_complete engine transition must still write
+// tasks.state = REVIEW. This preserves the #985 regression coverage while
+// terminal targets use COMPLETED instead.
+func TestProcessOnTurnCompleteViaEngine_NonTerminalStepWritesTaskStateReview(t *testing.T) {
+	ctx := context.Background()
+
+	sg, nameToID := buildWorkflowFromJSON(t, developmentWorkflowJSON)
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", nameToID["Backlog"])
+	setSessionExecID(t, repo, "s1", "exec-1")
+	setSessionState(t, ctx, repo, "s1", models.TaskSessionStateRunning)
+
+	agentMgr := &mockAgentManager{
+		repoForExecutionLookup: repo,
+		isAgentRunning:         true,
+	}
+	svc := createEngineService(t, repo, sg, agentMgr)
+	onEnterDone := make(chan struct{})
+	svc.onProcessOnEnterComplete = func() { close(onEnterDone) }
+	taskRepo := svc.taskRepo.(*mockTaskRepo)
+	seedMockTaskState(taskRepo, "t1", v1.TaskStateInProgress)
+
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to load session: %v", err)
+	}
+
+	transitioned := svc.processOnTurnCompleteViaEngine(ctx, "t1", session)
+	if !transitioned {
+		t.Fatalf("expected a transition from Backlog -> In Progress, got none")
+	}
+
+	assertStepByName(t, ctx, repo, "s1", "In Progress", nameToID)
+	select {
+	case <-onEnterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for on_enter processing")
+	}
+	taskRepo.mu.Lock()
+	history := append([]v1.TaskState(nil), taskRepo.stateHistory["t1"]...)
+	taskRepo.mu.Unlock()
+	wroteReview := false
+	for _, state := range history {
+		if state == v1.TaskStateReview {
+			wroteReview = true
+			break
+		}
+	}
+	if !wroteReview {
+		t.Errorf("tasks.state history = %v, want a %q write", history, v1.TaskStateReview)
+	}
+}
+
+// A terminal on_turn_complete engine transition flips the session to
+// WAITING_FOR_INPUT, moves the task to the Done step, and persists
+// tasks.state = COMPLETED so the board column and API state agree.
+func TestProcessOnTurnCompleteViaEngine_TerminalStepCompletesTask(t *testing.T) {
+	ctx := context.Background()
+
+	sg, nameToID := buildWorkflowFromJSON(t, developmentWorkflowJSON)
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", nameToID["New Step"])
+	setSessionExecID(t, repo, "s1", "exec-1")
+	setSessionState(t, ctx, repo, "s1", models.TaskSessionStateRunning)
+
+	agentMgr := &mockAgentManager{repoForExecutionLookup: repo}
+	svc := createEngineService(t, repo, sg, agentMgr)
+
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("failed to load session: %v", err)
+	}
+
+	transitioned := svc.processOnTurnCompleteViaEngine(ctx, "t1", session)
+	if !transitioned {
+		t.Fatalf("expected a transition from New Step → Done, got none")
+	}
+
+	// Terminal completion and ApplyTransition both run synchronously inside
+	// applyEngineTransition (before processOnEnter's goroutine), so the
+	// task-state and step assertions need no async wait. assertSessionState
+	// has its own polling loop for the WAITING_FOR_INPUT flip.
+	assertStepByName(t, ctx, repo, "s1", "Done", nameToID)
+	assertSessionState(t, ctx, repo, "s1", models.TaskSessionStateWaitingForInput)
+
+	task, err := repo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("failed to load task: %v", err)
+	}
+	if task.State != v1.TaskStateCompleted {
+		t.Errorf("tasks.state = %q, want %q", task.State, v1.TaskStateCompleted)
+	}
+}

@@ -1,0 +1,193 @@
+package agents
+
+import (
+	"slices"
+	"strings"
+)
+
+// emptyPermSettings is a shared zero-value permission settings map used by ACP
+// agents that have no CLI-driven permission flags. Permission stance is
+// expressed via ACP session modes and per-tool-call permission prompts.
+var emptyPermSettings = map[string]PermissionSetting{}
+
+// agentctlAutoApproveSetting is the universal profile toggle for Kandev-side
+// ACP permission auto-approval (not a subprocess CLI flag).
+var agentctlAutoApproveSetting = PermissionSetting{
+	Supported:   true,
+	Default:     false,
+	Label:       "Auto-approve all permissions",
+	Description: "Kandev allows every agent permission request without prompting you. Dangerous. Use only in trusted workspaces.",
+	ApplyMethod: PermissionApplyMethodAgentctlAutoApprove,
+}
+
+// CatalogPermissionSettings returns the agent's curated permission catalogue
+// plus the shared agentctl auto-approve entry advertised on every agent profile.
+func CatalogPermissionSettings(ag Agent) map[string]PermissionSetting {
+	return mergeAgentctlAutoApprove(ag.PermissionSettings())
+}
+
+// StripEnvFor returns the runtime-declared environment keys that should be
+// removed before spawning an agent subprocess. Inference-only paths derive
+// this from RuntimeConfig instead of carrying a second declaration.
+func StripEnvFor(ia InferenceAgent) []string {
+	if a, ok := ia.(Agent); ok {
+		if rt := a.Runtime(); rt != nil {
+			return rt.StripEnv
+		}
+	}
+	return nil
+}
+
+// RuntimeEnvFor returns a defensive copy of the agent runtime environment for
+// one-shot probe and inference subprocesses.
+func RuntimeEnvFor(ia InferenceAgent) map[string]string {
+	if a, ok := ia.(Agent); ok {
+		if rt := a.Runtime(); rt != nil && len(rt.Env) > 0 {
+			env := make(map[string]string, len(rt.Env))
+			for key, value := range rt.Env {
+				env[key] = value
+			}
+			return env
+		}
+	}
+	return nil
+}
+
+func mergeAgentctlAutoApprove(settings map[string]PermissionSetting) map[string]PermissionSetting {
+	merged := make(map[string]PermissionSetting, len(settings)+1)
+	for k, v := range settings {
+		merged[k] = v
+	}
+	merged[PermissionKeyAutoApprove] = agentctlAutoApproveSetting
+	return merged
+}
+
+func permissionCLIFlagArgs(settings map[string]PermissionSetting, values map[string]bool) [][]string {
+	if settings == nil || values == nil {
+		return nil
+	}
+	var args [][]string
+	for settingName, setting := range settings {
+		if !setting.Supported || setting.ApplyMethod != PermissionApplyMethodCLIFlag || setting.CLIFlag == "" {
+			continue
+		}
+		if value, exists := values[settingName]; !exists || !value {
+			continue
+		}
+		flagArgs := strings.Fields(setting.CLIFlag)
+		if setting.CLIFlagValue != "" {
+			flagArgs = append(flagArgs, setting.CLIFlagValue)
+		}
+		args = append(args, flagArgs)
+	}
+	return args
+}
+
+func withoutPermissionCLIFlagDuplicates(tokens []string, settings map[string]PermissionSetting, values map[string]bool) []string {
+	remaining := slices.Clone(tokens)
+	for _, permissionArgs := range permissionCLIFlagArgs(settings, values) {
+		if len(permissionArgs) == 0 {
+			continue
+		}
+		for i := 0; i+len(permissionArgs) <= len(remaining); i++ {
+			if !slices.Equal(remaining[i:i+len(permissionArgs)], permissionArgs) {
+				continue
+			}
+			remaining = append(remaining[:i], remaining[i+len(permissionArgs):]...)
+			break
+		}
+	}
+	return remaining
+}
+
+// CmdBuilder constructs CLI command slices using a fluent API.
+type CmdBuilder struct {
+	args []string
+}
+
+// Cmd starts building a command from a base command and arguments.
+func Cmd(base ...string) *CmdBuilder {
+	return &CmdBuilder{args: append([]string{}, base...)}
+}
+
+// Model appends a model flag if model is non-empty.
+// flag args support {model} placeholder, e.g. NewParam("--model", "{model}").
+func (b *CmdBuilder) Model(flag Param, model string) *CmdBuilder {
+	if flag.IsEmpty() || model == "" {
+		return b
+	}
+	for _, arg := range flag.args {
+		b.args = append(b.args, strings.ReplaceAll(arg, "{model}", model))
+	}
+	return b
+}
+
+// Resume appends a resume flag with sessionID if applicable.
+// Skipped when sessionID is empty, nativeResume is true, or flag is empty.
+func (b *CmdBuilder) Resume(flag Param, sessionID string, nativeResume bool) *CmdBuilder {
+	if sessionID == "" || nativeResume || flag.IsEmpty() {
+		return b
+	}
+	b.args = append(b.args, flag.args...)
+	b.args = append(b.args, sessionID)
+	return b
+}
+
+// ResumeAt appends a --resume-session-at flag with the message UUID.
+// Skipped when uuid is empty or flag is empty.
+func (b *CmdBuilder) ResumeAt(flag Param, uuid string) *CmdBuilder {
+	if uuid == "" || flag.IsEmpty() {
+		return b
+	}
+	b.args = append(b.args, flag.args...)
+	b.args = append(b.args, uuid)
+	return b
+}
+
+// Permissions appends per-tool permission flags when not auto-approving.
+// Each tool gets: flag tool:ask-user (e.g. --permission launch-process:ask-user).
+func (b *CmdBuilder) Permissions(flag string, tools []string, opts CommandOptions) *CmdBuilder {
+	if opts.AutoApprove || flag == "" || len(tools) == 0 {
+		return b
+	}
+	for _, tool := range tools {
+		b.args = append(b.args, flag, tool+":ask-user")
+	}
+	return b
+}
+
+// Settings appends CLI flags for enabled permission settings.
+func (b *CmdBuilder) Settings(settings map[string]PermissionSetting, values map[string]bool) *CmdBuilder {
+	for _, args := range permissionCLIFlagArgs(settings, values) {
+		b.args = append(b.args, args...)
+	}
+	return b
+}
+
+// Prompt appends a prompt flag if prompt is non-empty.
+// flag args support {prompt} placeholder, e.g. NewParam("--prompt", "{prompt}").
+// If flag is empty, the prompt is appended as a positional argument.
+func (b *CmdBuilder) Prompt(flag Param, prompt string) *CmdBuilder {
+	if prompt == "" {
+		return b
+	}
+	if flag.IsEmpty() {
+		b.args = append(b.args, prompt)
+		return b
+	}
+	for _, arg := range flag.args {
+		b.args = append(b.args, strings.ReplaceAll(arg, "{prompt}", prompt))
+	}
+	return b
+}
+
+// Flag appends arbitrary flag parts to the command.
+func (b *CmdBuilder) Flag(parts ...string) *CmdBuilder {
+	b.args = append(b.args, parts...)
+	return b
+}
+
+// Build returns the final Command value.
+func (b *CmdBuilder) Build() Command {
+	return Command{args: b.args}
+}

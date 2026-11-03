@@ -1,0 +1,222 @@
+"use client";
+
+import { useMemo } from "react";
+import { EditorActionsDropdown } from "./editor-actions-dropdown";
+import { IconCode, IconLoader2 } from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@kandev/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { useEditors } from "@/hooks/domains/settings/use-editors";
+import { useOpenSessionInEditor } from "@/hooks/use-open-session-in-editor";
+import { useSessionWorktrees } from "@/hooks/domains/session/use-session-worktrees";
+import { useAppStore } from "@/components/state-provider";
+import type { EditorOption } from "@/lib/types/http";
+import {
+  buildWorktreeOptions,
+  type WorktreeOption,
+} from "@/components/task/editor-worktree-options";
+import {
+  getAvailableTaskTopbarEditors,
+  resolveTaskTopbarEditorId,
+} from "@/components/task/editors-menu-availability";
+import { useTranslation } from "react-i18next";
+
+const menuItemClass = "cursor-pointer";
+
+type EditorsMenuProps = {
+  activeSessionId: string | null;
+  embeddedVscodeSupported: boolean;
+};
+
+function useWorktreeOptions(sessionId: string | null): WorktreeOption[] {
+  const worktrees = useSessionWorktrees(sessionId);
+  const repositoriesByWorkspace = useAppStore((state) => state.repositories.itemsByWorkspaceId);
+  return useMemo(
+    () => buildWorktreeOptions(worktrees, Object.values(repositoriesByWorkspace).flat()),
+    [worktrees, repositoriesByWorkspace],
+  );
+}
+
+function WorktreeItems({
+  options,
+  onSelect,
+}: {
+  options: WorktreeOption[];
+  onSelect: (worktreeId: string) => void;
+}) {
+  return (
+    <>
+      {options.map((option) => (
+        <DropdownMenuItem
+          key={option.worktreeId}
+          className={menuItemClass}
+          data-testid="editors-menu-worktree-item"
+          onClick={() => onSelect(option.worktreeId)}
+        >
+          <span className="truncate">{option.label}</span>
+          {option.branch && (
+            <span className="ml-auto pl-3 text-xs text-muted-foreground truncate max-w-40">
+              {option.branch}
+            </span>
+          )}
+        </DropdownMenuItem>
+      ))}
+    </>
+  );
+}
+
+function OpenEditorButton({
+  disabled,
+  isLoading,
+  tooltip,
+  worktreeOptions,
+  onOpen,
+}: {
+  disabled: boolean;
+  isLoading: boolean;
+  tooltip: string;
+  worktreeOptions: WorktreeOption[];
+  onOpen: (worktreeId?: string) => void;
+}) {
+  const icon = isLoading ? (
+    <IconLoader2 className="h-4 w-4 animate-spin" />
+  ) : (
+    <IconCode className="h-4 w-4" />
+  );
+  const buttonClass = "rounded-none border-0 cursor-pointer px-2 focus-visible:ring-inset";
+
+  // Multi-worktree sessions get a picker instead of opening the first worktree.
+  // The focusable span keeps the tooltip reachable while the button is
+  // disabled (disabled buttons receive no pointer/focus events).
+  if (worktreeOptions.length > 1) {
+    return (
+      <DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={disabled ? 0 : -1} className="inline-flex">
+              <DropdownMenuTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className={buttonClass}
+                  data-testid="editors-menu-open"
+                  disabled={disabled}
+                >
+                  {icon}
+                </Button>
+              </DropdownMenuTrigger>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{tooltip}</TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent align="end" className="min-w-56 w-auto">
+          <WorktreeItems options={worktreeOptions} onSelect={(worktreeId) => onOpen(worktreeId)} />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={disabled ? 0 : -1} className="inline-flex">
+          <Button
+            size="sm"
+            variant="outline"
+            className={buttonClass}
+            data-testid="editors-menu-open"
+            onClick={() => onOpen()}
+            disabled={disabled}
+          >
+            {icon}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function EditorMenuEntry({
+  editor,
+  worktreeOptions,
+  onOpen,
+}: {
+  editor: EditorOption;
+  worktreeOptions: WorktreeOption[];
+  onOpen: (editorId: string, worktreeId?: string) => void;
+}) {
+  if (worktreeOptions.length > 1) {
+    return (
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger className={menuItemClass}>{editor.name}</DropdownMenuSubTrigger>
+        <DropdownMenuSubContent className="min-w-56 w-auto">
+          <WorktreeItems
+            options={worktreeOptions}
+            onSelect={(worktreeId) => onOpen(editor.id, worktreeId)}
+          />
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+    );
+  }
+  return (
+    <DropdownMenuItem className={menuItemClass} onClick={() => onOpen(editor.id)}>
+      {editor.name}
+    </DropdownMenuItem>
+  );
+}
+
+export function EditorsMenu({ activeSessionId, embeddedVscodeSupported }: EditorsMenuProps) {
+  const { t } = useTranslation();
+  const openEditor = useOpenSessionInEditor(activeSessionId ?? null);
+  const { editors } = useEditors();
+  const defaultEditorId = useAppStore((state) => state.userSettings.defaultEditorId);
+  const worktreeOptions = useWorktreeOptions(activeSessionId ?? null);
+  const enabledEditors = useMemo(
+    () => getAvailableTaskTopbarEditors(editors, embeddedVscodeSupported),
+    [editors, embeddedVscodeSupported],
+  );
+
+  const resolvedEditorId = useMemo(() => {
+    return resolveTaskTopbarEditorId(defaultEditorId, enabledEditors);
+  }, [defaultEditorId, enabledEditors]);
+
+  const openWith = (editorId: string, worktreeId?: string) => {
+    if (!editorId) return;
+    void openEditor.open({ editorId, worktreeId });
+  };
+
+  return (
+    <div className="inline-flex h-7 rounded-md border border-border overflow-hidden">
+      <OpenEditorButton
+        disabled={!activeSessionId || openEditor.isLoading || enabledEditors.length === 0}
+        isLoading={openEditor.isLoading}
+        tooltip={activeSessionId ? t("task:openEditor") : t("task:selectASessionToOpenIts")}
+        worktreeOptions={worktreeOptions}
+        onOpen={(worktreeId) => openWith(resolvedEditorId, worktreeId)}
+      />
+      <EditorActionsDropdown sessionId={activeSessionId}>
+        {enabledEditors.length === 0 ? (
+          <DropdownMenuItem disabled>{t("task:noEditorsAvailable")}</DropdownMenuItem>
+        ) : (
+          enabledEditors.map((editor: EditorOption) => (
+            <EditorMenuEntry
+              key={editor.id}
+              editor={editor}
+              worktreeOptions={worktreeOptions}
+              onOpen={openWith}
+            />
+          ))
+        )}
+      </EditorActionsDropdown>
+    </div>
+  );
+}

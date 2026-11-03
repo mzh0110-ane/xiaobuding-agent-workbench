@@ -1,0 +1,1361 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
+	"github.com/kandev/kandev/internal/task/dto"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/service"
+	workflowmodels "github.com/kandev/kandev/internal/workflow/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// --- Test helpers ---
+
+func testLogger(t *testing.T) *logger.Logger {
+	t.Helper()
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	require.NoError(t, err)
+	return log
+}
+
+func makeWSMessage(t *testing.T, action string, payload interface{}) *ws.Message {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  action,
+		Payload: data,
+	}
+}
+
+func assertWSError(t *testing.T, resp *ws.Message, expectedCode string) {
+	t.Helper()
+	require.NotNil(t, resp)
+	assert.Equal(t, ws.MessageTypeError, resp.Type)
+	var ep ws.ErrorPayload
+	require.NoError(t, json.Unmarshal(resp.Payload, &ep))
+	assert.Equal(t, expectedCode, ep.Code)
+}
+
+// --- Workflow handler tests ---
+
+func TestHandleCreateWorkflowStep_MissingWorkflowID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"name": "Test Step",
+	})
+
+	resp, err := h.handleCreateWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleCreateWorkflowStep_MissingName(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPCreateWorkflowStep, map[string]interface{}{
+		"workflow_id": "wf-123",
+	})
+
+	resp, err := h.handleCreateWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleCreateWorkflowStep_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPCreateWorkflowStep,
+		Payload: json.RawMessage(`{invalid`),
+	}
+
+	resp, err := h.handleCreateWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleUpdateWorkflowStep_MissingStepID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateWorkflowStep, map[string]interface{}{
+		"name": "New Name",
+	})
+
+	resp, err := h.handleUpdateWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateWorkflowStep_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPUpdateWorkflowStep,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleUpdateWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleDeleteWorkflowStep_MissingStepID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPDeleteWorkflowStep, map[string]string{})
+
+	resp, err := h.handleDeleteWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleDeleteWorkflowStep_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPDeleteWorkflowStep,
+		Payload: json.RawMessage(`badjson`),
+	}
+
+	resp, err := h.handleDeleteWorkflowStep(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleReorderWorkflowSteps_MissingWorkflowID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPReorderWorkflowStep, map[string]interface{}{
+		"step_ids": []string{"s1", "s2"},
+	})
+
+	resp, err := h.handleReorderWorkflowSteps(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleReorderWorkflowSteps_MissingStepIDs(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPReorderWorkflowStep, map[string]interface{}{
+		"workflow_id": "wf-123",
+	})
+
+	resp, err := h.handleReorderWorkflowSteps(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleReorderWorkflowSteps_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPReorderWorkflowStep,
+		Payload: json.RawMessage(`{bad}`),
+	}
+
+	resp, err := h.handleReorderWorkflowSteps(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+// --- Agent handler tests ---
+
+func TestHandleUpdateAgent_MissingAgentID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateAgent, map[string]interface{}{
+		"supports_mcp": true,
+	})
+
+	resp, err := h.handleUpdateAgent(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateAgent_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPUpdateAgent,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleUpdateAgent(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleListAgentProfiles_MissingAgentID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPListAgentProfiles, map[string]string{})
+
+	resp, err := h.handleListAgentProfiles(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleListAgentProfiles_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPListAgentProfiles,
+		Payload: json.RawMessage(`badpayload`),
+	}
+
+	resp, err := h.handleListAgentProfiles(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleUpdateAgentProfile_MissingProfileID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateAgentProfile, map[string]interface{}{
+		"name": "New Name",
+	})
+
+	resp, err := h.handleUpdateAgentProfile(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateAgentProfile_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPUpdateAgentProfile,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleUpdateAgentProfile(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+// --- MCP Config handler tests ---
+
+func TestHandleGetMcpConfig_MissingProfileID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPGetMcpConfig, map[string]string{})
+
+	resp, err := h.handleGetMcpConfig(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleGetMcpConfig_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPGetMcpConfig,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleGetMcpConfig(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleUpdateMcpConfig_MissingProfileID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateMcpConfig, map[string]interface{}{
+		"enabled": true,
+	})
+
+	resp, err := h.handleUpdateMcpConfig(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateMcpConfig_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPUpdateMcpConfig,
+		Payload: json.RawMessage(`invalid`),
+	}
+
+	resp, err := h.handleUpdateMcpConfig(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+// --- Task handler tests ---
+
+func TestHandleMoveTask_MissingTaskID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"workflow_id":      "wf-123",
+		"workflow_step_id": "step-1",
+	})
+
+	resp, err := h.handleMoveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleMoveTask_MissingWorkflowID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-1",
+		"workflow_step_id": "step-1",
+	})
+
+	resp, err := h.handleMoveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleMoveTask_MissingStepID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":     "task-1",
+		"workflow_id": "wf-123",
+	})
+
+	resp, err := h.handleMoveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleMoveTask_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPMoveTask,
+		Payload: json.RawMessage(`invalid`),
+	}
+
+	resp, err := h.handleMoveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+// TestLookupSession_NoPrimarySession_ReturnsNilNil pins the contract that a
+// task with no primary session resolves to (nil, nil) — a legitimate "empty"
+// state that lets handleMoveTask fall through to the idle-move path — rather
+// than a backend error. Regression guard: lookupSession originally detected
+// this case by substring-matching the repository's error message; when the
+// repository switched to a wrapped taskrepo.ErrNoPrimarySession sentinel the
+// substring stopped matching, so sessionless task moves were wrongly rejected
+// as internal errors. Classifying via errors.Is keeps the two decoupled.
+func TestLookupSession_NoPrimarySession_ReturnsNilNil(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Test"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Board"}))
+	// Task created without an agent → no primary session row.
+	taskResult, err := svc.CreateTask(ctx, &service.CreateTaskRequest{
+		WorkspaceID: "ws-1",
+		WorkflowID:  "wf-1",
+		Title:       "Sessionless task",
+	})
+	task := taskResult.Task
+	require.NoError(t, err)
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+
+	session, lookupErr := h.lookupSession(ctx, task.ID)
+	require.NoError(t, lookupErr, "no-primary-session must not surface as a backend error")
+	assert.Nil(t, session, "no-primary-session must resolve to a nil session, not a value")
+}
+
+// recordingMessageQueuer captures QueueMessage calls for assertion.
+type recordingMessageQueuer struct {
+	calls []messagequeue.QueuedMessage
+}
+
+func (r *recordingMessageQueuer) QueueMessage(ctx context.Context, sessionID, taskID, content, model, userID string, planMode bool, attachments []messagequeue.MessageAttachment) (*messagequeue.QueuedMessage, error) {
+	return r.QueueMessageWithMetadata(ctx, sessionID, taskID, content, model, userID, planMode, attachments, nil)
+}
+
+func (r *recordingMessageQueuer) QueueMessageWithMetadata(_ context.Context, sessionID, taskID, content, model, userID string, planMode bool, _ []messagequeue.MessageAttachment, metadata map[string]interface{}) (*messagequeue.QueuedMessage, error) {
+	msg := messagequeue.QueuedMessage{
+		SessionID: sessionID,
+		TaskID:    taskID,
+		Content:   content,
+		Model:     model,
+		PlanMode:  planMode,
+		QueuedBy:  userID,
+		Metadata:  metadata,
+	}
+	if msg.ID == "" {
+		msg.ID = fmt.Sprintf("queued-%d", len(r.calls)+1)
+	}
+	r.calls = append(r.calls, msg)
+	return &msg, nil
+}
+
+type pendingMoveRecordingQueuer struct {
+	recordingMessageQueuer
+	pendingSessionID string
+	pendingMoves     []messagequeue.PendingMove
+}
+
+func (r *pendingMoveRecordingQueuer) SetPendingMove(_ context.Context, sessionID string, move *messagequeue.PendingMove) error {
+	r.pendingSessionID = sessionID
+	if move != nil {
+		r.pendingMoves = append(r.pendingMoves, *move)
+	}
+	return nil
+}
+
+func (r *recordingMessageQueuer) SetPendingMove(_ context.Context, _ string, _ *messagequeue.PendingMove) error {
+	return nil
+}
+
+func (r *recordingMessageQueuer) RemoveEntryForSession(
+	_ context.Context,
+	identity messagequeue.QueueSessionIdentity,
+	entryID string,
+) (*messagequeue.QueueRemovalResult, error) {
+	for index := range r.calls {
+		entry := r.calls[index]
+		if entry.ID == entryID && entry.SessionID == identity.SessionID && entry.TaskID == identity.TaskID {
+			r.calls = append(r.calls[:index], r.calls[index+1:]...)
+			return &messagequeue.QueueRemovalResult{Removed: []messagequeue.QueuedMessage{entry}}, nil
+		}
+	}
+	return nil, messagequeue.ErrEntryNotFound
+}
+
+func TestApplyMoveTaskImmediate_RollsBackExactHandoffAfterMoveFailure(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{
+		ID: "ws-rollback", Name: "Rollback", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-rollback", WorkspaceID: "ws-rollback", Name: "Board", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTask(ctx, &models.Task{
+		ID: "task-rollback", WorkspaceID: "ws-rollback", WorkflowID: "wf-rollback",
+		Title: "Rollback", State: v1.TaskStateTODO, CreatedAt: now, UpdatedAt: now,
+	}))
+	session := &models.TaskSession{
+		ID: "session-rollback", TaskID: "task-rollback", State: models.TaskSessionStateIdle,
+		IsPrimary: true, StartedAt: now, UpdatedAt: now,
+	}
+	require.NoError(t, repo.CreateTaskSession(ctx, session))
+
+	queue := &recordingMessageQueuer{}
+	queue.calls = append(queue.calls, messagequeue.QueuedMessage{
+		ID: "preexisting", SessionID: session.ID, TaskID: session.TaskID, Content: "keep me",
+	})
+	h := &Handlers{taskSvc: svc, messageQueue: queue, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{})
+	response, err := h.applyMoveTaskImmediate(ctx, msg, moveTaskRequest{
+		TaskID: "task-rollback", WorkflowID: "missing-workflow",
+		WorkflowStepID: "missing-step", Prompt: "handoff",
+	}, session)
+	require.NoError(t, err)
+	assertWSError(t, response, ws.ErrorCodeInternalError)
+	require.Len(t, queue.calls, 1)
+	assert.Equal(t, "preexisting", queue.calls[0].ID)
+}
+
+type pendingMoveFailingQueuer struct {
+	recordingMessageQueuer
+	pendingErr error
+	removedIDs []string
+}
+
+func (r *pendingMoveFailingQueuer) SetPendingMove(
+	_ context.Context,
+	_ string,
+	_ *messagequeue.PendingMove,
+) error {
+	return r.pendingErr
+}
+
+func (r *pendingMoveFailingQueuer) RemoveEntryForSession(
+	_ context.Context,
+	_ messagequeue.QueueSessionIdentity,
+	entryID string,
+) (*messagequeue.QueueRemovalResult, error) {
+	r.removedIDs = append(r.removedIDs, entryID)
+	for index := range r.calls {
+		if r.calls[index].ID == entryID {
+			entry := r.calls[index]
+			r.calls = append(r.calls[:index], r.calls[index+1:]...)
+			return &messagequeue.QueueRemovalResult{Removed: []messagequeue.QueuedMessage{entry}}, nil
+		}
+	}
+	return nil, messagequeue.ErrEntryNotFound
+}
+
+// TestDeferMoveTask_PendingMovePersistenceFailureLeavesQueueUntouched verifies
+// the deferred move path surfaces an internal error when SetPendingMove fails
+// and does not mutate the session queue. One-shot instructions now ride the
+// PendingMove's EntryOptions rather than a pre-queued hand-off, so there is no
+// hand-off message to roll back: the pre-existing queue entry must survive and
+// nothing may be removed.
+func TestDeferMoveTask_PendingMovePersistenceFailureLeavesQueueUntouched(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	seedRunningTask(
+		t, repo,
+		"ws-pending-failure", "wf-pending-failure", "task-pending-failure",
+		"session-pending-failure", "step-current",
+	)
+	queue := &pendingMoveFailingQueuer{pendingErr: errors.New("persist pending move")}
+	queue.calls = append(queue.calls, messagequeue.QueuedMessage{
+		ID: "preexisting", SessionID: "session-pending-failure",
+		TaskID: "task-pending-failure", Content: "keep me",
+	})
+	h := &Handlers{taskSvc: svc, messageQueue: queue, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-pending-failure",
+		"workflow_id":      "wf-pending-failure",
+		"workflow_step_id": "step-target",
+		"prompt":           "handoff",
+	})
+
+	response, err := h.handleMoveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, response, ws.ErrorCodeInternalError)
+	require.Empty(t, queue.removedIDs)
+	require.Len(t, queue.calls, 1)
+	assert.Equal(t, "preexisting", queue.calls[0].ID)
+}
+
+// TestQueueMoveTaskPrompt_NilQueueReturnsError ensures the call is safe (no panic)
+// and surfaces a descriptive error so callers can fail fast instead of silently
+// dropping the user-supplied prompt.
+func TestQueueMoveTaskPrompt_NilQueueReturnsError(t *testing.T) {
+	h := &Handlers{logger: testLogger(t).WithFields()}
+
+	_, err := h.queueMoveTaskPrompt(context.Background(), messagequeue.QueueSessionIdentity{
+		TaskID: "task-1", SessionID: "session-1", SessionIncarnationID: "inc-1",
+	}, "fix issues")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "message queue")
+}
+
+// TestQueueMoveTaskPrompt_EmptySessionIDReturnsError ensures a missing session ID
+// surfaces an error rather than silently no-op'ing — without a session there's
+// nowhere to deliver the prompt.
+func TestQueueMoveTaskPrompt_EmptySessionIDReturnsError(t *testing.T) {
+	queue := &recordingMessageQueuer{}
+	h := &Handlers{
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	_, err := h.queueMoveTaskPrompt(context.Background(), messagequeue.QueueSessionIdentity{
+		TaskID: "task-1", SessionIncarnationID: "inc-1",
+	}, "fix issues")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "primary session")
+	assert.Empty(t, queue.calls, "queue must not be invoked without a session ID")
+}
+
+// TestQueueMoveTaskPrompt_QueuesWithExpectedFields verifies the happy-path
+// invocation: the prompt is queued on the resolved session with the expected
+// metadata (sender = "mcp-move-task", plan mode disabled, no model override).
+func TestQueueMoveTaskPrompt_QueuesWithExpectedFields(t *testing.T) {
+	queue := &recordingMessageQueuer{}
+	h := &Handlers{
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	_, err := h.queueMoveTaskPrompt(context.Background(), messagequeue.QueueSessionIdentity{
+		TaskID: "task-1", SessionID: "session-99", SessionIncarnationID: "inc-99",
+	}, "Please fix the failing test in foo_test.go")
+	require.NoError(t, err)
+
+	require.Len(t, queue.calls, 1)
+	got := queue.calls[0]
+	assert.Equal(t, "session-99", got.SessionID)
+	assert.Equal(t, "task-1", got.TaskID)
+	assert.Equal(t, "Please fix the failing test in foo_test.go", got.Content)
+	assert.Equal(t, messagequeue.QueuedByMoveTask, got.QueuedBy)
+	assert.False(t, got.PlanMode)
+	assert.Equal(t, "", got.Model)
+}
+
+func TestHandleDeleteTask_MissingTaskID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPDeleteTask, map[string]string{})
+
+	resp, err := h.handleDeleteTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleDeleteTask_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPDeleteTask,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleDeleteTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleArchiveTask_MissingTaskID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{})
+
+	resp, err := h.handleArchiveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleArchiveTask_UsesHandoffCascadeWhenConfigured(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-handoff", Name: "Handoff"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-handoff", WorkspaceID: "ws-handoff", Name: "Board"}))
+	task := &models.Task{ID: "handoff-archive", WorkspaceID: "ws-handoff", WorkflowID: "wf-handoff", Title: "Archive", State: v1.TaskStateTODO}
+	require.NoError(t, repo.CreateTask(ctx, task))
+
+	h := &Handlers{
+		taskSvc:    svc,
+		handoffSvc: service.NewHandoffService(repo, repo, nil, nil, nil, testLogger(t)),
+		logger:     testLogger(t).WithFields(),
+	}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{"task_id": task.ID})
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var cascadeID string
+	require.NoError(t, repo.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(archived_by_cascade_id, '') FROM tasks WHERE id = ?`, task.ID).Scan(&cascadeID))
+	if cascadeID == "" {
+		t.Fatal("MCP archive did not use HandoffService cascade path")
+	}
+}
+
+func TestHandleArchiveTask_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPArchiveTask,
+		Payload: json.RawMessage(`bad`),
+	}
+
+	resp, err := h.handleArchiveTask(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+func TestHandleArchiveTask_RedactsCallerLookupError(t *testing.T) {
+	h := &Handlers{
+		taskSvc: service.NewService(service.Repos{
+			Tasks: failingCallerTaskRepository{err: errors.New("database unavailable: secret path")},
+		}, nil, testLogger(t), service.RepositoryDiscoveryConfig{}),
+		logger: testLogger(t).WithFields(),
+	}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": "target-task", "caller_task_id": "caller-task",
+	})
+
+	resp, err := h.handleArchiveTask(context.Background(), msg)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+	require.NotContains(t, string(resp.Payload), "secret path")
+	require.NotContains(t, string(resp.Payload), "database unavailable")
+}
+
+func TestHandleArchiveTask_MergedPRRunRejectsDifferentTarget(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-archive", Name: "Archive"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-archive", WorkspaceID: "ws-archive", Name: "Board"}))
+
+	boundTarget := &models.Task{
+		ID: "bound-target", WorkspaceID: "ws-archive", WorkflowID: "wf-archive",
+		Title: "Bound target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, boundTarget))
+	wrongTarget := &models.Task{
+		ID: "wrong-target", WorkspaceID: "ws-archive", WorkflowID: "wf-archive",
+		Title: "Wrong target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, wrongTarget))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-archive", WorkflowID: "wf-archive",
+		Title: "Automation run", State: v1.TaskStateTODO,
+		Origin: models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{
+			"trigger_type":                       "github_pr_merged",
+			models.MetaKeyAutomationTargetTaskID: boundTarget.ID,
+		},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id":        wrongTarget.ID,
+		"caller_task_id": caller.ID,
+	})
+
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+
+	unchanged, err := svc.GetTask(ctx, wrongTarget.ID)
+	require.NoError(t, err)
+	assert.Nil(t, unchanged.ArchivedAt, "a mismatched target must not be archived")
+}
+
+func TestHandleArchiveTask_MergedPRRunAcceptsBoundTarget(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-bound", Name: "Bound"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-bound", WorkspaceID: "ws-bound", Name: "Board"}))
+	target := &models.Task{
+		ID: "bound-target", WorkspaceID: "ws-bound", WorkflowID: "wf-bound",
+		Title: "Bound target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, target))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-bound", WorkflowID: "wf-bound",
+		Title: "Automation run", State: v1.TaskStateTODO,
+		Origin: models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{
+			"trigger_type":                       "github_pr_merged",
+			models.MetaKeyAutomationTargetTaskID: target.ID,
+		},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": target.ID, "caller_task_id": caller.ID,
+	})
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, ws.MessageTypeResponse, resp.Type)
+	archived, err := svc.GetTask(ctx, target.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, archived.ArchivedAt)
+}
+
+// TestHandleArchiveTask_MergedPRRunAcceptsRefreshedTargetAfterResume is the
+// regression guard for the reuse_thread + github_pr_merged defect: once a
+// resumed continuation task's metadata is refreshed for a NEW firing (as
+// orchestrator.refreshAutomationContinuationMetadata now does), the guard
+// must bind to the refreshed target, not the stale one from the first
+// firing. It exercises the metadata mutation through repo.SetTaskMetadataKey
+// — the exact concurrent-key-safe primitive, on the exact same *sqliterepo.
+// Repository type, that orchestrator.refreshAutomationContinuationMetadata
+// calls in production (rather than the unrelated Service.UpdateTaskMetadata
+// full-row path) — so this proves the guard accepts a binding written the
+// same way production writes it, not just whatever happens to be in the DB.
+func TestHandleArchiveTask_MergedPRRunAcceptsRefreshedTargetAfterResume(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-resume", Name: "Resume"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-resume", WorkspaceID: "ws-resume", Name: "Board"}))
+
+	firstTarget := &models.Task{
+		ID: "first-target", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "First merge target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, firstTarget))
+	secondTarget := &models.Task{
+		ID: "second-target", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "Second merge target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, secondTarget))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "Automation run", State: v1.TaskStateTODO,
+		Origin: models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{
+			"trigger_type":                       "github_pr_merged",
+			models.MetaKeyAutomationTargetTaskID: firstTarget.ID,
+		},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+
+	// A second firing resumes the same continuation task and refreshes its
+	// binding — this is what orchestrator.refreshAutomationContinuationMetadata
+	// does on the reuse path, one key at a time via the same primitive.
+	require.NoError(t, repo.SetTaskMetadataKey(ctx, caller.ID, "trigger_type", "github_pr_merged"))
+	require.NoError(t, repo.SetTaskMetadataKey(ctx, caller.ID, models.MetaKeyAutomationTargetTaskID, secondTarget.ID))
+
+	// The second merge's target is now accepted...
+	secondMsg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": secondTarget.ID, "caller_task_id": caller.ID,
+	})
+	resp, err := h.handleArchiveTask(ctx, secondMsg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	archived, err := svc.GetTask(ctx, secondTarget.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, archived.ArchivedAt, "the refreshed target must be archivable")
+
+	// ...and the stale first target is correctly refused against the now-current
+	// binding while it is still unarchived, so this assertion specifically tests
+	// the target guard rather than ordinary archive validation.
+	staleMsg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": firstTarget.ID, "caller_task_id": caller.ID,
+	})
+	resp, err = h.handleArchiveTask(ctx, staleMsg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleArchiveTask_MergedPRRunRejectsMissingBinding(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-missing", Name: "Missing"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-missing", WorkspaceID: "ws-missing", Name: "Board"}))
+	target := &models.Task{
+		ID: "target", WorkspaceID: "ws-missing", WorkflowID: "wf-missing",
+		Title: "Target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, target))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-missing", WorkflowID: "wf-missing",
+		Title: "Automation run", State: v1.TaskStateTODO,
+		Origin:   models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{"trigger_type": "github_pr_merged"},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": target.ID, "caller_task_id": caller.ID,
+	})
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+	unchanged, err := svc.GetTask(ctx, target.ID)
+	require.NoError(t, err)
+	assert.Nil(t, unchanged.ArchivedAt)
+}
+
+func TestHandleArchiveTask_OtherAutomationKeepsGenericBehavior(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-generic", Name: "Generic"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-generic", WorkspaceID: "ws-generic", Name: "Board"}))
+	target := &models.Task{
+		ID: "target", WorkspaceID: "ws-generic", WorkflowID: "wf-generic",
+		Title: "Target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, target))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-generic", WorkflowID: "wf-generic",
+		Title: "Scheduled run", State: v1.TaskStateTODO,
+		Origin:   models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{"trigger_type": "scheduled"},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": target.ID, "caller_task_id": caller.ID,
+	})
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	archived, err := svc.GetTask(ctx, target.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, archived.ArchivedAt)
+}
+
+// TestHandleArchiveTask_AlreadyArchived_IsIdempotent pins that re-archiving a
+// task the caller already archived reports success rather than surfacing the
+// ErrTaskAlreadyArchived sentinel as an opaque INTERNAL ERROR. Archiving is a
+// goal-state operation, so the requested state already holding is not a
+// failure — but the response flags it so the caller can tell the two apart.
+func TestHandleArchiveTask_AlreadyArchived_IsIdempotent(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Test"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-1", WorkspaceID: "ws-1", Name: "Board"}))
+	taskResult, err := svc.CreateTask(ctx, &service.CreateTaskRequest{
+		WorkspaceID: "ws-1",
+		WorkflowID:  "wf-1",
+		Title:       "Archive me",
+	})
+	task := taskResult.Task
+	require.NoError(t, err)
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{"task_id": task.ID})
+
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	var first map[string]interface{}
+	require.NoError(t, json.Unmarshal(resp.Payload, &first))
+	assert.Equal(t, true, first["success"])
+	assert.NotContains(t, first, "already_archived", "first archive is a real state change")
+
+	resp2, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.NotNil(t, resp2)
+	require.Equal(t, ws.MessageTypeResponse, resp2.Type, "re-archiving must not surface as an error")
+	var second map[string]interface{}
+	require.NoError(t, json.Unmarshal(resp2.Payload, &second))
+	assert.Equal(t, true, second["success"])
+	assert.Equal(t, true, second["already_archived"])
+}
+
+func TestHandleUpdateTaskState_MissingTaskID(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateTaskState, map[string]interface{}{
+		"state": "in_progress",
+	})
+
+	resp, err := h.handleUpdateTaskState(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateTaskState_MissingState(t *testing.T) {
+	h := &Handlers{}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateTaskState, map[string]interface{}{
+		"task_id": "task-1",
+	})
+
+	resp, err := h.handleUpdateTaskState(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleUpdateTask_PersistsState(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{
+		ID: "ws-update-state", Name: "Update State", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-update-state", WorkspaceID: "ws-update-state", Name: "Board", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTask(ctx, &models.Task{
+		ID: "task-update-state", WorkspaceID: "ws-update-state", WorkflowID: "wf-update-state",
+		Title: "Stateful", State: v1.TaskStateReview, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateTask, map[string]interface{}{
+		"task_id": "task-update-state",
+		"state":   "COMPLETED",
+	})
+
+	resp, err := h.handleUpdateTask(ctx, msg)
+	require.NoError(t, err)
+	assert.NotEqual(t, ws.MessageTypeError, resp.Type)
+
+	task, err := svc.GetTask(ctx, "task-update-state")
+	require.NoError(t, err)
+	assert.Equal(t, v1.TaskStateCompleted, task.State)
+}
+
+func TestHandleUpdateTask_TitleTooLongReturnsValidation(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{
+		ID: "ws-update-title", Name: "Update Title", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-update-title", WorkspaceID: "ws-update-title", Name: "Board", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTask(ctx, &models.Task{
+		ID: "task-update-title", WorkspaceID: "ws-update-title", WorkflowID: "wf-update-title",
+		Title: "Original", State: v1.TaskStateTODO, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	msg := makeWSMessage(t, ws.ActionMCPUpdateTask, map[string]interface{}{
+		"task_id": "task-update-title",
+		"title":   strings.Repeat("x", service.TaskTitleMaxLength+1),
+	})
+
+	resp, err := h.handleUpdateTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+// TestHandleMoveTask_ActiveSessionWithoutPrompt_DefersMove pins the production
+// bug where an agent on Work called move_task_kandev → Done without a prompt
+// mid-turn. The immediate path hit validateMoveSessions (RUNNING session) and
+// returned INTERNAL_ERROR. Active-session moves must always defer.
+func TestHandleMoveTask_ActiveSessionWithoutPrompt_DefersMove(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{
+		ID: "ws-move", Name: "Move", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-move", WorkspaceID: "ws-move", Name: "Board", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTask(ctx, &models.Task{
+		ID: "task-move", WorkspaceID: "ws-move", WorkflowID: "wf-move",
+		WorkflowStepID: "step-work", Title: "Move me", State: v1.TaskStateInProgress,
+		CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "sess-move", TaskID: "task-move", State: models.TaskSessionStateRunning,
+		IsPrimary: true, StartedAt: now, UpdatedAt: now,
+	}))
+
+	queue := &pendingMoveRecordingQueuer{}
+	h := &Handlers{
+		taskSvc:      svc,
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-move",
+		"workflow_id":      "wf-move",
+		"workflow_step_id": "step-done",
+		"position":         0,
+	})
+
+	resp, err := h.handleMoveTask(ctx, msg)
+	require.NoError(t, err)
+	assert.NotEqual(t, ws.MessageTypeError, resp.Type, "active-session move without prompt must not fail")
+
+	require.Len(t, queue.pendingMoves, 1)
+	assert.Equal(t, "step-done", queue.pendingMoves[0].WorkflowStepID)
+	assert.Equal(t, "sess-move", queue.pendingSessionID)
+	assert.Empty(t, queue.calls, "no hand-off prompt should be queued when prompt omitted")
+
+	task, err := svc.GetTask(ctx, "task-move")
+	require.NoError(t, err)
+	assert.Equal(t, "step-work", task.WorkflowStepID, "deferred move must not apply immediately")
+}
+
+// seedRunningTask creates a workspace, workflow, task, and a RUNNING session so
+// handleMoveTask takes the deferred path. Returns the task ID.
+func seedRunningTask(t *testing.T, repo interface {
+	CreateWorkspace(context.Context, *models.Workspace) error
+	CreateWorkflow(context.Context, *models.Workflow) error
+	CreateTask(context.Context, *models.Task) error
+	CreateTaskSession(context.Context, *models.TaskSession) error
+}, wsID, wfID, taskID, sessionID, currentStepID string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: wsID, Name: wsID, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: wfID, WorkspaceID: wsID, Name: wfID, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, repo.CreateTask(ctx, &models.Task{
+		ID: taskID, WorkspaceID: wsID, WorkflowID: wfID, WorkflowStepID: currentStepID,
+		Title: "task", State: v1.TaskStateInProgress, CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: sessionID, TaskID: taskID, State: models.TaskSessionStateRunning,
+		IsPrimary: true, StartedAt: now, UpdatedAt: now,
+	}))
+}
+
+// TestDeferMoveTask_RejectsNonExistentStep ensures deferMoveTask returns a
+// validation error when the requested workflow_step_id does not exist in the
+// workflow service, preventing a stale step ID from being stored as a pending move.
+func TestDeferMoveTask_RejectsNonExistentStep(t *testing.T) {
+	svc, repo, wfCtrl, wfRepo := newTestTaskServiceWithWorkflow(t)
+	ctx := context.Background()
+	seedRunningTask(t, repo, "ws-defer1", "wf-defer1", "task-defer1", "sess-defer1", "src-step")
+
+	// Only insert the source step — target "ghost-step" does not exist.
+	now := time.Now().UTC()
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "src-step", WorkflowID: "wf-defer1", Name: "Source", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	queue := &pendingMoveRecordingQueuer{}
+	h := &Handlers{
+		taskSvc:      svc,
+		workflowCtrl: wfCtrl,
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-defer1",
+		"workflow_id":      "wf-defer1",
+		"workflow_step_id": "ghost-step", // does not exist
+		"position":         0,
+	})
+
+	resp, err := h.handleMoveTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+	assert.Empty(t, queue.pendingMoves, "pending move must not be recorded for a non-existent step")
+}
+
+// TestDeferMoveTask_RejectsStepFromDifferentWorkflow ensures deferMoveTask
+// returns a validation error when the step exists but belongs to another workflow.
+func TestDeferMoveTask_RejectsStepFromDifferentWorkflow(t *testing.T) {
+	svc, repo, wfCtrl, wfRepo := newTestTaskServiceWithWorkflow(t)
+	ctx := context.Background()
+	seedRunningTask(t, repo, "ws-defer2", "wf-defer2", "task-defer2", "sess-defer2", "src-step2")
+
+	now := time.Now().UTC()
+	// source step (belongs to the task's workflow)
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "src-step2", WorkflowID: "wf-defer2", Name: "Source", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+	// A step that belongs to a different workflow — not wf-defer2
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "other-wf-step", WorkflowID: "wf-other", Name: "Other", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	queue := &pendingMoveRecordingQueuer{}
+	h := &Handlers{
+		taskSvc:      svc,
+		workflowCtrl: wfCtrl,
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-defer2",
+		"workflow_id":      "wf-defer2",
+		"workflow_step_id": "other-wf-step", // exists but in another workflow
+		"position":         0,
+	})
+
+	resp, err := h.handleMoveTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+	assert.Empty(t, queue.pendingMoves, "pending move must not be recorded for a step from another workflow")
+}
+
+// TestDeferMoveTask_RejectsWorkspaceMismatch ensures deferMoveTask returns a
+// validation error when the target step's workflow exists and matches
+// req.WorkflowID, but that workflow lives in a different workspace than the
+// task being moved. The deferred path bypasses task.Service.MoveTask (see
+// applyPendingMove's doc comment) so it must validate workspace ownership
+// independently, mirroring the immediate-apply path's validateTaskMove check.
+func TestDeferMoveTask_RejectsWorkspaceMismatch(t *testing.T) {
+	svc, repo, wfCtrl, wfRepo := newTestTaskServiceWithWorkflow(t)
+	ctx := context.Background()
+	seedRunningTask(t, repo, "ws-defer4", "wf-defer4", "task-defer4", "sess-defer4", "src-step4")
+
+	now := time.Now().UTC()
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "src-step4", WorkflowID: "wf-defer4", Name: "Source", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	// A separate workspace with its own workflow/step — the step exists and
+	// req.WorkflowID matches it, but its workspace differs from the task's.
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{
+		ID: "ws-defer4-other", Name: "Other", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-defer4-other", WorkspaceID: "ws-defer4-other", Name: "Other Board", CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "dst-step4-other", WorkflowID: "wf-defer4-other", Name: "Dest", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	queue := &pendingMoveRecordingQueuer{}
+	h := &Handlers{
+		taskSvc:      svc,
+		workflowCtrl: wfCtrl,
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":          "task-defer4",
+		"workflow_id":      "wf-defer4-other",
+		"workflow_step_id": "dst-step4-other",
+		"position":         0,
+	})
+
+	resp, err := h.handleMoveTask(ctx, msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
+	assert.Empty(t, queue.pendingMoves, "pending move must not be recorded for a cross-workspace target")
+}
+
+// TestDeferMoveTask_AcceptsValidStep ensures deferMoveTask succeeds when the
+// target step exists and belongs to the requested workflow.
+func TestDeferMoveTask_AcceptsValidStep(t *testing.T) {
+	svc, repo, wfCtrl, wfRepo := newTestTaskServiceWithWorkflow(t)
+	ctx := context.Background()
+	seedRunningTask(t, repo, "ws-defer3", "wf-defer3", "task-defer3", "sess-defer3", "src-step3")
+
+	now := time.Now().UTC()
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "src-step3", WorkflowID: "wf-defer3", Name: "Source", Position: 0, CreatedAt: now, UpdatedAt: now,
+	}))
+	require.NoError(t, wfRepo.CreateStep(ctx, &workflowmodels.WorkflowStep{
+		ID: "dst-step3", WorkflowID: "wf-defer3", Name: "Dest", Position: 1, CreatedAt: now, UpdatedAt: now,
+	}))
+
+	queue := &pendingMoveRecordingQueuer{}
+	h := &Handlers{
+		taskSvc:      svc,
+		workflowCtrl: wfCtrl,
+		messageQueue: queue,
+		logger:       testLogger(t).WithFields(),
+	}
+
+	msg := makeWSMessage(t, ws.ActionMCPMoveTask, map[string]interface{}{
+		"task_id":           "task-defer3",
+		"workflow_id":       "wf-defer3",
+		"workflow_step_id":  "dst-step3",
+		"position":          0,
+		"prompt":            "continue the work",
+		"sender_session_id": "sess-caller3",
+	})
+
+	resp, err := h.handleMoveTask(ctx, msg)
+	require.NoError(t, err)
+	assert.NotEqual(t, ws.MessageTypeError, resp.Type, "valid deferred move must succeed")
+	require.Len(t, queue.pendingMoves, 1)
+	assert.Equal(t, "dst-step3", queue.pendingMoves[0].WorkflowStepID)
+	assert.Equal(t, "sess-caller3", queue.pendingMoves[0].SenderSessionID)
+	assert.NotEmpty(t, queue.pendingMoves[0].MoveID)
+	// The legacy prompt is folded into one-shot entry instructions carried on
+	// the PendingMove; no hand-off message is pre-queued at defer time —
+	// instructions ride the target-step entry overlay applied at turn-end.
+	require.NotNil(t, queue.pendingMoves[0].EntryOptions)
+	assert.Equal(t, "continue the work", queue.pendingMoves[0].EntryOptions.Instructions)
+	assert.Empty(t, queue.calls)
+}
+
+func TestMoveTaskErrorMessage_SanitizesClassifiedErrors(t *testing.T) {
+	assert.Equal(t,
+		"Move task conflicts with the current task or workflow state",
+		moveTaskErrorMessage(fmt.Errorf("WIP limit exceeded for workflow step secret-step")),
+	)
+	assert.Equal(t,
+		"Invalid move_task request",
+		moveTaskErrorMessage(fmt.Errorf("workflow_step_id is required")),
+	)
+	assert.Equal(t,
+		"Failed to move task",
+		moveTaskErrorMessage(fmt.Errorf("database path /tmp/private failed")),
+	)
+}
+
+func TestNormalizeTaskState_AcceptsCommonAliases(t *testing.T) {
+	assert.Equal(t, v1.TaskStateCompleted, normalizeTaskState("complete"))
+	assert.Equal(t, v1.TaskStateCompleted, normalizeTaskState("DONE"))
+	assert.Equal(t, v1.TaskStateInProgress, normalizeTaskState("in_progress"))
+	assert.Equal(t, v1.TaskStateTODO, normalizeTaskState("open"))
+}
+
+func TestHandleUpdateTaskState_InvalidPayload(t *testing.T) {
+	h := &Handlers{}
+	msg := &ws.Message{
+		ID:      "test-id",
+		Type:    ws.MessageTypeRequest,
+		Action:  ws.ActionMCPUpdateTaskState,
+		Payload: json.RawMessage(`not json`),
+	}
+
+	resp, err := h.handleUpdateTaskState(context.Background(), msg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeBadRequest)
+}
+
+// --- Registration tests ---
+
+func TestRegisterHandlers_NilDeps_DoesNotPanic(t *testing.T) {
+	log := testLogger(t)
+	h := &Handlers{logger: log}
+	d := ws.NewDispatcher()
+
+	// Should not panic with nil config/task deps — handlers simply not registered.
+	assert.NotPanics(t, func() { h.RegisterHandlers(d) })
+}
+
+func TestRegisterHandlers_ListExecutorsActionDispatches(t *testing.T) {
+	svc, _ := newTestTaskService(t)
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+	d := ws.NewDispatcher()
+	h.RegisterHandlers(d)
+
+	msg := makeWSMessage(t, ws.ActionMCPListExecutors, map[string]interface{}{})
+	resp, err := d.Dispatch(context.Background(), msg)
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	assert.Equal(t, ws.ActionMCPListExecutors, resp.Action)
+
+	var payload dto.ListExecutorsResponse
+	require.NoError(t, json.Unmarshal(resp.Payload, &payload))
+	assert.Equal(t, len(payload.Executors), payload.Total)
+	assert.Contains(t, executorIDs(payload.Executors), models.ExecutorIDLocal)
+}
+
+func executorIDs(executors []dto.ExecutorDTO) []string {
+	ids := make([]string, 0, len(executors))
+	for _, executor := range executors {
+		ids = append(ids, executor.ID)
+	}
+	return ids
+}
+
+// --- Helper function tests ---
+
+func TestUnmarshalStringField(t *testing.T) {
+	t.Run("valid field", func(t *testing.T) {
+		payload := json.RawMessage(`{"task_id":"abc-123"}`)
+		val, err := unmarshalStringField(payload, "task_id")
+		assert.NoError(t, err)
+		assert.Equal(t, "abc-123", val)
+	})
+
+	t.Run("missing field returns empty", func(t *testing.T) {
+		payload := json.RawMessage(`{"other":"value"}`)
+		val, err := unmarshalStringField(payload, "task_id")
+		assert.NoError(t, err)
+		assert.Equal(t, "", val)
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		payload := json.RawMessage(`not json`)
+		_, err := unmarshalStringField(payload, "task_id")
+		assert.Error(t, err)
+	})
+
+	t.Run("empty payload", func(t *testing.T) {
+		payload := json.RawMessage(`{}`)
+		val, err := unmarshalStringField(payload, "task_id")
+		assert.NoError(t, err)
+		assert.Equal(t, "", val)
+	})
+}

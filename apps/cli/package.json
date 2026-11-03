@@ -1,0 +1,36 @@
+{
+  "name": "kandev",
+  "version": "0.97.0",
+  "private": false,
+  "description": "Launcher for Kandev — manage tasks, orchestrate agents, review changes, and ship value",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kdlbs/kandev.git"
+  },
+  "homepage": "https://github.com/kdlbs/kandev",
+  "type": "commonjs",
+  "bin": {
+    "kandev": "bin/cli.js"
+  },
+  "main": "bin/native-shim.js",
+  "files": [
+    "bin/cli.js",
+    "bin/native-shim.js"
+  ],
+  "engines": {
+    "npm": ">=7"
+  },
+  "optionalDependencies": {
+    "@kdlbs/runtime-linux-x64": "0.0.0-bootstrap",
+    "@kdlbs/runtime-linux-arm64": "0.0.0-bootstrap",
+    "@kdlbs/runtime-darwin-x64": "0.0.0-bootstrap",
+    "@kdlbs/runtime-darwin-arm64": "0.0.0-bootstrap",
+    "@kdlbs/runtime-win32-x64": "0.0.0-bootstrap"
+  },
+  "scripts": {
+    "build": "node -c bin/cli.js && node -c bin/native-shim.js",
+    "test": "node --test \"bin/*.test.mjs\"",
+    "prepublishOnly": "pnpm build"
+  }
+}

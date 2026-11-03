@@ -1,0 +1,612 @@
+// Mobile project: tap-activated PR/CI chip in the chat status bar.
+//
+// On mobile the desktop topbar PRTopbarButton is not mounted, and the chip's
+// HoverCard is unreachable by touch. The chip wraps a vaul Drawer that hosts
+// the PRCIPopover body — these specs exercise the open/close path and verify
+// the popover content renders the same surface as desktop.
+//
+// File name starts with "mobile-" so it lands in the `mobile-chrome` project
+// (Pixel 5 emulation) defined in playwright.config.ts.
+import { test, expect } from "../../fixtures/test-base";
+import type { SeedData } from "../../fixtures/test-base";
+import { SessionPage } from "../../pages/session-page";
+import type { ApiClient } from "../../helpers/api-client";
+import { waitForFiniteAnimations } from "../../helpers/animations";
+import { makePRCheckRun, makePRWorkflowRun } from "../../helpers/pr-checks";
+
+const OWNER = "acme";
+const REPO = "demo";
+const PR_NUMBER = 99;
+const PR_URL = `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`;
+
+type SeedTaskArgs = {
+  apiClient: ApiClient;
+  seedData: SeedData;
+  title: string;
+  description?: string;
+  prOverrides?: Partial<Parameters<ApiClient["mockGitHubAssociateTaskPR"]>[0]>;
+};
+
+async function seedTaskWithPR({
+  apiClient,
+  seedData,
+  title,
+  description = "/e2e:simple-message",
+  prOverrides = {},
+}: SeedTaskArgs): Promise<string> {
+  await apiClient.mockGitHubReset();
+  await apiClient.mockGitHubSetUser("test-user");
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description,
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: [seedData.repositoryId],
+    },
+  );
+  await apiClient.mockGitHubAssociateTaskPR({
+    workspace_id: seedData.workspaceId,
+    task_id: task.id,
+    owner: OWNER,
+    repo: REPO,
+    pr_number: PR_NUMBER,
+    pr_url: PR_URL,
+    pr_title: "Add mobile CI drawer",
+    head_branch: "feat/mobile-drawer",
+    base_branch: "main",
+    author_login: "test-user",
+    state: "open",
+    additions: 10,
+    deletions: 1,
+    ...prOverrides,
+  });
+  return task.id;
+}
+
+async function seedTaskWithPRAndTodos(args: SeedTaskArgs): Promise<string> {
+  return seedTaskWithPR({
+    ...args,
+    description: [
+      'e2e:plan([{"content":"Review mobile toolbar","status":"completed"},{"content":"Verify todo tap","status":"in_progress"}])',
+      'e2e:message("mobile todo and ci response")',
+    ].join("\n"),
+    prOverrides: {
+      checks_state: "success",
+      checks_total: 4,
+      checks_passing: 4,
+      ...args.prOverrides,
+    },
+  });
+}
+
+async function seedTaskWithTwoPRs(args: SeedTaskArgs): Promise<string> {
+  const taskId = await seedTaskWithPR(args);
+  await args.apiClient.mockGitHubAssociateTaskPR({
+    workspace_id: args.seedData.workspaceId,
+    task_id: taskId,
+    owner: OWNER,
+    repo: "api",
+    pr_number: 100,
+    pr_url: `https://github.com/${OWNER}/api/pull/100`,
+    pr_title: "PR events mobile PR",
+    head_branch: "feat/mobile-pr-events",
+    base_branch: "main",
+    author_login: "test-user",
+    state: "open",
+    checks_state: "success",
+    checks_total: 2,
+    checks_passing: 2,
+    review_state: "approved",
+    review_count: 1,
+  });
+  return taskId;
+}
+
+async function openTask(testPage: import("@playwright/test").Page, taskId: string) {
+  await testPage.goto(`/t/${taskId}`);
+  const session = new SessionPage(testPage);
+  await session.waitForLoad();
+  return session;
+}
+
+test.describe("mobile PR CI chip drawer", () => {
+  test("keeps grouped PR event automations usable without tray overflow", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    test.setTimeout(120_000);
+    const taskId = await seedTaskWithPRAndTodos({
+      apiClient,
+      seedData,
+      title: "Mobile PR event automation tray",
+      prOverrides: {
+        checks_state: "pending",
+        checks_total: 4,
+        checks_passing: 0,
+        review_state: "pending",
+        review_count: 0,
+        pending_review_count: 1,
+      },
+    });
+    await apiClient.updateTaskCIAutomationOptions(taskId, {
+      auto_fix_enabled: true,
+      auto_merge_enabled: true,
+      prompt_on_review_requested: true,
+      prompt_on_merged: true,
+      prompt_on_closed: true,
+    });
+    const session = await openTask(testPage, taskId);
+    const chip = session.prStatusChip();
+
+    await expect(chip).toBeVisible({ timeout: 15_000 });
+    await expect(chip.getByTestId("pr-status-auto-fix-chip")).toContainText("Auto-fix 0/10");
+    await expect(chip.getByTestId("pr-status-auto-merge-chip")).toHaveText("Auto-merge");
+    await expect(chip.getByTestId("pr-status-pr-events-chip")).toHaveText("PR events 3/3");
+    await expect(chip.getByTestId("pr-status-pr-events-chip")).toHaveCount(1);
+
+    const statusBar = session.activeChat().getByTestId("chat-status-bar");
+    await expect(statusBar).toHaveCSS("flex-wrap", "wrap");
+    await expect
+      .poll(
+        async () => {
+          await waitForFiniteAnimations(statusBar);
+          return statusBar.evaluate((element) => {
+            const bar = element.getBoundingClientRect();
+            const visibleChildren = Array.from(element.children).filter((child) => {
+              const style = getComputedStyle(child);
+              const rect = child.getBoundingClientRect();
+              return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0;
+            });
+            const childrenFit = visibleChildren.every((child) => {
+              const rect = child.getBoundingClientRect();
+              return rect.left >= bar.left - 1 && rect.right <= bar.right + 1;
+            });
+            return childrenFit && element.scrollWidth <= element.clientWidth + 1;
+          });
+        },
+        {
+          timeout: 30_000,
+          intervals: [100, 250, 500],
+          message: "Waiting for the mobile chat status bar children to fit within the bar",
+        },
+      )
+      .toBe(true);
+    expect(
+      await testPage.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+    await prCapture.screenshot("mobile-pr-pr-events-automation-tray", {
+      caption: "Grouped PR event automation badge in the mobile composer tray",
+    });
+
+    await session.tapPRStatusChip();
+    const drawer = session.prStatusChipDrawer();
+    await expect(
+      drawer.getByRole("switch", { name: "Auto-fix CI and address comments" }),
+    ).toBeVisible();
+    await expect(
+      drawer.getByRole("switch", { name: "Auto-merge or requeue when ready" }),
+    ).toBeVisible();
+    await expect(drawer.getByRole("switch", { name: "Your review is requested" })).toBeVisible();
+    await expect(drawer.getByRole("switch", { name: "PR merged" })).toBeVisible();
+    await expect(drawer.getByRole("switch", { name: "PR closed without merging" })).toBeVisible();
+  });
+
+  test("tapping the todo indicator beside the CI chip opens the todo list", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const taskId = await seedTaskWithPRAndTodos({
+      apiClient,
+      seedData,
+      title: "Mobile todo tap-open",
+    });
+    const session = await openTask(testPage, taskId);
+
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await expect(session.todoIndicator()).toBeVisible({ timeout: 15_000 });
+
+    await session.todoIndicator().tap();
+
+    const todoPopover = testPage.getByTestId("todo-indicator-popover");
+    await expect(todoPopover.getByText("Todos", { exact: true })).toBeVisible();
+    await expect(todoPopover.getByText("Verify todo tap", { exact: true })).toBeVisible();
+  });
+
+  test("tapping the chip opens the drawer with PR CI content", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Mobile CI tap-open";
+    const taskId = await seedTaskWithPR({
+      apiClient,
+      seedData,
+      title,
+      prOverrides: {
+        checks_state: "success",
+        checks_total: 4,
+        checks_passing: 4,
+        review_state: "approved",
+        review_count: 1,
+      },
+    });
+    const session = await openTask(testPage, taskId);
+
+    // Desktop topbar PR button never mounts on mobile — sanity check that we
+    // are exercising the chip path and not a leftover desktop affordance.
+    await expect(session.prTopbarButton()).toHaveCount(0);
+
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await expect(session.prStatusChipDrawer()).toHaveCount(0);
+
+    await session.tapPRStatusChip();
+
+    await expect(session.prStatusChipPopoverInner()).toBeVisible();
+    await expect(
+      session.prStatusChipDrawer().locator("[data-testid='pr-check-group'][data-kind='passed']"),
+    ).toBeVisible();
+    await expect(session.prStatusChipDrawer().getByTestId("pr-review-row")).toContainText(
+      "Approved",
+    );
+  });
+
+  test("shows a workflow approval reason and link in the mobile drawer", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    test.setTimeout(120_000);
+    const taskId = await seedTaskWithPR({
+      apiClient,
+      seedData,
+      title: "Mobile workflow approval",
+      prOverrides: {
+        head_sha: "mobile-workflow-head",
+        head_repo_owner: "contributor",
+        head_repo_name: "demo-fork",
+        review_state: "approved",
+        mergeable_state: "clean",
+      },
+    });
+    await apiClient.mockGitHubSeedPRFeedback({
+      owner: OWNER,
+      repo: REPO,
+      pr_number: PR_NUMBER,
+      workflow_runs: [
+        {
+          id: 700,
+          run_attempt: 1,
+          workflow_id: 900,
+          name: "Run tests",
+          event: "pull_request",
+          status: "completed",
+          conclusion: "action_required",
+          head_sha: "mobile-workflow-head",
+          head_branch: "feat/mobile-drawer",
+          head_repo_owner: "contributor",
+          head_repo_name: "demo-fork",
+          html_url: "https://github.com/acme/demo/actions/runs/700",
+          pull_requests: [
+            {
+              number: PR_NUMBER,
+              head_sha: "mobile-workflow-head",
+              head_branch: "feat/mobile-drawer",
+              head_repo_owner: "contributor",
+              head_repo_name: "demo-fork",
+            },
+          ],
+        },
+      ],
+    });
+
+    let session = await openTask(testPage, taskId);
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await session.tapPRStatusChip();
+    const notice = session.prStatusChipDrawer().getByTestId("pr-workflow-attention");
+    await expect(notice).toContainText("Awaiting maintainer approval");
+    const link = notice.getByTestId("pr-workflow-attention-link");
+    await expect(link).toHaveAttribute("href", "https://github.com/acme/demo/actions/runs/700");
+    const box = await link.boundingBox();
+    expect(box?.height).toBeGreaterThanOrEqual(44);
+    await prCapture.screenshot("mobile-workflow-approval-attention", {
+      caption: "Mobile PR drawer explains a workflow approval gate",
+    });
+
+    await session.prStatusChipDrawerClose().tap();
+    await testPage.reload();
+    session = new SessionPage(testPage);
+    await session.waitForLoad();
+    await session.tapPRStatusChip();
+    await expect(session.prStatusChipDrawer().getByTestId("pr-workflow-attention")).toContainText(
+      "Awaiting maintainer approval",
+    );
+  });
+
+  test("failed PR shows failed bucket inside the drawer", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Mobile CI failed";
+    const taskId = await seedTaskWithPR({
+      apiClient,
+      seedData,
+      title,
+      prOverrides: {
+        checks_state: "failure",
+        checks_total: 3,
+        checks_passing: 2,
+      },
+    });
+    const session = await openTask(testPage, taskId);
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await session.tapPRStatusChip();
+
+    const failedGroup = session
+      .prStatusChipDrawer()
+      .locator("[data-testid='pr-check-group'][data-kind='failed']");
+    await expect(failedGroup).toBeVisible();
+    // 3 checks_total − 2 checks_passing = 1 in the failed bucket.
+    await expect(failedGroup.getByTestId("pr-check-group-count")).toHaveText("1");
+  });
+
+  test("close button dismisses the drawer", async ({ testPage, apiClient, seedData }) => {
+    test.setTimeout(120_000);
+    const title = "Mobile CI close";
+    const taskId = await seedTaskWithPR({
+      apiClient,
+      seedData,
+      title,
+      prOverrides: {
+        checks_state: "success",
+        checks_total: 1,
+        checks_passing: 1,
+      },
+    });
+    const session = await openTask(testPage, taskId);
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await session.tapPRStatusChip();
+    await expect(session.prStatusChipDrawer()).toBeVisible();
+
+    await session.prStatusChipDrawerClose().tap();
+    await expect(session.prStatusChipDrawer()).toHaveCount(0, { timeout: 5_000 });
+  });
+
+  test("unlink control works inside the multi-PR drawer with a touch-sized target", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    test.setTimeout(120_000);
+    const taskId = await seedTaskWithTwoPRs({
+      apiClient,
+      seedData,
+      title: "Mobile multi PR unlink",
+      prOverrides: {
+        checks_state: "success",
+        checks_total: 2,
+        checks_passing: 2,
+      },
+    });
+    const session = await openTask(testPage, taskId);
+
+    await expect(session.prStatusChip()).toHaveAttribute("data-pr-count", "2", {
+      timeout: 15_000,
+    });
+    await session.tapPRStatusChip();
+    await prCapture.screenshot("mobile-pr-unlink-drawer", {
+      caption: "Mobile multi-PR drawer with touch-sized unlink controls",
+    });
+
+    const removeFirst = session.prMultiPopoverRemove(OWNER, REPO, PR_NUMBER);
+    await expect(removeFirst).toBeVisible();
+    const box = await removeFirst.boundingBox();
+    expect(box?.height).toBeGreaterThanOrEqual(44);
+    await removeFirst.tap();
+
+    await expect(session.prStatusChip()).toHaveAttribute("data-pr-number", "100");
+    await expect(session.prStatusChip()).toBeFocused();
+    await expect(session.prMultiPopoverRemove(OWNER, REPO, PR_NUMBER)).toHaveCount(0);
+    await expect(session.prStatusChipDrawer()).toHaveCount(0);
+    await expect
+      .poll(() =>
+        testPage.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      )
+      .toBe(true);
+
+    await testPage.reload();
+    const reloaded = new SessionPage(testPage);
+    await reloaded.waitForLoad();
+    await expect(reloaded.prStatusChip()).toHaveAttribute("data-pr-number", "100");
+  });
+
+  test("keeps a terminal sibling unlinkable on touch", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const taskId = await seedTaskWithTwoPRs({
+      apiClient,
+      seedData,
+      title: "Mobile terminal PR unlink",
+      prOverrides: {
+        state: "merged",
+      },
+    });
+    const session = await openTask(testPage, taskId);
+
+    await expect(session.prStatusChip()).toHaveAttribute("data-pr-count", "2", {
+      timeout: 15_000,
+    });
+    await session.tapPRStatusChip();
+
+    const removeMerged = session.prMultiPopoverRemove(OWNER, REPO, PR_NUMBER);
+    await expect(removeMerged).toBeVisible();
+    await removeMerged.tap();
+
+    await expect(session.prStatusChip()).toHaveAttribute("data-pr-number", "100");
+    await expect(session.prMultiPopoverRemove(OWNER, REPO, PR_NUMBER)).toHaveCount(0);
+    await expect(session.prStatusChipDrawer()).toHaveCount(0);
+  });
+
+  test("current PR checks: drawer shows the selected run and cancellation-only state", async ({
+    testPage,
+    apiClient,
+    seedData,
+    prCapture,
+  }) => {
+    test.setTimeout(150_000);
+    const headSHA = "mobile-current-pr-checks-head";
+    const identity = {
+      number: PR_NUMBER,
+      headSHA,
+      headBranch: "feat/mobile-drawer",
+      headRepoOwner: "contributor",
+      headRepoName: "demo-fork",
+    };
+    const taskId = await seedTaskWithPR({
+      apiClient,
+      seedData,
+      title: "current PR checks: mobile drawer parity",
+      prOverrides: {
+        head_sha: headSHA,
+        head_repo_owner: identity.headRepoOwner,
+        head_repo_name: identity.headRepoName,
+        checks_state: "failure",
+        checks_total: 2,
+        checks_passing: 0,
+      },
+    });
+    await apiClient.mockGitHubSeedPRFeedback({
+      owner: OWNER,
+      repo: REPO,
+      pr_number: PR_NUMBER,
+      checks: [
+        makePRCheckRun({
+          id: 9001,
+          suiteId: 2001,
+          name: "Preview / deploy-fork",
+          status: "completed",
+          conclusion: "cancelled",
+          htmlUrl: "https://github.com/acme/demo/actions/runs/990/deploy",
+        }),
+        makePRCheckRun({
+          id: 9002,
+          suiteId: 2001,
+          name: "Preview / update-description-fork",
+          status: "completed",
+          conclusion: "cancelled",
+          htmlUrl: "https://github.com/acme/demo/actions/runs/990/description",
+        }),
+        makePRCheckRun({
+          id: 9011,
+          suiteId: 2002,
+          name: "Preview / package",
+          status: "in_progress",
+          htmlUrl: "https://github.com/acme/demo/actions/runs/991/package",
+        }),
+        makePRCheckRun({
+          id: 9010,
+          suiteId: 2002,
+          name: "Preview / lint",
+          status: "completed",
+          conclusion: "success",
+          htmlUrl: "https://github.com/acme/demo/actions/runs/991/lint",
+        }),
+      ],
+      workflow_runs: [
+        makePRWorkflowRun({
+          id: 990,
+          suiteId: 2001,
+          identity,
+          status: "completed",
+          conclusion: "cancelled",
+          url: "https://github.com/acme/demo/actions/runs/990",
+        }),
+        makePRWorkflowRun({
+          id: 991,
+          suiteId: 2002,
+          identity,
+          status: "in_progress",
+          url: "https://github.com/acme/demo/actions/runs/991",
+        }),
+      ],
+    });
+
+    let session = await openTask(testPage, taskId);
+    await expect(session.prStatusChip()).toBeVisible({ timeout: 15_000 });
+    await session.tapPRStatusChip();
+    let drawer = session.prStatusChipDrawer();
+    const inProgress = drawer.locator("[data-testid='pr-check-group'][data-kind='in_progress']");
+    await expect(inProgress).toBeVisible();
+    await expect(inProgress.getByTestId("pr-check-group-count")).toHaveText("1");
+    await expect(drawer.locator("[data-testid='pr-check-group'][data-kind='failed']")).toHaveCount(
+      0,
+    );
+    if (prCapture.capturing) {
+      await expect(drawer.getByTestId("pr-popover-updated-at")).toBeVisible({ timeout: 10_000 });
+      await expect(drawer.getByTestId("pr-popover-updating")).toHaveCount(0);
+      await waitForFiniteAnimations(drawer);
+      await prCapture.screenshot("current-pr-checks-phone", {
+        caption: "Phone drawer showing current workflow progress without superseded failures",
+      });
+    }
+    const currentRunPopup = testPage.waitForEvent("popup");
+    await drawer.getByTestId("pr-workflow-open").click();
+    const openedCurrentRun = await currentRunPopup;
+    await expect(openedCurrentRun).toHaveURL(
+      "https://github.com/acme/demo/actions/runs/991/package",
+    );
+    await openedCurrentRun.close();
+    await session.prStatusChipDrawerClose().tap();
+    await expect(session.prStatusChipDrawer()).toHaveCount(0);
+
+    await apiClient.mockGitHubSeedPRFeedback({
+      owner: OWNER,
+      repo: REPO,
+      pr_number: PR_NUMBER,
+      checks: [
+        makePRCheckRun({
+          id: 9021,
+          suiteId: 2003,
+          name: "Preview / deploy-fork",
+          status: "completed",
+          conclusion: "cancelled",
+          htmlUrl: "https://github.com/acme/demo/actions/runs/992/deploy",
+        }),
+      ],
+      workflow_runs: [
+        makePRWorkflowRun({
+          id: 992,
+          suiteId: 2003,
+          identity,
+          status: "completed",
+          conclusion: "cancelled",
+          url: "https://github.com/acme/demo/actions/runs/992",
+        }),
+      ],
+    });
+    await testPage.reload();
+    session = await openTask(testPage, taskId);
+    await session.tapPRStatusChip();
+    drawer = session.prStatusChipDrawer();
+    await expect(drawer.getByTestId("pr-checks-empty")).toHaveText("Checks not successful");
+    await expect(drawer.locator("[data-testid='pr-check-group']")).toHaveCount(0);
+    await session.prStatusChipDrawerClose().tap();
+    await expect(session.prStatusChipDrawer()).toHaveCount(0);
+  });
+});

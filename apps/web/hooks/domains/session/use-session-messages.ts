@@ -1,0 +1,1127 @@
+/* eslint-disable max-lines -- session hydration and lifecycle hooks share one transcript contract. */
+
+import { useCallback, useEffect, useLayoutEffect, useRef, type MutableRefObject } from "react";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import {
+  isWebSocketRequestTimeoutError,
+  SESSION_ENTRY_REQUEST_TIMEOUT_MS,
+  SESSION_ENTRY_RETRY_DELAY_MS,
+} from "@/lib/ws/client";
+import { useForegroundRefresh } from "@/hooks/use-foreground-refresh";
+import { useAppStore, useAppStoreApi } from "@/components/state-provider";
+import type { TaskSessionState, Message } from "@/lib/types/http";
+import { createDebugLogger, isDebug } from "@/lib/debug/log";
+import { ensureSessionTurnsLoaded } from "./use-session-turns-hydration";
+import {
+  useUnknownSessionSubscriptionRetry,
+  useUnknownSessionSubscriptionRetryEffect,
+} from "./use-session-subscription-retry";
+import {
+  doFetchMessages,
+  getHydratedMessagesForGeneration,
+  recordHydratedGeneration,
+  type MessageFetchOptions,
+  type SessionHydrationRef,
+} from "./use-session-message-fetch";
+import { useMessageFetchState } from "./use-message-fetch-state";
+import type { MessageHistoryStatus } from "./use-message-fetch-state";
+import { reconcileLatestMessageWindow } from "./message-window-reconciliation";
+import { t } from "@/lib/i18n";
+
+export { shouldRetryUnknownSessionSubscription } from "./use-session-subscription-retry";
+// Test seam: exported for direct unit coverage of hydration dedup/guards.
+export { ensureSessionTurnsLoaded } from "./use-session-turns-hydration";
+
+const INITIAL_FETCH_LIMIT = 100;
+const RUNNING_BACKFILL_INITIAL_DELAY_MS = 1200;
+const RUNNING_BACKFILL_INTERVAL_MS = 5000;
+const MAX_HISTORY_FETCH_ATTEMPTS = 2;
+const TERMINAL_SESSION_STATES: Partial<Record<TaskSessionState, true>> = {
+  WAITING_FOR_INPUT: true,
+  COMPLETED: true,
+  FAILED: true,
+};
+
+// Monotonic guard against stale concurrent fetches. Each fetch claims an
+// increasing sequence number before awaiting; a completion only merges if no
+// newer fetch for the same session has already merged, so an older in-flight
+// fetch cannot overwrite newer state (WS-delivered messages or a newer fetch's
+// snapshot) when two fetches for the same session race.
+let fetchSeqCounter = 0;
+const lastAppliedFetchSeq = new Map<string, number>();
+
+/** Claims the next monotonic fetch sequence number. */
+export function nextFetchSeq(): number {
+  fetchSeqCounter += 1;
+  return fetchSeqCounter;
+}
+
+/**
+ * Records that the fetch identified by `seq` is about to merge for `sessionId`.
+ * Returns false when a newer fetch has already merged for the session, so the
+ * caller can skip the stale merge.
+ */
+export function commitFetchSeq(sessionId: string, seq: number): boolean {
+  const applied = lastAppliedFetchSeq.get(sessionId) ?? 0;
+  if (seq < applied) return false;
+  lastAppliedFetchSeq.set(sessionId, seq);
+  return true;
+}
+
+// States where a turn (or the agent boot) is actively progressing.
+const ACTIVE_SESSION_STATES: ReadonlySet<TaskSessionState> = new Set(["STARTING", "RUNNING"]);
+// States the session settles into once a turn finishes.
+const SETTLED_SESSION_STATES: ReadonlySet<TaskSessionState> = new Set([
+  "IDLE",
+  "WAITING_FOR_INPUT",
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+]);
+
+/**
+ * True when the session just left an active state for a settled one — i.e. a
+ * turn (or a resume's agent boot) finished. Session-scoped message updates
+ * emitted as the turn winds down (e.g. the `agent_boot` `script_execution`
+ * completion during a resume) can be missed if the live subscription lapsed
+ * during the resume churn, so this is the signal to refetch and reconcile.
+ *
+ * `state_changed` / `turn.completed` are broadcast globally (not session-scoped),
+ * so the client always observes this transition even when its session
+ * subscription was dropped.
+ */
+export function isTurnSettleTransition(
+  prev: TaskSessionState | null,
+  next: TaskSessionState | null,
+): boolean {
+  if (prev === null || next === null) return false;
+  return ACTIVE_SESSION_STATES.has(prev) && SETTLED_SESSION_STATES.has(next);
+}
+
+export function hasUserPromptInActiveTurn(messages: Message[], activeTurnId: string | null) {
+  if (!activeTurnId) return false;
+  return messages.some(
+    (m) => m.turn_id === activeTurnId && m.type === "message" && m.author_type === "user",
+  );
+}
+
+export function shouldRunMessageBackfill(params: {
+  taskSessionState: TaskSessionState | null;
+  connectionStatus: string;
+  activeTurnId: string | null;
+  messages: Message[];
+}) {
+  // The active prompt may be the missed WS frame; start backfill once the turn exists.
+  return (
+    params.connectionStatus === "connected" &&
+    params.taskSessionState === "RUNNING" &&
+    params.activeTurnId !== null
+  );
+}
+
+const debug = createDebugLogger("messages:fetch");
+
+function summarizeMessages(messages: Message[]): {
+  count: number;
+  byType: Record<string, number>;
+  userMessageCount: number;
+  agentMessageCount: number;
+  oldestCreatedAt: string | null;
+  newestCreatedAt: string | null;
+} {
+  const byType: Record<string, number> = {};
+  let userMessageCount = 0;
+  let agentMessageCount = 0;
+  for (const m of messages) {
+    const t = m.type ?? "unknown";
+    byType[t] = (byType[t] ?? 0) + 1;
+    if (m.type === "message" && m.author_type === "user") userMessageCount++;
+    if (m.type === "message" && m.author_type === "agent") agentMessageCount++;
+  }
+  return {
+    count: messages.length,
+    byType,
+    userMessageCount,
+    agentMessageCount,
+    oldestCreatedAt: messages[0]?.created_at ?? null,
+    newestCreatedAt: messages[messages.length - 1]?.created_at ?? null,
+  };
+}
+
+interface UseSessionMessagesReturn {
+  isLoading: boolean;
+  isInitialMessagesLoading: boolean;
+  historyRefreshPending: boolean;
+  messages: Message[];
+  historyInitialized: boolean;
+  hasMore: boolean;
+  oldestCursor: string | null;
+  historyStatus: MessageHistoryStatus;
+  historyError: unknown;
+  retryHistory: () => void;
+}
+
+type MessageListResponse = { messages: Message[]; has_more?: boolean; cursor?: string };
+type InFlightMessageRequest = {
+  readiness: Promise<void>;
+  promise: Promise<MessageListResponse>;
+  cachedAtRequest: Message[];
+  settled: boolean;
+};
+
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_META = {
+  isLoading: false,
+  isLoadingMore: false,
+  historyInitialized: false,
+  hasMore: false,
+  oldestCursor: null,
+};
+const inFlightMessageRequests = new Map<string, InFlightMessageRequest>();
+
+/** Debug-only summary of a fetch response (no-op unless debug logging is on). */
+function logFetchSummary(
+  sessionId: string,
+  fetched: Message[],
+  response: MessageListResponse,
+  limit: number,
+): void {
+  if (!isDebug()) return;
+  const summary = summarizeMessages(fetched);
+  debug("message.list response", {
+    sessionId,
+    hasMore: response.has_more ?? false,
+    cursor: response.cursor ?? null,
+    ...summary,
+  });
+  if (fetched.length > 0 && summary.userMessageCount === 0 && summary.agentMessageCount === 0) {
+    debug("WARNING: fetched window contains no user/agent message rows", {
+      sessionId,
+      limit,
+      hasMore: response.has_more ?? false,
+      byType: summary.byType,
+      hint: t("task:messageFetchLimitHint"),
+    });
+  }
+}
+
+function requestSessionMessages(
+  client: NonNullable<ReturnType<typeof getWebSocketClient>>,
+  sessionId: string,
+  readiness: Promise<void>,
+  cachedAtRequest: Message[],
+  force = false,
+): InFlightMessageRequest {
+  const existing = inFlightMessageRequests.get(sessionId);
+  if (!force && existing?.readiness === readiness && !existing.settled) return existing;
+
+  const requestParams = {
+    session_id: sessionId,
+    limit: INITIAL_FETCH_LIMIT,
+    sort: "desc" as const,
+  };
+  const promise = client.request<MessageListResponse>(
+    "message.list",
+    requestParams,
+    SESSION_ENTRY_REQUEST_TIMEOUT_MS,
+  );
+  const entry = { readiness, promise, cachedAtRequest: [...cachedAtRequest], settled: false };
+  inFlightMessageRequests.set(sessionId, entry);
+  void promise.then(
+    () => {
+      entry.settled = true;
+      window.setTimeout(() => {
+        if (inFlightMessageRequests.get(sessionId) === entry) {
+          inFlightMessageRequests.delete(sessionId);
+        }
+      }, 0);
+    },
+    () => {
+      entry.settled = true;
+      window.setTimeout(() => {
+        if (inFlightMessageRequests.get(sessionId) === entry) {
+          inFlightMessageRequests.delete(sessionId);
+        }
+      }, 0);
+    },
+  );
+  return entry;
+}
+
+/** Fetch latest messages via WS and merge with any that arrived via live notifications. */
+// eslint-disable-next-line complexity -- The ordered snapshot path keeps its guards adjacent to the commit fence.
+async function fetchAndStoreMessagesAttempt({
+  sessionId,
+  store,
+  isActive,
+  hydrationRef,
+  hydrationKey,
+  options,
+}: {
+  sessionId: string;
+  store: ReturnType<typeof useAppStoreApi>;
+  isActive?: () => boolean;
+  hydrationRef?: SessionHydrationRef;
+  hydrationKey?: string;
+  options?: MessageFetchOptions;
+}): Promise<Message[]> {
+  const client = getWebSocketClient();
+  if (!client) {
+    return [];
+  }
+  // Initial and recovery fetches must not overtake the server-side
+  // session.subscribe registration. The client returns an already-resolved
+  // promise when no durable subscription is active, preserving fetch behavior
+  // for non-session callers while gating this hook's normal subscription path.
+  const readiness = client.getSessionSubscriptionReadiness(sessionId);
+  await readiness;
+  if (isActive && !isActive()) return [];
+  const hydratedMessages = getHydratedMessagesForGeneration({
+    hydrationRef,
+    sessionId,
+    readiness,
+    hydrationKey,
+    store,
+    force: options?.force,
+  });
+  if (hydratedMessages !== undefined) return hydratedMessages;
+  // The messages fetch is the session-entry chokepoint: any path that opens a
+  // session's transcript must also make its turns resolvable. Start it only
+  // after subscription acknowledgement so the REST snapshot cannot race the
+  // initial WebSocket subscription registration.
+  if (!options?.force) void ensureSessionTurnsLoaded(sessionId, store, { readiness });
+  const cachedAtRequest = store.getState().messages.bySession[sessionId] ?? [];
+  const seq = nextFetchSeq();
+  // Keep the snapshot on the deduplicated request. Concurrent callers may
+  // observe different cache contents, but reconciliation must use the
+  // baseline captured by the caller that actually issued the network request.
+  const request = requestSessionMessages(
+    client,
+    sessionId,
+    readiness,
+    cachedAtRequest,
+    options?.force,
+  );
+  const response = await request.promise;
+  if (isActive && !isActive()) return [];
+  const fetched = [...(response.messages ?? [])].reverse();
+  logFetchSummary(sessionId, fetched, response, INITIAL_FETCH_LIMIT);
+  const { messages: merged, oldestCursor } = reconcileLatestMessageWindow({
+    cachedAtRequest: request.cachedAtRequest,
+    cachedAtResponse: store.getState().messages.bySession[sessionId] ?? [],
+    fetched,
+    authoritative: options?.authoritative,
+  });
+  // Stale-fetch guard: if a newer fetch for this session already merged while
+  // this one was in flight, skip the merge so the older snapshot can't drop
+  // newer messages. The newer state is already in the store.
+  if (!commitFetchSeq(sessionId, seq)) {
+    debug("message.list stale fetch skipped", { sessionId, seq });
+    return store.getState().messages.bySession[sessionId] ?? merged;
+  }
+  // Idempotent merge: the store reconciles this snapshot against current state,
+  // preserving object/array identity for unchanged messages so the periodic
+  // refetch doesn't re-render the whole chat (see reconcileMessages).
+  store.getState().mergeMessages(sessionId, merged, {
+    historyInitialized: true,
+    hasMore: response.has_more ?? false,
+    oldestCursor,
+  });
+  recordHydratedGeneration(hydrationRef, sessionId, readiness, hydrationKey);
+  // The store now holds the identity-reconciled array; callers only read length
+  // and message content from the return, so `merged` is equivalent.
+  return merged;
+}
+
+function waitForHistoryRetry(isActive?: () => boolean): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(
+      () => resolve(!isActive || isActive()),
+      SESSION_ENTRY_RETRY_DELAY_MS,
+    );
+    if (isActive && !isActive()) {
+      window.clearTimeout(timer);
+      resolve(false);
+    }
+  });
+}
+
+/** Fetch history with one bounded retry for a timed-out message.list request. */
+// eslint-disable-next-line max-params -- session hydration needs its active and generation guards.
+async function fetchAndStoreMessages(
+  sessionId: string,
+  store: ReturnType<typeof useAppStoreApi>,
+  isActive?: () => boolean,
+  hydrationRef?: SessionHydrationRef,
+  hydrationKey?: string,
+  onRetry?: () => void,
+  options?: MessageFetchOptions,
+): Promise<Message[]> {
+  for (let attempt = 0; attempt < MAX_HISTORY_FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchAndStoreMessagesAttempt({
+        sessionId,
+        store,
+        isActive,
+        hydrationRef,
+        hydrationKey,
+        options,
+      });
+    } catch (error) {
+      const retryable =
+        isWebSocketRequestTimeoutError(error) &&
+        error.action === "message.list" &&
+        attempt + 1 < MAX_HISTORY_FETCH_ATTEMPTS;
+      if (!retryable || !(await waitForHistoryRetry(isActive))) throw error;
+      if (!isActive || isActive()) onRetry?.();
+    }
+  }
+  return [];
+}
+
+/**
+ * When the initial fetch window contains no user/agent message rows (common
+ * when the latest turn produced hundreds of tool calls), the chat would render
+ * as an opaque collapsed activity group with nothing meaningful to scroll
+ * past — the lazy-load sentinel at the top of the list never fires because
+ * the user has no anchor to scroll from. Paginate backward via the same HTTP
+ * endpoint `useLazyLoadMessages` uses until we span at least one user/agent
+ * message or hit the page budget.
+ */
+function useTerminalStateFetch(
+  taskSessionId: string | null,
+  taskSessionState: TaskSessionState | null,
+  hasAgentMessage: boolean,
+  sessionFetchGenerationRef: MutableRefObject<number>,
+  refs: {
+    store: ReturnType<typeof useAppStoreApi>;
+    setIsLoading: (v: boolean) => void;
+    setIsWaitingForInitialMessages: (v: boolean) => void;
+    setHistoryStatus: (v: MessageHistoryStatus) => void;
+    setHistoryError: (v: unknown) => void;
+    initialFetchStartRef: MutableRefObject<number | null>;
+    lastFetchedSessionIdRef: MutableRefObject<string | null>;
+  },
+) {
+  const lastFetchStateKeyRef = useRef<string | null>(null);
+  const connectionStatus = useAppStore((state) => state.connection.status);
+  useEffect(() => {
+    let active = true;
+    const generation = sessionFetchGenerationRef.current;
+    const isCurrentGeneration = () => sessionFetchGenerationRef.current === generation;
+    const isActive = () => active && isCurrentGeneration();
+    const deactivate = () => {
+      active = false;
+    };
+    if (!taskSessionId || connectionStatus !== "connected") return deactivate;
+    if (!taskSessionState) return deactivate;
+    if (!TERMINAL_SESSION_STATES[taskSessionState]) return deactivate;
+    const key = `${taskSessionId}:${taskSessionState}`;
+    if (lastFetchStateKeyRef.current === key) return deactivate;
+    lastFetchStateKeyRef.current = key;
+    void doFetchMessages({
+      taskSessionId,
+      ...refs,
+      fetchAndStoreMessages,
+      isActive,
+      canFinalizeLoading: isCurrentGeneration,
+      onError: (error) => console.error("Failed to fetch messages after state change:", error),
+    });
+    return deactivate;
+  }, [
+    taskSessionId,
+    taskSessionState,
+    hasAgentMessage,
+    connectionStatus,
+    refs,
+    sessionFetchGenerationRef,
+  ]);
+}
+
+// Silent WS disconnects (NAT timeout, laptop sleep, suspended tab) leave
+// connectionStatus stuck at "connected" and no resubscribe fires. Backfill
+// whenever the tab regains visibility to recover missed messages without
+// requiring a page refresh.
+export function useVisibilityBackfill(
+  taskSessionId: string | null,
+  store: ReturnType<typeof useAppStoreApi>,
+  sessionFetchGenerationRef?: MutableRefObject<number>,
+) {
+  useForegroundRefresh(
+    () => {
+      if (!taskSessionId) return;
+      const generation = sessionFetchGenerationRef?.current;
+      const isActive = () =>
+        generation === undefined || sessionFetchGenerationRef?.current === generation;
+      const visibilityState = document.visibilityState;
+      const state = store.getState();
+      const existingCount = state.messages.bySession[taskSessionId]?.length ?? 0;
+      const newestBefore =
+        state.messages.bySession[taskSessionId]?.slice(-1)[0]?.created_at ?? null;
+      debug("visibilityBackfill: visibilitychange fired", {
+        sessionId: taskSessionId,
+        visibilityState,
+        connectionStatus: state.connection?.status ?? "unknown",
+        existingCount,
+        newestBefore,
+      });
+      fetchAndStoreMessages(taskSessionId, store, isActive)
+        .then(() => {
+          const afterCount = store.getState().messages.bySession[taskSessionId]?.length ?? 0;
+          const newestAfter =
+            store.getState().messages.bySession[taskSessionId]?.slice(-1)[0]?.created_at ?? null;
+          debug("visibilityBackfill: refetch complete", {
+            sessionId: taskSessionId,
+            delta: afterCount - existingCount,
+            newestBefore,
+            newestAfter,
+          });
+        })
+        .catch((err) => {
+          debug("visibilityBackfill: refetch failed", { sessionId: taskSessionId, err });
+        });
+    },
+    Boolean(taskSessionId),
+    taskSessionId,
+  );
+}
+
+type SessionSubscriptionParams = {
+  taskSessionId: string | null;
+  connectionStatus: string;
+  store: ReturnType<typeof useAppStoreApi>;
+  fetchRefs: ReturnType<typeof useMessageFetchState>["refs"];
+  hydrationRef: SessionHydrationRef;
+  hydrationKey: string;
+  sessionFetchGenerationRef: MutableRefObject<number>;
+};
+
+function useSessionSubscription({
+  taskSessionId,
+  connectionStatus,
+  isSessionStartingOrUnknown,
+  store,
+  fetchRefs,
+  hydrationRef,
+  hydrationKey,
+  sessionFetchGenerationRef,
+}: SessionSubscriptionParams & { isSessionStartingOrUnknown: boolean }) {
+  useEffect(() => {
+    debug("subscription: effect ran", {
+      sessionId: taskSessionId,
+      connectionStatus,
+      isSessionStartingOrUnknown,
+    });
+    if (!taskSessionId || connectionStatus !== "connected") {
+      debug("subscription: skipped (no session or not connected)", {
+        sessionId: taskSessionId,
+        connectionStatus,
+      });
+      return;
+    }
+    const client = getWebSocketClient();
+    if (!client) {
+      debug("subscription: skipped (no ws client)", { sessionId: taskSessionId });
+      return;
+    }
+    debug("subscription: subscribing", { sessionId: taskSessionId });
+    const subscription = client.subscribeSessionWithReady(taskSessionId);
+    let active = true;
+    const generation = sessionFetchGenerationRef.current;
+
+    // Re-fetch messages after the server acknowledges the subscription to
+    // close the gap between SSR (which may have run before the agent
+    // responded) and this subscription.
+    void subscription.ready
+      .then(() => {
+        if (!active) return;
+        const isCurrentGeneration = () => sessionFetchGenerationRef.current === generation;
+        const isActive = () => active && isCurrentGeneration();
+        return doFetchMessages({
+          taskSessionId,
+          ...fetchRefs,
+          fetchAndStoreMessages,
+          isActive,
+          canFinalizeLoading: isCurrentGeneration,
+          hydrationRef,
+          hydrationKey,
+        });
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+      debug("subscription: unsubscribing", { sessionId: taskSessionId });
+      subscription.unsubscribe();
+    };
+  }, [
+    taskSessionId,
+    connectionStatus,
+    store,
+    fetchRefs,
+    isSessionStartingOrUnknown,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  ]);
+}
+
+/**
+ * Refetch messages whenever a turn settles (active → settled). During a resume
+ * the agent_boot `script_execution` is created and then marked completed within
+ * ~1s, all server-side; if the live session subscription lapsed in that window
+ * the completion `session.message.updated` is dropped and the entry renders
+ * with a spinner forever (until a manual refresh). The settle transition is
+ * delivered globally, so reconciling messages here recovers any session-scoped
+ * updates missed while the turn was running.
+ */
+function useResyncOnTurnSettle(
+  taskSessionId: string | null,
+  taskSessionState: TaskSessionState | null,
+  connectionStatus: string,
+  store: ReturnType<typeof useAppStoreApi>,
+  sessionFetchGenerationRef: MutableRefObject<number>,
+) {
+  const prevRef = useRef<{ sessionId: string | null; state: TaskSessionState | null }>({
+    sessionId: null,
+    state: null,
+  });
+  useEffect(() => {
+    const prev = prevRef.current;
+    prevRef.current = { sessionId: taskSessionId, state: taskSessionState };
+    if (!taskSessionId || connectionStatus !== "connected") return;
+    const prevState = prev.sessionId === taskSessionId ? prev.state : null;
+    if (!isTurnSettleTransition(prevState, taskSessionState)) return;
+    debug("resync on turn settle", {
+      sessionId: taskSessionId,
+      prev: prevState,
+      next: taskSessionState,
+    });
+    const generation = sessionFetchGenerationRef.current;
+    fetchAndStoreMessages(
+      taskSessionId,
+      store,
+      () => sessionFetchGenerationRef.current === generation,
+    ).catch(() => {});
+  }, [taskSessionId, taskSessionState, connectionStatus, store, sessionFetchGenerationRef]);
+}
+
+function useRunningMessageBackfill(
+  taskSessionId: string | null,
+  shouldBackfill: boolean,
+  store: ReturnType<typeof useAppStoreApi>,
+  sessionFetchGenerationRef: MutableRefObject<number>,
+) {
+  useEffect(() => {
+    if (!taskSessionId || !shouldBackfill) return;
+
+    const generation = sessionFetchGenerationRef.current;
+    let inFlight = false;
+    const sync = () => {
+      if (inFlight) return;
+      inFlight = true;
+      debug("running backfill", { sessionId: taskSessionId });
+      fetchAndStoreMessages(
+        taskSessionId,
+        store,
+        () => sessionFetchGenerationRef.current === generation,
+      )
+        .catch((err) => {
+          debug("running backfill failed", { sessionId: taskSessionId, err });
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    const initial = window.setTimeout(sync, RUNNING_BACKFILL_INITIAL_DELAY_MS);
+    const interval = window.setInterval(sync, RUNNING_BACKFILL_INTERVAL_MS);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(interval);
+    };
+  }, [taskSessionId, shouldBackfill, store, sessionFetchGenerationRef]);
+}
+
+function useSessionMessageInputs(taskSessionId: string | null) {
+  const messages = useAppStore((state) =>
+    taskSessionId ? (state.messages.bySession[taskSessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES,
+  );
+  const messagesMeta = useAppStore((state) =>
+    taskSessionId ? (state.messages.metaBySession[taskSessionId] ?? EMPTY_META) : EMPTY_META,
+  );
+  const taskSessionState = useAppStore((state) =>
+    taskSessionId ? (state.taskSessions.items[taskSessionId]?.state ?? null) : null,
+  );
+  const activeTurnId = useAppStore((state) =>
+    taskSessionId ? (state.turns.activeBySession[taskSessionId] ?? null) : null,
+  );
+  const connectionStatus = useAppStore((state) => state.connection.status);
+  return { messages, messagesMeta, taskSessionState, activeTurnId, connectionStatus };
+}
+function useSessionLifecycleSubscriptions(
+  params: SessionSubscriptionParams & {
+    taskSessionState: TaskSessionState | null;
+    activeTurnId: string | null;
+    messages: Message[];
+  },
+) {
+  const {
+    taskSessionId,
+    taskSessionState,
+    connectionStatus,
+    activeTurnId,
+    messages,
+    store,
+    fetchRefs,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  } = params;
+  // Bool flips exactly once when a freshly-adopted session leaves STARTING,
+  // so the subscription effect re-runs then (covering the backend race where
+  // session.subscribe arrives before the session is fully constructed) without
+  // churning on every subsequent RUNNING ↔ WAITING_FOR_INPUT transition.
+  const isSessionStartingOrUnknown = taskSessionState === null || taskSessionState === "STARTING";
+  const unknownSessionRetryToken = useUnknownSessionSubscriptionRetry({
+    taskSessionId,
+    taskSessionState,
+    connectionStatus,
+  });
+  useSessionSubscription({
+    taskSessionId,
+    connectionStatus,
+    isSessionStartingOrUnknown,
+    store,
+    fetchRefs,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  });
+  useUnknownSessionSubscriptionRetryEffect({
+    taskSessionId,
+    connectionStatus,
+    retryToken: unknownSessionRetryToken,
+  });
+  useResyncOnTurnSettle(
+    taskSessionId,
+    taskSessionState,
+    connectionStatus,
+    store,
+    sessionFetchGenerationRef,
+  );
+  useRunningMessageBackfill(
+    taskSessionId,
+    shouldRunMessageBackfill({
+      taskSessionState,
+      connectionStatus,
+      activeTurnId,
+      messages,
+    }),
+    store,
+    sessionFetchGenerationRef,
+  );
+}
+type SessionEntryFetchParams = {
+  taskSessionId: string | null;
+  connectionStatus: string;
+  messagesLength: number;
+  historyInitialized: boolean;
+  store: ReturnType<typeof useAppStoreApi>;
+  prevSessionIdRef: MutableRefObject<string | null>;
+  fetchState: ReturnType<typeof useMessageFetchState>;
+  hydrationRef: SessionHydrationRef;
+  hydrationKey: string;
+  sessionFetchGenerationRef: MutableRefObject<number>;
+};
+function useInitialMessagesWait(params: SessionEntryFetchParams): void {
+  const { taskSessionId, messagesLength, historyInitialized, fetchState } = params;
+  const {
+    initialFetchStartRef,
+    lastFetchedSessionIdRef,
+    setIsWaitingForInitialMessages,
+    setIsCachedHistoryRefreshPending,
+    setHistoryStatus,
+    setHistoryError,
+  } = fetchState;
+  useEffect(() => {
+    if (!taskSessionId) {
+      initialFetchStartRef.current = null;
+      lastFetchedSessionIdRef.current = null;
+      setIsWaitingForInitialMessages(false);
+      setIsCachedHistoryRefreshPending(false);
+      setHistoryStatus("ready");
+      setHistoryError(null);
+      return;
+    }
+    if (messagesLength > 0) {
+      setIsWaitingForInitialMessages(false);
+      if (historyInitialized) {
+        setHistoryStatus("ready");
+        setHistoryError(null);
+      }
+      return;
+    }
+    if (initialFetchStartRef.current === null) {
+      initialFetchStartRef.current = Date.now();
+      setIsWaitingForInitialMessages(true);
+    }
+  }, [
+    taskSessionId,
+    messagesLength,
+    initialFetchStartRef,
+    lastFetchedSessionIdRef,
+    setIsWaitingForInitialMessages,
+    setIsCachedHistoryRefreshPending,
+    setHistoryStatus,
+    setHistoryError,
+    historyInitialized,
+  ]);
+}
+function useSessionEntryMessageFetch(params: SessionEntryFetchParams): void {
+  const {
+    taskSessionId,
+    connectionStatus,
+    messagesLength,
+    historyInitialized,
+    store,
+    prevSessionIdRef,
+    fetchState,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  } = params;
+  const {
+    lastFetchedSessionIdRef,
+    setIsWaitingForInitialMessages,
+    setIsCachedHistoryRefreshPending,
+    cachedRefreshGenerationRef,
+    refs: fetchRefs,
+  } = fetchState;
+  useEffect(() => {
+    const generation = sessionFetchGenerationRef.current;
+    const isCurrentGeneration = () => sessionFetchGenerationRef.current === generation;
+    if (!taskSessionId || connectionStatus !== "connected") return;
+    const isFreshMount = prevSessionIdRef.current === null;
+    const sessionChanged =
+      prevSessionIdRef.current !== null && prevSessionIdRef.current !== taskSessionId;
+    prevSessionIdRef.current = taskSessionId;
+    if (sessionChanged) {
+      lastFetchedSessionIdRef.current = null;
+      cachedRefreshGenerationRef.current += 1;
+      setIsCachedHistoryRefreshPending(false);
+    }
+    if (messagesLength > 0 && !sessionChanged && !isFreshMount) {
+      lastFetchedSessionIdRef.current = taskSessionId;
+      setIsWaitingForInitialMessages(false);
+      if (historyInitialized) fetchRefs.setHistoryStatus("ready");
+      return;
+    }
+    if (isFreshMount && messagesLength > 0) {
+      lastFetchedSessionIdRef.current = taskSessionId;
+      setIsWaitingForInitialMessages(false);
+      setIsCachedHistoryRefreshPending(true);
+      const refreshGeneration = ++cachedRefreshGenerationRef.current;
+      void doFetchMessages({
+        taskSessionId,
+        ...fetchRefs,
+        setIsWaitingForInitialMessages: () => {},
+        fetchAndStoreMessages,
+        isActive: isCurrentGeneration,
+        canFinalizeLoading: isCurrentGeneration,
+        hydrationRef,
+        hydrationKey,
+      })
+        .catch(() => {})
+        .finally(() => {
+          if (isCurrentGeneration() && cachedRefreshGenerationRef.current === refreshGeneration) {
+            setIsCachedHistoryRefreshPending(false);
+          }
+        });
+      return;
+    }
+    if (lastFetchedSessionIdRef.current === taskSessionId) return;
+    void doFetchMessages({
+      taskSessionId,
+      ...fetchRefs,
+      fetchAndStoreMessages,
+      isActive: isCurrentGeneration,
+      canFinalizeLoading: isCurrentGeneration,
+      hydrationRef,
+      hydrationKey,
+    });
+  }, [
+    taskSessionId,
+    connectionStatus,
+    messagesLength,
+    historyInitialized,
+    store,
+    prevSessionIdRef,
+    lastFetchedSessionIdRef,
+    setIsWaitingForInitialMessages,
+    setIsCachedHistoryRefreshPending,
+    fetchRefs,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  ]);
+}
+
+function useSessionHistoryRecoveryState({
+  taskSessionId,
+  connectionStatus,
+  messages,
+  messagesLoading,
+  isWaitingForInitialMessages,
+  messagesMetaLoading,
+  fetchState,
+  hydrationRef,
+  hydrationKey,
+}: {
+  taskSessionId: string | null;
+  connectionStatus: string;
+  messages: Message[];
+  messagesLoading: boolean;
+  isWaitingForInitialMessages: boolean;
+  messagesMetaLoading: boolean;
+  fetchState: ReturnType<typeof useMessageFetchState>;
+  hydrationRef: SessionHydrationRef;
+  hydrationKey: string;
+}) {
+  const activeSessionIdRef = useRef(taskSessionId);
+  const historySessionIdRef = useRef(taskSessionId);
+  const previousConnectionStatusRef = useRef(connectionStatus);
+  const sessionFetchGenerationRef = useRef(0);
+  const { refs: fetchRefs } = fetchState;
+
+  useLayoutEffect(() => {
+    sessionFetchGenerationRef.current += 1;
+    activeSessionIdRef.current = taskSessionId;
+    const sessionChanged = historySessionIdRef.current !== taskSessionId;
+    const connectionChanged = previousConnectionStatusRef.current !== connectionStatus;
+    previousConnectionStatusRef.current = connectionStatus;
+    if (sessionChanged || connectionChanged) fetchRefs.setIsLoading(false);
+    if (sessionChanged) {
+      historySessionIdRef.current = taskSessionId;
+      fetchRefs.setHistoryStatus(taskSessionId ? "loading" : "ready");
+      fetchRefs.setHistoryError(null);
+    }
+    return () => {
+      sessionFetchGenerationRef.current += 1;
+    };
+  }, [connectionStatus, fetchRefs, taskSessionId]);
+
+  const retryHistory = useCallback(() => {
+    const retrySessionId = taskSessionId;
+    if (
+      !retrySessionId ||
+      connectionStatus !== "connected" ||
+      messagesLoading ||
+      isWaitingForInitialMessages ||
+      messagesMetaLoading
+    ) {
+      return;
+    }
+    const generation = sessionFetchGenerationRef.current;
+    const clientRecovery = getWebSocketClient()?.retryCoreSessionRecovery(retrySessionId);
+    if (clientRecovery) {
+      hydrationRef.current = null;
+      fetchState.lastFetchedSessionIdRef.current = null;
+      void clientRecovery;
+      return;
+    }
+    fetchState.lastFetchedSessionIdRef.current = null;
+    fetchState.cachedRefreshGenerationRef.current += 1;
+    hydrationRef.current = null;
+    const isCurrentGeneration = () =>
+      activeSessionIdRef.current === retrySessionId &&
+      sessionFetchGenerationRef.current === generation;
+    void doFetchMessages({
+      taskSessionId: retrySessionId,
+      ...fetchRefs,
+      setIsWaitingForInitialMessages:
+        messages.length > 0 ? () => {} : fetchRefs.setIsWaitingForInitialMessages,
+      fetchAndStoreMessages,
+      isActive: isCurrentGeneration,
+      canFinalizeLoading: isCurrentGeneration,
+      hydrationRef,
+      hydrationKey,
+    });
+  }, [
+    connectionStatus,
+    fetchRefs,
+    hydrationKey,
+    hydrationRef,
+    isWaitingForInitialMessages,
+    messages.length,
+    messagesLoading,
+    messagesMetaLoading,
+    taskSessionId,
+  ]);
+
+  return { retryHistory, sessionFetchGenerationRef };
+}
+
+function useCoreSessionRecovery({
+  taskSessionId,
+  connectionStatus,
+  store,
+  fetchRefs,
+  hydrationRef,
+  hydrationKey,
+  sessionFetchGenerationRef,
+}: {
+  taskSessionId: string | null;
+  connectionStatus: string;
+  store: ReturnType<typeof useAppStoreApi>;
+  fetchRefs: ReturnType<typeof useMessageFetchState>["refs"];
+  hydrationRef: SessionHydrationRef;
+  hydrationKey: string;
+  sessionFetchGenerationRef: MutableRefObject<number>;
+}): void {
+  useEffect(() => {
+    if (!taskSessionId || connectionStatus !== "connected") return;
+    const client = getWebSocketClient();
+    if (!client) return;
+    const generation = sessionFetchGenerationRef.current;
+    let active = true;
+    const isActive = () =>
+      active &&
+      sessionFetchGenerationRef.current === generation &&
+      store.getState().taskSessions.items[taskSessionId] !== undefined;
+
+    const unregister = client.registerCoreSessionRecovery(taskSessionId, async () => {
+      if (!isActive()) return false;
+      fetchRefs.lastFetchedSessionIdRef.current = null;
+      hydrationRef.current = null;
+      const readiness = client.getSessionSubscriptionReadiness(taskSessionId);
+      const [messagesReady, turnsReady] = await Promise.all([
+        doFetchMessages({
+          taskSessionId,
+          ...fetchRefs,
+          fetchAndStoreMessages,
+          isActive,
+          canFinalizeLoading: () => isActive(),
+          hydrationRef,
+          hydrationKey,
+          options: { force: true, authoritative: true },
+        }),
+        ensureSessionTurnsLoaded(taskSessionId, store, {
+          readiness,
+          force: true,
+          replace: true,
+        }),
+      ]);
+      return isActive() && messagesReady && turnsReady;
+    });
+
+    return () => {
+      active = false;
+      unregister();
+    };
+  }, [
+    connectionStatus,
+    fetchRefs,
+    hydrationKey,
+    hydrationRef,
+    sessionFetchGenerationRef,
+    store,
+    taskSessionId,
+  ]);
+}
+
+export function useSessionMessages(taskSessionId: string | null): UseSessionMessagesReturn {
+  const store = useAppStoreApi();
+  const { messages, messagesMeta, taskSessionState, activeTurnId, connectionStatus } =
+    useSessionMessageInputs(taskSessionId);
+  const prevSessionIdRef = useRef<string | null>(null);
+  const hydrationRef = useRef<SessionHydrationRef["current"]>(null);
+  const hydrationKey = `${taskSessionId ?? "none"}:${
+    taskSessionState === null || taskSessionState === "STARTING" ? "starting" : "settled"
+  }`;
+  const isSessionEntryRefreshPending =
+    taskSessionId !== null &&
+    connectionStatus === "connected" &&
+    prevSessionIdRef.current !== taskSessionId;
+  const hasAgentMessage = messages.some((message: Message) => message.author_type === "agent");
+  const fetchState = useMessageFetchState(store);
+  const {
+    isLoading,
+    isWaitingForInitialMessages,
+    isCachedHistoryRefreshPending,
+    historyStatus,
+    historyError,
+    refs: fetchRefs,
+  } = fetchState;
+  const { retryHistory, sessionFetchGenerationRef } = useSessionHistoryRecoveryState({
+    taskSessionId,
+    connectionStatus,
+    messages,
+    messagesLoading: isLoading,
+    isWaitingForInitialMessages,
+    messagesMetaLoading: messagesMeta.isLoading,
+    fetchState,
+    hydrationRef,
+    hydrationKey,
+  });
+  useCoreSessionRecovery({
+    taskSessionId,
+    connectionStatus,
+    store,
+    fetchRefs,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  });
+  useSessionLifecycleSubscriptions({
+    taskSessionId,
+    taskSessionState,
+    connectionStatus,
+    activeTurnId,
+    messages,
+    store,
+    fetchRefs,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  });
+  const entryFetchParams = {
+    taskSessionId,
+    connectionStatus,
+    messagesLength: messages.length,
+    historyInitialized: messagesMeta.historyInitialized,
+    store,
+    prevSessionIdRef,
+    fetchState,
+    hydrationRef,
+    hydrationKey,
+    sessionFetchGenerationRef,
+  };
+  useInitialMessagesWait(entryFetchParams);
+  useSessionEntryMessageFetch(entryFetchParams);
+  useVisibilityBackfill(taskSessionId, store, sessionFetchGenerationRef);
+  useTerminalStateFetch(
+    taskSessionId,
+    taskSessionState,
+    hasAgentMessage,
+    sessionFetchGenerationRef,
+    fetchRefs,
+  );
+
+  return {
+    isLoading: isLoading || isWaitingForInitialMessages || messagesMeta.isLoading,
+    isInitialMessagesLoading: isWaitingForInitialMessages,
+    historyRefreshPending:
+      isLoading ||
+      isWaitingForInitialMessages ||
+      messagesMeta.isLoading ||
+      isCachedHistoryRefreshPending ||
+      isSessionEntryRefreshPending,
+    messages,
+    historyInitialized: messagesMeta.historyInitialized,
+    hasMore: messagesMeta.hasMore,
+    oldestCursor: messagesMeta.oldestCursor,
+    historyStatus,
+    historyError,
+    retryHistory,
+  };
+}

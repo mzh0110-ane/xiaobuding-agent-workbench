@@ -1,0 +1,169 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { type Page } from "@playwright/test";
+import { test, expect } from "../../fixtures/test-base";
+import type { SeedData } from "../../fixtures/test-base";
+import type { ApiClient } from "../../helpers/api-client";
+import { SessionPage } from "../../pages/session-page";
+
+/**
+ * Resolve the code-server install directory. Checks the default kandev install
+ * path at ~/.kandev/tools/code-server/ (real HOME, not e2e temp HOME).
+ */
+function findCodeServerInstall(): string | null {
+  const home = os.homedir();
+  const installDir = path.join(home, ".kandev", "tools", "code-server");
+  if (!fs.existsSync(installDir)) return null;
+
+  const entries = fs.readdirSync(installDir);
+  for (const entry of entries) {
+    const binPath = path.join(installDir, entry, "bin", "code-server");
+    if (fs.existsSync(binPath)) return installDir;
+  }
+  return null;
+}
+
+/** Mirror an existing code-server install without writing into the host cache. */
+function seedCodeServerInstall(sourceInstallDir: string, targetInstallDir: string): void {
+  if (fs.existsSync(targetInstallDir)) return;
+
+  fs.mkdirSync(targetInstallDir, { recursive: true });
+  for (const entry of fs.readdirSync(sourceInstallDir)) {
+    const sourceRoot = path.join(sourceInstallDir, entry);
+    const sourceBinDir = path.join(sourceRoot, "bin");
+    const sourceBinary = path.join(sourceBinDir, "code-server");
+    if (!fs.existsSync(sourceBinary)) continue;
+
+    const targetRoot = path.join(targetInstallDir, entry);
+    const targetBinDir = path.join(targetRoot, "bin");
+    fs.mkdirSync(targetBinDir, { recursive: true });
+    for (const child of fs.readdirSync(sourceRoot)) {
+      if (child === "bin") continue;
+      fs.symlinkSync(path.join(sourceRoot, child), path.join(targetRoot, child));
+    }
+    for (const child of fs.readdirSync(sourceBinDir)) {
+      if (child.endsWith(".install-complete")) continue;
+      fs.symlinkSync(path.join(sourceBinDir, child), path.join(targetBinDir, child));
+    }
+    fs.writeFileSync(path.join(targetBinDir, "code-server.install-complete"), "");
+  }
+}
+
+const codeServerDir = findCodeServerInstall();
+
+test.beforeEach(async ({ backend }) => {
+  if (!codeServerDir) {
+    test.skip(true, "code-server not installed — skipping VS Code e2e tests");
+    return;
+  }
+
+  seedCodeServerInstall(
+    codeServerDir,
+    path.join(backend.tmpDir, ".kandev", "tools", "code-server"),
+  );
+});
+
+/**
+ * Seed a task + session via the API and navigate directly to the session page.
+ * Waits for the mock agent to complete its turn (idle input visible).
+ */
+async function seedTaskWithSession(
+  testPage: Page,
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+  repositoryIds: string[] = [seedData.repositoryId],
+): Promise<{ session: SessionPage; sessionId: string }> {
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description: "/e2e:simple-message",
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: repositoryIds,
+    },
+  );
+
+  if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+  await testPage.goto(`/t/${task.id}`);
+
+  const session = new SessionPage(testPage);
+  await session.waitForLoad();
+  await session.waitForChatIdle({ timeout: 30_000 });
+
+  return { session, sessionId: task.session_id };
+}
+
+test.describe("VS Code toolbar open", () => {
+  test("adds the embedded editor tab for a repository-less session", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Repository-less VSCode Open Test",
+      [],
+    );
+
+    await testPage.getByTestId("editors-menu-open").click();
+
+    await expect(session.vscodeTab()).toBeVisible({ timeout: 10_000 });
+  });
+});
+
+test.describe("VS Code open panel", () => {
+  test.describe.configure({ retries: 1 });
+
+  /**
+   * Regression test for VS Code panel placement.
+   *
+   * Adding the VS Code panel via the dockview "+" menu must place it in the
+   * center group (alongside agent sessions), not in the right sidebar.
+   */
+  test("opens VS Code panel in the center group", async ({ testPage, apiClient, seedData }) => {
+    const pageErrors: Error[] = [];
+    testPage.on("pageerror", (err) => pageErrors.push(err));
+
+    const { session } = await seedTaskWithSession(
+      testPage,
+      apiClient,
+      seedData,
+      "VSCode Open Panel Test",
+    );
+
+    // Open the "+" dropdown in the center group header and click "VS Code"
+    await session.addPanelButton().click();
+    await testPage.getByRole("menuitem", { name: "VS Code" }).click();
+
+    // Assert: VS Code tab appears in dockview
+    await expect(session.vscodeTab()).toBeVisible({ timeout: 10_000 });
+
+    // Assert: VS Code tab is in the center group (same tab bar as the session),
+    // not in the right sidebar.
+    const centerTabBar = testPage.locator(
+      ".dv-tabs-and-actions-container:has(.dv-default-tab:has-text('VS Code'))",
+    );
+    await expect(centerTabBar.locator("[data-testid^='session-tab-']")).toBeVisible({
+      timeout: 5_000,
+    });
+
+    // Assert: "Starting VS Code Server" progress text is visible while booting
+    await expect(testPage.getByText("Starting VS Code Server")).toBeVisible({ timeout: 30_000 });
+
+    // Assert: code-server iframe loads
+    await expect(session.vscodeIframe()).toBeVisible({ timeout: 90_000 });
+
+    // Assert: no dockview referencePanel errors were thrown
+    const referencePanelErrors = pageErrors.filter(
+      (e) => e.message.includes("referencePanel") && e.message.includes("does not exist"),
+    );
+    expect(referencePanelErrors).toHaveLength(0);
+  });
+});

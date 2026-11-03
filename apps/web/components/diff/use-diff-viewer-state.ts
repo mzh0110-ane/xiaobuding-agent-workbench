@@ -1,0 +1,526 @@
+import { useState, useCallback, useEffect, useMemo, useRef, type RefObject } from "react";
+import type {
+  SelectedLineRange,
+  FileDiffMetadata,
+  DiffLineAnnotation,
+  AnnotationSide,
+  ChangeContent,
+} from "@pierre/diffs";
+import type { FileDiffData, DiffComment, DiffCommentUpdate } from "@/lib/diff/types";
+import { buildDiffComment, useCommentActions } from "@/lib/diff/comment-utils";
+import { useDiffComments } from "./use-diff-comments";
+import { useDiffMetadata } from "./use-diff-metadata";
+import { useExpandableDiff } from "./use-expandable-diff";
+import type { RevertBlockInfo } from "./diff-viewer";
+import type { AnnotationMetadata } from "./use-diff-annotation-renderer";
+import { useReviewFindingAnnotations } from "./use-review-finding-annotations";
+import { useOptionalAppStore } from "@/components/state-provider";
+import {
+  walkthroughStepMatchesFile,
+  type WalkthroughTargetFile,
+} from "@/lib/diff/walkthrough-match";
+import type { WalkthroughStep } from "@/lib/types/http";
+
+type BuildAnnotationsOpts = {
+  comments: DiffComment[];
+  editingCommentId: string | null;
+  showCommentForm: boolean;
+  selectedLines: SelectedLineRange | null;
+  enableAcceptReject: boolean;
+  fileDiffMetadata: FileDiffMetadata | null;
+};
+
+type HunkState = {
+  addLine: number;
+  delLine: number;
+  lastCtxAdd: number;
+  lastCtxDel: number;
+  blockIdx: number;
+};
+
+export type HunkOutputs = {
+  result: DiffLineAnnotation<AnnotationMetadata>[];
+  lineMap: Map<string, string>;
+  revertMap: Map<string, RevertBlockInfo>;
+};
+
+/** Process a single change block within a hunk. */
+function processChangeBlock(
+  content: ChangeContent,
+  deletionLines: string[],
+  state: HunkState,
+  out: HunkOutputs,
+) {
+  const aLen = content.additions;
+  const dLen = content.deletions;
+  if (aLen === 0 && dLen === 0) return;
+
+  const cbId = `cb-${state.blockIdx++}`;
+  const side: AnnotationSide = aLen > 0 ? "additions" : "deletions";
+  const lineNumber = side === "additions" ? state.lastCtxAdd : state.lastCtxDel;
+  out.result.push({ side, lineNumber, metadata: { type: "hunk-actions", changeBlockId: cbId } });
+  for (let l = 0; l < aLen; l++) out.lineMap.set(`additions:${state.addLine + l}`, cbId);
+  for (let l = 0; l < dLen; l++) out.lineMap.set(`deletions:${state.delLine + l}`, cbId);
+  const oldLines = deletionLines
+    .slice(content.deletionLineIndex, content.deletionLineIndex + dLen)
+    .map((l) => l.replace(/\r?\n$/, ""));
+  out.revertMap.set(cbId, {
+    addStart: state.addLine,
+    addCount: aLen,
+    oldLines,
+  });
+}
+
+/** Build hunk-level annotations, line->changeBlock map, and revert info. */
+export function buildHunkAnnotations(fileDiffMetadata: FileDiffMetadata, out: HunkOutputs) {
+  const state: HunkState = { addLine: 0, delLine: 0, lastCtxAdd: 0, lastCtxDel: 0, blockIdx: 0 };
+  for (const hunk of fileDiffMetadata.hunks) {
+    if (hunk.additionCount === 0 && hunk.deletionCount === 0) continue;
+    state.addLine = hunk.additionStart;
+    state.delLine = hunk.deletionStart;
+    state.lastCtxAdd = state.addLine > 1 ? state.addLine - 1 : state.addLine;
+    state.lastCtxDel = state.delLine > 1 ? state.delLine - 1 : state.delLine;
+    for (const content of hunk.hunkContent) {
+      if (content.type === "context") {
+        const len = content.lines;
+        state.lastCtxAdd = state.addLine + len - 1;
+        state.lastCtxDel = state.delLine + len - 1;
+        state.addLine += len;
+        state.delLine += len;
+        continue;
+      }
+      processChangeBlock(content, fileDiffMetadata.deletionLines, state, out);
+      state.addLine += content.additions;
+      state.delLine += content.deletions;
+    }
+  }
+}
+
+/** Build all diff line annotations (comments, new-comment form, hunk actions). */
+function buildAnnotations(opts: BuildAnnotationsOpts) {
+  const {
+    comments,
+    editingCommentId,
+    showCommentForm,
+    selectedLines,
+    enableAcceptReject,
+    fileDiffMetadata,
+  } = opts;
+  const result: DiffLineAnnotation<AnnotationMetadata>[] = comments.map((comment) => ({
+    side: comment.side,
+    lineNumber: comment.endLine,
+    metadata: { type: "comment" as const, comment, isEditing: editingCommentId === comment.id },
+  }));
+
+  if (showCommentForm && selectedLines) {
+    result.push({
+      side: (selectedLines.side || "additions") as AnnotationSide,
+      lineNumber: Math.max(selectedLines.start, selectedLines.end),
+      metadata: { type: "new-comment-form" as const },
+    });
+  }
+
+  const newLineMap = new Map<string, string>();
+  const newRevertMap = new Map<string, RevertBlockInfo>();
+  if (enableAcceptReject && fileDiffMetadata) {
+    buildHunkAnnotations(fileDiffMetadata, {
+      result,
+      lineMap: newLineMap,
+      revertMap: newRevertMap,
+    });
+  }
+
+  return { annotations: result, lineMap: newLineMap, revertMap: newRevertMap };
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+type UseDiffViewerStateOpts = {
+  data: FileDiffData;
+  enableComments: boolean;
+  enableAcceptReject: boolean;
+  /** Render and navigate to the active task walkthrough inside this diff. */
+  enableWalkthroughAnnotations?: boolean;
+  sessionId?: string;
+  onCommentAdd?: (comment: DiffComment) => void;
+  onCommentDelete?: (commentId: string) => void;
+  onCommentUpdate?: (commentId: string, updates: DiffCommentUpdate) => void;
+  onCommentRun?: (comment: DiffComment) => void;
+  externalComments?: DiffComment[];
+  onRevertBlock?: (filePath: string, info: RevertBlockInfo) => Promise<void> | void;
+  /** Enable diff expansion (requires fetching full file content) */
+  enableExpansion?: boolean;
+  /** Base git ref for fetching old content (e.g., "origin/main", "HEAD~1") */
+  baseRef?: string;
+  /** Multi-repo subpath for the file (e.g. "kandev"); empty for single-repo. */
+  repo?: string;
+};
+
+/**
+ * Returns a `walkthrough-step` annotation anchored to the active walkthrough
+ * step's line when that step targets this file, else null. Additive and gated:
+ * with no active walkthrough it returns null and the diff is unaffected.
+ */
+export function buildWalkthroughSelectedLines(
+  file: WalkthroughTargetFile,
+  step: WalkthroughStep | null | undefined,
+  enabled = true,
+): SelectedLineRange | null {
+  if (!enabled || !step || !walkthroughStepMatchesFile(file, step)) return null;
+  return {
+    side: "additions",
+    start: step.line,
+    end: step.line_end ?? step.line,
+  };
+}
+
+function useWalkthroughSelection(
+  filePath: string,
+  repo: string | undefined,
+  enabled: boolean,
+): {
+  annotation: DiffLineAnnotation<AnnotationMetadata> | null;
+  selectedLines: SelectedLineRange | null;
+} {
+  const activeTaskId = useOptionalAppStore((s) => (enabled ? s.tasks.activeTaskId : null), null);
+  const walkthrough = useOptionalAppStore(
+    (s) => (enabled && activeTaskId ? s.walkthroughs.byTaskId[activeTaskId] : null),
+    null,
+  );
+  const activeStep = useOptionalAppStore(
+    (s) => (enabled && activeTaskId ? (s.walkthroughs.activeStepByTaskId[activeTaskId] ?? 0) : 0),
+    0,
+  );
+  return useMemo(() => {
+    const step = walkthrough?.steps[activeStep];
+    const selectedLines = buildWalkthroughSelectedLines(
+      { path: filePath, repository_name: repo },
+      step,
+      enabled,
+    );
+    if (!selectedLines) return { annotation: null, selectedLines: null };
+    return {
+      annotation: {
+        side: "additions" as AnnotationSide,
+        lineNumber: Math.max(selectedLines.start, selectedLines.end),
+        metadata: { type: "walkthrough-step" as const },
+      },
+      selectedLines,
+    };
+  }, [walkthrough, activeStep, filePath, repo, enabled]);
+}
+
+function useDiffViewerAnnotations({
+  comments,
+  editingCommentId,
+  showCommentForm,
+  selectedLines,
+  enableAcceptReject,
+  fileDiffMetadata,
+  filePath,
+  repo,
+  diff,
+  enableWalkthroughAnnotations,
+  changeLineMapRef,
+  revertInfoRef,
+}: BuildAnnotationsOpts & {
+  filePath: string;
+  repo?: string;
+  diff?: string;
+  enableWalkthroughAnnotations: boolean;
+  changeLineMapRef: RefObject<Map<string, string>>;
+  revertInfoRef: RefObject<Map<string, RevertBlockInfo>>;
+}) {
+  const { annotations, lineMap, revertMap } = useMemo(
+    () =>
+      buildAnnotations({
+        comments,
+        editingCommentId,
+        showCommentForm,
+        selectedLines,
+        enableAcceptReject,
+        fileDiffMetadata,
+      }),
+    [
+      comments,
+      editingCommentId,
+      showCommentForm,
+      selectedLines,
+      enableAcceptReject,
+      fileDiffMetadata,
+    ],
+  );
+
+  const walkthrough = useWalkthroughSelection(filePath, repo, enableWalkthroughAnnotations);
+  const reviewFindings = useReviewFindingAnnotations({ filePath, repo, diff });
+  const withWalkthrough = useMemo(() => {
+    const combined = [...annotations, ...reviewFindings.annotations];
+    return walkthrough.annotation ? [...combined, walkthrough.annotation] : combined;
+  }, [annotations, reviewFindings.annotations, walkthrough.annotation]);
+
+  useEffect(() => {
+    changeLineMapRef.current = lineMap;
+    revertInfoRef.current = revertMap;
+  }, [lineMap, revertMap, changeLineMapRef, revertInfoRef]);
+
+  return {
+    annotations: withWalkthrough,
+    walkthroughSelectedLines: walkthrough.selectedLines,
+    unanchoredFindings: reviewFindings.unanchored,
+  };
+}
+
+type CommentHandlerOpts = {
+  selectedLines: SelectedLineRange | null;
+  setSelectedLines: React.Dispatch<React.SetStateAction<SelectedLineRange | null>>;
+  setShowCommentForm: React.Dispatch<React.SetStateAction<boolean>>;
+  enableComments: boolean;
+  onCommentAdd?: (comment: DiffComment) => void;
+  onCommentRun?: (comment: DiffComment) => void;
+  externalComments?: DiffComment[];
+  data: FileDiffData;
+  sessionId?: string;
+  repositoryName?: string;
+  addComment: (range: SelectedLineRange, content: string) => DiffComment;
+  removeComment: (commentId: string) => void;
+  updateComment: (commentId: string, updates: DiffCommentUpdate) => void;
+  setEditingComment: (commentId: string | null) => void;
+  onCommentDelete?: (commentId: string) => void;
+  onCommentUpdate?: (commentId: string, updates: DiffCommentUpdate) => void;
+};
+
+function useDiffViewerCommentHandlers(opts: CommentHandlerOpts) {
+  const {
+    selectedLines,
+    setSelectedLines,
+    setShowCommentForm,
+    enableComments,
+    onCommentAdd,
+    onCommentRun,
+    externalComments,
+    data,
+    sessionId,
+    repositoryName,
+    addComment,
+    removeComment,
+    updateComment,
+    setEditingComment,
+    onCommentDelete,
+    onCommentUpdate,
+  } = opts;
+  const handleLineSelectionEnd = useCallback(
+    (range: SelectedLineRange | null) => {
+      setSelectedLines(range);
+      if (range && enableComments) setShowCommentForm(true);
+    },
+    [enableComments, setSelectedLines, setShowCommentForm],
+  );
+
+  const createCommentFromSelection = useCallback(
+    (content: string): DiffComment | null => {
+      if (!selectedLines) return null;
+      return buildDiffComment({
+        filePath: data.filePath,
+        repositoryName,
+        sessionId: sessionId || "",
+        startLine: selectedLines.start,
+        endLine: selectedLines.end,
+        side: (selectedLines.side || "additions") as DiffComment["side"],
+        text: content,
+      });
+    },
+    [selectedLines, data.filePath, sessionId, repositoryName],
+  );
+
+  const submitComment = useCallback(
+    (content: string, runAfter?: (c: DiffComment) => void) => {
+      if (!selectedLines) return;
+      if (onCommentAdd && externalComments !== undefined) {
+        const comment = createCommentFromSelection(content);
+        if (comment) {
+          onCommentAdd(comment);
+          runAfter?.(comment);
+        }
+      } else if (sessionId) {
+        const stored = addComment(selectedLines, content);
+        if (runAfter && stored) runAfter(stored);
+      }
+      setShowCommentForm(false);
+      setSelectedLines(null);
+    },
+    [
+      selectedLines,
+      onCommentAdd,
+      externalComments,
+      sessionId,
+      addComment,
+      createCommentFromSelection,
+      setShowCommentForm,
+      setSelectedLines,
+    ],
+  );
+
+  const handleCommentSubmit = useCallback(
+    (content: string) => submitComment(content),
+    [submitComment],
+  );
+
+  const handleCommentSubmitAndRun = useCallback(
+    (content: string) => submitComment(content, onCommentRun),
+    [submitComment, onCommentRun],
+  );
+
+  const { handleCommentDelete, handleCommentUpdate } = useCommentActions({
+    removeComment,
+    updateComment,
+    setEditingComment,
+    onCommentDelete,
+    onCommentUpdate,
+    externalComments,
+  });
+
+  return {
+    handleLineSelectionEnd,
+    handleCommentSubmit,
+    handleCommentSubmitAndRun: onCommentRun ? handleCommentSubmitAndRun : undefined,
+    handleCommentDelete,
+    handleCommentUpdate,
+  };
+}
+
+function useRevertBlock(
+  filePath: string,
+  onRevertBlock?: (filePath: string, info: RevertBlockInfo) => Promise<void> | void,
+) {
+  const revertInfoRef = useRef<Map<string, RevertBlockInfo>>(new Map());
+  const handleRevertBlock = useCallback(
+    async (changeBlockId: string) => {
+      const info = revertInfoRef.current.get(changeBlockId);
+      if (!info) return;
+      await onRevertBlock?.(filePath, info);
+    },
+    [filePath, onRevertBlock],
+  );
+  return { revertInfoRef, handleRevertBlock };
+}
+
+/**
+ * The session-scoped comment store for one file. Extracted from
+ * useDiffViewerState to keep that hook under the function line cap.
+ */
+function useInternalDiffComments(data: FileDiffData, sessionId?: string, repositoryName?: string) {
+  return useDiffComments({
+    sessionId: sessionId || "",
+    filePath: data.filePath,
+    repositoryName,
+    diff: data.diff,
+    newContent: data.newContent,
+    oldContent: data.oldContent,
+  });
+}
+
+export function useDiffViewerState(opts: UseDiffViewerStateOpts) {
+  const {
+    data,
+    enableComments,
+    enableAcceptReject,
+    enableWalkthroughAnnotations = true,
+    sessionId,
+    onCommentAdd,
+    onCommentDelete,
+    onCommentUpdate,
+    onCommentRun,
+    externalComments,
+    onRevertBlock,
+    enableExpansion = false,
+    baseRef,
+    repo,
+  } = opts;
+
+  const [selectedLines, setSelectedLines] = useState<SelectedLineRange | null>(null);
+  const [showCommentForm, setShowCommentForm] = useState(false);
+
+  const {
+    comments: internalComments,
+    addComment,
+    removeComment,
+    updateComment,
+    editingCommentId,
+    setEditingComment,
+  } = useInternalDiffComments(data, sessionId, repo);
+
+  const comments = externalComments || internalComments;
+  const baseDiffMetadata = useDiffMetadata(data);
+  const expansion = useExpandableDiff({
+    sessionId,
+    filePath: data.filePath,
+    baseRef,
+    fileDiffMetadata: baseDiffMetadata,
+    diff: data.diff,
+    enableExpansion,
+    repo,
+  });
+
+  const { revertInfoRef, handleRevertBlock } = useRevertBlock(data.filePath, onRevertBlock);
+  const changeLineMapRef = useRef<Map<string, string>>(new Map());
+  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const { annotations, walkthroughSelectedLines, unanchoredFindings } = useDiffViewerAnnotations({
+    comments,
+    editingCommentId,
+    showCommentForm,
+    selectedLines,
+    enableAcceptReject,
+    fileDiffMetadata: expansion.metadata,
+    filePath: data.filePath,
+    repo,
+    diff: data.diff,
+    enableWalkthroughAnnotations,
+    changeLineMapRef,
+    revertInfoRef,
+  });
+
+  const commentHandlers = useDiffViewerCommentHandlers({
+    selectedLines,
+    setSelectedLines,
+    setShowCommentForm,
+    enableComments,
+    onCommentAdd,
+    onCommentRun,
+    externalComments,
+    data,
+    sessionId,
+    repositoryName: repo,
+    addComment,
+    removeComment,
+    updateComment,
+    setEditingComment,
+    onCommentDelete,
+    onCommentUpdate,
+  });
+
+  return {
+    comments,
+    fileDiffMetadata: expansion.metadata,
+    annotations,
+    walkthroughSelectedLines,
+    unanchoredFindings,
+    selectedLines,
+    showCommentForm,
+    setShowCommentForm,
+    setSelectedLines,
+    editingCommentId,
+    setEditingComment,
+    handleRevertBlock,
+    ...commentHandlers,
+    changeLineMapRef,
+    hideTimeoutRef,
+    isExpansionContentLoaded: expansion.isContentLoaded,
+    isExpansionLoading: expansion.isLoading,
+    expansionError: expansion.error,
+    loadExpansionContent: expansion.loadContent,
+    canExpand: expansion.canExpand,
+  };
+}

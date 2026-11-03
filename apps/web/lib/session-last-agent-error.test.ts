@@ -1,0 +1,333 @@
+import { beforeEach, describe, expect, it } from "vitest";
+
+import {
+  getStoredAcknowledgedAgentErrors,
+  getStoredDismissedAgentErrors,
+  lastAgentErrorStamp,
+  readLastAgentError,
+  setStoredAcknowledgedAgentErrors,
+  setStoredDismissedAgentErrors,
+} from "./session-last-agent-error";
+
+const AGENT_ERROR_MESSAGE = "agent process exited";
+const AGENT_EXECUTION_ID = "exec-1";
+const OCCURRED_AT = "2026-06-14T12:00:00Z";
+const OTHER_TAB_SESSION_ID = "session-other-tab";
+const THIS_TAB_SESSION_ID = "session-this-tab";
+const OTHER_TAB_STAMP = "stamp-other";
+const THIS_TAB_STAMP = "stamp-this";
+const MANAGED_RUNTIME_NPM_FAILURE = "managed_runtime_npm_resolution";
+const NPM_ERROR_CODE_ETARGET = "npm error code ETARGET";
+
+describe("readLastAgentError", () => {
+  it("reads structured failure fields in snake_case", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          failure_code: MANAGED_RUNTIME_NPM_FAILURE,
+          failure_details: NPM_ERROR_CODE_ETARGET,
+        },
+      }),
+    ).toMatchObject({
+      code: MANAGED_RUNTIME_NPM_FAILURE,
+      details: NPM_ERROR_CODE_ETARGET,
+    });
+  });
+
+  it("reads typed managed runtime startup metadata", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: "Agent stopped during startup",
+          failure_code: "managed_runtime_startup",
+          startup_reason: "early_exit",
+          startup_attempts: 2,
+        },
+      }),
+    ).toMatchObject({
+      code: "managed_runtime_startup",
+      startupReason: "early_exit",
+      startupAttempts: 2,
+    });
+  });
+
+  it("reads structured failure fields in camelCase", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          code: MANAGED_RUNTIME_NPM_FAILURE,
+          details: NPM_ERROR_CODE_ETARGET,
+          startupAttempts: 2,
+        },
+      }),
+    ).toMatchObject({
+      code: MANAGED_RUNTIME_NPM_FAILURE,
+      details: NPM_ERROR_CODE_ETARGET,
+      startupAttempts: 2,
+    });
+  });
+});
+
+// eslint-disable-next-line max-lines-per-function -- this group preserves the complete metadata compatibility matrix.
+describe("readLastAgentError optional metadata", () => {
+  it("reads bootstrap correlation and bounded causes", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: "The agent could not start.",
+          execution_id: "execution-1",
+          phase: "bootstrap",
+          attempt_id: "attempt-1",
+          causes: [
+            {
+              operation: "resume",
+              code: "permission_denied",
+              detail: "The required contribution access was denied.",
+            },
+          ],
+        },
+      }),
+    ).toMatchObject({
+      executionId: "execution-1",
+      phase: "bootstrap",
+      attemptId: "attempt-1",
+      causes: [
+        {
+          operation: "resume",
+          code: "permission_denied",
+          detail: "The required contribution access was denied.",
+        },
+      ],
+    });
+  });
+
+  it("reads safe typed selection evidence and drops malformed optional fields", () => {
+    const error = readLastAgentError({
+      last_agent_error: {
+        message: "The agent could not start.",
+        causes: [
+          {
+            operation: "start",
+            code: "model_unavailable",
+            reason: "requested_not_advertised",
+            requested_model: "vendor/opus-5",
+            effective_model: "gpt-5.2",
+            prompt_not_sent: true,
+          },
+          {
+            operation: "resume",
+            code: "permission_mode_mismatch",
+            reason: "effective_mismatch",
+            requested_mode: "default",
+            effective_mode: "plan",
+            prompt_not_sent: false,
+          },
+        ],
+      },
+    });
+
+    expect(error?.causes).toEqual([
+      {
+        operation: "start",
+        code: "model_unavailable",
+        reason: "requested_not_advertised",
+        requested_model: "vendor/opus-5",
+        effective_model: "gpt-5.2",
+        prompt_not_sent: true,
+      },
+      {
+        operation: "resume",
+        code: "permission_mode_mismatch",
+        reason: "effective_mismatch",
+        requested_mode: "default",
+        effective_mode: "plan",
+        prompt_not_sent: false,
+      },
+    ]);
+
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: "The agent could not start.",
+          causes: [
+            {
+              operation: "resume",
+              code: "model_selection_failed",
+              reason: "not_a_reason",
+              requested_model: "/home/user/private-model",
+              prompt_not_sent: "false",
+            },
+          ],
+        },
+      })?.causes,
+    ).toEqual([{ operation: "resume", code: "model_selection_failed" }]);
+  });
+
+  it("reads typed launch recovery fields and keeps action order bounded", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: "base branch is missing",
+          code: "base_branch_missing",
+          recovery_actions: ["pick_base_branch", "pick_base_branch", "unknown", "retry_default"],
+          task_repository_id: "task-repo-1",
+          stamp: "launch-stamp-1",
+        },
+      }),
+    ).toMatchObject({
+      recoveryActions: ["pick_base_branch", "retry_default"],
+      taskRepositoryId: "task-repo-1",
+      stamp: "launch-stamp-1",
+    });
+  });
+
+  it("reads snake_case metadata and keeps occurredAt optional", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          agent_execution_id: AGENT_EXECUTION_ID,
+        },
+      }),
+    ).toEqual({
+      message: AGENT_ERROR_MESSAGE,
+      agentExecutionId: AGENT_EXECUTION_ID,
+    });
+  });
+
+  it("reads the remediation_url field from snake_case and camelCase metadata", () => {
+    const url = "https://opencode.ai/workspace/wrk_01KQM7K5CYT715264YKKFB17ZY/go";
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          remediation_url: url,
+        },
+      }),
+    ).toEqual({
+      message: AGENT_ERROR_MESSAGE,
+      remediationUrl: url,
+    });
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          remediationUrl: url,
+        },
+      }),
+    ).toEqual({
+      message: AGENT_ERROR_MESSAGE,
+      remediationUrl: url,
+    });
+  });
+
+  it("omits remediationUrl when the metadata carries no URL", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: { message: AGENT_ERROR_MESSAGE, remediation_url: "" },
+      }),
+    ).toEqual({ message: AGENT_ERROR_MESSAGE });
+  });
+
+  it("reads camelCase metadata after a store round trip", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          occurredAt: OCCURRED_AT,
+          agentExecutionId: AGENT_EXECUTION_ID,
+        },
+      }),
+    ).toEqual({
+      message: AGENT_ERROR_MESSAGE,
+      occurredAt: OCCURRED_AT,
+      agentExecutionId: AGENT_EXECUTION_ID,
+    });
+  });
+
+  it("returns null when the server has marked the error dismissed", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          occurred_at: OCCURRED_AT,
+          dismissed_at: "2026-06-14T12:05:00Z",
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when dismissal is provided as camelCase dismissedAt", () => {
+    expect(
+      readLastAgentError({
+        last_agent_error: {
+          message: AGENT_ERROR_MESSAGE,
+          occurredAt: OCCURRED_AT,
+          dismissedAt: "2026-06-14T12:05:00Z",
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("lastAgentErrorStamp", () => {
+  it("combines occurredAt and message so a fresh error invalidates a prior dismissal", () => {
+    expect(lastAgentErrorStamp({ message: AGENT_ERROR_MESSAGE, occurredAt: OCCURRED_AT })).toBe(
+      `${OCCURRED_AT}:${AGENT_ERROR_MESSAGE}`,
+    );
+  });
+
+  it("tolerates a missing occurredAt", () => {
+    expect(lastAgentErrorStamp({ message: AGENT_ERROR_MESSAGE })).toBe(`:${AGENT_ERROR_MESSAGE}`);
+  });
+});
+
+describe("setStoredDismissedAgentErrors", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("merges with existing entries so a concurrent tab's writes are not clobbered", () => {
+    // Simulate a write from another tab landing first.
+    setStoredDismissedAgentErrors({ [OTHER_TAB_SESSION_ID]: OTHER_TAB_STAMP });
+
+    // This tab then dismisses for a different session using a stale snapshot
+    // (i.e. one that does not include `session-other-tab`).
+    setStoredDismissedAgentErrors({ [THIS_TAB_SESSION_ID]: THIS_TAB_STAMP });
+
+    expect(getStoredDismissedAgentErrors()).toEqual({
+      [OTHER_TAB_SESSION_ID]: OTHER_TAB_STAMP,
+      [THIS_TAB_SESSION_ID]: THIS_TAB_STAMP,
+    });
+  });
+
+  it("overwrites existing entries for the same session id", () => {
+    setStoredDismissedAgentErrors({ "session-a": "stamp-v1" });
+    setStoredDismissedAgentErrors({ "session-a": "stamp-v2" });
+    expect(getStoredDismissedAgentErrors()).toEqual({ "session-a": "stamp-v2" });
+  });
+});
+
+describe("setStoredAcknowledgedAgentErrors", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("merges with existing sidebar acknowledgement entries", () => {
+    setStoredAcknowledgedAgentErrors({ [OTHER_TAB_SESSION_ID]: OTHER_TAB_STAMP });
+    setStoredAcknowledgedAgentErrors({ [THIS_TAB_SESSION_ID]: THIS_TAB_STAMP });
+
+    expect(getStoredAcknowledgedAgentErrors()).toEqual({
+      [OTHER_TAB_SESSION_ID]: OTHER_TAB_STAMP,
+      [THIS_TAB_SESSION_ID]: THIS_TAB_STAMP,
+    });
+  });
+
+  it("overwrites existing sidebar acknowledgement entries for the same session id", () => {
+    setStoredAcknowledgedAgentErrors({ "session-a": "stamp-v1" });
+    setStoredAcknowledgedAgentErrors({ "session-a": "stamp-v2" });
+    expect(getStoredAcknowledgedAgentErrors()).toEqual({ "session-a": "stamp-v2" });
+  });
+});

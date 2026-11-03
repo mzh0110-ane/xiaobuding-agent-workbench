@@ -1,0 +1,261 @@
+# profiles.yaml — runtime defaults for prod / dev / e2e environments.
+# ─────────────────────────────────────────────────────────────────────
+# This file is the ONE place to look for "what does dev mode set?" /
+# "what does e2e mode set?" / "what ships off in production?". The
+# backend embeds it (//go:embed in apps/backend/internal/profiles) and
+# at startup applies the matching profile's values to its own env
+# *unless the variable is already set*. That last point matters: any
+# launcher, per-spec override, or self-hoster's shell still wins.
+# profiles.yaml only fills in the gaps.
+#
+# ── How profile selection works ────────────────────────────────────
+#
+# Detection at backend startup, in order:
+#   • KANDEV_E2E_MOCK=true        → e2e   (set by playwright fixtures)
+#   • KANDEV_DEBUG_DEV_MODE=true  → dev   (set by `make dev`)
+#   • (neither)                   → prod  (the safe default)
+#
+# Each leaf below lists the value for each profile. A missing profile
+# inherits the prod value, so a knob that never changes only needs to
+# declare `prod`. An empty string ("") means "leave the env var unset"
+# — handy for prod when the var simply shouldn't exist.
+#
+# ── How to flip a feature on for every user ────────────────────────
+#
+# Set its `prod` value to `true`. Ship the next release. Once the
+# feature has been on by default for a release or two and is
+# permanent, remove its live wiring and move its key/environment pair
+# to runtimeflags' append-only retired-identity set.
+#
+# ── See also ───────────────────────────────────────────────────────
+#
+#   docs/decisions/0007-runtime-feature-flags.md  pattern + rationale
+#   apps/backend/internal/profiles/profiles.go    loader + parser
+
+# ── Feature flags ─────────────────────────────────────────────────
+# Gate in-progress code that ships disabled to production. New flags
+# go here as `KANDEV_FEATURES_<NAME>` — the backend's config package
+# maps them to `features.<name>` Viper keys automatically.
+features:
+  # Retains supported language-server leases across browser disconnects. The
+  # bounded task-host lifecycle is enabled by default; this restart-required
+  # flag remains the operator kill switch.
+  KANDEV_FEATURES_LSP_BROWSER_CONTINUITY:
+    prod: "true"
+    dev:  "true"
+    e2e:  "true"
+
+  # Office (autonomous agent surface). Off in prod until the feature
+  # is user-ready; on in dev/e2e so contributors and tests exercise it.
+  KANDEV_FEATURES_OFFICE:
+    prod: "false"
+    dev:  "true"
+    e2e:  "true"
+
+  # Opt-in authentication + per-user workspaces. This flag IS the on/off
+  # switch: when on, every visitor must sign in (the first becomes admin via
+  # a setup wizard) and workspaces are private per user. Off everywhere by
+  # default so kandev stays single-user until a deployment opts in. The
+  # dedicated auth e2e project turns it on per-spec via backend.restart(env).
+  KANDEV_FEATURES_AUTH:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Agent-authored plugin web applications. Off in every shipped profile until
+  # the isolated runtime and lifecycle are ready for opt-in use.
+  KANDEV_FEATURES_CANVASES:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Organizations: a tenant boundary above users. Requires KANDEV_FEATURES_AUTH;
+  # the backend refuses to start with this on and auth off. Off everywhere until
+  # the runtime-isolation work (per-org filesystem roots, per-org agent
+  # credentials, tenant-pinned executors) lands.
+  KANDEV_FEATURES_MULTI_TENANCY:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Dynamic agent profiles and provider-error routing. Off in every shipped
+  # profile until the complete guarded implementation is ready.
+  KANDEV_FEATURES_DYNAMIC_AGENT_ROUTING:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Native Codex app-server is separate from Codex ACP and remains opt-in.
+  KANDEV_FEATURES_CODEX_APP_SERVER:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Safe continuation of an interrupted native conversation. Explicit opt-in.
+  KANDEV_FEATURES_PROVIDER_INTERRUPTION_CONTINUATION:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Normalized background work and subagent lifecycle management.
+  KANDEV_FEATURES_AGENT_BACKGROUND_WORK:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # High-risk Claude-only background prompt handoff experiment. Off in every
+  # profile so it is exercised only by contributors who deliberately opt in.
+  KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # High-risk mid-turn steering experiment: deliver a prompt into a turn that is
+  # still generating. Off in every profile; e2e specs that need it set the env
+  # var per-spec so the default stays honest.
+  KANDEV_FEATURES_CLAUDE_MID_TURN_STEERING:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+  # Needs-you Inbox: a workspace-scoped sidebar destination listing exactly
+  # the answerable clarification bundles for the active workspace. Off in
+  # prod until the feature is user-ready; on in dev/e2e so contributors and
+  # tests exercise it.
+  KANDEV_FEATURES_NEEDS_YOU_INBOX:
+    prod: "false"
+    dev:  "true"
+    e2e:  "true"
+
+  # Agent survival across a backend restart (worktree/local executors only).
+  # Off in every profile: it replaces the standalone control server's
+  # kill-on-restart safeguard with an adoption handshake, and is unavailable
+  # on Windows. E2E specs that need it set the env var per-spec.
+  KANDEV_FEATURES_AGENT_SURVIVAL:
+    prod: "false"
+    dev:  "false"
+    e2e:  "false"
+
+# ── Mock providers ────────────────────────────────────────────────
+# Swap real third-party services for in-memory fakes. Production
+# leaves all of these unset (real APIs). Dev opts into the mock agent
+# CLI alongside real CLIs; e2e isolates to mocks only.
+mocks:
+  # Mock agent CLI registration.
+  #   ""     real CLIs only (prod)
+  #   "true" mock alongside real CLIs (dev — try the UI without installing every agent)
+  #   "only" mock is the SOLE agent (e2e isolation)
+  KANDEV_MOCK_AGENT:
+    prod: ""
+    dev:  "true"
+    e2e:  "only"
+
+  # Mount the /api/v1/_test/* test-harness routes. Hard-gated off in
+  # production — never enable on a public backend.
+  KANDEV_E2E_MOCK:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+
+  # Replace third-party clients with in-memory fakes
+  # so e2e specs don't hit live APIs (and dev doesn't need tokens).
+  KANDEV_MOCK_GITHUB:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+  KANDEV_MOCK_GITLAB:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+  KANDEV_MOCK_JIRA:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+  KANDEV_MOCK_LINEAR:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+  KANDEV_MOCK_SENTRY:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+  KANDEV_MOCK_AZURE_DEVOPS:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+
+# ── Debug / observability ─────────────────────────────────────────
+# Production keeps these off so /debug/* endpoints and pprof aren't
+# exposed publicly. Dev turns everything on.
+debug:
+  # Enables /debug/vars (expvar), /debug/pprof/*, and dev-only routes.
+  KANDEV_DEBUG_DEV_MODE:
+    prod: ""
+    dev:  "true"
+    e2e:  ""
+
+  # Legacy debug behavior variable — kept for compatibility with older
+  # deploy scripts that enable pprof. It does not select the dev profile.
+  KANDEV_DEBUG_PPROF_ENABLED:
+    prod: ""
+    dev:  "true"
+    e2e:  ""
+
+  # Dump every ACP protocol frame (raw + normalized) to per-session JSONL
+  # files for offline debugging of stuck/odd sessions. Always-on in dev:
+  # the agentctl janitor caps file size (rotation), prunes by age + total
+  # count, and flushes/closes writers on shutdown, so it can't grow disk
+  # without bound. Files default to ~/.kandev/logs/acp/ (override with
+  # KANDEV_DEBUG_LOG_DIR). PRIVACY: frames carry full prompt/file/tool
+  # content — strictly local-dev; never enable in prod. When agentctl runs
+  # inside a Docker executor the files land *inside the container*, so this
+  # is meant for standalone/dev. Retention knobs (all optional):
+  #   KANDEV_DEBUG_ACP_MAX_FILES       (default 200)
+  #   KANDEV_DEBUG_ACP_RETENTION_HOURS (default 48)
+  #   KANDEV_DEBUG_ACP_MAX_FILE_BYTES  (default 8388608 = 8 MiB)
+  KANDEV_DEBUG_AGENT_MESSAGES:
+    prod: ""
+    dev:  "true"
+    e2e:  ""
+
+# ── Browser identity ─────────────────────────────────────────────
+# Distinguish the local development tab from release and preview tabs without
+# changing the title of production or e2e environments.
+ui:
+  KANDEV_WEB_TITLE_PREFIX:
+    prod: ""
+    dev:  "Dev"
+    e2e:  ""
+
+# ── E2E test tuning ───────────────────────────────────────────────
+# Behaviour knobs that only matter when running playwright. These
+# don't belong in dev (would mask real interactions) and never in
+# prod (would leak test-only behaviour).
+e2eTuning:
+  # Holds a mock ACP cancellation through navigation and hydration without
+  # changing production cancellation behavior.
+  KANDEV_E2E_CANCEL_HOLD_DURATION:
+    prod: ""
+    dev:  ""
+    e2e:  "8s"
+  KANDEV_E2E_PROMPT_CANCEL_JOIN_TIMEOUT:
+    prod: ""
+    dev:  ""
+    e2e:  "3s"
+
+  # Auto-approve every permission request in agentctl so e2e specs
+  # don't have to script the approval UI. Read by the agentctl child
+  # process; the backend forwards its env to children, so setting it
+  # here lands in the right place.
+  AGENTCTL_AUTO_APPROVE_PERMISSIONS:
+    prod: ""
+    dev:  ""
+    e2e:  "true"
+
+  # Short plan-coalesce window so coalesce-boundary specs don't have
+  # to wait for the production-default delay. Read by the planning
+  # service at startup.
+  KANDEV_PLAN_COALESCE_WINDOW_MS:
+    prod: ""
+    dev:  ""
+    e2e:  "2000"

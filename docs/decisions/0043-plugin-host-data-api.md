@@ -1,0 +1,217 @@
+# 0043 — Plugins read/write kandev data via capability-gated Host gRPC RPCs
+
+- Status: accepted
+- Date: 2026-07-17
+- Area: backend, protocol
+- Related: [docs/specs/plugins/requirements/plugins.md](../specs/plugins/requirements/plugins.md) ("Host data API"),
+  [docs/plans/plugins/GRPC-CONTRACT.md](../plans/plugins/GRPC-CONTRACT.md),
+  [docs/plans/plugins/host-data-api/plan.md](../plans/plugins/host-data-api/plan.md)
+
+## Context
+
+The plugin system (spec `docs/specs/plugins/requirements/plugins.md`) gives plugins a
+capability-gated `Host` gRPC service — `GetState`/`SetState`/`DeleteState`/
+`ListState`/`RevealSecret`/`EmitEvent` — but **no sanctioned way to read or write
+kandev's own domain data** (tasks, sessions, workspaces, workflows, agent
+profiles, repositories, comments). The manifest already reserves
+`capabilities.api_read` / `capabilities.api_write` (string lists) for this, and
+`manifest.CanRead(resource)` / `CanWrite(resource)` already exist, but no Host
+RPC consumes them.
+
+A real plugin exposed the gap. `kandev-plugin-agent-stats`
+(`/home/jcfs/.kandev/tasks/tokens-per-task-loc_9tk/kandev-plugin-agent-stats/`)
+needs per-session lines-of-code plus each session's agent/model/`acp_session_id`
+to attribute externally-measured token usage (from `tokscale`, keyed by
+`acp_session_id`) to agents. With no data API, it **opens the kandev SQLite file
+directly, read-only** (`~/.kandev/data/kandev.db`) and runs SQL against
+`task_sessions`, `task_session_commits`, `task_session_git_snapshots`, and
+`executors_running`.
+
+Direct DB access is only possible because the backend spawns plugin subprocesses
+unsandboxed on the same host, and the plugin can guess the default DB path. It is
+wrong on every axis:
+
+- **Schema coupling.** The plugin's SQL hard-codes column names, the
+  `agent_profile_snapshot` JSON shape, and the `task_session_git_snapshots.files`
+  JSON shape. Any internal schema change silently breaks it.
+- **No events on write.** kandev's convention (`apps/backend/CLAUDE.md`: "any code
+  path that mutates a task row must publish `task.*` events") cannot hold for a
+  plugin writing SQL — it would bypass the event bus and break WS-driven UI.
+- **Breaks on Postgres.** kandev supports a Postgres backend; a plugin that opens
+  a SQLite file has no data there at all.
+- **No auth or scoping.** The plugin reads every row in the database regardless of
+  what it declared or should see.
+
+We want a "carrot" that makes the sanctioned path strictly better than touching
+the file, so we can then pursue the "stick" (env-scrubbing, not shipping the DB
+path into the subprocess, sandboxing) without stranding a legitimate use case.
+
+## Decision
+
+Extend the existing `kandev.plugin.v1` `Host` service with typed data RPCs.
+Plugins read (phase 1) and later write (phase 2) kandev data over the same
+capability-gated Host gRPC channel they already use for state and secrets. They
+never open the database file and never receive internal domain structs over the
+wire.
+
+Concretely:
+
+1. **New RPCs on the Host surface.** Add read RPCs now — `ListTasks`, `GetTask`,
+   `ListWorkspaces`, `ListWorkflows`, `ListWorkflowSteps`, `ListAgentProfiles`,
+   `ListRepositories`, `ListSessions`, `ListSessionCodeStats` — and defer write
+   RPCs (`CreateTask`, `UpdateTask`, `CreateComment`) to phase 2. The frozen
+   draft lives at `docs/plans/plugins/HOST-DATA-API.proto`; it is folded into
+   `apps/backend/proto/kandev/plugin/v1/plugin.proto`. (Whether these land on the
+   existing `service Host` or a sibling `service HostData` served on the same
+   broker connection is an implementation detail settled in the plan; the wire
+   package and capability model are identical either way.)
+
+2. **Capability gating per resource.** Each read RPC requires
+   `api_read:<resource>` in the plugin's manifest; each write RPC requires
+   `api_write:<resource>` (e.g. `api_read:tasks`, `api_read:sessions`,
+   `api_write:tasks`, `api_write:comments`). Enforcement reuses the existing
+   per-plugin binding and `manifest.CanRead`/`CanWrite`; an undeclared capability
+   returns gRPC `PermissionDenied` with `capability 'api_read:tasks' not declared`
+   — identical to today's state/secrets gating. The gate lives at the RPC handler
+   (or the existing unary interceptor), not in the plugin.
+
+3. **Reads go through the service layer; writes go through service methods that
+   publish events.** Read handlers call the relevant service (`taskSvc`,
+   workflow service, analytics/session aggregation), never a repository directly,
+   so future access rules and derived fields stay in one place. Write handlers
+   call `Service.CreateTask` / `UpdateTask` / comment-create methods that publish
+   `task.*` events — never `repository.TaskRepository`. Publishing events is the
+   whole reason plugins must not write the DB.
+
+4. **Hand-mapped, versioned DTOs — never internal structs.** The proto messages
+   are a stable public contract. The backend maps internal models → these DTOs
+   with explicit code; that mapping *is* the decoupling. We do not marshal domain
+   structs through `structpb`, do not generate DTOs from models, and do not
+   expose raw table rows. `SessionCodeStats` is a deliberately **computed** shape
+   (committed insertions/deletions + peak pending-diff additions/deletions),
+   never the raw `task_session_commits` / `task_session_git_snapshots` rows whose
+   JSON schema churns.
+
+5. **Conventions across the contract.**
+   - **Pagination:** opaque cursor (`Page{limit, cursor}` → `PageInfo{next_cursor,
+     has_more}`), so the server can change ordering or store without breaking
+     plugins.
+   - **Timestamps:** RFC3339 strings, matching the `Event` envelope and the JSON
+     API — one time representation across the whole plugin contract.
+   - **Nullables:** proto `optional` so absent (NULL) is distinguishable from
+     empty.
+   - **Write provenance:** the server stamps `source = "plugin:<id>"` on created
+     rows/comments; a plugin cannot set it.
+   - **API v1 compatibility:** DTO fields are additive-only. The read-side
+     `Task.labels` field shipped in v0.93.0 and remains at field 23 as deprecated
+     source/wire compatibility. New provider integrations keep their annotations
+     in plugin-owned task state and UI slot data; task label writes are not part
+     of the plugin write contract.
+
+## Open decisions (recorded, with recommendation)
+
+- **(a) Workspace scoping.** Plugins are instance-global today (installed by the
+  operator, no per-user access). Reads could either require a `workspace_id` /
+  become workspace-scoped, or stay global with a filter hook. **Recommendation
+  for v1: global-with-hook** — reads return across all workspaces the instance
+  holds, filters (`workspace_ids`, `task_ids`) narrow results, and a single
+  server-side scoping hook is left in place so a future per-plugin or per-user
+  workspace restriction can be enforced without a contract change. Matches the
+  existing "plugins are global to the instance" permission model in the spec.
+
+- **(b) SessionCodeStats freshness.** Computed **on demand per request** in v1
+  (one aggregation query per `ListSessionCodeStats` call, filtered and paginated),
+  not precomputed or cached. The agent-stats plugin already caches its own report
+  for 60s, so per-request compute is acceptable; a materialized/precomputed path
+  is future work if the query proves hot.
+
+## Consequences
+
+- Plugins get a first-class, stable data path; the agent-stats plugin is
+  rewritten to use it (`host.Sessions().List(...)` +
+  `host.Sessions().CodeStats(...)`) and stops opening the DB file — the proof the
+  carrot is sufficient.
+- The proto is a public contract: DTO fields are additive-only thereafter;
+  removing or renaming a field is a breaking change requiring a new api_version.
+- Deprecated fields remain generated in API v1. In particular, `Task.labels`
+  stays readable for clients compiled against v0.93.0 even though new plugins
+  should not use it for provider-specific annotations.
+- A **new read-only per-session LOC aggregation must be added** at the service/
+  repository layer. `internal/analytics/repository/sqlite/stats.go` aggregates git
+  stats at workspace and per-repository granularity only; nothing computes
+  per-session committed LOC + peak pending-diff, and the peak-pending snapshot
+  aggregation (`MAX` over per-snapshot `SUM` of `json_each(files).additions`) does
+  not exist in-tree. This is the one net-new query the decision requires.
+- Enables the security "stick": once the sanctioned path exists, we can scrub
+  `KANDEV_*` env from the plugin subprocess, stop making the DB path derivable,
+  and pursue sandboxing without breaking a real plugin. Tracked as the isolation
+  follow-ups referenced from the plugin-system buildout.
+- Write RPCs inherit kandev's event-publishing invariant for free by routing
+  through service methods; no plugin can mutate a task without `task.*` firing.
+
+## Update — 2026-07-26: writes implemented
+
+The phase-2 write RPCs are now wired, following this ADR's decision points 3–5
+verbatim. Concretely:
+
+- **`CreateTask` / `UpdateTask`** (capability `api_write:tasks`) route through
+  `internal/task/service.Service.CreateTask` / `UpdateTask` — the same
+  event-publishing methods the REST/MCP API uses — via a backendapp adapter
+  (`pluginsTaskWriterAdapter`) that translates the SDK's plugins-local input
+  structs into `service.CreateTaskRequest` / `UpdateTaskRequest` (the service
+  types can't be referenced from `internal/plugins` without the import cycle
+  this ADR's `SetDataSources` note already calls out). `CreateTask` resolves
+  placement defaults (single workspace; that workspace's first workflow;
+  ambiguous → `InvalidArgument`) and honors an optional `start_agent` that
+  best-effort launches an agent through the orchestrator (a launch failure never
+  fails the create, matching REST/MCP's async auto-start). `UpdateTask` exposes
+  a **conservative field mask** — `title` / `description` / `state` /
+  `priority`, each optional — deliberately smaller than the full REST
+  update surface. `workflow_step_id` remains present for wire compatibility but
+  is rejected by Update; plugins must use `MoveTask` for workflow transitions.
+- **`SendMessage`** (capability `api_write:messages`) replaced the originally
+  planned `CreateComment`: an office `TaskComment` is an office/dashboard
+  construct, not a way to message the agent working a task. SendMessage delivers
+  a prompt to a task session through the orchestrator's real delivery path — the
+  same one `message_task` uses — via a backendapp adapter
+  (`pluginsTaskMessengerAdapter`) that resolves the target session (explicit id,
+  verified to belong to the task, or the task's primary session), records a user
+  message stamped `source = "plugin:<id>"`, and dispatches by session state: a
+  running session queues the prompt; an idle/completed one is prompted (resuming
+  the agent process if it has gone); a never-started one is launched with the
+  prompt as its first turn. A failed dispatch deletes the recorded message so no
+  orphan prompt is left. The adapter and the orchestrator task-starter are
+  reached via a late `SetWriteDeps` hook read live at call time, because the
+  orchestrator is constructed after boot-active plugins spawn — the same
+  live-read pattern the utility agent (ADR 0048) uses.
+- **Provenance.** The server stamps `source = "plugin:<id>"` — task metadata
+  `source` for created tasks (the Task model has no source column), and the
+  recorded user message's metadata for SendMessage. A plugin cannot set it.
+- **Gating** is per-method on the shared accessors: `Tasks()` gates List/Get on
+  `api_read:tasks` and Create/Update on `api_write:tasks`; `Messages()` gates
+  List on `api_read:messages` and Send on `api_write:messages` — each pair
+  independent, so a plugin may hold one without the other. Undeclared → gRPC
+  `PermissionDenied`, identical to reads.
+
+This closes the "writes deferred to phase 2" language in the Decision above.
+The comment-create RPC named there was dropped in favor of SendMessage.
+Broadening the write surface (delete/archive tasks, sessions/workspaces, a
+wider update mask, delivery-mode/interrupt on SendMessage) remains future work.
+
+## Alternatives considered
+
+- **Raw DB access (status quo).** What the agent-stats plugin does today.
+  Rejected: schema coupling, no write events, breaks on Postgres, no auth/scoping,
+  and only possible because the subprocess is unsandboxed. This is the failure the
+  ADR exists to close.
+- **REST passthrough with the plugin's own HTTP client.** Let plugins call
+  kandev's HTTP API. Rejected: reintroduces credential/auth machinery the gRPC
+  contract deliberately removed (`GRPC-CONTRACT.md` §1), couples plugins to the
+  backend's network topology and base URL, and duplicates the transport the
+  Host channel already provides securely (spawn relationship + AutoMTLS).
+- **Expose internal structs via `structpb`.** Marshal domain models as generic
+  structs over the existing Struct-typed fields. Rejected: recreates the exact
+  schema coupling of raw DB access, just one layer up — plugins would depend on
+  internal field names and shapes with no stable contract boundary.
+</content>
+</invoke>

@@ -1,0 +1,688 @@
+/**
+ * HTTP API client for the office feature endpoints.
+ * Covers onboarding, agents, issues, labels, documents, dashboard, skills,
+ * config sync, routines, costs, approvals, and workspace settings.
+ */
+export class OfficeApiClient {
+  constructor(private baseUrl: string) {}
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await fetch(`${this.baseUrl}/api/v1/office${path}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Office API ${method} /api/v1/office${path} failed (${res.status}): ${text}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  /** Like {@link request}, but returns the raw Response instead of throwing on non-2xx —
+   * for endpoints a test exercises across success and rejection status codes (409, 503). */
+  async rawRequest(method: string, path: string, body?: unknown): Promise<Response> {
+    return fetch(`${this.baseUrl}/api/v1/office${path}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  // --- Onboarding ---
+
+  async getOnboardingState(): Promise<Record<string, unknown>> {
+    return this.request("GET", "/onboarding-state");
+  }
+
+  async completeOnboarding(data: {
+    workspaceName: string;
+    taskPrefix: string;
+    agentName: string;
+    agentProfileId: string;
+    executorPreference: string;
+    taskTitle?: string;
+    taskDescription?: string;
+  }): Promise<{ workspaceId: string; agentId: string; projectId: string }> {
+    return this.request("POST", "/onboarding/complete", {
+      workspaceName: data.workspaceName,
+      taskPrefix: data.taskPrefix,
+      agentName: data.agentName,
+      agentProfileId: data.agentProfileId,
+      executorPreference: data.executorPreference,
+      taskTitle: data.taskTitle,
+      taskDescription: data.taskDescription,
+    });
+  }
+
+  async importFromFS(): Promise<Record<string, unknown>> {
+    return this.request("POST", "/onboarding/import-fs", undefined);
+  }
+
+  async deleteWorkspace(wsId: string, confirmName: string): Promise<void> {
+    await this.request("DELETE", `/workspaces/${wsId}`, { confirm_name: confirmName });
+  }
+
+  // --- Agents ---
+
+  async listAgents(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/agents`);
+  }
+
+  async createAgent(
+    wsId: string,
+    data: {
+      name: string;
+      role: string;
+      agent_profile_id?: string;
+      executor_preference?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request<{ agent: Record<string, unknown> }>(
+      "POST",
+      `/workspaces/${wsId}/agents`,
+      data,
+    );
+    return res.agent ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async getAgent(id: string): Promise<Record<string, unknown>> {
+    const res = await this.request<{ agent: Record<string, unknown> }>("GET", `/agents/${id}`);
+    return res.agent ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async updateAgent(id: string, data: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const res = await this.request<{ agent: Record<string, unknown> }>(
+      "PATCH",
+      `/agents/${id}`,
+      data,
+    );
+    return res.agent ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async deleteAgent(id: string): Promise<void> {
+    await this.request("DELETE", `/agents/${id}`);
+  }
+
+  async updateAgentStatus(
+    id: string,
+    status: string,
+    pauseReason?: string,
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = { status };
+    if (pauseReason !== undefined) body.pause_reason = pauseReason;
+    const res = await this.request<{ agent: Record<string, unknown> }>(
+      "PATCH",
+      `/agents/${id}/status`,
+      body,
+    );
+    return res.agent ?? (res as unknown as Record<string, unknown>);
+  }
+
+  // --- Issues / Tasks ---
+
+  /**
+   * Create an office task via the core /api/v1/tasks endpoint (not /office/).
+   * Supports `blocked_by` (IDs of tasks that must complete before this one)
+   * and other office-specific fields that the base ApiClient does not expose.
+   */
+  async createTask(
+    wsId: string,
+    title: string,
+    opts?: {
+      parent_id?: string;
+      blocked_by?: string[];
+      workflow_id?: string;
+      description?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {
+      workspace_id: wsId,
+      title,
+      description: opts?.description ?? "",
+    };
+    if (opts?.parent_id) body.parent_id = opts.parent_id;
+    if (opts?.blocked_by?.length) body.blocked_by = opts.blocked_by;
+    if (opts?.workflow_id) body.workflow_id = opts.workflow_id;
+    // Use the core /api/v1/tasks route (not the /office/ prefix)
+    const res = await fetch(`${this.baseUrl}/api/v1/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Office createTask POST /api/v1/tasks failed (${res.status}): ${text}`);
+    }
+    return res.json() as Promise<Record<string, unknown>>;
+  }
+
+  async listTasks(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/tasks`);
+  }
+
+  async getTask(id: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${id}`);
+  }
+
+  async updateTaskStatus(
+    id: string,
+    status: string,
+    comment: string,
+  ): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/tasks/${id}`, { status, comment });
+  }
+
+  /**
+   * Assign the task to an agent (instance id). Office's TaskUpdated
+   * subscriber fires a `task_assigned` run for the assignee, which is
+   * what the routing dispatch path needs to fire.
+   */
+  async assignTask(id: string, assigneeAgentProfileId: string): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/tasks/${id}`, {
+      assignee_agent_profile_id: assigneeAgentProfileId,
+    });
+  }
+
+  async searchTasks(wsId: string, query: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/tasks/search?q=${encodeURIComponent(query)}`);
+  }
+
+  /**
+   * Reassign (or clear, with "") the task's project. Publishes
+   * `office.task.updated` with `fields: ["project_id"]`, which is what the
+   * costs page's live refetch gate keys off.
+   */
+  async updateTaskProjectId(id: string, projectId: string): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/tasks/${id}`, { project_id: projectId });
+  }
+
+  /**
+   * Create a project in the workspace. Onboarding does not seed a default
+   * project (see e2e/tests/office/project-repository-picker.spec.ts), so
+   * tests that need a real project_id to reassign a task to must create
+   * one first.
+   */
+  async createProject(wsId: string, name: string): Promise<Record<string, unknown>> {
+    const res = await this.request<{ project?: Record<string, unknown> }>(
+      "POST",
+      `/workspaces/${wsId}/projects`,
+      { name },
+    );
+    return res.project ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async listProjects(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/projects`);
+  }
+
+  // --- Labels ---
+
+  async addLabel(wsId: string, taskId: string, name: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/workspaces/${wsId}/tasks/${taskId}/labels`, { name });
+  }
+
+  async removeLabel(wsId: string, taskId: string, name: string): Promise<void> {
+    await this.request(
+      "DELETE",
+      `/workspaces/${wsId}/tasks/${taskId}/labels/${encodeURIComponent(name)}`,
+    );
+  }
+
+  async listTaskLabels(wsId: string, taskId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/tasks/${taskId}/labels`);
+  }
+
+  async listWorkspaceLabels(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/labels`);
+  }
+
+  async updateLabel(
+    wsId: string,
+    labelId: string,
+    data: { name?: string; color?: string },
+  ): Promise<void> {
+    await this.request("PATCH", `/workspaces/${wsId}/labels/${labelId}`, data);
+  }
+
+  async deleteLabel(wsId: string, labelId: string): Promise<void> {
+    await this.request("DELETE", `/workspaces/${wsId}/labels/${labelId}`);
+  }
+
+  // --- Documents ---
+
+  async listDocuments(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${taskId}/documents`);
+  }
+
+  async getDocument(taskId: string, key: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${taskId}/documents/${encodeURIComponent(key)}`);
+  }
+
+  async createOrUpdateDocument(
+    taskId: string,
+    key: string,
+    data: {
+      type: string;
+      title: string;
+      content: string;
+      author_kind?: string;
+      author_name?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/tasks/${taskId}/documents/${encodeURIComponent(key)}`, data);
+  }
+
+  async deleteDocument(taskId: string, key: string): Promise<void> {
+    await this.request("DELETE", `/tasks/${taskId}/documents/${encodeURIComponent(key)}`);
+  }
+
+  async listRevisions(taskId: string, key: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${taskId}/documents/${encodeURIComponent(key)}/revisions`);
+  }
+
+  async revertDocument(
+    taskId: string,
+    key: string,
+    revId: string,
+  ): Promise<Record<string, unknown>> {
+    return this.request(
+      "POST",
+      `/tasks/${taskId}/documents/${encodeURIComponent(key)}/revisions/${revId}/restore`,
+    );
+  }
+
+  // --- Comments ---
+
+  async listTaskComments(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${taskId}/comments`);
+  }
+
+  async createTaskComment(taskId: string, body: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/comments`, { body });
+  }
+
+  // --- Provider routing ---
+
+  /**
+   * Fetch the workspace routing config + known-provider catalogue.
+   * Returns the default disabled-balanced shape when no row exists yet.
+   */
+  async getRouting(wsId: string): Promise<{
+    config: {
+      enabled: boolean;
+      provider_order: string[];
+      default_tier: "frontier" | "balanced" | "economy";
+      provider_profiles: Record<
+        string,
+        {
+          tier_map: { frontier?: string; balanced?: string; economy?: string };
+          execution_profile_ids?: { frontier?: string; balanced?: string; economy?: string };
+        }
+      >;
+      role_tiers?: Record<string, "frontier" | "balanced" | "economy">;
+    };
+    known_providers: string[];
+    execution_profiles: Array<{
+      id: string;
+      name: string;
+      provider_id: string;
+      model: string;
+      mode?: string;
+    }>;
+  }> {
+    return this.request("GET", `/workspaces/${wsId}/routing`);
+  }
+
+  /**
+   * Persist a workspace routing config. The backend validator runs in
+   * strict mode when `enabled=true`; the test callers pass a complete
+   * config in that case.
+   */
+  async updateRouting(
+    wsId: string,
+    cfg: {
+      enabled: boolean;
+      provider_order: string[];
+      default_tier: "frontier" | "balanced" | "economy";
+      provider_profiles: Record<
+        string,
+        {
+          tier_map: { frontier?: string; balanced?: string; economy?: string };
+          execution_profile_ids?: { frontier?: string; balanced?: string; economy?: string };
+        }
+      >;
+      role_tiers?: Record<string, "frontier" | "balanced" | "economy">;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.request("PUT", `/workspaces/${wsId}/routing`, cfg);
+  }
+
+  async retryRoutingProvider(
+    wsId: string,
+    providerId: string,
+  ): Promise<{ status: string; retry_at?: string }> {
+    return this.request("POST", `/workspaces/${wsId}/routing/retry`, { provider_id: providerId });
+  }
+
+  async listRoutingHealth(
+    wsId: string,
+  ): Promise<{ health: Array<{ provider_id: string; state: string; error_code?: string }> }> {
+    return this.request("GET", `/workspaces/${wsId}/routing/health`);
+  }
+
+  async getRoutingPreview(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/routing/preview`);
+  }
+
+  async getAgentRoute(agentId: string): Promise<{
+    preview: Record<string, unknown>;
+    overrides: {
+      provider_order_source?: string;
+      provider_order?: string[];
+      tier_source?: string;
+      tier?: string;
+    };
+    last_failure_code?: string;
+    last_failure_run?: string;
+  }> {
+    return this.request("GET", `/agents/${agentId}/route`);
+  }
+
+  async listRouteAttempts(runId: string): Promise<{
+    attempts: Array<{
+      seq: number;
+      provider_id: string;
+      execution_profile_id: string;
+      model: string;
+      tier: string;
+      outcome: string;
+      error_code?: string;
+    }>;
+  }> {
+    return this.request("GET", `/runs/${runId}/attempts`);
+  }
+
+  // --- Dashboard ---
+
+  async getDashboard(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/dashboard`);
+  }
+
+  async getInbox(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/inbox`);
+  }
+
+  async listActivity(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/activity`);
+  }
+
+  async listRuns(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/runs`);
+  }
+
+  // --- Skills ---
+
+  async listSkills(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/skills`);
+  }
+
+  async discoverUserHomeSkills(wsId: string, provider: string): Promise<Record<string, unknown>> {
+    return this.request(
+      "GET",
+      `/workspaces/${wsId}/skills/discover?provider=${encodeURIComponent(provider)}`,
+    );
+  }
+
+  async createSkill(
+    wsId: string,
+    data: { name: string; slug: string; content: string },
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request<{ skill: Record<string, unknown> }>(
+      "POST",
+      `/workspaces/${wsId}/skills`,
+      data,
+    );
+    return res.skill ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async getSkill(id: string): Promise<Record<string, unknown>> {
+    const res = await this.request<{ skill: Record<string, unknown> }>("GET", `/skills/${id}`);
+    return res.skill ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async updateSkill(
+    id: string,
+    data: { name?: string; slug?: string; content?: string },
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request<{ skill: Record<string, unknown> }>(
+      "PATCH",
+      `/skills/${id}`,
+      data,
+    );
+    return res.skill ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async importUserHomeSkill(
+    wsId: string,
+    provider: string,
+    key: string,
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request<{ skills: Record<string, unknown>[] }>(
+      "POST",
+      `/workspaces/${wsId}/skills/import`,
+      {
+        source_type: "user_home",
+        provider,
+        key,
+      },
+    );
+    return res.skills?.[0] ?? {};
+  }
+
+  async getSkillFile(id: string, filePath: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/skills/${id}/files?path=${encodeURIComponent(filePath)}`);
+  }
+
+  async deleteSkill(id: string): Promise<void> {
+    await this.request("DELETE", `/skills/${id}`);
+  }
+
+  // --- Config ---
+
+  async exportConfig(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/config/export`);
+  }
+
+  async getIncomingDiff(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/config/sync/incoming`);
+  }
+
+  async applyOutgoingSync(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/workspaces/${wsId}/config/sync/export-fs`, undefined);
+  }
+
+  async applyIncomingSync(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/workspaces/${wsId}/config/sync/import-fs`, undefined);
+  }
+
+  // --- Config Sync (provider) ---
+  // Covers internal/office/configsync's HTTP surface: a per-workspace
+  // GitHub/GitLab source config, forced sync, and removal. Distinct from the
+  // filesystem <-> DB diff surface above.
+
+  // getConfigSyncConfig returns null on a 204 (no config yet for this
+  // workspace) rather than calling res.json() on an empty body.
+  async getConfigSyncConfig(wsId: string): Promise<Record<string, unknown> | null> {
+    const res = await fetch(`${this.baseUrl}/api/v1/office/workspaces/${wsId}/config-sync/config`);
+    if (res.status === 204) return null;
+    if (!res.ok) {
+      throw new Error(
+        `Office API GET config-sync/config failed (${res.status}): ${await res.text()}`,
+      );
+    }
+    return res.json();
+  }
+
+  async setConfigSyncConfig(
+    wsId: string,
+    payload: {
+      provider: "github" | "gitlab";
+      repo_owner?: string;
+      repo_name?: string;
+      project_path?: string;
+      branch?: string;
+      path?: string;
+      interval_seconds?: number;
+      poll_enabled?: boolean;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.request("POST", `/workspaces/${wsId}/config-sync/config`, payload);
+  }
+
+  async deleteConfigSyncConfig(wsId: string): Promise<void> {
+    await this.request("DELETE", `/workspaces/${wsId}/config-sync/config`);
+  }
+
+  async forceConfigSync(wsId: string): Promise<{
+    config: Record<string, unknown>;
+    result?: {
+      created: string[] | null;
+      updated: string[] | null;
+      deleted: string[] | null;
+      warnings: string[] | null;
+      unchanged: boolean;
+    };
+    error?: string;
+  }> {
+    return this.request("POST", `/workspaces/${wsId}/config-sync/sync`, undefined);
+  }
+
+  // --- Routines ---
+
+  async listRoutines(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/routines`);
+  }
+
+  async createRoutine(
+    wsId: string,
+    data: {
+      name: string;
+      description?: string;
+      catch_up_policy?: string;
+      assignee_agent_profile_id?: string;
+      concurrency_policy?: string;
+      catch_up_max?: number;
+      task_template?: string;
+      variables?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request<{ routine: Record<string, unknown> }>(
+      "POST",
+      `/workspaces/${wsId}/routines`,
+      data,
+    );
+    return res.routine ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async getRoutine(id: string): Promise<Record<string, unknown>> {
+    const res = await this.request<{ routine: Record<string, unknown> }>("GET", `/routines/${id}`);
+    return res.routine ?? (res as unknown as Record<string, unknown>);
+  }
+
+  async listRoutineRuns(routineId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/routines/${routineId}/runs`);
+  }
+
+  /** Manual fire (AC-OFFICE-KILL-SWITCH-002.4). Raw: a paused workspace answers 409. */
+  async runRoutine(routineId: string): Promise<Response> {
+    return this.rawRequest("POST", `/routines/${routineId}/run`);
+  }
+
+  async listRoutineTriggers(routineId: string): Promise<Record<string, unknown>[]> {
+    const res = await this.request<{ triggers: Record<string, unknown>[] | null }>(
+      "GET",
+      `/routines/${routineId}/triggers`,
+    );
+    return res.triggers ?? [];
+  }
+
+  // --- Workspace pause (kill switch) ---
+
+  async getWorkspacePause(wsId: string): Promise<{
+    workspace_id: string;
+    paused: boolean;
+    pause: Record<string, unknown> | null;
+  }> {
+    return this.request("GET", `/workspaces/${wsId}/pause`);
+  }
+
+  /** Raw: exercised at both 200 (success) and 400 (invalid reason). */
+  async pauseWorkspace(wsId: string, reason: string): Promise<Response> {
+    return this.rawRequest("POST", `/workspaces/${wsId}/pause`, { reason });
+  }
+
+  /** Raw: exercised at 200 both paused and not-paused. */
+  async resumeWorkspace(wsId: string, reason?: string): Promise<Response> {
+    return this.rawRequest("POST", `/workspaces/${wsId}/resume`, reason ? { reason } : undefined);
+  }
+
+  // --- Costs ---
+
+  async getCostSummary(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/costs/summary`);
+  }
+
+  async listBudgets(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/budgets`);
+  }
+
+  // --- Approvals ---
+
+  async listApprovals(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/approvals`);
+  }
+
+  async decideApproval(id: string, status: string, note: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/approvals/${id}/decide`, { status, note });
+  }
+
+  // --- Tree Controls ---
+
+  async pauseTaskTree(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/tree/pause`);
+  }
+
+  async resumeTaskTree(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/tree/resume`);
+  }
+
+  async cancelTaskTree(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/tree/cancel`);
+  }
+
+  async restoreTaskTree(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/tree/restore`);
+  }
+
+  async previewTaskTree(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("POST", `/tasks/${taskId}/tree/preview`);
+  }
+
+  async getSubtreeCostSummary(taskId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/tasks/${taskId}/tree/cost-summary`);
+  }
+
+  // --- Settings ---
+
+  async getWorkspaceSettings(wsId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/workspaces/${wsId}/settings`);
+  }
+
+  async updateWorkspaceSettings(
+    wsId: string,
+    data: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.request("PATCH", `/workspaces/${wsId}/settings`, data);
+  }
+}

@@ -1,0 +1,1482 @@
+package service
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"maps"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/agentruntime"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/steptelemetry"
+	"github.com/kandev/kandev/internal/task/models"
+	taskrepo "github.com/kandev/kandev/internal/task/repository"
+	"github.com/kandev/kandev/internal/worktree"
+)
+
+// Turn operations
+
+const (
+	runtimeModelConfigID = "model"
+	turnEventMetadataKey = "metadata"
+)
+
+// StartTurn creates a new turn for a session and publishes the turn.started event.
+// Returns the created turn.
+func (s *Service) StartTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	return s.createTurn(ctx, sessionID, true, nil)
+}
+
+// ReserveTurn durably creates a turn before an external prompt dispatch, but
+// delays turn.started until the dispatch is acknowledged.
+func (s *Service) ReserveTurn(
+	ctx context.Context,
+	sessionID string,
+	recovery *models.PromptDispatchRecovery,
+) (*models.Turn, error) {
+	if recovery == nil {
+		recovery = &models.PromptDispatchRecovery{}
+	}
+	return s.createTurn(ctx, sessionID, false, recovery)
+}
+
+func (s *Service) createTurn(
+	ctx context.Context,
+	sessionID string,
+	publishStarted bool,
+	recovery *models.PromptDispatchRecovery,
+) (*models.Turn, error) {
+	session, err := s.sessions.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
+	if session == nil {
+		return nil, fmt.Errorf("task session %s not found", sessionID)
+	}
+	unlock := s.lockWorkspaceSources(session.TaskID)
+	defer unlock()
+
+	metadata := turnStartRuntimeMetadata(session)
+	if recovery != nil {
+		metadata[models.TurnMetaKeyPromptDispatchPending] = true
+		metadata[models.TurnMetaKeyPromptDispatchClarificationPendingID] = recovery.PendingID
+		metadata[models.TurnMetaKeyPromptDispatchClarificationTurnID] = recovery.TurnID
+		metadata[models.TurnMetaKeyPromptDispatchClarificationMessageIDs] = recovery.MessageIDs
+	}
+	turn := &models.Turn{
+		ID:                 uuid.New().String(),
+		TaskSessionID:      sessionID,
+		TaskID:             session.TaskID,
+		ExecutionProfileID: session.ExecutionProfileID,
+		RouteGeneration:    session.RouteGeneration,
+		StartedAt:          time.Now().UTC(),
+		Metadata:           metadata,
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
+	}
+
+	var (
+		stamped bool
+		receipt *models.ConversationMutationReceipt
+	)
+	if writer, ok := s.turns.(taskrepo.ConversationTurnStampWriter); ok {
+		stamped, receipt, err = writer.CreateTurnWithStepStampConversationReceipt(ctx, turn)
+	} else {
+		stamped, err = s.turns.CreateTurnWithStepStamp(ctx, turn)
+	}
+	if err != nil {
+		s.logger.Error("failed to create turn", zap.Error(err))
+		return nil, err
+	}
+	// Recorded only once the turn is durably persisted — the counter's
+	// "turns created" framing must not count a turn CreateTurn rejected.
+	steptelemetry.RecordTurnStamp(s.logger, stamped)
+
+	if publishStarted {
+		// had_output is only meaningful on turn.completed; omit it from turn.started.
+		_ = s.publishTurnEvent(events.TurnStarted, turn, nil, receipt)
+	}
+
+	s.logger.Debug("started turn",
+		zap.String("turn_id", turn.ID),
+		zap.String("session_id", sessionID),
+		zap.String("task_id", turn.TaskID))
+
+	return turn, nil
+}
+
+// MarkReservedTurnDispatchAttempted establishes an at-most-once boundary
+// immediately before external dispatch. Startup fails closed on this marker
+// because a crash can no longer prove whether agentctl accepted the prompt.
+// On success it refreshes the supplied turn's metadata and update time from
+// the persisted row so PublishReservedTurn can consume the durable marker.
+func (s *Service) MarkReservedTurnDispatchAttempted(ctx context.Context, turn *models.Turn) error {
+	if turn == nil {
+		return errors.New("cannot mark nil reserved turn attempted")
+	}
+	updated, persistedMetadata, updatedAt, err := s.turns.UpdateActiveTurnMetadata(
+		ctx,
+		turn.TaskSessionID,
+		turn.ID,
+		map[string]interface{}{models.TurnMetaKeyPromptDispatchAttempted: true},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("mark reserved turn %s dispatch attempted: %w", turn.ID, err)
+	}
+	if !updated {
+		return fmt.Errorf("mark reserved turn %s dispatch attempted: turn is no longer active", turn.ID)
+	}
+	durable, _ := persistedMetadata[models.TurnMetaKeyPromptDispatchAttempted].(bool)
+	if !durable {
+		return fmt.Errorf("verify reserved turn %s dispatch attempt: marker missing", turn.ID)
+	}
+	turn.Metadata = persistedMetadata
+	turn.UpdatedAt = updatedAt
+	return nil
+}
+
+// PublishReservedTurn makes a durably attempted reservation authoritative.
+// Recovery metadata stays durable until the event bus accepts turn.started, so
+// a failed publication remains discoverable by startup reconciliation.
+func (s *Service) PublishReservedTurn(ctx context.Context, turn *models.Turn) error {
+	if turn == nil {
+		return errors.New("cannot publish nil reserved turn")
+	}
+	if attempted, _ := turn.Metadata[models.TurnMetaKeyPromptDispatchAttempted].(bool); !attempted {
+		return fmt.Errorf("cannot publish unattempted reserved turn %s", turn.ID)
+	}
+	// Re-read under session turn-write authority before revealing anything. A
+	// no-op patch gives publication a current, active durable snapshot without
+	// copying the caller's potentially stale metadata over concurrent fields.
+	updated, persistedMetadata, updatedAt, err := s.turns.UpdateActiveTurnMetadata(
+		ctx,
+		turn.TaskSessionID,
+		turn.ID,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("publish reserved turn %s: %w", turn.ID, err)
+	}
+	if !updated {
+		persisted, getErr := s.turns.GetTurn(ctx, turn.ID)
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return fmt.Errorf("publish reserved turn %s: reservation missing: %w", turn.ID, getErr)
+		}
+		if getErr != nil {
+			return fmt.Errorf("inspect unpublished reserved turn %s: %w", turn.ID, getErr)
+		}
+		if persisted.CompletedAt == nil {
+			return fmt.Errorf("publish reserved turn %s: active metadata update was rejected", turn.ID)
+		}
+		turn.Metadata = persisted.Metadata
+		turn.CompletedAt = persisted.CompletedAt
+		turn.UpdatedAt = persisted.UpdatedAt
+		return nil
+	}
+	if pending, _ := persistedMetadata[models.TurnMetaKeyPromptDispatchPending].(bool); !pending {
+		return fmt.Errorf("publish reserved turn %s: durable reservation marker missing", turn.ID)
+	}
+	if attempted, _ := persistedMetadata[models.TurnMetaKeyPromptDispatchAttempted].(bool); !attempted {
+		return fmt.Errorf("publish reserved turn %s: durable dispatch attempt marker missing", turn.ID)
+	}
+
+	publicTurn := *turn
+	publicTurn.Metadata = maps.Clone(persistedMetadata)
+	models.ClearPromptDispatchMetadata(publicTurn.Metadata)
+	publicTurn.UpdatedAt = updatedAt
+	if err := s.publishTurnEvent(events.TurnStarted, &publicTurn, nil); err != nil {
+		return fmt.Errorf("publish reserved turn %s start event: %w", turn.ID, err)
+	}
+
+	cleared, publishedMetadata, publishedAt, err := s.turns.ClearTurnPromptDispatchMetadata(
+		ctx,
+		turn.TaskSessionID,
+		turn.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("clear published reserved turn %s recovery metadata: %w", turn.ID, err)
+	}
+	if !cleared {
+		return fmt.Errorf("clear published reserved turn %s recovery metadata: reservation missing", turn.ID)
+	}
+	turn.Metadata = publishedMetadata
+	turn.UpdatedAt = publishedAt
+	return nil
+}
+
+// ReconcileUnpublishedPromptTurns restores unhanded clarification responses
+// and claims whose empty successor never reached agentctl, or accepts
+// reservations with output proof.
+func (s *Service) ReconcileUnpublishedPromptTurns(ctx context.Context) (int, error) {
+	if s.turns == nil {
+		return 0, errors.New("cannot reconcile unpublished prompt turns without a turn repository")
+	}
+	reconciled, err := s.turns.ReconcileUnpublishedPromptTurns(ctx)
+	if err != nil {
+		return reconciled, err
+	}
+	turns, err := s.turns.ListTurnsPendingStartEvent(ctx)
+	if err != nil {
+		return reconciled, fmt.Errorf("list recovered turns pending start-event replay: %w", err)
+	}
+	var replayErrs []error
+	for _, turn := range turns {
+		if err := s.replayRecoveredTurnEvents(ctx, turn); err != nil {
+			replayErrs = append(replayErrs, err)
+		}
+	}
+	return reconciled, errors.Join(replayErrs...)
+}
+
+func (s *Service) replayRecoveredTurnEvents(ctx context.Context, turn *models.Turn) error {
+	if turn == nil {
+		return errors.New("cannot replay events for nil recovered turn")
+	}
+	if err := s.publishTurnEvent(events.TurnStarted, turn, nil); err != nil {
+		return fmt.Errorf("replay recovered turn %s start event: %w", turn.ID, err)
+	}
+	if turn.CompletedAt != nil {
+		hadOutput := s.turnHadOutput(ctx, turn)
+		if err := s.publishTurnEvent(events.TurnCompleted, turn, &hadOutput); err != nil {
+			return fmt.Errorf("replay recovered turn %s completion event: %w", turn.ID, err)
+		}
+	}
+	cleared, _, _, err := s.turns.ClearTurnPromptDispatchMetadata(
+		ctx,
+		turn.TaskSessionID,
+		turn.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("clear recovered turn %s event marker: %w", turn.ID, err)
+	}
+	if !cleared {
+		return fmt.Errorf("clear recovered turn %s event marker: turn missing", turn.ID)
+	}
+	return nil
+}
+
+// RollbackReservedTurn removes only an empty rejected reservation. If output
+// already references the row, the prompt was ambiguously accepted and the
+// durable turn is preserved.
+func (s *Service) RollbackReservedTurn(
+	ctx context.Context,
+	sessionID, turnID string,
+) (bool, error) {
+	turn, err := s.turns.GetTurn(ctx, turnID)
+	if err != nil {
+		return false, err
+	}
+	if turn.TaskSessionID != sessionID {
+		return false, nil
+	}
+	removed, err := s.turns.DeleteTurnIfUnreferenced(ctx, sessionID, turnID)
+	if err != nil || !removed {
+		return removed, err
+	}
+	if err := s.publishTurnEvent(events.TurnRemoved, turn, nil); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// createCompletedTurn persists a synthetic turn that is never observable as
+// active. It is used for lifecycle messages that must belong to a turn without
+// making an idle task appear to have an active agent turn.
+func (s *Service) createCompletedTurn(ctx context.Context, session *models.TaskSession) (*models.Turn, error) {
+	if session == nil {
+		return nil, errors.New("cannot create completed turn without a session")
+	}
+	now := time.Now().UTC()
+	metadata := turnStartRuntimeMetadata(session)
+	metadata[models.TurnMetaKeyLifecycleOnly] = true
+	turn := &models.Turn{
+		ID:                 uuid.New().String(),
+		TaskSessionID:      session.ID,
+		TaskID:             session.TaskID,
+		ExecutionProfileID: session.ExecutionProfileID,
+		RouteGeneration:    session.RouteGeneration,
+		StartedAt:          now,
+		CompletedAt:        &now,
+		Metadata:           metadata,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	stamped, err := s.turns.CreateTurnWithStepStamp(ctx, turn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create completed turn: %w", err)
+	}
+	// Recorded only once the turn is durably persisted — the counter's
+	// "turns created" framing must not count a turn CreateTurn rejected.
+	steptelemetry.RecordTurnStamp(s.logger, stamped)
+	return turn, nil
+}
+
+// turnStartRuntimeMetadata composes the turn's immutable start-of-turn
+// runtime-config-snapshot metadata. The workflow-step-at-start stamp is
+// added separately by CreateTurnWithStepStamp, which reads the task's
+// current step inside the same transaction as the turn insert — see that
+// method's doc comment for why the read can no longer happen here, ahead of
+// and unlocked against the insert.
+func turnStartRuntimeMetadata(session *models.TaskSession) map[string]interface{} {
+	metadata := runtimeConfigSnapshotMetadata(session)
+	if metadata == nil {
+		return map[string]interface{}{}
+	}
+	return metadata
+}
+
+func runtimeConfigSnapshotMetadata(session *models.TaskSession) map[string]interface{} {
+	if session == nil {
+		return nil
+	}
+	snapshot := buildTurnRuntimeConfigSnapshot(session)
+	if snapshot.Model == "" && snapshot.Mode == "" && len(snapshot.ConfigOptions) == 0 {
+		return nil
+	}
+	return map[string]interface{}{models.TurnMetaKeyRuntimeConfigSnapshot: snapshot}
+}
+
+func buildTurnRuntimeConfigSnapshot(session *models.TaskSession) models.TurnRuntimeConfigSnapshot {
+	effective, _ := models.LoadEffectiveSessionRuntimeConfig(session)
+	baseline, _ := models.LoadSessionACPConfigBaseline(session.Metadata)
+	result := models.TurnRuntimeConfigSnapshot{
+		Model:          effective.Model,
+		Mode:           effective.Mode,
+		ConfigBaseline: maps.Clone(baseline),
+	}
+	selector, ok := lifecycle.LoadSessionModelsSnapshot(session.Metadata[models.SessionMetaKeyACPModelState])
+	if result.Model == "" && ok {
+		result.Model = selector.CurrentModelID
+	}
+	seen := make(map[string]struct{}, len(selector.ConfigOptions))
+	for _, option := range selector.ConfigOptions {
+		selected, ok := selectedTurnConfigOption(option, effective.ConfigOptions)
+		if !ok {
+			continue
+		}
+		result.ConfigOptions = append(result.ConfigOptions, selected)
+		seen[option.ID] = struct{}{}
+	}
+	unknownIDs := make([]string, 0)
+	for id := range effective.ConfigOptions {
+		if _, exists := seen[id]; !exists && id != runtimeModelConfigID {
+			unknownIDs = append(unknownIDs, id)
+		}
+	}
+	sort.Strings(unknownIDs)
+	for _, id := range unknownIDs {
+		value := effective.ConfigOptions[id]
+		if value != "" {
+			result.ConfigOptions = append(result.ConfigOptions, models.TurnRuntimeConfigOption{
+				ID: id, Value: value, ValueName: value,
+			})
+		}
+	}
+	return result
+}
+
+func selectedTurnConfigOption(
+	option streams.ConfigOption,
+	overrides map[string]string,
+) (models.TurnRuntimeConfigOption, bool) {
+	if option.ID == "" || option.ID == runtimeModelConfigID || option.Category == runtimeModelConfigID {
+		return models.TurnRuntimeConfigOption{}, false
+	}
+	value := option.CurrentValue
+	if override, exists := overrides[option.ID]; exists {
+		value = override
+	}
+	if value == "" {
+		return models.TurnRuntimeConfigOption{}, false
+	}
+	return models.TurnRuntimeConfigOption{
+		ID:        option.ID,
+		Name:      option.Name,
+		Value:     value,
+		ValueName: selectedConfigValueName(option.Options, value),
+	}, true
+}
+
+func selectedConfigValueName(options []streams.ConfigOptionValue, value string) string {
+	for _, option := range options {
+		if option.Value == value {
+			return option.Name
+		}
+	}
+	return value
+}
+
+// stringConfigOptions decodes the profile option shapes used by persisted
+// task-service metadata. Keep this package-local decoder available for the
+// service coverage tests that exercise both in-memory and JSON-like values.
+func stringConfigOptions(raw interface{}) map[string]string {
+	switch values := raw.(type) {
+	case map[string]string:
+		return maps.Clone(values)
+	case map[string]interface{}:
+		result := make(map[string]string, len(values))
+		for key, value := range values {
+			if text := models.StringFromAny(value); text != "" {
+				result[key] = text
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+// GetTurn returns a turn by ID.
+func (s *Service) GetTurn(ctx context.Context, turnID string) (*models.Turn, error) {
+	return s.turns.GetTurn(ctx, turnID)
+}
+
+// ListTurnsBySession returns all persisted turns for a session.
+func (s *Service) ListTurnsBySession(ctx context.Context, sessionID string) ([]*models.Turn, error) {
+	return s.turns.ListTurnsBySession(ctx, sessionID)
+}
+
+// CompleteTurn marks a turn as completed and publishes the turn.completed event.
+func (s *Service) CompleteTurn(ctx context.Context, turnID string) error {
+	if turnID == "" {
+		return nil // No active turn to complete
+	}
+
+	receipt, err := s.completeTurnMutation(ctx, turnID)
+	if err != nil {
+		s.logger.Error("failed to complete turn", zap.String("turn_id", turnID), zap.Error(err))
+		return err
+	}
+
+	// Fetch the completed turn to get the completed_at timestamp
+	turn, err := s.turns.GetTurn(ctx, turnID)
+	if err != nil {
+		s.logger.Debug("failed to refetch completed turn", zap.String("turn_id", turnID), zap.Error(err))
+		// Turn was likely deleted (task deletion race), skip publishing
+		return nil
+	}
+
+	hadOutput := s.turnHadOutput(ctx, turn)
+	_ = s.publishTurnEvent(events.TurnCompleted, turn, &hadOutput, receipt)
+
+	s.logger.Debug("completed turn",
+		zap.String("turn_id", turnID),
+		zap.String("session_id", turn.TaskSessionID),
+		zap.String("task_id", turn.TaskID))
+
+	return nil
+}
+
+func (s *Service) completeTurnMutation(ctx context.Context, turnID string) (*models.ConversationMutationReceipt, error) {
+	if writer, ok := s.turns.(taskrepo.ConversationMutationWriter); ok {
+		return writer.CompleteTurnWithConversationReceipt(ctx, turnID)
+	}
+	if affected, err := s.turns.CompletePendingToolCallsForTurn(ctx, turnID); err != nil {
+		s.logger.Warn("failed to complete pending tool calls for turn", zap.String("turn_id", turnID), zap.Error(err))
+	} else if affected > 0 {
+		s.logger.Info("completed stale pending tool calls on turn end",
+			zap.String("turn_id", turnID),
+			zap.Int64("affected", affected))
+	}
+	return nil, s.turns.CompleteTurn(ctx, turnID)
+}
+
+// GetActiveTurn returns the currently active (non-completed) turn for a session.
+// Returns (nil, nil) when no turn is active. Other errors (DB failures) are returned as-is.
+func (s *Service) GetActiveTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	turn, err := s.turns.GetActiveTurnBySessionID(ctx, sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return turn, err
+}
+
+// UpdateTurn persists changes to an existing turn.
+func (s *Service) UpdateTurn(ctx context.Context, turn *models.Turn) error {
+	if turn == nil {
+		return nil
+	}
+	return s.turns.UpdateTurn(ctx, turn)
+}
+
+// PatchTurnMetadata atomically merges metadata into an active or completed turn.
+func (s *Service) PatchTurnMetadata(
+	ctx context.Context,
+	sessionID, turnID string,
+	updates map[string]interface{},
+) error {
+	updated, _, err := s.turns.PatchTurnMetadata(ctx, sessionID, turnID, updates)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("patch turn %s metadata: turn not found in session %s", turnID, sessionID)
+	}
+	return nil
+}
+
+// AbandonOpenTurns closes any open turns for a session by setting their
+// completed_at = started_at. Used on session resume to bury orphan turns left
+// behind by a previous crash/restart so a fresh prompt starts a fresh turn
+// (preventing the UI from showing the orphan's stale started_at as the running
+// timer, and preventing the orphan from poisoning analytics with hours of dead
+// time).
+//
+// Mirrors the iteration shape of orchestrator.completeTurnForSession: the DB is
+// authoritative, so we loop GetActiveTurn → AbandonTurn until none remain, with
+// a sanity cap to break runaway loops.
+func (s *Service) AbandonOpenTurns(ctx context.Context, sessionID string) error {
+	const maxIterations = 16
+	closed := 0
+	for closed < maxIterations {
+		turn, err := s.GetActiveTurn(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		if turn == nil {
+			return nil
+		}
+		if err := s.turns.AbandonTurn(ctx, turn.ID); err != nil {
+			s.logger.Error("failed to abandon turn",
+				zap.String("turn_id", turn.ID),
+				zap.String("session_id", sessionID),
+				zap.Error(err))
+			return err
+		}
+		// Same safety net as CompleteTurn: any tool calls left in a non-terminal
+		// state belong to a turn that is no longer running, so flip them to
+		// "complete" instead of leaving them to spin forever in the UI.
+		if affected, err := s.turns.CompletePendingToolCallsForTurn(ctx, turn.ID); err != nil {
+			s.logger.Warn("failed to complete pending tool calls for abandoned turn",
+				zap.String("turn_id", turn.ID),
+				zap.Error(err))
+		} else if affected > 0 {
+			s.logger.Info("completed pending tool calls on abandoned turn",
+				zap.String("turn_id", turn.ID),
+				zap.Int64("affected", affected))
+		}
+		// Re-fetch so the published event carries the persisted completed_at
+		// (= started_at) rather than a synthesized one.
+		refreshed, err := s.turns.GetTurn(ctx, turn.ID)
+		if err != nil {
+			s.logger.Debug("failed to refetch abandoned turn",
+				zap.String("turn_id", turn.ID),
+				zap.Error(err))
+		} else {
+			// Abandoned turns are orphans swept on resume, not live completions.
+			// Report had_output=true so the frontend never shows an "empty turn"
+			// notice for them — only genuine live completions should trigger it.
+			hadOutput := true
+			_ = s.publishTurnEvent(events.TurnCompleted, refreshed, &hadOutput)
+		}
+		s.logger.Info("abandoned orphan turn on session resume",
+			zap.String("turn_id", turn.ID),
+			zap.String("session_id", sessionID))
+		closed++
+	}
+	// Only warn if turns are *still* accumulating after the cap. Closing
+	// exactly maxIterations turns and then finding the session clean is not a
+	// runaway — same shape as completeTurnForSession.
+	if turn, err := s.GetActiveTurn(ctx, sessionID); err == nil && turn != nil {
+		s.logger.Warn("AbandonOpenTurns hit iteration cap; some orphan turns may remain",
+			zap.String("session_id", sessionID),
+			zap.Int("closed", closed),
+			zap.Int("max_iterations", maxIterations))
+	}
+	return nil
+}
+
+// getOrStartTurn returns the active turn for a session, or starts a new one if none exists.
+// This is used to ensure messages always have a valid turn ID.
+func (s *Service) getOrStartTurn(ctx context.Context, sessionID string) (*models.Turn, error) {
+	// Route through GetActiveTurn so the ErrNoRows → (nil, nil) normalization
+	// applies consistently. A real DB read failure is logged before falling
+	// through to StartTurn — same observability contract as the orchestrator's
+	// startTurnForSession adoption path.
+	turn, err := s.GetActiveTurn(ctx, sessionID)
+	if err != nil {
+		s.logger.Warn("failed to look up active turn; will create a new one",
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+	} else if turn != nil {
+		return turn, nil
+	}
+
+	// No active turn (or read failed), start a new one
+	return s.StartTurn(ctx, sessionID)
+}
+
+// PublishTurnStarted is publishTurnEvent(events.TurnStarted, ...)'s exported
+// form, for callers outside this package that insert a turn directly
+// (bypassing StartTurn/ReserveTurn) but still need the frontend's
+// turns.bySession to learn about it. The e2e test harness
+// (internal/office/testharness) is the only current caller: it seeds turns
+// with caller-controlled timestamps to construct D1 turn-ordering scenarios,
+// which StartTurn's always-now stamping cannot produce. Without this, a
+// message attached to a harness-seeded turn the frontend has never observed
+// via turn.started is silently excluded by D1's turn-scoped
+// clarification/permission detection.
+func (s *Service) PublishTurnStarted(ctx context.Context, turn *models.Turn) error {
+	// had_output is only meaningful on turn.completed; omit it here too.
+	return s.publishTurnEvent(events.TurnStarted, turn, nil)
+}
+
+// publishTurnEvent publishes a turn event to the event bus. hadOutput reports
+// whether the turn produced any agent output; it is only meaningful for
+// turn.completed events (the frontend uses it to surface an "empty turn"
+// notice). Pass nil for turn.started so the field is omitted entirely rather
+// than carrying a misleading "false" on a turn that has not completed.
+func (s *Service) publishTurnEvent(eventType string, turn *models.Turn, hadOutput *bool, receipts ...*models.ConversationMutationReceipt) error {
+	if s.eventBus == nil {
+		return errors.New("turn event bus is unavailable")
+	}
+	if turn == nil {
+		s.logger.Warn("publishTurnEvent: turn is nil, skipping", zap.String("event_type", eventType))
+		return nil
+	}
+	// Prompt-dispatch fields are private recovery state. A fast completion can
+	// race start-event publication before the durable cleanup commits, so every
+	// public event must sanitize its own metadata snapshot.
+	metadata := maps.Clone(turn.Metadata)
+	models.ClearPromptDispatchMetadata(metadata)
+	payload := map[string]interface{}{
+		"id":                   turn.ID,
+		"session_id":           turn.TaskSessionID,
+		"task_id":              turn.TaskID,
+		"execution_profile_id": turn.ExecutionProfileID,
+		"route_generation":     turn.RouteGeneration,
+		"started_at":           turn.StartedAt,
+		"completed_at":         turn.CompletedAt,
+		"metadata":             turn.Metadata,
+		"created_at":           turn.CreatedAt,
+		"updated_at":           turn.UpdatedAt,
+	}
+	payload[turnEventMetadataKey] = metadata
+	if hadOutput != nil {
+		payload["had_output"] = *hadOutput
+	}
+	if len(receipts) > 0 && receipts[0] != nil {
+		projectedReceipt := projectConversationReceipt(receipts[0])
+		if hadOutput != nil {
+			for index := range projectedReceipt.Operations {
+				operation := &projectedReceipt.Operations[index]
+				if operation.Entity != models.ConversationEntityTurn || operation.Turn == nil || operation.Turn.ID != turn.ID {
+					continue
+				}
+				output := *hadOutput
+				operation.HadOutput = &output
+				break
+			}
+		}
+		payload["conversation_receipt"] = projectedReceipt
+	}
+	if err := s.eventBus.Publish(context.Background(), eventType, bus.NewEvent(eventType, "task-service", payload)); err != nil {
+		s.logger.Error("failed to publish turn event",
+			zap.String("event_type", eventType),
+			zap.String("turn_id", turn.ID),
+			zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// turnHadOutput reports whether a completed turn produced any agent output.
+// It reads only the turn's own persisted messages (indexed by turn_id; all
+// agent text/tool messages are written before the turn is completed, so the DB
+// is authoritative even for streaming agents whose text is drained via chunk
+// events). A read failure defaults to true so a transient DB error never
+// produces a spurious "empty turn" notice.
+func (s *Service) turnHadOutput(ctx context.Context, turn *models.Turn) bool {
+	// A turn terminated by a recoverable agent failure carries its error entry
+	// as the turn's outcome, so it counts as output even though the
+	// status/recovery message itself is not in the agent-output allowlist.
+	if errorTerminated, _ := turn.Metadata[models.TurnMetaKeyErrorTerminated].(bool); errorTerminated {
+		return true
+	}
+	msgs, err := s.messages.ListMessagesByTurnID(ctx, turn.ID)
+	if err != nil {
+		s.logger.Debug("failed to list messages for had_output; assuming output",
+			zap.String("turn_id", turn.ID),
+			zap.Error(err))
+		return true
+	}
+	return turnHadAgentOutput(msgs, turn.ID)
+}
+
+// turnHadAgentOutput returns true when any message belonging to turnID is
+// agent-authored, user-visible output: a tool call, a native plan/todo, a
+// permission or clarification prompt (both render inline in chat), or a
+// non-empty text response. It is an allowlist on purpose — incidental,
+// non-answer messages the runtime attaches to a turn (lifecycle "status" /
+// "script_execution" notices, logs, progress, thinking) must NOT count, so a
+// turn that only emits those (or nothing at all) is still treated as empty.
+// User messages never count.
+func turnHadAgentOutput(msgs []*models.Message, turnID string) bool {
+	for _, m := range msgs {
+		if m == nil || m.TurnID != turnID || m.AuthorType != models.MessageAuthorAgent {
+			continue
+		}
+		switch m.Type {
+		case models.MessageTypeToolCall, models.MessageTypeToolEdit, models.MessageTypeToolRead,
+			models.MessageTypeToolSearch,
+			models.MessageTypeToolExecute, models.MessageTypeAgentPlan, models.MessageTypeTodo,
+			models.MessageTypePermissionRequest, models.MessageTypeClarificationRequest:
+			return true
+		case models.MessageTypeMessage, models.MessageTypeContent, "":
+			if strings.TrimSpace(m.Content) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// GetGitSnapshots retrieves git snapshots for a session
+func (s *Service) GetGitSnapshots(ctx context.Context, sessionID string, limit int) ([]*models.GitSnapshot, error) {
+	return s.gitSnapshots.GetGitSnapshotsBySession(ctx, sessionID, limit)
+}
+
+// GetLatestGitSnapshot retrieves the latest git snapshot for a session
+func (s *Service) GetLatestGitSnapshot(ctx context.Context, sessionID string) (*models.GitSnapshot, error) {
+	return s.gitSnapshots.GetLatestGitSnapshot(ctx, sessionID)
+}
+
+// GetFirstGitSnapshot retrieves the first git snapshot for a session (oldest)
+func (s *Service) GetFirstGitSnapshot(ctx context.Context, sessionID string) (*models.GitSnapshot, error) {
+	return s.gitSnapshots.GetFirstGitSnapshot(ctx, sessionID)
+}
+
+// GetSessionCommits retrieves commits for a session
+func (s *Service) GetSessionCommits(ctx context.Context, sessionID string) ([]*models.SessionCommit, error) {
+	return s.gitSnapshots.GetSessionCommits(ctx, sessionID)
+}
+
+// GetLatestSessionCommit retrieves the latest commit for a session
+func (s *Service) GetLatestSessionCommit(ctx context.Context, sessionID string) (*models.SessionCommit, error) {
+	return s.gitSnapshots.GetLatestSessionCommit(ctx, sessionID)
+}
+
+// GetCumulativeDiff computes the cumulative diff from base commit to current HEAD
+// by using the first snapshot's base_commit and the latest snapshot's files
+func (s *Service) GetCumulativeDiff(ctx context.Context, sessionID string) (*models.CumulativeDiff, error) {
+	// Get the first snapshot to find the base commit
+	firstSnapshot, err := s.gitSnapshots.GetFirstGitSnapshot(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil // No snapshots yet — valid state for fresh tasks
+		}
+		return nil, fmt.Errorf("failed to get first git snapshot: %w", err)
+	}
+
+	// Get the latest snapshot for current state
+	latestSnapshot, err := s.gitSnapshots.GetLatestGitSnapshot(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest git snapshot: %w", err)
+	}
+
+	// Count total commits for this session
+	commits, err := s.gitSnapshots.GetSessionCommits(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session commits: %w", err)
+	}
+
+	return &models.CumulativeDiff{
+		SessionID:    sessionID,
+		BaseCommit:   firstSnapshot.BaseCommit,
+		HeadCommit:   latestSnapshot.HeadCommit,
+		TotalCommits: len(commits),
+		Files:        latestSnapshot.Files,
+	}, nil
+}
+
+// GetWorkspaceInfoForSession returns workspace information for a task session.
+// This implements the lifecycle.WorkspaceInfoProvider interface.
+// The taskID parameter is optional - if empty, it will be looked up from the session.
+func (s *Service) GetWorkspaceInfoForSession(ctx context.Context, taskID, sessionID string) (*lifecycle.WorkspaceInfo, error) {
+	session, err := s.sessions.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session %s: %w", sessionID, err)
+	}
+	if session == nil {
+		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+
+	// Use session's TaskID if not provided
+	if taskID == "" {
+		taskID = session.TaskID
+	}
+
+	// Get workspace path from the session's worktree(s).
+	// Multi-repo: every per-repo worktree sits as a sibling under the task root
+	// (~/.kandev/tasks/{taskDirName}/{repoName}/), so the workspace path agentctl
+	// needs is the parent of any one of them. Picking the first repo's path here
+	// would point agentctl at a single repo subdir and disable the per-repo
+	// tracker fan-out that scanRepositorySubdirs relies on.
+	var workspacePath string
+	if len(session.Worktrees) > 1 {
+		workspacePath = filepath.Dir(session.Worktrees[0].WorktreePath)
+	} else if len(session.Worktrees) == 1 {
+		workspacePath = session.Worktrees[0].WorktreePath
+	}
+
+	// If no worktree, try to get from repository snapshot
+	if workspacePath == "" && session.RepositorySnapshot != nil {
+		if path, ok := session.RepositorySnapshot["path"].(string); ok {
+			workspacePath = path
+		}
+	}
+
+	// Get agent name (registry slug) from profile snapshot.
+	// Prefer "agent_name" (the slug used as registry key) over "agent_id" (the database UUID).
+	var agentID string
+	if session.AgentProfileSnapshot != nil {
+		if name, ok := session.AgentProfileSnapshot["agent_name"].(string); ok {
+			agentID = name
+		} else if id, ok := session.AgentProfileSnapshot["agent_id"].(string); ok {
+			agentID = id
+		}
+	}
+
+	// Get ACP session ID and persisted session runtime settings from metadata.
+	var acpSessionID, sessionMode string
+	var runtimeConfig models.SessionRuntimeConfig
+	runtimeConfigOptionsSet := false
+	if session.Metadata != nil {
+		if id, ok := session.Metadata["acp_session_id"].(string); ok {
+			acpSessionID = id
+		}
+		if mode, ok := session.Metadata[models.SessionMetaKeySessionMode].(string); ok {
+			sessionMode = mode
+		}
+		if cfg, ok := models.LoadSessionRuntimeConfig(session.Metadata); ok {
+			runtimeConfig = cfg
+			if sessionMode == "" {
+				sessionMode = cfg.Mode
+			}
+		}
+		if overrides, ok := models.LoadSessionRuntimeConfigOverrides(session.Metadata); ok {
+			if overrides.Model != "" {
+				runtimeConfig.Model = overrides.Model
+			}
+			if overrides.Mode != "" {
+				sessionMode = overrides.Mode
+			}
+			if overrides.ConfigOptions != nil {
+				if runtimeConfig.ConfigOptions == nil {
+					runtimeConfig.ConfigOptions = make(map[string]string)
+				}
+				for key, value := range overrides.ConfigOptions {
+					runtimeConfig.ConfigOptions[key] = value
+				}
+			}
+		}
+		runtimeConfigOptionsSet = runtimeConfig.ConfigOptions != nil
+	}
+
+	info := &lifecycle.WorkspaceInfo{
+		TaskID:                  taskID,
+		SessionID:               sessionID,
+		TaskEnvironmentID:       session.TaskEnvironmentID,
+		WorkspacePath:           workspacePath,
+		AgentProfileID:          session.AgentProfileID,
+		ExecutionProfileID:      session.ExecutionProfileID,
+		ExecutorProfileID:       session.ExecutorProfileID,
+		AgentID:                 agentID,
+		ACPSessionID:            acpSessionID,
+		SessionMode:             sessionMode,
+		RuntimeModel:            runtimeConfig.Model,
+		RuntimeConfigOptions:    runtimeConfig.ConfigOptions,
+		RuntimeConfigOptionsSet: runtimeConfigOptionsSet,
+	}
+	// Durable folder attachments are replayed by lifecycle for both fresh
+	// launch and workspace-only session recovery.
+	if s.workspaceFolders != nil {
+		folders, err := s.workspaceFolders.ListTaskWorkspaceFolders(ctx, taskID)
+		if err != nil {
+			return nil, fmt.Errorf("list task workspace folders: %w", err)
+		}
+		for _, folder := range folders {
+			if folder != nil {
+				info.WorkspaceFolders = append(info.WorkspaceFolders, lifecycle.WorkspaceFolderSpec{Name: folder.DisplayName, LocalPath: folder.LocalPath})
+			}
+		}
+	}
+
+	var taskEnv *models.TaskEnvironment
+	if session.TaskEnvironmentID != "" {
+		env, envErr := s.taskEnvironments.GetTaskEnvironment(ctx, session.TaskEnvironmentID)
+		if envErr != nil {
+			logFields := []zap.Field{
+				zap.String("session_id", sessionID),
+				zap.String("task_environment_id", session.TaskEnvironmentID),
+				zap.Error(envErr),
+			}
+			if errors.Is(envErr, taskrepo.ErrTaskEnvironmentNotFound) {
+				s.logger.Debug("failed to get task environment for session", logFields...)
+			} else {
+				s.logger.Warn("failed to get task environment for session", logFields...)
+			}
+		} else {
+			taskEnv = env
+		}
+	}
+	if taskEnv == nil && taskID != "" {
+		env, envErr := s.taskEnvironments.GetTaskEnvironmentByTaskID(ctx, taskID)
+		if envErr != nil {
+			s.logger.Warn("failed to get task environment by task",
+				zap.String("task_id", taskID),
+				zap.String("session_id", sessionID),
+				zap.Error(envErr))
+		} else {
+			taskEnv = env
+		}
+	}
+	if taskEnv != nil {
+		applyTaskEnvironmentToWorkspaceInfo(info, taskEnv)
+		info.ValidatedTaskEnvironmentID = taskEnv.ID
+		info.ValidatedExecutorType = taskEnv.ExecutorType
+		info.ValidatedTaskEnvironmentGeneration = taskEnv.OwnershipGeneration
+		if info.ExecutorType == "" {
+			info.ExecutorType = taskEnv.ExecutorType
+		}
+		info.TaskDirName = taskEnv.TaskDirName
+		if taskEnv.TaskID != "" && taskEnv.TaskID != taskID {
+			owner, ownerErr := s.tasks.GetTask(ctx, taskEnv.TaskID)
+			if ownerErr != nil {
+				return nil, fmt.Errorf("get workspace owner task: %w", ownerErr)
+			}
+			info.WorkspaceOwnerArchived = owner != nil && owner.ArchivedAt != nil
+		}
+	}
+	workspaceInventory := session.Worktrees
+	if taskEnv != nil {
+		workspaceInventory = taskEnv.Repos
+	}
+	workspaceRepositories, err := s.populateWorkspaceRepositorySpecs(ctx, taskID, workspaceInventory, info)
+	if err != nil {
+		return nil, err
+	}
+
+	// Populate executor info for correct runtime selection and remote reconnection
+	running, err := s.executors.GetExecutorRunningBySessionID(ctx, sessionID)
+	if err != nil {
+		if isExecutorRunningNotFoundError(err) {
+			s.logger.Debug("executor running not ready for session",
+				zap.String("session_id", sessionID),
+				zap.Error(err))
+		} else {
+			return nil, fmt.Errorf("load runtime inventory for session %q: %w", sessionID, err)
+		}
+	} else if running != nil {
+		info.RuntimeName = running.Runtime
+		info.AgentExecutionID = running.AgentExecutionID
+		mergePersistentWorkspaceMetadata(info, running.Metadata)
+		if officeProfileID, ok := running.Metadata[lifecycle.MetadataKeyOfficeAgentProfileID].(string); ok && strings.TrimSpace(officeProfileID) != "" {
+			info.AgentProfileID = officeProfileID
+		}
+		if running.ContainerID != "" {
+			ensureWorkspaceMetadata(info)[lifecycle.MetadataKeyContainerID] = running.ContainerID
+		}
+	}
+	s.populateWorkspaceRecoveryErrorObservation(taskID, sessionID, session, taskEnv, workspaceRepositories, info)
+	executorID := session.ExecutorID
+	recordedKubernetes := running != nil && running.Runtime == agentruntime.RuntimeKubernetes
+	if recordedKubernetes {
+		executorID = strings.TrimSpace(running.ExecutorID)
+		if executorID == "" {
+			return nil, errors.New("restore Kubernetes workspace: recorded executor ID is missing")
+		}
+	}
+	if executorID != "" {
+		if err := s.applyWorkspaceExecutorRecord(ctx, sessionID, executorID, recordedKubernetes, info); err != nil {
+			return nil, err
+		}
+	}
+
+	return info, nil
+}
+
+func (s *Service) applyWorkspaceExecutorRecord(
+	ctx context.Context,
+	sessionID, executorID string,
+	recordedKubernetes bool,
+	info *lifecycle.WorkspaceInfo,
+) error {
+	exec, err := s.executors.GetExecutor(ctx, executorID)
+	if err != nil {
+		if recordedKubernetes {
+			return fmt.Errorf("restore Kubernetes workspace executor %q: %w", executorID, err)
+		}
+		s.logger.Warn("failed to get executor for session",
+			zap.String("session_id", sessionID),
+			zap.String("executor_id", executorID),
+			zap.Error(err))
+		return nil
+	}
+	if exec == nil {
+		if recordedKubernetes {
+			return fmt.Errorf("restore Kubernetes workspace executor %q: executor not found", executorID)
+		}
+		return nil
+	}
+	if recordedKubernetes && exec.Type != models.ExecutorTypeKubernetes {
+		return fmt.Errorf("restore Kubernetes workspace executor %q: executor is no longer Kubernetes", executorID)
+	}
+	info.ExecutorType = string(exec.Type)
+	// Only stable SSH connection/profile keys fill missing metadata. A retained
+	// Kubernetes row instead keeps resource inventory while current connection
+	// config authoritatively replaces every connection key.
+	if exec.Type == models.ExecutorTypeSSH {
+		mergeExecutorConfigMetadata(info, exec.Config)
+	}
+	if exec.Type == models.ExecutorTypeKubernetes {
+		ensureWorkspaceMetadata(info)["executor_id"] = executorID
+		mergeKubernetesExecutorConfigMetadata(info, exec.Config)
+	}
+	return nil
+}
+
+func (s *Service) populateWorkspaceRecoveryErrorObservation(
+	taskID, sessionID string,
+	session *models.TaskSession,
+	taskEnv *models.TaskEnvironment,
+	workspaceRepositories map[string]*models.Repository,
+	info *lifecycle.WorkspaceInfo,
+) {
+	if taskEnv == nil || taskEnv.ExecutorType != string(models.ExecutorTypeWorktree) ||
+		info.TaskEnvironmentID == "" || info.EnvironmentOwnerTaskID == "" || info.OwnershipGeneration <= 0 {
+		return
+	}
+	errorStamp := ""
+	if lastError, ok := models.LoadLastAgentError(session.Metadata); ok {
+		errorStamp = lastError.Stamp()
+	}
+	selectionSnapshot, snapshotErr := models.CaptureWorkspaceRecoverySelectionSnapshot(session, taskEnv, func(repositoryID string) (*models.Repository, error) {
+		repository, ok := workspaceRepositories[repositoryID]
+		if !ok {
+			return nil, fmt.Errorf("repository %q was not in the captured workspace inventory", repositoryID)
+		}
+		return repository, nil
+	})
+	switch {
+	case snapshotErr != nil:
+		s.logger.Warn("failed to capture workspace recovery inventory",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.Error(snapshotErr))
+	case !selectionSnapshot.Complete():
+		s.logger.Warn("workspace recovery inventory is incomplete",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID))
+	default:
+		info.RecoveryErrorObservation = &models.WorkspaceRecoveryErrorObservation{
+			TaskID: taskID, SessionID: sessionID, TaskEnvironmentID: info.TaskEnvironmentID,
+			EnvironmentOwnerTaskID: info.EnvironmentOwnerTaskID, OwnershipGeneration: info.OwnershipGeneration,
+			SelectionSnapshot: selectionSnapshot,
+			SessionState:      session.State, AgentExecutionID: info.AgentExecutionID,
+			ExpectedErrorStamp: errorStamp,
+		}
+	}
+}
+
+type workspaceWorktreeKey struct {
+	repositoryID string
+	branchSlug   string
+}
+
+type workspaceRepositoryProjection struct {
+	taskRepository *models.TaskRepository
+	repository     *models.Repository
+	repoName       string
+}
+
+func (s *Service) populateWorkspaceRepositorySpecs(ctx context.Context, taskID string, sessionWorktrees []*models.TaskEnvironmentRepo, info *lifecycle.WorkspaceInfo) (map[string]*models.Repository, error) {
+	if taskID == "" || s.taskRepos == nil || s.repoEntities == nil {
+		return nil, nil
+	}
+	if err := s.populateWorkspaceTaskMetadata(ctx, taskID, info); err != nil {
+		return nil, err
+	}
+	worktreesByIdentity := indexWorkspaceWorktrees(sessionWorktrees)
+	projections, err := s.workspaceRepositoryProjections(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	repositories := indexWorkspaceRepositoryEntities(projections)
+	branchPlans := worktree.BuildBranchIdentityPlans(workspaceBranchIdentityInputs(projections))
+	for index, projection := range projections {
+		info.WorkspaceRepositories = append(info.WorkspaceRepositories, s.workspaceRepositorySpec(projection, branchPlans[index].IdentitySlug, worktreesByIdentity))
+	}
+	return repositories, nil
+}
+
+func (s *Service) populateWorkspaceTaskMetadata(ctx context.Context, taskID string, info *lifecycle.WorkspaceInfo) error {
+	task, err := s.tasks.GetTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("get workspace task: %w", err)
+	}
+	if task != nil {
+		info.WorkspaceID = task.WorkspaceID
+		info.TaskArchived = task.ArchivedAt != nil
+	}
+	return nil
+}
+
+func indexWorkspaceWorktrees(sessionWorktrees []*models.TaskEnvironmentRepo) map[workspaceWorktreeKey]*models.TaskEnvironmentRepo {
+	worktreesByIdentity := make(map[workspaceWorktreeKey]*models.TaskEnvironmentRepo, len(sessionWorktrees))
+	for _, worktree := range sessionWorktrees {
+		if worktree != nil && worktree.RepositoryID != "" {
+			worktreesByIdentity[workspaceWorktreeKey{repositoryID: worktree.RepositoryID, branchSlug: worktree.BranchSlug}] = worktree
+		}
+	}
+	return worktreesByIdentity
+}
+
+func indexWorkspaceRepositoryEntities(projections []workspaceRepositoryProjection) map[string]*models.Repository {
+	repositories := make(map[string]*models.Repository, len(projections))
+	for _, projection := range projections {
+		repositories[projection.taskRepository.RepositoryID] = projection.repository
+	}
+	return repositories
+}
+
+func (s *Service) workspaceRepositorySpec(
+	projection workspaceRepositoryProjection,
+	branchIdentitySlug string,
+	worktreesByIdentity map[workspaceWorktreeKey]*models.TaskEnvironmentRepo,
+) lifecycle.WorkspaceRepositorySpec {
+	taskRepository, repository := projection.taskRepository, projection.repository
+	branchTemplate := repository.WorktreeBranchTemplate
+	if taskRepository.BranchPolicyBranchTemplate != "" {
+		branchTemplate = taskRepository.BranchPolicyBranchTemplate
+	}
+	cloneRelocation := s.managedCloneRelocationProof(repository)
+	spec := lifecycle.WorkspaceRepositorySpec{
+		RepositoryID: taskRepository.RepositoryID, RepositoryPath: repository.LocalPath, RepoName: projection.repoName,
+		CloneRelocation: cloneRelocation,
+		BaseBranch:      taskRepository.BaseBranch, DefaultBranch: repository.DefaultBranch,
+		CheckoutBranch: taskRepository.CheckoutBranch, WorktreeBranchPrefix: repository.WorktreeBranchPrefix,
+		WorktreeBranchTemplate: branchTemplate, PullBeforeWorktree: repository.PullBeforeWorktree,
+	}
+	if selected := worktreesByIdentity[workspaceWorktreeKey{repositoryID: taskRepository.RepositoryID, branchSlug: branchIdentitySlug}]; selected != nil {
+		spec.WorktreeID = selected.WorktreeID
+		spec.WorktreePath = selected.WorktreePath
+		spec.WorktreeBranch = selected.WorktreeBranch
+		spec.BranchSlug = selected.BranchSlug
+		spec.BranchIdentitySlug = selected.BranchSlug
+		spec.WorktreeSourceClonePath = selected.WorktreeSourceClonePath
+		spec.WorktreeSourceCommonDir = selected.WorktreeSourceCommonDir
+		if cloneRelocation != nil {
+			cloneRelocation.RecordedSourcePath = selected.WorktreeSourceClonePath
+			cloneRelocation.RecordedSourceCommonDir = selected.WorktreeSourceCommonDir
+		}
+	}
+	return spec
+}
+
+func (s *Service) managedCloneRelocationProof(repository *models.Repository) *worktree.ManagedCloneRelocationProof {
+	paths, ok := s.repoCloneLocation.(interface {
+		ManagedCloneRelocationPaths(
+			*models.Repository,
+		) (root, providerSource, ownerNameSource, destination string, managed bool, err error)
+	})
+	if !ok {
+		return nil
+	}
+	root, source, ownerNameSource, destination, managed, err := paths.ManagedCloneRelocationPaths(repository)
+	if err != nil || !managed {
+		return nil
+	}
+	return &worktree.ManagedCloneRelocationProof{
+		ManagedRoot: root, ExpectedSourcePath: source, LegacyOwnerNameSourcePath: ownerNameSource,
+		ExpectedDestinationPath: destination,
+		Identity: worktree.ManagedRepositoryIdentity{
+			Provider: repository.Provider, Host: repository.ProviderHost,
+			Owner: repository.ProviderOwner, Name: repository.ProviderName,
+		},
+	}
+}
+
+func (s *Service) workspaceRepositoryProjections(ctx context.Context, taskID string) ([]workspaceRepositoryProjection, error) {
+	taskRepositories, err := s.taskRepos.ListTaskRepositories(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("list task repositories: %w", err)
+	}
+	projections := make([]workspaceRepositoryProjection, 0, len(taskRepositories))
+	for _, taskRepository := range taskRepositories {
+		if taskRepository == nil {
+			continue
+		}
+		repository, err := s.repoEntities.GetRepository(ctx, taskRepository.RepositoryID)
+		if err != nil {
+			return nil, fmt.Errorf("get workspace repository: %w", err)
+		}
+		if repository == nil {
+			return nil, fmt.Errorf("workspace repository %q not found", taskRepository.RepositoryID)
+		}
+		repoName := worktree.SanitizeRepoDirName(repository.Name)
+		if repoName == "" || repository.LocalPath == "" {
+			continue
+		}
+		projections = append(projections, workspaceRepositoryProjection{taskRepository: taskRepository, repository: repository, repoName: repoName})
+	}
+	return projections, nil
+}
+
+func workspaceBranchIdentityInputs(projections []workspaceRepositoryProjection) []worktree.BranchIdentityInput {
+	inputs := make([]worktree.BranchIdentityInput, 0, len(projections))
+	for _, projection := range projections {
+		taskRepository, repository := projection.taskRepository, projection.repository
+		inputs = append(inputs, worktree.BranchIdentityInput{
+			RepositoryID: taskRepository.RepositoryID, BaseBranch: taskRepository.BaseBranch, CheckoutBranch: taskRepository.CheckoutBranch,
+			DefaultBranch: repository.DefaultBranch, PRNumber: taskRepositoryPRNumber(taskRepository.Metadata), Position: taskRepository.Position,
+		})
+	}
+	return inputs
+}
+
+func taskRepositoryPRNumber(metadata map[string]interface{}) int {
+	if metadata == nil {
+		return 0
+	}
+	switch number := metadata["pr_number"].(type) {
+	case float64:
+		if number > 0 {
+			return int(number)
+		}
+	case int:
+		if number > 0 {
+			return number
+		}
+	case int64:
+		if number > 0 {
+			return int(number)
+		}
+	}
+	return 0
+}
+
+// PersistSessionRuntimeModel records the session's selected ACP model.
+func (s *Service) PersistSessionRuntimeModel(ctx context.Context, sessionID, modelID string) error {
+	if modelID == "" {
+		return nil
+	}
+	if err := s.updateSessionRuntimeConfigOverrides(ctx, sessionID, func(cfg *models.SessionRuntimeConfig) {
+		cfg.Model = modelID
+	}); err != nil {
+		return err
+	}
+	return s.resetContextWindow(ctx, sessionID)
+}
+
+// PersistSessionRuntimeMode records the session's selected ACP permission mode.
+func (s *Service) PersistSessionRuntimeMode(ctx context.Context, sessionID, modeID string) error {
+	if modeID == "" {
+		return nil
+	}
+	if err := s.sessions.SetSessionMetadataKey(ctx, sessionID, models.SessionMetaKeySessionMode, modeID); err != nil {
+		return err
+	}
+	return s.updateSessionRuntimeConfigOverrides(ctx, sessionID, func(cfg *models.SessionRuntimeConfig) {
+		cfg.Mode = modeID
+	})
+}
+
+// PersistSessionRuntimeConfigOption records a selected dynamic ACP config option.
+func (s *Service) PersistSessionRuntimeConfigOption(ctx context.Context, sessionID, configID, value string) error {
+	if configID == "" {
+		return nil
+	}
+	if err := s.updateSessionRuntimeConfigOverrides(ctx, sessionID, func(cfg *models.SessionRuntimeConfig) {
+		if cfg.ConfigOptions == nil {
+			cfg.ConfigOptions = make(map[string]string)
+		}
+		cfg.ConfigOptions[configID] = value
+		if configID == runtimeModelConfigID {
+			cfg.Model = value
+		}
+	}); err != nil {
+		return err
+	}
+	if configID == runtimeModelConfigID {
+		return s.resetContextWindow(ctx, sessionID)
+	}
+	return nil
+}
+
+func (s *Service) updateSessionRuntimeConfigOverrides(ctx context.Context, sessionID string, mutate func(*models.SessionRuntimeConfig)) error {
+	s.runtimeOverridesMu.Lock()
+	defer s.runtimeOverridesMu.Unlock()
+
+	session, err := s.sessions.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if session == nil {
+		return fmt.Errorf("agent session not found: %s", sessionID)
+	}
+	cfg, _ := models.LoadSessionRuntimeConfigOverrides(session.Metadata)
+	mutate(&cfg)
+	if cfg.IsZero() {
+		return nil
+	}
+	return s.sessions.SetSessionMetadataKey(ctx, sessionID, models.SessionMetaKeyRuntimeConfigOverrides, cfg)
+}
+
+func applyTaskEnvironmentToWorkspaceInfo(info *lifecycle.WorkspaceInfo, env *models.TaskEnvironment) {
+	// Always align info.TaskEnvironmentID with the env we resolved against.
+	// When session.TaskEnvironmentID points to a stale/missing env, the
+	// caller falls back to GetTaskEnvironmentByTaskID and ends up with a
+	// different env.ID. Previously we only updated info.TaskEnvironmentID
+	// when it was empty, so the metadata + path here would come from env
+	// while the ID still pointed at the stale row — a mismatch downstream
+	// reconcilers and progress events would key off the wrong env.
+	info.TaskEnvironmentID = env.ID
+	info.EnvironmentOwnerTaskID = env.TaskID
+	info.OwnershipGeneration = env.OwnershipGeneration
+	if info.ExecutorProfileID == "" {
+		info.ExecutorProfileID = env.ExecutorProfileID
+	}
+	if info.WorkspacePath == "" || (!filepath.IsAbs(info.WorkspacePath) && filepath.IsAbs(env.WorkspacePath)) {
+		info.WorkspacePath = env.WorkspacePath
+	}
+	if env.ContainerID != "" {
+		ensureWorkspaceMetadata(info)[lifecycle.MetadataKeyContainerID] = env.ContainerID
+	}
+	if env.ContainerControlAuthTokenSecretID != "" {
+		ensureWorkspaceMetadata(info)[lifecycle.MetadataKeyContainerControlAuthSecret] = env.ContainerControlAuthTokenSecretID
+	}
+	if env.ContainerBootstrapNonceSecretID != "" {
+		ensureWorkspaceMetadata(info)[lifecycle.MetadataKeyBootstrapNonceSecret] = env.ContainerBootstrapNonceSecretID
+	}
+	if env.ExecutorType == string(models.ExecutorTypeSSH) && env.WorkspacePath != "" {
+		ensureWorkspaceMetadata(info)[lifecycle.MetadataKeySSHRemoteTaskDir] = env.WorkspacePath
+	}
+	if env.SandboxID != "" {
+		ensureWorkspaceMetadata(info)["sprite_name"] = env.SandboxID
+	}
+}
+
+func mergePersistentWorkspaceMetadata(info *lifecycle.WorkspaceInfo, metadata map[string]interface{}) {
+	filtered := lifecycle.FilterPersistentMetadata(metadata)
+	if filtered == nil {
+		return
+	}
+	dst := ensureWorkspaceMetadata(info)
+	for k, v := range filtered {
+		dst[k] = v
+	}
+}
+
+func ensureWorkspaceMetadata(info *lifecycle.WorkspaceInfo) map[string]interface{} {
+	if info.Metadata == nil {
+		info.Metadata = make(map[string]interface{})
+	}
+	return info.Metadata
+}
+
+// mergeExecutorConfigMetadata projects an SSH executor record's stable
+// connection/profile config keys (e.g. ssh_host, ssh_host_alias,
+// ssh_host_fingerprint, ssh_user) into the workspace metadata WITHOUT
+// overwriting values already present — a live ExecutorRunning record carries
+// authoritative per-session values (remote dirs/ports) and must win. This is
+// the fallback that lets terminal-state SSH sessions open a terminal / restore
+// the workspace when no running record exists.
+//
+// It filters through lifecycle.FilterSSHWorkspaceFallbackConfig rather than the
+// general persistent-metadata allowlist so that (a) alias-only executors
+// (ssh_host_alias, no ssh_host) are preserved, and (b) session-scoped runtime
+// keys (remote agentctl port/PID/session dir) can never be projected — those
+// would make a restore reattach to a stale/dead remote instance.
+func mergeExecutorConfigMetadata(info *lifecycle.WorkspaceInfo, config map[string]string) {
+	filtered := lifecycle.FilterSSHWorkspaceFallbackConfig(config)
+	if filtered == nil {
+		return
+	}
+	dst := ensureWorkspaceMetadata(info)
+	for k, v := range filtered {
+		if _, exists := dst[k]; exists {
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+func mergeKubernetesExecutorConfigMetadata(info *lifecycle.WorkspaceInfo, config map[string]string) {
+	dst := ensureWorkspaceMetadata(info)
+	for _, key := range []string{
+		lifecycle.MetadataKeyKubernetesAuthMode,
+		lifecycle.MetadataKeyKubernetesKubeconfigPath,
+		lifecycle.MetadataKeyKubernetesKubeContext,
+		lifecycle.MetadataKeyKubernetesConfigNamespace,
+		lifecycle.MetadataKeyKubernetesRequestTimeoutSeconds,
+	} {
+		dst[key] = config[key]
+	}
+}
+
+// GetWorkspaceInfoForEnvironment returns workspace information for a task environment.
+func (s *Service) GetWorkspaceInfoForEnvironment(ctx context.Context, taskEnvironmentID string) (*lifecycle.WorkspaceInfo, error) {
+	if taskEnvironmentID == "" {
+		return nil, fmt.Errorf("task_environment_id is required")
+	}
+	env, err := s.taskEnvironments.GetTaskEnvironment(ctx, taskEnvironmentID)
+	if err != nil {
+		return nil, err
+	}
+	if env == nil {
+		return nil, fmt.Errorf("task environment %s not found", taskEnvironmentID)
+	}
+	sessions, err := s.sessions.ListTaskSessions(ctx, env.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sessions for task environment %s: %w", taskEnvironmentID, err)
+	}
+	matching := make([]*models.TaskSession, 0, len(sessions))
+	for _, session := range sessions {
+		if session.TaskEnvironmentID == taskEnvironmentID {
+			matching = append(matching, session)
+		}
+	}
+	if len(matching) > 0 {
+		sort.SliceStable(matching, func(i, j int) bool {
+			if !matching[i].StartedAt.Equal(matching[j].StartedAt) {
+				return matching[i].StartedAt.After(matching[j].StartedAt)
+			}
+			if !matching[i].UpdatedAt.Equal(matching[j].UpdatedAt) {
+				return matching[i].UpdatedAt.After(matching[j].UpdatedAt)
+			}
+			return matching[i].ID > matching[j].ID
+		})
+		info, err := s.GetWorkspaceInfoForSession(ctx, env.TaskID, matching[0].ID)
+		if err != nil {
+			return nil, err
+		}
+		// Fall back to the task environment's workspace path for quick-chat
+		// sessions that have no worktree or repository path on the session.
+		if info.WorkspacePath == "" && env.WorkspacePath != "" {
+			info.WorkspacePath = env.WorkspacePath
+		}
+		return info, nil
+	}
+	return nil, fmt.Errorf("task environment %s has no linked task session", taskEnvironmentID)
+}
+
+func isExecutorRunningNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, models.ErrExecutorRunningNotFound)
+}

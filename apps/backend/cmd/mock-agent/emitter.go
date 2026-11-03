@@ -1,0 +1,460 @@
+package main
+
+import (
+	"context"
+	"fmt"
+
+	acp "github.com/coder/acp-go-sdk"
+	"github.com/google/uuid"
+)
+
+// sessionUpdater abstracts the ACP connection methods used by the emitter.
+// The real acp.AgentSideConnection satisfies this; tests provide a mock.
+type sessionUpdater interface {
+	SessionUpdate(ctx context.Context, n acp.SessionNotification) error
+	RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
+}
+
+// emitter wraps an ACP connection and session ID to provide
+// convenient methods for streaming agent updates.
+type emitter struct {
+	ctx        context.Context
+	conn       sessionUpdater
+	sid        acp.SessionId
+	mcpServers map[string]mcpServerDef
+}
+
+// callMCPTool invokes an MCP tool through the server definitions attached to
+// this ACP session. ACP can create several sessions in one mock-agent process,
+// and each session can expose a different per-session SSE endpoint.
+func (e *emitter) callMCPTool(serverName, toolName string, args map[string]any) (string, error) {
+	if e == nil || e.mcpServers == nil {
+		return callMCPTool(serverName, toolName, args)
+	}
+	return callMCPToolCtxForServers(e.ctx, e.mcpServers, serverName, toolName, args)
+}
+
+// callMCPToolCtx invokes an MCP tool with a context and the server definitions
+// attached to this ACP session.
+func (e *emitter) callMCPToolCtx(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+	if e == nil || e.mcpServers == nil {
+		return callMCPToolCtx(ctx, serverName, toolName, args)
+	}
+	return callMCPToolCtxForServers(ctx, e.mcpServers, serverName, toolName, args)
+}
+
+// text sends an agent text message update.
+func (e *emitter) text(msg string) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update:    acp.UpdateAgentMessageText(msg),
+	})
+}
+
+func (e *emitter) textWithID(msg string) {
+	messageID := acp.MessageId(uuid.NewString())
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content:   acp.TextBlock(msg),
+			MessageId: &messageID,
+		}},
+	})
+}
+
+// thought sends an agent thinking/reasoning update.
+func (e *emitter) thought(msg string) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update:    acp.UpdateAgentThoughtText(msg),
+	})
+}
+
+func (e *emitter) thoughtWithID(msg string) {
+	messageID := acp.MessageId(uuid.NewString())
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:   acp.TextBlock(msg),
+			MessageId: &messageID,
+		}},
+	})
+}
+
+func (e *emitter) responseAttemptReset() {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{
+			Meta: map[string]any{
+				"kandevMock": map[string]any{"responseAttemptReset": true},
+			},
+		}},
+	})
+}
+
+// startTool announces a new tool call.
+func (e *emitter) startTool(id acp.ToolCallId, title string, kind acp.ToolKind, input any, locs ...acp.ToolCallLocation) {
+	opts := []acp.ToolCallStartOpt{
+		acp.WithStartKind(kind),
+		acp.WithStartStatus(acp.ToolCallStatusPending),
+		acp.WithStartRawInput(input),
+	}
+	if len(locs) > 0 {
+		opts = append(opts, acp.WithStartLocations(locs))
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update:    acp.StartToolCall(id, title, opts...),
+	})
+}
+
+// completeTool marks a tool call as completed with output.
+func (e *emitter) completeTool(id acp.ToolCallId, output any) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput(output),
+		),
+	})
+}
+
+// plan sends an ACP Plan update with the provided entries.
+func (e *emitter) plan(entries []acp.PlanEntry) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update:    acp.UpdatePlan(entries...),
+	})
+}
+
+// sessionInfo sends the ACP session metadata extension used by goal-aware
+// providers. The caller supplies only the provider metadata under _meta.
+func (e *emitter) sessionInfo(meta map[string]any) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{
+			SessionInfoUpdate: &acp.SessionSessionInfoUpdate{
+				SessionUpdate: "session_info_update",
+				Meta:          meta,
+			},
+		},
+	})
+}
+
+// monitorClaudeMeta builds the `_meta.claudeCode.toolName=Monitor` payload
+// claude-agent-acp tags Monitor tool_call notifications with. Used by
+// e2e:monitor_* directives to reproduce the wire format exactly so the
+// kandev ACP adapter's Monitor recognizers fire the same way they do in
+// production.
+func monitorClaudeMeta() any {
+	return map[string]any{"claudeCode": map[string]any{"toolName": "Monitor"}}
+}
+
+// monitorClaudeMetaWithTask is like monitorClaudeMeta but also embeds a
+// `toolResponse.taskId` field — claude-agent-acp emits this on the
+// registration update.
+func monitorClaudeMetaWithTask(taskID string) any {
+	return map[string]any{
+		"claudeCode": map[string]any{
+			"toolName":     "Monitor",
+			"toolResponse": map[string]any{"taskId": taskID},
+		},
+	}
+}
+
+// startMonitorTool emits the initial Monitor tool_call (status=pending) and
+// then a registration tool_call_update whose rawOutput banner carries the
+// taskID. This reproduces the two-frame wire pattern the kandev adapter
+// expects: a recognizable banner is the only signal it has that an apparent
+// "completed" really means "registered".
+//
+// The acp-go-sdk does not expose `WithStartMeta` / `WithUpdateMeta` helpers
+// at the time of writing, so we set Meta via a local option closure.
+func (e *emitter) startMonitorTool(id acp.ToolCallId, taskID, command string) {
+	withStartMeta := func(meta any) acp.ToolCallStartOpt {
+		return func(tc *acp.SessionUpdateToolCall) { tc.Meta = toMetaMap(meta) }
+	}
+	withUpdateMeta := func(meta any) acp.ToolCallUpdateOpt {
+		return func(tu *acp.SessionToolCallUpdate) { tu.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.StartToolCall(id, "Monitor",
+			acp.WithStartKind(acp.ToolKindOther),
+			acp.WithStartStatus(acp.ToolCallStatusPending),
+			acp.WithStartRawInput(map[string]any{"command": command}),
+			withStartMeta(monitorClaudeMeta()),
+		),
+	})
+	banner := fmt.Sprintf("Monitor started (task %s, timeout 60000ms). You will be notified on each event.", taskID)
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput(banner),
+			withUpdateMeta(monitorClaudeMetaWithTask(taskID)),
+		),
+	})
+}
+
+// toMetaMap is a small adapter so the local meta builders can return `any`
+// (matching the kandev-side recognizer signature) while the SDK's Meta field
+// requires `map[string]any` specifically.
+func toMetaMap(v any) map[string]any {
+	if v == nil {
+		return nil
+	}
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+// emitMonitorEvent reproduces the model-echoed task-notification envelope
+// that fires when a real Monitor's stdout produces a line. The kandev
+// adapter parses these out of agent_message_chunks and routes them back to
+// the originating Monitor's tool_call card.
+func (e *emitter) emitMonitorEvent(taskID, body string) {
+	envelope := fmt.Sprintf(
+		"Human: <task-notification>\n<task-id>%s</task-id>\n<event>%s</event>\n</task-notification>",
+		taskID, body,
+	)
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update:    acp.UpdateAgentMessageText(envelope),
+	})
+}
+
+// endMonitorTool emits the terminal Monitor tool_call_update — the kandev
+// adapter would normally synthesize this on its own at prompt-end, but tests
+// drive it explicitly so they don't have to wait for the prompt to finish.
+func (e *emitter) endMonitorTool(id acp.ToolCallId) {
+	withUpdateMeta := func(meta any) acp.ToolCallUpdateOpt {
+		return func(tu *acp.SessionToolCallUpdate) { tu.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput("Monitor exited"),
+			withUpdateMeta(monitorClaudeMeta()),
+		),
+	})
+}
+
+// subagent meta keys/values claude-agent-acp uses under
+// `_meta.claudeCode.toolResponse`. Pulled out so goconst stays happy.
+const (
+	subagentKeyStatus       = "status"
+	subagentStatusCompleted = "completed"
+	subagentStatusAsync     = "async_launched"
+	subagentKeyDescription  = "description"
+	subagentKeyPrompt       = "prompt"
+	subagentKeySubagentType = "subagent_type"
+)
+
+const (
+	claudeOriginMetaKey          = "_claude/origin"
+	claudeOriginHuman            = "human"
+	claudeOriginTaskNotification = "task-notification"
+)
+
+// foregroundIdle emits the human-origin usage boundary Claude sends after it
+// hands the foreground back while detached work remains active.
+func (e *emitter) foregroundIdle() {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+			Size: 1_000_000,
+			Used: 24_000,
+			Meta: map[string]any{
+				claudeOriginMetaKey: map[string]any{"kind": claudeOriginHuman},
+			},
+		}},
+	})
+}
+
+// subagentClaudeMeta builds the `_meta.claudeCode.toolName=Agent` payload that
+// claude-agent-acp tags subagent (Task) tool_call notifications with. The
+// kandev ACP adapter recognizes subagents by this marker.
+func subagentClaudeMeta() any {
+	return map[string]any{"claudeCode": map[string]any{"toolName": "Agent"}}
+}
+
+// subagentResult describes the result metadata claude-agent-acp reports for a
+// finished subagent under `_meta.claudeCode.toolResponse`.
+type subagentResult struct {
+	agentID      string
+	subagentType string
+	durationMs   int64
+	totalTokens  int64
+	toolUseCount int
+}
+
+// subagentClaudeMetaWithResponse embeds a `toolResponse` block mirroring the
+// real claude-agent-acp completion frame so the kandev adapter's
+// EnrichSubagentResult populates every metric the UI renders.
+func subagentClaudeMetaWithResponse(r subagentResult) any {
+	return map[string]any{
+		"claudeCode": map[string]any{
+			"toolName": "Agent",
+			"toolResponse": map[string]any{
+				"agentId":           r.agentID,
+				"agentType":         r.subagentType,
+				subagentKeyStatus:   subagentStatusCompleted,
+				"totalDurationMs":   r.durationMs,
+				"totalTokens":       r.totalTokens,
+				"totalToolUseCount": r.toolUseCount,
+			},
+		},
+	}
+}
+
+// startSubagentTool emits the initial subagent tool_call (status=pending) in
+// claude-agent-acp's wire shape: title "Task", kind Other, the Agent meta
+// marker, and rawInput carrying description/prompt/subagent_type.
+func (e *emitter) startSubagentTool(id acp.ToolCallId, description, prompt, subagentType string) {
+	withStartMeta := func(meta any) acp.ToolCallStartOpt {
+		return func(tc *acp.SessionUpdateToolCall) { tc.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.StartToolCall(id, "Task",
+			acp.WithStartKind(acp.ToolKindOther),
+			acp.WithStartStatus(acp.ToolCallStatusPending),
+			acp.WithStartRawInput(map[string]any{
+				subagentKeyDescription:  description,
+				subagentKeyPrompt:       prompt,
+				subagentKeySubagentType: subagentType,
+			}),
+			withStartMeta(subagentClaudeMeta()),
+		),
+	})
+}
+
+// launchAsyncSubagentTool mirrors Claude's detached Agent launch: the Task
+// invocation is terminal, but its independently-running workload is not.
+func (e *emitter) launchAsyncSubagentTool(
+	id acp.ToolCallId,
+	description, prompt, subagentType string,
+) {
+	e.startSubagentTool(id, description, prompt, subagentType)
+	withUpdateMeta := func(meta any) acp.ToolCallUpdateOpt {
+		return func(tu *acp.SessionToolCallUpdate) { tu.Meta = toMetaMap(meta) }
+	}
+	response := map[string]any{
+		"claudeCode": map[string]any{
+			"toolResponse": map[string]any{
+				"agentId":           asyncSubagentAgentID,
+				"agentType":         subagentType,
+				subagentKeyStatus:   subagentStatusAsync,
+				"isAsync":           true,
+				"outputFile":        "/tmp/kandev-e2e-detached.output",
+				"canReadOutputFile": true,
+			},
+		},
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateRawOutput("Async agent launched successfully."),
+			withUpdateMeta(response),
+		),
+	})
+}
+
+// completeDetachedWork emits the same task-notification usage boundary Claude
+// sends when an async workload finishes. The provider does not expose the task
+// ID on this frame, so the orchestrator retires it only when one registration is
+// outstanding and the completion is therefore unambiguous.
+func (e *emitter) completeDetachedWork() {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+			Size: 1_000_000,
+			Used: 25_000,
+			Meta: map[string]any{
+				claudeOriginMetaKey: map[string]any{"kind": claudeOriginTaskNotification},
+			},
+		}},
+	})
+}
+
+// completeSubagentTool emits the terminal subagent tool_call_update with the
+// result text and the `toolResponse` metadata block.
+func (e *emitter) completeSubagentTool(id acp.ToolCallId, resultText string, r subagentResult) {
+	withUpdateMeta := func(meta any) acp.ToolCallUpdateOpt {
+		return func(tu *acp.SessionToolCallUpdate) { tu.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput(resultText),
+			withUpdateMeta(subagentClaudeMetaWithResponse(r)),
+		),
+	})
+}
+
+// subagentChildMeta tags a tool call as a subagent's internal call via
+// `_meta.claudeCode.parentToolUseId`, mirroring claude-agent-acp so the kandev
+// adapter nests it under the parent Task card.
+func subagentChildMeta(parentToolUseID acp.ToolCallId) any {
+	return map[string]any{"claudeCode": map[string]any{"parentToolUseId": string(parentToolUseID)}}
+}
+
+// startChildTool emits a tool_call attributed to a parent subagent (Task).
+func (e *emitter) startChildTool(id, parent acp.ToolCallId, title string, kind acp.ToolKind, input any) {
+	withStartMeta := func(meta any) acp.ToolCallStartOpt {
+		return func(tc *acp.SessionUpdateToolCall) { tc.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.StartToolCall(id, title,
+			acp.WithStartKind(kind),
+			acp.WithStartStatus(acp.ToolCallStatusPending),
+			acp.WithStartRawInput(input),
+			withStartMeta(subagentChildMeta(parent)),
+		),
+	})
+}
+
+// completeChildTool completes a subagent child tool call, keeping the parent
+// attribution on the terminal frame too.
+func (e *emitter) completeChildTool(id, parent acp.ToolCallId, output any) {
+	withUpdateMeta := func(meta any) acp.ToolCallUpdateOpt {
+		return func(tu *acp.SessionToolCallUpdate) { tu.Meta = toMetaMap(meta) }
+	}
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput(output),
+			withUpdateMeta(subagentChildMeta(parent)),
+		),
+	})
+}
+
+// requestPermission asks the client for permission to proceed with a tool call.
+// Returns true if permission was granted, false otherwise.
+func (e *emitter) requestPermission(toolCallID acp.ToolCallId, title string, kind acp.ToolKind, input any) bool {
+	resp, err := e.conn.RequestPermission(e.ctx, acp.RequestPermissionRequest{
+		SessionId: e.sid,
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: toolCallID,
+			Title:      acp.Ptr(title),
+			Kind:       acp.Ptr(kind),
+			Status:     acp.Ptr(acp.ToolCallStatusPending),
+			RawInput:   input,
+		},
+		Options: []acp.PermissionOption{
+			{Kind: acp.PermissionOptionKindAllowOnce, Name: "Allow", OptionId: "allow"},
+			{Kind: acp.PermissionOptionKindRejectOnce, Name: "Reject", OptionId: "reject"},
+		},
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(logOutput, "mock-agent: permission request failed: %v\n", err)
+		return false
+	}
+	return resp.Outcome.Selected != nil && string(resp.Outcome.Selected.OptionId) == "allow"
+}

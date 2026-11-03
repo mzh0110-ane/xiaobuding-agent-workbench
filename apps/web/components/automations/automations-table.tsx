@@ -1,0 +1,189 @@
+"use client";
+
+import { useTranslation } from "react-i18next";
+import { useRouter } from "@/lib/routing/client-router";
+import { Badge } from "@kandev/ui/badge";
+import { Button } from "@kandev/ui/button";
+import { Switch } from "@kandev/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@kandev/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { IconPlayerPlay, IconTrash } from "@tabler/icons-react";
+import type { Automation, TriggerType } from "@/lib/types/automation";
+import { formatRelativeTime } from "@/lib/utils";
+
+type AutomationsTableProps = {
+  automations: Automation[];
+  dirtyIds: ReadonlySet<string>;
+  workspaceId: string;
+  onToggleEnabled: (id: string, enabled: boolean) => void;
+  onTrigger: (id: string) => void;
+  onDelete: (id: string) => void;
+};
+
+const GITHUB_BADGE_VARIANT = "bg-purple-500/15 text-purple-400 border-purple-500/20";
+
+const TRIGGER_BADGE_VARIANT: Record<TriggerType, string> = {
+  scheduled: "bg-blue-500/15 text-blue-400 border-blue-500/20",
+  github_pr: GITHUB_BADGE_VARIANT,
+  github_pr_merged: GITHUB_BADGE_VARIANT,
+  github_push: GITHUB_BADGE_VARIANT,
+  github_ci: GITHUB_BADGE_VARIANT,
+  webhook: "bg-orange-500/15 text-orange-400 border-orange-500/20",
+  plugin_event: "bg-orange-500/15 text-orange-400 border-orange-500/20",
+};
+
+// The keys are persisted TriggerType identifiers the backend stores and
+// replays — only the catalog key is display copy, so the map holds keys and
+// resolves them at render (a module-scope t() would freeze at the boot locale).
+const TRIGGER_LABEL_KEYS: Record<TriggerType, string> = {
+  scheduled: "automations:triggerLabelScheduled",
+  github_pr: "automations:triggerLabelGithubPr",
+  github_pr_merged: "automations:triggerLabelGithubPrMerged",
+  github_push: "automations:triggerLabelGithubPush",
+  github_ci: "automations:triggerLabelGithubCi",
+  webhook: "automations:triggerLabelWebhook",
+  plugin_event: "automations:triggerLabelWebhook",
+};
+
+function TriggerBadges({ triggers }: { triggers: Automation["triggers"] }) {
+  const { t } = useTranslation();
+  const items = triggers ?? [];
+  if (items.length === 0) {
+    return <span className="text-xs text-muted-foreground">{t("automations:noTriggers")}</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {items.map((trigger) => (
+        <Badge key={trigger.id} variant="outline" className={TRIGGER_BADGE_VARIANT[trigger.type]}>
+          {t(TRIGGER_LABEL_KEYS[trigger.type])}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+function RowActions({
+  id,
+  onTrigger,
+  onDelete,
+}: {
+  id: string;
+  onTrigger: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center justify-end gap-0.5">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="cursor-pointer"
+            onClick={() => onTrigger(id)}
+          >
+            <IconPlayerPlay className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("automations:triggerManually")}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="cursor-pointer"
+            data-testid={`automation-delete-button-${id}`}
+            aria-label={t("automations:delete")}
+            onClick={() => onDelete(id)}
+          >
+            <IconTrash className="h-3.5 w-3.5 text-destructive" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{t("automations:delete")}</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
+export function AutomationsTable({
+  automations,
+  dirtyIds,
+  workspaceId,
+  onToggleEnabled,
+  onTrigger,
+  onDelete,
+}: AutomationsTableProps) {
+  const { t } = useTranslation();
+  const router = useRouter();
+
+  return (
+    <div
+      className="rounded-md border"
+      data-testid="automations-table"
+      data-settings-dirty={dirtyIds.size > 0}
+      data-settings-dirty-level="container"
+    >
+      <Table>
+        <TableHeader>
+          <TableRow className="hover:bg-transparent focus-within:bg-transparent">
+            <TableHead>{t("automations:columnName")}</TableHead>
+            <TableHead>{t("automations:columnTriggers")}</TableHead>
+            <TableHead>{t("automations:columnEnabled")}</TableHead>
+            <TableHead>{t("automations:columnLastTriggered")}</TableHead>
+            <TableHead className="w-[100px]" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {automations.length === 0 ? (
+            <TableRow>
+              <TableCell
+                colSpan={5}
+                className="text-center text-muted-foreground py-8"
+                data-testid="automations-empty"
+              >
+                {t("automations:noAutomationsYet")}
+              </TableCell>
+            </TableRow>
+          ) : (
+            automations.map((a) => (
+              <TableRow
+                key={a.id}
+                data-testid={`automation-row-${a.id}`}
+                data-settings-dirty={dirtyIds.has(a.id)}
+                data-settings-dirty-level="container"
+                className="cursor-pointer hover:bg-muted/50"
+                onClick={() =>
+                  router.push(`/settings/workspaces/${workspaceId}/automations/${a.id}`)
+                }
+              >
+                <TableCell className="font-medium">{a.name}</TableCell>
+                <TableCell>
+                  <TriggerBadges triggers={a.triggers} />
+                </TableCell>
+                <TableCell onClick={(e) => e.stopPropagation()}>
+                  <Switch
+                    data-testid={`automation-enabled-${a.id}`}
+                    size="sm"
+                    checked={a.enabled}
+                    data-settings-dirty={dirtyIds.has(a.id)}
+                    onCheckedChange={(checked) => onToggleEnabled(a.id, checked)}
+                    className="cursor-pointer"
+                  />
+                </TableCell>
+                <TableCell className="text-muted-foreground text-sm">
+                  {a.last_triggered_at
+                    ? formatRelativeTime(a.last_triggered_at)
+                    : t("automations:neverTriggered")}
+                </TableCell>
+                <TableCell onClick={(e) => e.stopPropagation()}>
+                  <RowActions id={a.id} onTrigger={onTrigger} onDelete={onDelete} />
+                </TableCell>
+              </TableRow>
+            ))
+          )}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}

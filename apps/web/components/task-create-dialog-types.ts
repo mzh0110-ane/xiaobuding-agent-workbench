@@ -1,0 +1,742 @@
+import type { RepositoryCheckoutOptions } from "@/lib/types/repository-checkout-options";
+import type React from "react";
+import type { RefObject } from "react";
+import type { ComboboxOption } from "@/components/combobox";
+import type {
+  LocalRepository,
+  Repository,
+  RepositorySet,
+  Executor,
+  Task,
+  TaskPriority,
+  CreateTaskResponse,
+} from "@/lib/types/http";
+import type { createTask } from "@/lib/api";
+import type { UseBranchesByURLResult } from "@/hooks/domains/github/use-branches-by-url";
+import type { UsePRInfoByURLResult } from "@/hooks/domains/github/use-pr-info-by-url";
+import type { RepositoryInspection } from "@/lib/plugins/types";
+import type { UtilityGenerationResult } from "@/hooks/use-utility-agent-generator";
+import type { AgentProfileOption, WorkspaceState } from "@/lib/state/slices";
+import type { AgentProfileRecentUseContext } from "@/lib/types/http-agent-profile-recent-use";
+import type { TaskEditDialogDependenciesState } from "@/hooks/domains/task/use-task-edit-dialog-dependencies";
+import type {
+  KanbanMultiState,
+  WorkflowSnapshotData,
+  WorkflowsState,
+} from "@/lib/state/slices/kanban/types";
+
+type Workspace = WorkspaceState["items"][number];
+import type {
+  useRepositoryOptions,
+  useBranchOptions,
+  useAgentProfileOptions,
+  useExecutorProfileOptions,
+} from "@/components/task-create-dialog-options";
+import type { useToast } from "@/components/toast-provider";
+import type { TaskCreateLaunchPreview } from "@/components/task-create-dialog-launch-preview";
+
+export type TaskCreateSubmit = (
+  payload: Parameters<typeof createTask>[0],
+) => Promise<CreateTaskResponse>;
+
+/**
+ * Shape of the task being edited that both `TaskCreateDialogProps.editingTask`
+ * and `SubmitHandlersDeps.editingTask` need. `runnerEditable`/
+ * `runnerIneligibleReason` gate the executor-profile selector independently
+ * of `state`.
+ */
+export type TaskEditTarget = {
+  id: string;
+  title: string;
+  description?: string;
+  workflowStepId: string;
+  state?: Task["state"];
+  repositoryId?: string;
+  repositories?: TaskRepositorySnapshot[];
+  primaryExecutorProfileId?: string;
+  runnerEditable?: boolean;
+  runnerIneligibleReason?: string;
+};
+
+export interface TaskCreateDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  mode?: "create" | "edit" | "session";
+  workspaceId: string | null;
+  workflowId: string | null;
+  defaultStepId: string | null;
+  steps: Array<{
+    id: string;
+    title: string;
+    events?: {
+      on_enter?: Array<{ type: string; config?: Record<string, unknown> }>;
+      on_turn_complete?: Array<{ type: string; config?: Record<string, unknown> }>;
+    };
+  }>;
+  editingTask?: TaskEditTarget | null;
+  onSuccess?: (
+    task: Task,
+    mode: "create" | "edit",
+    meta?: { taskSessionId?: string | null; willNavigate?: boolean; autoFocus?: boolean },
+  ) => void;
+  onCreateSession?: (data: {
+    prompt: string;
+    agentProfileId: string;
+    executorId: string;
+    attachments?: ReturnType<
+      typeof import("@/components/task-create-dialog-helpers").toMessageAttachments
+    >;
+  }) => void;
+  /** Optional trusted create-mode transport; edit and session modes ignore it. */
+  createTask?: TaskCreateSubmit;
+  initialValues?: TaskCreateDialogInitialValues;
+  taskId?: string | null;
+  parentTaskId?: string;
+  lockedFields?: { repository?: boolean; branch?: boolean; workflow?: boolean };
+  transformDescriptionBeforeSubmit?: (description: string) => Promise<string> | string;
+  descriptionPlaceholder?: string;
+  aboveDescriptionSlot?: React.ReactNode;
+  extraFormSlot?: React.ReactNode;
+  bottomSlot?: React.ReactNode;
+  submitBlockedReason?: string | null;
+  /** Element to return keyboard focus to on close, confirmed or cancelled.
+   * Omitted callers keep Radix's default restore-to-previously-focused-element
+   * behavior. */
+  focusReturnRef?: RefObject<HTMLElement | null>;
+}
+
+export type DialogPromptEnhance = {
+  onEnhance: () => void;
+  isLoading: boolean;
+  isConfigured: boolean;
+  pendingResult: UtilityGenerationResult | null;
+  onApplyPending: () => void;
+  onCopyPending: () => Promise<void> | void;
+};
+
+/**
+ * One repository row in the task-create form. The form tracks every repo
+ * (whether one or many) as an entry in `repositories[]`. There is no
+ * "primary" — the backend treats them all equally and uses array order
+ * for position. Removing the last row clears the form's repo selection.
+ *
+ * Exactly one of `repositoryId` (workspace repo) or `localPath` (on-machine
+ * git folder discovered via the workspace's repo discovery) is set per row.
+ * `key` is a stable client-side id used as React key and for
+ * add/update/remove ops; it's not sent to the backend.
+ */
+export type TaskRepoRow = {
+  key: string;
+  /** Workspace repo id, when the user picked from the workspace's repos. */
+  repositoryId?: string;
+  /** On-machine repo path, when the user picked from discovered repos. */
+  localPath?: string;
+  branch: string;
+  /** Explicit effective base copied from a repository set or chosen in the form. */
+  baseBranch?: string;
+  /** Saved repository policy selected for this row. */
+  branchPolicyId?: string;
+};
+
+/** Repository fields needed to rehydrate an edit form without losing a policy snapshot. */
+export type TaskRepositorySnapshot = {
+  repository_id: string;
+  base_branch?: string;
+  id?: string;
+  task_id?: string;
+  checkout_branch?: string;
+  branch_policy_id?: string;
+  branch_policy_name?: string;
+  branch_policy_base_branch?: string;
+  branch_policy_branch_template?: string;
+  branch_policy_pull_request_target?: string;
+  position?: number;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+/**
+ * One remote-repo row in the task-create form. Each row is either a
+ * picker-selected repo or a manually-pasted URL/PR — both collapse to a
+ * single `url` field, with `source` only used for UI affordance.
+ */
+export type TaskRemoteRepoRow = {
+  checkoutOptions?: RepositoryCheckoutOptions;
+  key: string; // stable client-side React key
+  url: string; // canonical https://… or paste-as-typed
+  /** Exact credential-free clone URL returned by provider URL inspection. */
+  remoteUrl?: string;
+  branch: string;
+  source: "picker" | "paste";
+  prNumber?: number;
+  prBaseBranch?: string;
+  prHeadBranch?: string;
+  // Optional metadata when source === "picker":
+  provider?: string;
+  providerHost?: string;
+  providerScope?: string;
+  providerRepoId?: string;
+  providerOwner?: string;
+  providerName?: string;
+  fullName?: string; // "owner/name"
+};
+
+export type StepType = {
+  id: string;
+  title: string;
+  /** Workflow that supplied these fallback-only steps. */
+  workflowId?: string;
+  position?: number;
+  is_start_step?: boolean;
+  prompt?: string;
+  events?: {
+    on_enter?: Array<{ type: string; config?: Record<string, unknown> }>;
+    on_turn_complete?: Array<{ type: string; config?: Record<string, unknown> }>;
+  };
+};
+
+export type TaskCreateDialogInitialValues = {
+  title: string;
+  description?: string;
+  /** Create-mode source preset: start without a repository in a scratch workspace. */
+  noRepository?: boolean;
+  /** Create-mode launch hint; the dialog resolves a capable local profile by type. */
+  preferLocalExecutor?: boolean;
+  /** Existing task repository rows, including immutable policy snapshots. */
+  repositories?: TaskRepositorySnapshot[];
+  repositoryId?: string;
+  branch?: string;
+  /** Existing remote branch to check out directly in the worktree (e.g. a PR's head branch),
+   * instead of creating a new branch off `branch`. */
+  checkoutBranch?: string;
+  state?: Task["state"];
+  /** Provider-neutral remote URL used to seed remote mode. */
+  remoteUrl?: string;
+  /** Already-authorized provider descriptor; avoids an async inspection race on submit. */
+  remoteRepository?: RepositoryInspection;
+  /** @deprecated Use remoteUrl. Kept for GitHub launch callers during migration. */
+  githubUrl?: string;
+  prNumber?: number;
+  prBaseBranch?: string;
+};
+
+export type StoreSelections = {
+  agentProfiles: AgentProfileOption[];
+  /**
+   * Subset of `agentProfiles` that can run on the currently-selected executor
+   * profile (`useExecutorProfileCompat`). Drives auto-selection in
+   * `useDefaultSelectionsEffect` so a previously-used profile that's
+   * incompatible with the current executor (e.g. Claude profile + Sprites)
+   * doesn't get silently restored and trip the "No compatible" empty state.
+   *
+   * Equal to `agentProfiles` until the executor profile + auth-spec catalog
+   * have loaded — read together with `authLoaded` to know which case applies.
+   */
+  compatibleAgentProfiles: AgentProfileOption[];
+  /**
+   * True once the remote-auth catalog has been fetched. Until then,
+   * `compatibleAgentProfiles` is just `agentProfiles` (no filter applied), so
+   * auto-pick must wait — otherwise the first render restores a lastId that
+   * looks valid against the unfiltered list, the specs land milliseconds
+   * later, and `noCompatibleAgent` flips true via the
+   * "selected-not-in-compatible" branch.
+   */
+  authLoaded: boolean;
+  executors: Executor[];
+  workspaceDefaults: Workspace | null | undefined;
+  userSettingsLoaded?: boolean;
+  lastUsedAgentProfileId?: string | null;
+  lastUsedExecutorProfileId?: string | null;
+  effectiveWorkflowId?: string | null;
+};
+
+/**
+ * Agent-profile compatibility with the selected executor profile.
+ *   compatible:            no executor selected, nothing selected yet, or the
+ *                          selection passes the executor's credential check.
+ *   selected-incompatible: a compatible profile exists but the selected one
+ *                          fails the executor credential check (e.g. executor
+ *                          switched after the agent was chosen, or a workflow
+ *                          pins it).
+ *   selected-unavailable: a compatible profile exists, but the current
+ *                         selection is disabled or unavailable because dynamic
+ *                         routing is off.
+ *   none-compatible:       an executor is selected and no profile passes.
+ */
+export type AgentCompatState =
+  | "compatible"
+  | "selected-incompatible"
+  | "selected-unavailable"
+  | "none-compatible";
+
+export type DialogComputedValues = {
+  isPassthroughProfile: boolean;
+  effectiveWorkflowId: string | null;
+  effectiveDefaultStepId: string | null;
+  workspaceDefaults: Workspace | null | undefined;
+  hasRepositorySelection: boolean;
+  branchOptions: ReturnType<typeof useBranchOptions>;
+  agentProfileOptions: ReturnType<typeof useAgentProfileOptions>;
+  executorProfileOptions: ReturnType<typeof useExecutorProfileOptions>;
+  executorHint: string | null;
+  isLocalExecutor: boolean;
+  headerRepositoryOptions: ReturnType<typeof useRepositoryOptions>["headerRepositoryOptions"];
+  agentProfilesLoading: boolean;
+  executorsLoading: boolean;
+  /** True when the effective workflow has an agent_profile_id override */
+  workflowAgentLocked: boolean;
+  /** The agent_profile_id from the effective workflow (empty string if none) */
+  workflowAgentProfileId: string;
+  /** User selection if any, else the workflow override; what footer/submit/passthrough should consult */
+  effectiveAgentProfileId: string;
+  /** Display name of the currently selected executor profile (null if none). */
+  selectedExecutorProfileName: string | null;
+  /** True whenever `agentCompatState` is not `compatible`; gates submission. */
+  noCompatibleAgent: boolean;
+  /** Compatibility state of the effective agent profile with the selected executor profile. */
+  agentCompatState: AgentCompatState;
+  /** Label of the effective agent profile (null when none is selected or it is unknown). */
+  selectedAgentProfileName: string | null;
+  /** Subset of agent profiles that pass the executor's auth-credential check. See `StoreSelections.compatibleAgentProfiles`. */
+  compatibleAgentProfiles: AgentProfileOption[];
+  /** True once the remote-auth catalog has been fetched. See `StoreSelections.authLoaded`. */
+  authLoaded: boolean;
+};
+
+export type DialogComputedArgs = {
+  fs: DialogFormState;
+  open: boolean;
+  workspaceId: string | null;
+  workflowId: string | null;
+  defaultStepId: string | null;
+  settingsData: {
+    agentsLoaded: boolean;
+    executorsLoaded: boolean;
+    capabilitiesLoaded: boolean;
+  };
+  agentProfiles: AgentProfileOption[];
+  workspaces: Workspace[];
+  executors: Executor[];
+  repositories: Repository[];
+  workflows: Array<{
+    id: string;
+    workspaceId?: string;
+    agent_profile_id?: string;
+    hidden?: boolean;
+  }>;
+  lockedWorkflow: boolean;
+  lastUsedWorkflowIdsByWorkspace: Record<string, string>;
+  userSettingsLoaded?: boolean;
+  snapshots: Record<string, WorkflowSnapshotData>;
+  agentProfileRecentUseContext?: AgentProfileRecentUseContext;
+};
+
+export type TaskCreateEffectsArgs = {
+  open: boolean;
+  workspaceId: string | null;
+  workflowId: string | null;
+  effectiveWorkflowId: string | null;
+  repositories: Repository[];
+  repositoriesLoading: boolean;
+  agentProfiles: AgentProfileOption[];
+  compatibleAgentProfiles: AgentProfileOption[];
+  authLoaded: boolean;
+  executors: Executor[];
+  workspaceDefaults: Workspace | null | undefined;
+  toast: ReturnType<typeof useToast>["toast"];
+  workflows: Array<{ id: string; agent_profile_id?: string }>;
+  /** Backend-owned last-used repository. */
+  lastUsedRepositoryId?: string | null;
+  /** Whether DB-backed user settings are loaded, or a best-effort fetch has settled. */
+  userSettingsLoaded?: boolean;
+  /** Backend-owned last-used agent profile. */
+  lastUsedAgentProfileId?: string | null;
+  /** Backend-owned last-used executor profile. */
+  lastUsedExecutorProfileId?: string | null;
+  /** Backend-owned last-used branch. */
+  lastUsedBranch?: string | null;
+  /**
+   * True when the currently-selected executor is the local-host one (no
+   * worktree, no container). Drives the "reset row.branch on local switch"
+   * effect so toggling worktree → local restores the chip default to the
+   * workspace's current branch instead of leaving a stale pick from the
+   * worktree run that would trigger a destructive `git checkout` on submit.
+   */
+  isLocalExecutor: boolean;
+  /**
+   * Branch the caller wants preserved across the local-switch reset (e.g. the
+   * PR head branch when launching from a GitHub PR). The reset effect skips
+   * rows whose branch matches this value so the explicit caller choice isn't
+   * clobbered by the executor's async settle on mount.
+   */
+  preserveBranch?: string;
+  /**
+   * The task's own stored executor profile, when editing a task that has one.
+   * Seeds the picker directly instead of the create-mode "resolve a default"
+   * autopick.
+   */
+  editingTaskExecutorProfileId?: string | null;
+};
+
+import type { FileAttachment } from "@/components/task/chat/file-attachment";
+import type {
+  WorkflowAgentOverrideOption,
+  WorkflowAgentOverrideRow,
+} from "@/components/task-create-dialog-workflow-agent-overrides";
+
+export type TaskFormInputsHandle = {
+  getValue: () => string;
+  setValue: (v: string) => void;
+  getAttachments: () => FileAttachment[];
+  clearAttachments?: () => void;
+};
+
+export type DialogFormState = {
+  /** Predecessor task IDs chosen in the dialog's "Depends on" selector. */
+  blockedBy: string[];
+  setBlockedBy: (v: string[]) => void;
+  taskName: string;
+  setTaskName: (v: string) => void;
+  hasTitle: boolean;
+  setHasTitle: (v: boolean) => void;
+  hasDescription: boolean;
+  setHasDescription: (v: boolean) => void;
+  hasPendingAttachmentUploads: boolean;
+  setHasPendingAttachmentUploads: (v: boolean) => void;
+  /** Restored draft description, used as initialDescription for TaskFormInputs */
+  draftDescription: string;
+  /** Cycle counter incremented each time dialog opens - used in key for remount */
+  openCycle: number;
+  /** Computed defaults for current open cycle (includes draft restoration) */
+  currentDefaults: { name: string; description: string };
+  descriptionInputRef: import("react").RefObject<TaskFormInputsHandle | null>;
+  /**
+   * Unified list of repos on this task. Each row carries either a workspace
+   * `repositoryId` or a discovered `localPath`, plus its base `branch`. The
+   * order is the position the backend sees. There is no "primary" concept.
+   */
+  repositories: TaskRepoRow[];
+  /** False while rows are hydrated from an existing task; true after user edits. */
+  repositoriesDirty: boolean;
+  setRepositories: React.Dispatch<React.SetStateAction<TaskRepoRow[]>>;
+  setRepositoriesDirty: (dirty: boolean) => void;
+  addRepository: () => void;
+  removeRepository: (key: string) => void;
+  updateRepository: (key: string, patch: Partial<TaskRepoRow>) => void;
+  /**
+   * Remote URL list driving the new "GitHub Remote" mode. Each row carries a
+   * URL + branch; legacy singleton URL flow reads `remoteRepos[0]` during the
+   * transitional period until the multi-row UI lands.
+   */
+  remoteRepos: TaskRemoteRepoRow[];
+  setRemoteRepos: React.Dispatch<React.SetStateAction<TaskRemoteRepoRow[]>>;
+  addRemoteRepo: () => void;
+  removeRemoteRepo: (key: string) => void;
+  updateRemoteRepo: (key: string, patch: Partial<TaskRemoteRepoRow>) => void;
+  /**
+   * Per-URL branches cache. Each chip reads its own row's branches by URL;
+   * no dialog-level singleton branch field remains.
+   */
+  branchesByUrl: UseBranchesByURLResult;
+  /**
+   * Per-URL PR-info cache. Each chip calls `ensure(row.url)` when its URL
+   * changes; the chip auto-selects the PR head branch when the URL is a PR
+   * URL and the row's branch is still empty. The dialog also reads the
+   * first row's `info(url).suggestedTitle` to autofill the task title.
+   */
+  prInfoByUrl: UsePRInfoByURLResult;
+  agentProfileId: string;
+  setAgentProfileId: (v: string) => void;
+  executorId: string;
+  setExecutorId: (v: string) => void;
+  executorProfileId: string;
+  setExecutorProfileId: (v: string) => void;
+  /**
+   * Writes executorProfileId from an autopick/stored-profile seed effect
+   * only, never from the user's own picker. This is the sole writer
+   * seededExecutorProfileId tracks, so a user selection can never be
+   * mistaken for a seed regardless of which write lands first.
+   */
+  setExecutorProfileIdFromSeed: (v: string) => void;
+  /**
+   * The executor profile id the dialog seeded for this open cycle (stored
+   * value in edit mode, resolved default in create mode) — never a value the
+   * user chose. Null until a value has been seeded. Submit flows compare the
+   * final selection against this to decide whether the user actually changed
+   * the runner.
+   */
+  seededExecutorProfileId: string | null;
+  discoveredRepositories: LocalRepository[];
+  setDiscoveredRepositories: (v: LocalRepository[]) => void;
+  discoverReposLoading: boolean;
+  setDiscoverReposLoading: (v: boolean) => void;
+  discoverReposLoaded: boolean;
+  setDiscoverReposLoaded: (v: boolean) => void;
+  selectedWorkflowId: string | null;
+  setSelectedWorkflowId: (v: string | null) => void;
+  /** Task-only replacement profile by fixed workflow source profile. */
+  workflowAgentOverrides: Record<string, string>;
+  setWorkflowAgentOverrides: (v: Record<string, string>) => void;
+  fetchedSteps: StepType[] | null;
+  setFetchedSteps: (v: StepType[] | null) => void;
+  isCreatingSession: boolean;
+  setIsCreatingSession: (v: boolean) => void;
+  isCreatingTask: boolean;
+  setIsCreatingTask: (v: boolean) => void;
+  /** True when the form is in the GitHub Remote (URL) mode. */
+  useRemote: boolean;
+  setUseRemote: (v: boolean) => void;
+  githubUrlError: string | null;
+  setGitHubUrlError: (v: string | null) => void;
+  /** When non-empty, the selected workflow overrides the agent profile */
+  workflowAgentProfileId: string;
+  setWorkflowAgentProfileId: (v: string) => void;
+  /** Clear draft on successful submission (before closing dialog) */
+  clearDraft: () => void;
+  /** Local executor only: opt-in to discard local changes and start the task on a new branch */
+  freshBranchEnabled: boolean;
+  setFreshBranchEnabled: (v: boolean) => void;
+  /** Currently checked-out branch in the selected local repo (for the disabled selector placeholder) */
+  currentLocalBranch: string;
+  setCurrentLocalBranch: (v: string) => void;
+  /** True while resolving currentLocalBranch — distinguishes "still loading" from "no branch on disk" */
+  currentLocalBranchLoading: boolean;
+  setCurrentLocalBranchLoading: (v: boolean) => void;
+  /** No-repo mode: when true the task is created with no repositories. */
+  noRepository: boolean;
+  setNoRepository: (v: boolean) => void;
+  /** Launch-only hint for choosing a capable direct local executor profile. */
+  preferLocalExecutor: boolean;
+  setPreferLocalExecutor: (v: boolean) => void;
+  /** Optional host folder for repo-less tasks; empty means scratch workspace. */
+  workspacePath: string;
+  setWorkspacePath: (v: string) => void;
+  /** Create-mode opt-in. Autopilot is immutable after task creation. */
+  autopilot: boolean;
+  setAutopilot: (v: boolean) => void;
+  /** Priority to submit with the created task. Defaults to `medium`. */
+  priority: TaskPriority;
+  setPriority: (v: TaskPriority) => void;
+};
+
+export type SubmitHandlersDeps = {
+  isSessionMode: boolean;
+  isEditMode: boolean;
+  /** Create-mode opt-in: derive a provisional title from the prompt. */
+  autoTitle?: boolean;
+  /** Create-mode opt-in. The backend fixes this value at task creation. */
+  autopilot: boolean;
+  isPassthroughProfile: boolean;
+  taskName: string;
+  workspaceId: string | null;
+  workflowId: string | null;
+  effectiveWorkflowId: string | null;
+  /** Unified repo list from the form. Empty when in GitHub URL mode. */
+  repositories: TaskRepoRow[];
+  /** Whether the user explicitly changed repository selections in this form. */
+  repositoriesDirty: boolean;
+  /** All on-machine discovered repos — used to look up `default_branch` for `localPath` rows. */
+  discoveredRepositories: LocalRepository[];
+  /** Workspace repositories — used to look up `default_branch` for `repositoryId` rows. */
+  workspaceRepositories: Repository[];
+  /** True when the GitHub Remote (URL) mode is active. */
+  useRemote: boolean;
+  /** Remote-repo rows (multi-row). The submit path collapses non-empty rows into `repos[]`. */
+  remoteRepos: TaskRemoteRepoRow[];
+  /**
+   * Per-URL PR-info cache. The submit path consults this so a PR row whose
+   * head lives on a fork can still anchor `base_branch` to the PR's actual
+   * target (from the GitHub API).
+   */
+  prInfoByUrl: UsePRInfoByURLResult;
+  agentProfileId: string;
+  executorId: string;
+  executorProfileId: string;
+  /** See {@link DialogFormState.seededExecutorProfileId}. */
+  seededExecutorProfileId: string | null;
+  editingTask?: TaskEditTarget | null;
+  onSuccess?: (
+    task: Task,
+    mode: "create" | "edit",
+    meta?: { taskSessionId?: string | null; willNavigate?: boolean; autoFocus?: boolean },
+  ) => void;
+  onCreateSession?: (data: {
+    prompt: string;
+    agentProfileId: string;
+    executorId: string;
+    attachments?: ReturnType<
+      typeof import("@/components/task-create-dialog-helpers").toMessageAttachments
+    >;
+  }) => void;
+  onOpenChange: (open: boolean) => void;
+  /** Create-mode transport override. Omitted to use Kandev's REST task endpoint. */
+  createTask?: TaskCreateSubmit;
+  /** Refreshes selected branch-policy options after a stale task submission. */
+  refreshBranchPolicies?: () => Promise<void>;
+  preserveTaskCreateLastUsedOnClose?: () => void;
+  taskId: string | null;
+  parentTaskId?: string;
+  descriptionInputRef: React.RefObject<TaskFormInputsHandle | null>;
+  setIsCreatingSession: (v: boolean) => void;
+  setIsCreatingTask: (v: boolean) => void;
+  setHasTitle: (v: boolean) => void;
+  setHasDescription: (v: boolean) => void;
+  setTaskName: (v: string) => void;
+  setRepositories: React.Dispatch<React.SetStateAction<TaskRepoRow[]>>;
+  setRemoteRepos: React.Dispatch<React.SetStateAction<TaskRemoteRepoRow[]>>;
+  setAgentProfileId: (v: string) => void;
+  setExecutorId: (v: string) => void;
+  setSelectedWorkflowId: (v: string | null) => void;
+  setFetchedSteps: (v: null) => void;
+  clearDraft: () => void;
+  freshBranchEnabled: boolean;
+  isLocalExecutor: boolean;
+  /** Resolved on-disk path for the selected repository (workspace or discovered). Empty if not local. */
+  repositoryLocalPath: string;
+  /** When true, the task is created with no repositories (repo-less mode). */
+  noRepository: boolean;
+  /** Predecessor task IDs to link at creation time. */
+  blockedBy?: string[];
+  /** Edit-mode dependency draft and persistence state. */
+  editDependencies?: Pick<TaskEditDialogDependenciesState, "isDirty" | "ready" | "save">;
+  /** Optional host folder for repo-less tasks; empty means kandev creates a scratch workspace. */
+  workspacePath: string;
+  /** Priority to submit with the created task. Defaults to `medium`. */
+  priority: TaskPriority;
+  /** Task-only replacements for fixed workflow step agent profiles. */
+  workflowAgentOverrides: Record<string, string>;
+  /** Create-mode validation shared by the footer and every submit entry point. */
+  workflowAgentOverridesBlockedReason?: string;
+  /**
+   * Optional async transform applied to the trimmed description before the
+   * API payload is built. Used by feature wrappers (e.g. Improve Kandev) to
+   * append generated context like bundle file paths.
+   */
+  transformDescriptionBeforeSubmit?: (description: string) => Promise<string> | string;
+};
+
+import type { JiraTicket } from "@/lib/types/jira";
+import type { LinearIssue } from "@/lib/types/linear";
+import type { useKeyboardShortcutHandler } from "@/hooks/use-keyboard-shortcut";
+
+/**
+ * Props shared by all dialog-body variants (CreateModeBody, SessionModeBody,
+ * DialogFormBody). Lives in this types module so task-create-dialog.tsx
+ * stays under the per-file line cap — the dialog file is already a thin
+ * orchestrator over many sibling modules and this is the largest type
+ * surface left in it.
+ */
+export type DialogFormBodyProps = {
+  isSessionMode: boolean;
+  isCreateMode: boolean;
+  isEditMode: boolean;
+  /** Create-mode opt-in: hide the manual title field and use the prompt. */
+  autoTitle?: boolean;
+  isTaskStarted: boolean;
+  initialDescription: string;
+  workspaceId: string | null;
+  onJiraImport?: (ticket: JiraTicket) => void;
+  onLinearImport?: (issue: LinearIssue) => void;
+  agentProfileOptions: ReturnType<typeof useAgentProfileOptions>;
+  executorProfileOptions: ComboboxOption[];
+  agentProfiles: AgentProfileOption[];
+  agentProfilesLoading: boolean;
+  executorsLoading: boolean;
+  isCreatingSession: boolean;
+  isCreatingTask?: boolean;
+  workflows: WorkflowsState["items"];
+  snapshots: KanbanMultiState["snapshots"];
+  effectiveWorkflowId: string | null;
+  launchPreview: TaskCreateLaunchPreview | null;
+  fs: DialogFormState;
+  editDependencies: TaskEditDialogDependenciesState;
+  handleKeyDown: ReturnType<typeof useKeyboardShortcutHandler>;
+  onTaskNameChange: (v: string) => void;
+  onRowRepositoryChange: (key: string, value: string) => void;
+  onRowBranchChange: (key: string, value: string) => void;
+  onRowPolicyChange?: (key: string, policyId: string, baseBranch: string) => void;
+  onAgentProfileChange: (v: string) => void;
+  onExecutorProfileChange: (v: string) => void;
+  onWorkflowChange: (v: string) => void;
+  onToggleRemote?: () => void;
+  onToggleFreshBranch: (enabled: boolean) => void;
+  onToggleNoRepository?: () => void;
+  onWorkspacePathChange: (value: string) => void;
+  /** Repository sets available in this workspace, and how to apply or define one. */
+  repositorySets?: {
+    sets: RepositorySet[];
+    onApply: (set: RepositorySet) => void;
+    /**
+     * Present when the current selection can be saved as a new set. Null when
+     * there is no workspace-repository row to save, so the action is never a
+     * dead end.
+     */
+    save?: {
+      workspaceId: string;
+      rows: TaskRepoRow[];
+      repositories: Repository[];
+      isLocalExecutor: boolean;
+      freshBranchEnabled: boolean;
+      open: boolean;
+      setOpen: (open: boolean) => void;
+    } | null;
+  };
+  localRepositoryCreation?: {
+    executorSelection:
+      | import("@/components/task-create-dialog-handlers").DirectLocalExecutorSelection
+      | null;
+    onCreated: (rowKey: string, repository: Repository) => void;
+  };
+  enhance?: DialogPromptEnhance;
+  workflowAgentLocked: boolean;
+  /** Workspace repositories — driven into the chip row for repo + branch picks. */
+  repositories: Repository[];
+  onRefreshRepositories?: () => void;
+  repositoriesRefreshing?: boolean;
+  lastUsedBranch?: string | null;
+  userSettingsLoaded?: boolean;
+  /** Computed in the parent: single-row + local executor + not URL mode. */
+  freshBranchAvailable: boolean;
+  /**
+   * True when the selected executor profile runs locally on the host. Used
+   * to lock the per-row branch pill (the user's checkout dictates the
+   * branch for local execution; fresh-branch mode unlocks it).
+   */
+  isLocalExecutor: boolean;
+  agentCompatState: AgentCompatState;
+  /** Label of the effective agent profile, for the incompatible-agent note. */
+  selectedAgentProfileName: string | null;
+  /** Name of the effective workflow, for the workflow-locked incompatible note. */
+  effectiveWorkflowName: string | null;
+  executorProfileName: string | null;
+  /** Optional render slot above the description editor. */
+  aboveDescriptionSlot?: React.ReactNode;
+  /** Optional render slot inside the dialog body (rendered above the chip row). */
+  extraFormSlot?: React.ReactNode;
+  /** Optional render slot at the bottom of the dialog body (above the footer). */
+  bottomSlot?: React.ReactNode;
+  /** Optional override for the description placeholder. */
+  descriptionPlaceholder?: string;
+  /** When true, hides the workflow picker so the enforced workflow can't be swapped. */
+  workflowLocked?: boolean;
+  workflowAgentOverrideRows: WorkflowAgentOverrideRow[];
+  workflowAgentOverrideOptions: WorkflowAgentOverrideOption[];
+  workflowAgentOverridesLoading: boolean;
+  workflowAgentOverridesInvalid: boolean;
+  workflowAgentOverridesError: boolean;
+  onWorkflowAgentOverrideChange: (sourceProfileId: string, replacementProfileId: string) => void;
+  onResetWorkflowAgentOverrides: () => void;
+  onRetryWorkflowAgentOverrides: () => void;
+  /**
+   * Called by a plugin composer action after it inserted text into the
+   * description and wants the form submitted the native way. The dialog
+   * routes this to a programmatic form submit so dictation can create the task
+   * hands-free.
+   */
+  onComposerSubmit?: () => boolean | Promise<boolean>;
+  /** From computeRunnerEditable: gates the executor-profile selector independently of isTaskStarted. */
+  runnerEditable: boolean;
+  /** From computeRunnerIneligibleReason: presented when runnerEditable is false. */
+  runnerIneligibleReason: string;
+};

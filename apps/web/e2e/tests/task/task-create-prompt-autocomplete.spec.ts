@@ -1,0 +1,124 @@
+import { test, expect } from "../../fixtures/test-base";
+import { KanbanPage } from "../../pages/kanban-page";
+import { expectTaskDescription } from "../../pages/task-description-editor";
+import type { Page } from "@playwright/test";
+
+const PROMPT_NAME = "e2e-bug-template";
+const PROMPT_CONTENT = "Reproduce, isolate, fix with a regression test.";
+const MENU_TITLE = /Mention tasks, files, prompts/i;
+
+async function clearTaskCreateDrafts(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    for (const key of Object.keys(window.sessionStorage)) {
+      if (key.startsWith("kandev.taskCreateDraft.")) window.sessionStorage.removeItem(key);
+    }
+  });
+}
+
+test.describe("Task creation: custom prompt autocomplete", () => {
+  test.afterEach(async ({ apiClient }) => {
+    const { prompts } = await apiClient.listPrompts();
+    for (const p of prompts) {
+      if (!p.builtin && p.name === PROMPT_NAME) {
+        await apiClient.deletePrompt(p.id).catch(() => undefined);
+      }
+    }
+  });
+
+  test("typing @<name> opens the menu and selecting inserts a prompt reference", async ({
+    testPage,
+    apiClient,
+  }) => {
+    test.setTimeout(60_000);
+
+    await apiClient.createPrompt(PROMPT_NAME, PROMPT_CONTENT);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await clearTaskCreateDrafts(testPage);
+    await kanban.createTaskButton.first().click();
+
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    const editor = testPage.getByTestId("task-description-input");
+    // A draft can be restored by the dialog after the storage cleanup above
+    // if the previous dialog-close save is still settling. This scenario is
+    // specifically about inserting into an empty composer, so establish that
+    // user-visible starting state before typing the mention.
+    await editor.fill("");
+    await editor.click();
+    await editor.pressSequentially("@e2e-bu");
+
+    const menu = testPage.getByText(MENU_TITLE);
+    await expect(menu).toBeVisible({ timeout: 5_000 });
+    const promptOption = testPage.getByRole("option").filter({ hasText: PROMPT_NAME });
+    await expect(promptOption).toBeVisible();
+    await expect(promptOption).toHaveAttribute("aria-selected", "true");
+
+    await editor.press("Enter");
+
+    await expectTaskDescription(editor, `@${PROMPT_NAME}`);
+    await expect(menu).not.toBeVisible();
+  });
+
+  test("typing @ inside a word does NOT open the menu", async ({ testPage, apiClient }) => {
+    test.setTimeout(60_000);
+
+    await apiClient.createPrompt(PROMPT_NAME, PROMPT_CONTENT);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await clearTaskCreateDrafts(testPage);
+    await kanban.createTaskButton.first().click();
+    await expect(testPage.getByTestId("create-task-dialog")).toBeVisible();
+
+    const editor = testPage.getByTestId("task-description-input");
+    await editor.click();
+    // No preceding whitespace before @ — the trigger is invalid.
+    await editor.pressSequentially("foo@bar");
+
+    await expectTaskDescription(editor, "foo@bar");
+    await expect(testPage.getByText(MENU_TITLE)).toHaveCount(0);
+  });
+
+  test("Enter inside the menu does NOT submit the form", async ({ testPage, apiClient }) => {
+    test.setTimeout(60_000);
+
+    await apiClient.createPrompt(PROMPT_NAME, PROMPT_CONTENT);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+    await clearTaskCreateDrafts(testPage);
+    await kanban.createTaskButton.first().click();
+
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+    await expectTaskDescription(testPage.getByTestId("task-description-input"), "");
+
+    // Fill title so the form would be otherwise submittable.
+    await testPage.getByTestId("task-title-input").fill("autocomplete-enter-test");
+    const editor = testPage.getByTestId("task-description-input");
+    await editor.click();
+    await editor.pressSequentially("@e2e-bu");
+
+    // Wait for the menu AND its option to actually populate before pressing
+    // Enter. The autocomplete popup can open a beat before its options hydrate;
+    // pressing Enter against an empty/half-open menu lets the key fall through
+    // to the form submit, which closes the dialog and fails the assertions
+    // below. Gating on the option (not just the title) is the condition that
+    // makes the selection deterministic. Also wait for the filtered result to
+    // become the active item: the menu opens on the bare `@` trigger before
+    // the async frame that applies the typed query, so an early Enter could
+    // still select the first built-in prompt.
+    await expect(testPage.getByText(MENU_TITLE)).toBeVisible();
+    const promptOption = testPage.getByRole("option").filter({ hasText: PROMPT_NAME });
+    await expect(promptOption).toBeVisible();
+    await expect(promptOption).toHaveAttribute("aria-selected", "true");
+    await editor.press("Enter");
+
+    // Dialog must still be open — Enter selected the menu item, not the form submit.
+    await expect(dialog).toBeVisible();
+    await expectTaskDescription(editor, `@${PROMPT_NAME}`);
+  });
+});

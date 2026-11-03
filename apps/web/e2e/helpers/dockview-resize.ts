@@ -1,0 +1,272 @@
+import { expect, type Page } from "@playwright/test";
+import { computeRightMaxPx, computeSidebarMaxPx } from "../../lib/state/layout-manager/caps";
+import type { SeedData } from "../fixtures/test-base";
+import type { ApiClient } from "../helpers/api-client";
+import { SessionPage } from "../pages/session-page";
+import { dwell } from "./causal-waits";
+
+export const WIDE_VIEWPORT = { width: 1600, height: 900 };
+
+/** Open a fresh task at the given (or wide-default) viewport and wait for
+ *  the desktop dockview layout to settle. Shared by every pane-resize spec. */
+export async function openWideTask(
+  page: Page,
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+  viewport: { width: number; height: number } = WIDE_VIEWPORT,
+): Promise<SessionPage> {
+  await page.setViewportSize(viewport);
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description: "/e2e:simple-message",
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repository_ids: [seedData.repositoryId],
+    },
+  );
+  await page.goto(`/t/${task.id}`);
+  const session = new SessionPage(page);
+  await session.waitForLoad();
+  await session.waitForDockviewReady();
+  return session;
+}
+
+/** Read the live pixel width of a dockview group containing a given panel. */
+export async function getDockviewGroupWidth(page: Page, panelId: string): Promise<number> {
+  return page.evaluate((id) => {
+    type Group = { width: number };
+    type Panel = { group: Group };
+    type Api = { getPanel: (id: string) => Panel | undefined };
+    const api = (window as unknown as { __dockviewApi__?: Api }).__dockviewApi__;
+    if (!api) throw new Error("dockview api not exposed");
+    const pnl = api.getPanel(id);
+    if (!pnl) throw new Error(`panel ${id} not found`);
+    return pnl.group.width;
+  }, panelId);
+}
+
+/** Read the dockview container's live pixel width. */
+export async function getDockviewContainerWidth(page: Page): Promise<number> {
+  return page.evaluate(() =>
+    Math.round(document.querySelector(".dv-dockview")?.getBoundingClientRect().width ?? -1),
+  );
+}
+
+/**
+ * Wait for a `setViewportSize` to have reached dockview's layout.
+ *
+ * Two conditions, both required, evaluated together in one `page.evaluate` so
+ * they describe a single instant:
+ *
+ *  1. the container's CSS box has moved off the width it had before, and
+ *  2. dockview's own `api.width` agrees with that box.
+ *
+ * (1) alone is not enough, and the reason is subtle. The app syncs a container
+ * resize into `api.layout` from `setupContainerResizeSync`'s ResizeObserver;
+ * measured under load (12 saturated cores, 6x CDP CPU throttling, five
+ * scenarios: auto shrink and grow, manual-width shrink and grow, over-cap
+ * re-clamp), that sync is already complete at the first ResizeObserver
+ * delivery reporting the new box, right column included. But a poll does not
+ * observe via ResizeObserver: `getBoundingClientRect()` forces a synchronous
+ * reflow, so it can read the post-resize box in a task that runs *before* that
+ * delivery, and therefore before `api.layout`. Condition (2) closes that
+ * window by reading the value the sync actually produces.
+ *
+ * (2) alone would be the already-true trap: `api.width` matches the box before
+ * the viewport changes as well, so it is satisfied instantly. Only the pair is
+ * causal, which is why this is not simply a poll on the expected group width.
+ * That matters most for the callers asserting a width must **not** change
+ * across the resize: they have no event of their own, and polling the value
+ * they expect would pass against the width that was already there.
+ *
+ * A 1px tolerance absorbs fractional-vs-rounded differences between the two
+ * readings; it is far below any real column-width assertion's slack.
+ */
+export async function waitForDockviewViewportResize(
+  page: Page,
+  previousContainerWidth: number,
+  timeout = 5_000,
+): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page.evaluate((previous) => {
+          const element = document.querySelector(".dv-dockview");
+          const api = (window as unknown as { __dockviewApi__?: { width: number } })
+            .__dockviewApi__;
+          if (!element) return "no dockview container";
+          if (!api) return "dockview api not exposed";
+          const css = Math.round(element.getBoundingClientRect().width);
+          if (css === previous) return `container still ${css}px`;
+          const layout = Math.round(api.width);
+          if (Math.abs(layout - css) > 1) return `container ${css}px but api.width ${layout}px`;
+          return "settled";
+        }, previousContainerWidth),
+      {
+        timeout,
+        message: `dockview never took the new viewport (was ${previousContainerWidth}px)`,
+      },
+    )
+    .toBe("settled");
+}
+
+/** Read the live pixel width of a dockview group by group ID. */
+export async function getDockviewGroupWidthById(page: Page, groupId: string): Promise<number> {
+  return page.evaluate((id) => {
+    type Group = { id: string; width: number };
+    type Api = { groups: Group[] };
+    const api = (window as unknown as { __dockviewApi__?: Api }).__dockviewApi__;
+    if (!api) throw new Error("dockview api not exposed");
+    const g = api.groups.find((grp) => grp.id === id);
+    if (!g) throw new Error(`group ${id} not found`);
+    return g.width;
+  }, groupId);
+}
+
+/**
+ * Programmatically resize a column via dockview's internal splitview API.
+ *
+ * `targetWidth` is the desired width in pixels; dockview clamps it against
+ * the constraints applied by `setConstraints`, so the returned actual width
+ * reflects what was permitted (cap-enforcement is what we want to verify).
+ *
+ * Avoids the flakiness of real pointer motion in headless CI — `page.mouse`
+ * drags are sensitive to viewport-overlap and pointer-events targeting,
+ * which produce intermittent failures across sharded browser instances.
+ */
+async function loosenPinnedConstraints(
+  page: Page,
+  column: "sidebar" | "right",
+  runtimeCap: number,
+): Promise<void> {
+  await page.evaluate(
+    ({ col, cap }) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const api = (window as any).__dockviewApi__;
+      if (!api) return;
+      const constraint = { maximumWidth: cap, minimumWidth: 50 };
+      if (col === "sidebar") {
+        api.getPanel("sidebar")?.group.api.setConstraints(constraint);
+        return;
+      }
+      const r = api.getPanel("files") ?? api.getPanel("changes");
+      r?.group.api.setConstraints(constraint);
+      for (const gid of ["group-right-top", "group-right-bottom"]) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        api.groups.find((g: any) => g.id === gid)?.api.setConstraints(constraint);
+      }
+    },
+    { col: column, cap: runtimeCap },
+  );
+}
+
+// eslint-disable-next-line complexity
+export async function resizeColumnViaSplitview(
+  page: Page,
+  column: "sidebar" | "right",
+  targetWidth: number,
+): Promise<number> {
+  // Production locks pinned-column maxWidth to the current width to prevent
+  // dockview's proportional rebalance from growing them. Real users bypass
+  // that lock via the sash-drag handler (mousedown widens the cap to the
+  // runtime container-proportional cap). Tests simulate the same widening —
+  // to the same runtime cap, NOT unlimited — so cap-enforcement assertions
+  // still work end-to-end. Production uses Dockview's measured width because
+  // the app sidebar is outside the workbench.
+  const { availableWidth, sidebarWidth } = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api = (window as any).__dockviewApi__;
+    const sv = api?.component?.gridview?.root?.splitview;
+    return {
+      availableWidth:
+        api?.width ?? document.querySelector<HTMLElement>(".dv-dockview")?.clientWidth ?? 1440,
+      sidebarWidth: api?.getPanel("sidebar") && sv?.length >= 3 ? sv.getViewSize(0) : 0,
+    };
+  });
+  const runtimeCap =
+    column === "sidebar"
+      ? computeSidebarMaxPx(availableWidth)
+      : computeRightMaxPx(availableWidth, sidebarWidth);
+  await loosenPinnedConstraints(page, column, runtimeCap);
+  const result = await page.evaluate(
+    // eslint-disable-next-line complexity
+    ({ col, target }) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const w = window as any;
+      const api = w.__dockviewApi__;
+      const sv = api?.component?.gridview?.root?.splitview;
+      if (!api || !sv) throw new Error("dockview splitview not exposed");
+      if (sv.length < 2) throw new Error("dockview has fewer than 2 columns");
+      if (col === "sidebar" && !api.getPanel("sidebar")) {
+        throw new Error("cannot resize sidebar when hidden (index 0 is center column)");
+      }
+      const idx = col === "sidebar" ? 0 : sv.length - 1;
+      const sash =
+        col === "right"
+          ? (sv.sashes?.[sv.sashes.length - 1]?.container as HTMLElement | undefined)
+          : null;
+      sash?.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true }));
+      sv.resizeView(idx, target);
+      sash?.dispatchEvent(new MouseEvent("mouseup", { button: 0, bubbles: true }));
+      const actual = sv.getViewSize(idx) as number;
+      // Mirror the production sash-drag mouseup behavior: update the pinned
+      // target so `enforcePinnedTargets` doesn't restore the old size on the
+      // next layout-change tick.
+      if (typeof w.__setPinnedTarget__ === "function") {
+        w.__setPinnedTarget__(col, actual);
+      }
+      // The sidebar width is a global pref persisted on a real drag's mouseup.
+      // Mirror that so cross-task / reload assertions see the same width.
+      if (col === "sidebar" && typeof w.__setGlobalSidebarWidth__ === "function") {
+        w.__setGlobalSidebarWidth__(actual);
+      }
+      // `sv.resizeView` alone does not fire `onDidLayoutChange` in dockview
+      // 4.x — without that, the debounced layout-persistence handler never
+      // saves the new width. Call the exposed test helper to force-flush the
+      // current layout into storage so reload assertions see the new state.
+      if (typeof w.__persistDockviewLayout__ === "function") {
+        w.__persistDockviewLayout__();
+      }
+      return actual;
+    },
+    { col: column, target: targetWidth },
+  );
+  // The evaluate above force-flushes via `__persistDockviewLayout__`, but the
+  // ordinary debounced write can still be in flight behind it. Not converted to
+  // an observation of the stored layout: a resize that clamps to the width it
+  // already had writes nothing, and the ~30 call sites include several that
+  // deliberately ask for a clamped width.
+  await dwell(
+    page,
+    400,
+    "product-timer",
+    "the dockview layout persists on a ~350ms debounce in our own code and publishes nothing when it lands, so reload assertions downstream have to be spaced past it",
+  );
+  return result;
+}
+
+/**
+ * Return the index of the sash bordering the sidebar / right column.
+ *  - sidebar sash: between groups[0] and groups[1] (= sash 0)
+ *  - right sash:  between groups[N-2] and groups[N-1] (= last sash)
+ */
+export async function getColumnSashIndex(page: Page, column: "sidebar" | "right"): Promise<number> {
+  if (column === "sidebar") return 0;
+  return page.evaluate(() => {
+    const count = document.querySelectorAll(".dv-sash").length;
+    if (count === 0) throw new Error("no .dv-sash elements found");
+    return count - 1;
+  });
+}
+
+/** Expect a width to be approximately equal (±slack px) to a target. */
+export function expectApproxWidth(actual: number, target: number, slack = 8): void {
+  expect(
+    Math.abs(actual - target) <= slack,
+    `width ${actual} not within ±${slack} of target ${target}`,
+  ).toBe(true);
+}

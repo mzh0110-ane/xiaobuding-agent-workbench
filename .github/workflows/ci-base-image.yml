@@ -1,0 +1,184 @@
+name: CI base image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/docker/ci-base/**
+      - .github/workflows/ci-base-image.yml
+      - apps/backend/go.mod
+      - apps/pnpm-lock.yaml
+      - apps/web/package.json
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/docker/ci-base/**
+      - .github/workflows/ci-base-image.yml
+      - apps/backend/go.mod
+      - apps/pnpm-lock.yaml
+      - apps/web/package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/kdlbs/kandev-ci
+  POSTGRES_DIGEST: sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54
+  POSTGRES_SOURCE: docker.io/library/postgres:16@sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54
+  POSTGRES_TARGET: ghcr.io/kdlbs/kandev-ci:postgres-16
+  POSTGRES_18_DIGEST: sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+  POSTGRES_18_SOURCE: docker.io/library/postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+  POSTGRES_18_TARGET: ghcr.io/kdlbs/kandev-ci:postgres-18
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Push the built images to GHCR on any `push` to main (the default
+      # publish path) or on manual `workflow_dispatch` (used to seed new tag
+      # names from a feature branch before the consumer workflows on the same
+      # branch can pull them — otherwise we hit a chicken-and-egg loop where
+      # the PR that introduces a new tag can never go green).
+      - name: Log in to GHCR
+        if: |
+          github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Service containers are pulled before any job step can add retries. Keep
+      # the Postgres image beside the job image in GHCR so backend CI has one
+      # registry dependency. A single image-index source is copied byte-for-byte,
+      # so the upstream digest remains valid at the mirrored location.
+      - name: Mirror Postgres to GHCR
+        if: |
+          github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create \
+            --tag "${POSTGRES_TARGET}" \
+            "${POSTGRES_SOURCE}"
+
+          docker buildx imagetools create \
+            --tag "${POSTGRES_18_TARGET}" \
+            "${POSTGRES_18_SOURCE}"
+
+          mirrored_digest="sha256:$(
+            docker buildx imagetools inspect --raw "${POSTGRES_TARGET}" \
+              | sha256sum \
+              | cut -d ' ' -f 1
+          )"
+          if [[ "${mirrored_digest}" != "${POSTGRES_DIGEST}" ]]; then
+            echo "::error::Postgres mirror digest ${mirrored_digest} does not match ${POSTGRES_DIGEST}"
+            exit 1
+          fi
+
+          mirrored_18_digest="sha256:$(
+            docker buildx imagetools inspect --raw "${POSTGRES_18_TARGET}" \
+              | sha256sum \
+              | cut -d ' ' -f 1
+          )"
+          if [[ "${mirrored_18_digest}" != "${POSTGRES_18_DIGEST}" ]]; then
+            echo "::error::Postgres 18 mirror digest ${mirrored_18_digest} does not match ${POSTGRES_18_DIGEST}"
+            exit 1
+          fi
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          # Hash reflects image content (Dockerfile + dependencies) only; the
+          # workflow file is intentionally excluded so cosmetic edits to it
+          # (renaming a step, fixing a summary) don't produce a wasteful retag.
+          hash=$(cat \
+              .github/docker/ci-base/Dockerfile \
+              apps/backend/go.mod \
+              apps/pnpm-lock.yaml \
+              apps/web/package.json \
+            | sha256sum | cut -c1-12)
+          echo "image_tag=${hash}" >> "$GITHUB_OUTPUT"
+          echo "Computed content hash: sha-${hash}"
+
+      # Stage 1: runtime (Playwright + Node + pnpm + Docker CLI — no Go).
+      # Consumed by the `e2e` shards and `e2e-report`, where the smaller pull
+      # is the speedup that pays for the split.
+      - name: Build and push runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: .github/docker/ci-base/Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,scope=runtime,mode=max
+          tags: |
+            ${{ env.IMAGE_NAME }}:runtime-sha-${{ steps.tag.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:runtime-latest
+
+      # Stage 2: build (runtime + Go + golangci-lint + go-licenses).
+      # Consumed by the `build` job, `backend-tests`, and `frontend-tests`.
+      # `cache-from` includes the runtime scope so the shared lower layers
+      # only build once across both pushes.
+      - name: Build and push build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: .github/docker/ci-base/Dockerfile
+          target: build
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          cache-from: |
+            type=gha,scope=build
+            type=gha,scope=runtime
+          cache-to: type=gha,scope=build,mode=max
+          tags: |
+            ${{ env.IMAGE_NAME }}:build-sha-${{ steps.tag.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:build-latest
+
+      # Stage 3: desktop (runtime + Tauri Linux dependencies + Rust).
+      # Consumed by the host-independent desktop smoke job.
+      - name: Build and push desktop
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: .github/docker/ci-base/Dockerfile
+          target: desktop
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          cache-from: |
+            type=gha,scope=desktop
+            type=gha,scope=runtime
+          cache-to: type=gha,scope=desktop,mode=max
+          tags: |
+            ${{ env.IMAGE_NAME }}:desktop-sha-${{ steps.tag.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:desktop-latest
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Kandev CI base image"
+            echo ""
+            echo "- runtime: \`${IMAGE_NAME}:runtime-sha-${IMAGE_TAG}\` / \`runtime-latest\`"
+            echo "- build:   \`${IMAGE_NAME}:build-sha-${IMAGE_TAG}\` / \`build-latest\`"
+            echo "- desktop: \`${IMAGE_NAME}:desktop-sha-${IMAGE_TAG}\` / \`desktop-latest\`"
+            echo "- postgres: \`${POSTGRES_TARGET}@${POSTGRES_DIGEST}\`"
+            echo "- postgres 18: \`${POSTGRES_18_TARGET}@${POSTGRES_18_DIGEST}\`"
+            echo "- pushed:  \`${PUSHED}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+          PUSHED: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}

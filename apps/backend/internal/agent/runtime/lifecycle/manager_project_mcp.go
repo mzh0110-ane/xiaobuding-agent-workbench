@@ -1,0 +1,83 @@
+package lifecycle
+
+import (
+	"context"
+	"fmt"
+
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	agentctltypes "github.com/kandev/kandev/internal/agentctl/types"
+)
+
+// materializeRuntimeProjectMCP writes project-local MCP config for protocol-mode
+// agents whose underlying CLI does not consume ACP session/new mcpServers.
+func (m *Manager) materializeRuntimeProjectMCP(
+	ctx context.Context,
+	execution *AgentExecution,
+	agentConfig agents.Agent,
+	profileInfo *AgentProfileInfo,
+	executorType string,
+) error {
+	return m.materializeRuntimeProjectMCPWithPreparation(ctx, execution, agentConfig, profileInfo, executorType, nil)
+}
+
+func (m *Manager) materializeRuntimeProjectMCPWithPreparation(
+	ctx context.Context,
+	execution *AgentExecution,
+	agentConfig agents.Agent,
+	profileInfo *AgentProfileInfo,
+	executorType string,
+	progress *prepareProgressRecorder,
+) error {
+	if execution == nil || agentConfig == nil {
+		return nil
+	}
+	rt := agentConfig.Runtime()
+	if rt == nil || rt.ProjectMCPStrategy == nil {
+		return nil
+	}
+	if isCursorMCPAuthStrategy(rt.ProjectMCPStrategy) {
+		if err := m.prepareCursorMCPAuthWithProgress(execution, profileInfo, executorType, rt.ProjectMCPStrategy, progress); err != nil {
+			return err
+		}
+		return m.reconcileAndMaterializeCursorProjectMCPWithPreparation(ctx, execution, agentConfig, profileInfo, executorType, rt.ProjectMCPStrategy, progress)
+	}
+	if err := m.prepareCursorMCPAuth(execution, profileInfo, executorType, rt.ProjectMCPStrategy); err != nil {
+		return err
+	}
+	servers, err := m.runtimeProjectMCPServers(ctx, execution, agentConfig, profileInfo, executorType, rt.ProjectMCPStrategy)
+	if err != nil {
+		return err
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	artifacts, err := rt.ProjectMCPStrategy.BuildPassthroughMCP(servers, m.passthroughMCPPaths(execution))
+	if err != nil {
+		return fmt.Errorf("build project MCP config: %w", err)
+	}
+	return m.writePassthroughMCPFiles(execution, artifacts.Files)
+}
+
+func (m *Manager) runtimeProjectMCPServers(
+	ctx context.Context,
+	execution *AgentExecution,
+	agentConfig agents.Agent,
+	profileInfo *AgentProfileInfo,
+	executorType string,
+	strategy mcpconfig.PassthroughMCPStrategy,
+) ([]agentctltypes.McpServer, error) {
+	servers, err := m.passthroughMCPServers(ctx, execution, agentConfig, profileInfo, executorType, strategy)
+	if err == nil {
+		return servers, nil
+	}
+	if passthroughMCPConfigPort(execution) <= 0 {
+		m.logger.Warn("skipping project MCP config: agentctl instance port unavailable",
+			zap.String("execution_id", execution.ID),
+			zap.String("agent_id", agentConfig.ID()))
+		return nil, nil
+	}
+	return nil, err
+}

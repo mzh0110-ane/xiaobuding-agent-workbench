@@ -1,0 +1,239 @@
+package shared
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/kandev/kandev/internal/office/models"
+	"github.com/kandev/kandev/internal/workflow/engine"
+)
+
+// ErrEngineNoSession is returned by WorkflowEngineDispatcher when a task has
+// no active or reusable session, so the workflow engine cannot evaluate a
+// trigger for it.
+var ErrEngineNoSession = errors.New("workflow engine: no active session for task")
+
+// ErrWorkspacePaused is the typed error every gate site (workspace-kill-
+// switch) returns when PauseGate.PauseState reports a confirmed pause. It
+// is a shared sentinel — not office/pause's own type — so every consumer
+// package (routines, service, scheduler, wakeup) and every caller that
+// branches on it (routine HTTP handlers, the cron ticker, reactivity, the
+// approval adapter) can import it without importing office/pause itself.
+var ErrWorkspacePaused = errors.New("office: workspace paused")
+
+// ErrPauseGateUnavailable is the typed error a gate site returns when
+// PauseGate.PauseState itself failed (read error), distinct from a
+// confirmed pause: the gate fails closed on this error too, but callers
+// that map it to HTTP use 503, not 409, and cron/event logging keeps it at
+// its ordinary level rather than swallowing it the way a confirmed pause is.
+var ErrPauseGateUnavailable = errors.New("office: workspace pause state unavailable")
+
+// PauseGate is the narrow read-only surface every gate site consults
+// before dispatching, queueing, or launching work. Implemented by
+// office/pause.Service and wired in via each consumer's own SetPauseGate
+// setter — defined once here (rather than duplicated per consumer package)
+// because every implementation and every caller share the identical
+// signature and the same two sentinel errors above.
+type PauseGate interface {
+	// PauseState returns the workspace's active pause record, or (nil, nil)
+	// when the workspace is running. A non-nil error means the read itself
+	// failed (fail closed); it is not a signal that the workspace is paused.
+	PauseState(ctx context.Context, workspaceID string) (*models.WorkspacePause, error)
+}
+
+// AgentReader provides read access to agent instances.
+// Implemented by the agents feature (and transitionally by office/service.Service).
+type AgentReader interface {
+	// GetAgentInstance looks up an agent by ID or name.
+	GetAgentInstance(ctx context.Context, idOrName string) (*models.AgentInstance, error)
+	// ListAgentInstances returns all agent instances for a workspace.
+	// An empty wsID returns agents across all workspaces.
+	ListAgentInstances(ctx context.Context, wsID string) ([]*models.AgentInstance, error)
+	// ListAgentInstancesByIDs returns agent instances whose ids are in `ids`,
+	// in unspecified order. Rows missing from the DB are omitted. An empty
+	// input returns an empty slice.
+	ListAgentInstancesByIDs(ctx context.Context, ids []string) ([]*models.AgentInstance, error)
+}
+
+// AgentWriter provides write access to agent status.
+// Implemented by the agents feature (and transitionally by office/service.Service).
+type AgentWriter interface {
+	// UpdateAgentStatusFields persists a new status and optional pause reason for an agent.
+	UpdateAgentStatusFields(ctx context.Context, agentID, status, pauseReason string) error
+}
+
+// QueueOutcome reports what a RunQueuer.QueueRun call actually did. This is
+// the neutral queue contract shared by office producers and the runs service.
+// The runs service aliases this type so callers can compare outcomes across
+// the two package boundaries without maintaining duplicate declarations.
+type QueueOutcome string
+
+const (
+	// QueueOutcomeQueued means a new runs row was inserted.
+	QueueOutcomeQueued QueueOutcome = "queued"
+	// QueueOutcomeDeduped means an existing row with the same IdempotencyKey
+	// already existed and no new row was inserted.
+	QueueOutcomeDeduped QueueOutcome = "deduped"
+	// QueueOutcomeCoalesced means the request was merged into an existing
+	// pending run rather than creating a new one.
+	QueueOutcomeCoalesced QueueOutcome = "coalesced"
+	// QueueOutcomeNone means no enqueue was attempted, or the attempt
+	// returned an error before any outcome was determined.
+	QueueOutcomeNone QueueOutcome = ""
+	// QueueOutcomeRateLimited means an agent-initiated assignment wake was
+	// refused because its task allowance was exhausted. No row was inserted
+	// and no existing row was merged.
+	QueueOutcomeRateLimited QueueOutcome = "rate_limited"
+)
+
+// RunQueuer enqueues run requests for agent instances.
+// Implemented by the run feature (and transitionally by office/service.Service).
+type RunQueuer interface {
+	// QueueRun enqueues a run for agentInstanceID with the given reason, payload,
+	// and optional idempotency key (empty string disables deduplication). The
+	// returned QueueOutcome reports what actually happened (queued / deduped /
+	// coalesced / none-on-error) so callers that need to distinguish a fresh
+	// insert from a no-op don't have to infer it from side effects.
+	QueueRun(ctx context.Context, agentInstanceID, reason, payload, idempotencyKey string) (QueueOutcome, error)
+}
+
+// WorkflowEngineDispatcher routes typed office task events through the
+// workflow engine. Implementations resolve the task's session and translate
+// typed trigger payloads into engine.HandleInput.
+type WorkflowEngineDispatcher interface {
+	HandleTrigger(
+		ctx context.Context,
+		taskID string,
+		trigger engine.Trigger,
+		payload any,
+		operationID string,
+	) error
+}
+
+// ActivityLogger logs activity entries across office features.
+// Implemented by the ActivityLoggerImpl in shared/activity.go.
+type ActivityLogger interface {
+	// LogActivity records an activity entry. Errors are logged but not returned.
+	LogActivity(ctx context.Context, wsID, actorType, actorID, action, targetType, targetID, details string)
+	// LogActivityWithRun records an activity entry tagged with the originating
+	// office run id (and optional session id). Use this from agent-driven
+	// mutation paths so the run detail page's Tasks Touched surface can join
+	// activity rows back to the run that produced them.
+	LogActivityWithRun(ctx context.Context, wsID, actorType, actorID, action, targetType, targetID, details, runID, sessionID string)
+}
+
+// CostChecker reads cost data for budget and dashboard features.
+// Implemented by the costs feature (and transitionally by office/service.Service).
+type CostChecker interface {
+	// GetCostSummary returns the total spend in subcents (hundredths of a
+	// cent) for a workspace.
+	GetCostSummary(ctx context.Context, wsID string) (int64, error)
+}
+
+// BudgetChecker evaluates budget policies before or after execution.
+// Implemented by the budgets feature (and transitionally by office/service.Service).
+type BudgetChecker interface {
+	// CheckPreExecutionBudget returns (allowed, reason, error).
+	// If allowed is false, the caller should skip execution.
+	CheckPreExecutionBudget(ctx context.Context, agentInstanceID, projectID, workspaceID string) (bool, string, error)
+}
+
+// SkillReader provides read access to skill definitions.
+// Implemented by the skills feature (and transitionally by office/service.Service).
+type SkillReader interface {
+	// GetSkillFromConfig looks up a skill by ID or slug.
+	GetSkillFromConfig(ctx context.Context, idOrSlug string) (*models.Skill, error)
+	// ListSkillsFromConfig returns all skills for a workspace.
+	// An empty workspaceID returns skills across all workspaces.
+	ListSkillsFromConfig(ctx context.Context, workspaceID string) ([]*models.Skill, error)
+}
+
+// ProjectReader provides read access to project records.
+// Implemented by the projects feature (and transitionally by office/service.Service).
+type ProjectReader interface {
+	// GetProjectFromConfig looks up a project by ID or name.
+	GetProjectFromConfig(ctx context.Context, idOrName string) (*models.Project, error)
+	// ListProjectsFromConfig returns all projects for a workspace.
+	// An empty workspaceID returns projects across all workspaces.
+	ListProjectsFromConfig(ctx context.Context, workspaceID string) ([]*models.Project, error)
+}
+
+// RoutineReader provides read access to routine records.
+// Implemented by the routines feature (and transitionally by office/service.Service).
+type RoutineReader interface {
+	// GetRoutineFromConfig looks up a routine by ID or name.
+	GetRoutineFromConfig(ctx context.Context, idOrName string) (*models.Routine, error)
+	// ListRoutinesFromConfig returns all routines for a workspace.
+	// An empty workspaceID returns routines across all workspaces.
+	ListRoutinesFromConfig(ctx context.Context, workspaceID string) ([]*models.Routine, error)
+}
+
+// PendingPermission is a simplified, office-safe view of a pending
+// clarification/permission request for display in the office inbox.
+type PendingPermission struct {
+	PendingID string
+	SessionID string
+	TaskID    string
+	Prompt    string
+	Context   string
+	CreatedAt time.Time
+}
+
+// PermissionLister provides a snapshot of pending permission/clarification requests.
+// Implemented by clarification.Store (or any wrapper around it).
+type PermissionLister interface {
+	// ListPendingPermissions returns all pending permission requests.
+	// The returned slice is a snapshot; callers must not modify its elements.
+	ListPendingPermissions() []PendingPermission
+}
+
+// ModelPricing carries per-million-token pricing in subcents. Duplicates
+// the costs.ModelPricing shape so the shared package doesn't depend on
+// the costs package.
+type ModelPricing struct {
+	InputPerMillion       int64
+	CachedReadPerMillion  int64
+	CachedWritePerMillion int64
+	OutputPerMillion      int64
+}
+
+// PricingLookup resolves per-model pricing. Implemented by the
+// office/costs/modelsdev package. Returns (zero, false) when the model
+// is unknown or the cache hasn't warmed yet.
+type PricingLookup interface {
+	LookupForModel(ctx context.Context, modelID string) (ModelPricing, bool)
+}
+
+// PricingCatalogVersioner is an optional capability a PricingLookup
+// implementation may satisfy to report an "as-of" identifier for the
+// pricing data it served — recorded on CostEvent.PricingCatalogVersion so a
+// models.dev-list-priced row can be traced back to the catalogue state that
+// produced it. Deliberately separate from PricingLookup (rather than
+// widening it) so existing implementers and test fakes are unaffected;
+// callers type-assert and treat a missing implementation as "no version
+// available" (NULL column), not an error.
+type PricingCatalogVersioner interface {
+	// CatalogVersion returns an identifier for the currently-served
+	// pricing data, or "" when none is available yet (e.g. cold cache,
+	// nothing loaded). models.dev's dataset carries no version field of
+	// its own, so implementations report the load/fetch time instead.
+	CatalogVersion() string
+}
+
+// PricingLookupWithVersion is an optional capability a PricingLookup
+// implementation may satisfy to return pricing and its catalogue version
+// from one atomic snapshot. Calling LookupForModel and CatalogVersion
+// separately takes two independent lock acquisitions; a background refresh
+// can install a new catalogue in between and pair one catalogue's rates
+// with a different catalogue's version identifier on the stored row — a
+// provenance column that lies, which is the exact failure class
+// CostEvent.CostSource exists to eliminate. Callers type-assert and prefer
+// this over the separate calls whenever both values are needed together.
+type PricingLookupWithVersion interface {
+	// LookupForModelWithVersion behaves like PricingLookup.LookupForModel
+	// but also returns the catalogue version that produced the pricing,
+	// read from the same snapshot so the two can never describe different
+	// catalogue states.
+	LookupForModelWithVersion(ctx context.Context, modelID string) (pricing ModelPricing, version string, ok bool)
+}

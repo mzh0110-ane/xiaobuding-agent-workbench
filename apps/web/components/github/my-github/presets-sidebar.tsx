@@ -1,0 +1,361 @@
+"use client";
+
+import { IconX, IconDeviceFloppy, IconBookmark } from "@tabler/icons-react";
+import type { Icon } from "@tabler/icons-react";
+import { useCallback } from "react";
+import { Button } from "@kandev/ui/button";
+import { SavedQueryLoadStatus, type SavedQueryLoadState } from "./saved-query-load-status";
+import { cn } from "@/lib/utils";
+import { PR_PRESETS, ISSUE_PRESETS, type PresetOption, type PresetGroup } from "./search-bar";
+import type { SavedPreset } from "./saved-preset-model";
+import { useTranslation } from "react-i18next";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import { SavedQueryDefaultButton } from "@/components/integrations/saved-query-default-button";
+import { SavedTaskViewDeleteConfirmation } from "@/components/confirmation/saved-task-view-delete-confirmation";
+import {
+  useSavedTaskViewDeleteConfirmation,
+  type SavedTaskViewDeleteTarget,
+} from "@/components/confirmation/use-saved-task-view-delete-confirmation";
+
+export type SidebarSelection = {
+  kind: "pr" | "issue";
+  source: "preset" | "saved";
+  id: string;
+};
+
+export type SidebarSelectionRequest =
+  | SidebarSelection
+  | { kind: SidebarSelection["kind"]; source: "kind-switch" };
+
+export type PresetsSidebarProps = {
+  selected: SidebarSelection;
+  onSelect: (request: SidebarSelectionRequest) => void;
+  savedPresets: SavedPreset[];
+  onDeleteSaved: (id: string) => void;
+  canSaveCurrent: boolean;
+  onSaveCurrent: () => void;
+  onToggleSavedDefault: (preset: SavedPreset) => void;
+  defaultMutationPendingId: string | null;
+  prPresets?: PresetOption[];
+  issuePresets?: PresetOption[];
+  savedQueryLoad?: SavedQueryLoadState;
+};
+
+function KindToggle({
+  kind,
+  onChange,
+}: {
+  kind: "pr" | "issue";
+  onChange: (k: "pr" | "issue") => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="mx-2 mb-3 grid shrink-0 grid-cols-2 rounded-md border p-0.5 text-xs">
+      {(["pr", "issue"] as const).map((value) => (
+        <button
+          key={value}
+          type="button"
+          aria-pressed={kind === value}
+          onClick={() => onChange(value)}
+          className={cn(
+            "min-h-11 px-2 py-1 rounded cursor-pointer transition-colors",
+            kind === value
+              ? "bg-muted font-medium text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {value === "pr" ? t("github:pullRequests") : t("github:issues")}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SectionHeader({ title }: { title: string }) {
+  return (
+    <div className="px-2 mt-3 mb-1 text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
+      {title}
+    </div>
+  );
+}
+
+function PresetItem({
+  label,
+  Icon,
+  active,
+  onClick,
+  trailing,
+}: {
+  label: string;
+  Icon: Icon;
+  active: boolean;
+  onClick: () => void;
+  trailing?: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "group/item mx-1 flex min-w-0 items-center rounded-md text-sm transition-colors",
+        active ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:bg-muted/50",
+      )}
+    >
+      <button
+        type="button"
+        aria-pressed={active}
+        onClick={onClick}
+        className="flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Icon className="h-4 w-4 shrink-0" />
+        <span className="min-w-0 flex-1 break-words py-2">{label}</span>
+      </button>
+      {trailing}
+    </div>
+  );
+}
+
+function PresetGroupList({
+  presets,
+  group,
+  selected,
+  onSelect,
+  kind,
+}: {
+  presets: PresetOption[];
+  group: PresetGroup;
+  selected: SidebarSelection;
+  onSelect: (s: SidebarSelection) => void;
+  kind: "pr" | "issue";
+}) {
+  const { t } = useTranslation();
+  const items = presets.filter((p) => p.group === group);
+  if (items.length === 0) return null;
+  return (
+    <>
+      <SectionHeader title={group === "inbox" ? t("github:inbox") : t("github:created")} />
+      {items.map((p) => (
+        <PresetItem
+          key={`${kind}-${p.value}`}
+          label={p.label}
+          Icon={p.icon}
+          active={selected.source === "preset" && selected.id === p.value}
+          onClick={() => onSelect({ kind, source: "preset", id: p.value })}
+        />
+      ))}
+    </>
+  );
+}
+
+function SavedSection({
+  saved,
+  selected,
+  onSelect,
+  onDelete,
+  kind,
+  onToggleSavedDefault,
+  defaultMutationPendingId,
+  savedQueryLoad,
+}: {
+  saved: SavedPreset[];
+  selected: SidebarSelection;
+  onSelect: (s: SidebarSelection) => void;
+  onDelete: (id: string) => void;
+  kind: "pr" | "issue";
+  onToggleSavedDefault: (preset: SavedPreset) => void;
+  defaultMutationPendingId: string | null;
+  savedQueryLoad?: SavedQueryLoadState;
+}) {
+  const { t } = useTranslation();
+  const deletion = useSavedTaskViewDeleteConfirmation<HTMLButtonElement>(saved);
+  const { isMobile } = useResponsiveBreakpoint();
+  const defaultMutationPending = defaultMutationPendingId !== null;
+  return (
+    <>
+      <SectionHeader title={t("github:saved")} />
+      {savedQueryLoad && <SavedQueryLoadStatus {...savedQueryLoad} />}
+      {saved.length === 0 && !savedQueryLoad?.loading && !savedQueryLoad?.error && (
+        <div className="mx-2 px-2 py-1 text-xs text-muted-foreground/80 italic">
+          {t("github:noSavedQueriesYet")}
+        </div>
+      )}
+      {saved.map((preset) => (
+        <GitHubSavedPresetEntry
+          key={preset.id}
+          preset={preset}
+          active={selected.source === "saved" && selected.id === preset.id}
+          deletion={deletion}
+          defaultMutationPending={defaultMutationPending}
+          defaultMutationPendingForPreset={defaultMutationPendingId === preset.id}
+          onSelect={() => onSelect({ kind, source: "saved", id: preset.id })}
+          onDelete={onDelete}
+          onToggleDefault={() => void onToggleSavedDefault(preset)}
+        />
+      ))}
+      {isMobile && deletion.target && (
+        <SavedTaskViewDeleteConfirmation
+          target={deletion.target}
+          presentation="inline"
+          open
+          anchorRef={deletion.anchorRef}
+          confirmDisabled={defaultMutationPending}
+          onOpenChange={(open) => {
+            if (!open) deletion.close();
+          }}
+          onConfirm={onDelete}
+        />
+      )}
+    </>
+  );
+}
+
+type GitHubSavedDeletion = {
+  target: SavedTaskViewDeleteTarget | null;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
+  close: () => void;
+  registerAnchor: (id: string, element: HTMLButtonElement | null) => void;
+  request: (target: SavedTaskViewDeleteTarget) => void;
+};
+
+function GitHubSavedPresetEntry({
+  preset,
+  active,
+  deletion,
+  defaultMutationPending,
+  defaultMutationPendingForPreset,
+  onSelect,
+  onDelete,
+  onToggleDefault,
+}: {
+  preset: SavedPreset;
+  active: boolean;
+  deletion: GitHubSavedDeletion;
+  defaultMutationPending: boolean;
+  defaultMutationPendingForPreset: boolean;
+  onSelect: () => void;
+  onDelete: (id: string) => void;
+  onToggleDefault: () => void;
+}) {
+  const { t } = useTranslation();
+  const { isMobile } = useResponsiveBreakpoint();
+  if (!isMobile && deletion.target?.id === preset.id) {
+    return (
+      <div className="mx-1 min-w-0 p-1">
+        <SavedTaskViewDeleteConfirmation
+          target={deletion.target}
+          presentation="inline"
+          open
+          anchorRef={deletion.anchorRef}
+          confirmDisabled={defaultMutationPending}
+          onOpenChange={(open) => {
+            if (!open) deletion.close();
+          }}
+          onConfirm={onDelete}
+        />
+      </div>
+    );
+  }
+  const deleteLabel = t("integrations:deleteSavedQueryNamed", { label: preset.label });
+  const accessibleDeleteLabel = defaultMutationPending
+    ? t("integrations:savedQueryDefaultUpdateInProgress", { action: deleteLabel })
+    : deleteLabel;
+  return (
+    <PresetItem
+      label={preset.label}
+      Icon={IconBookmark}
+      active={active}
+      onClick={onSelect}
+      trailing={
+        <div className="flex shrink-0 items-center">
+          <SavedQueryDefaultButton
+            label={preset.label}
+            isDefault={preset.isDefault}
+            disabled={defaultMutationPending}
+            pending={defaultMutationPendingForPreset}
+            testId={`github-saved-query-default-${preset.id}`}
+            onToggle={onToggleDefault}
+          />
+          <button
+            ref={(element) => deletion.registerAnchor(preset.id, element)}
+            type="button"
+            disabled={defaultMutationPending}
+            onClick={() => deletion.request({ id: preset.id, label: preset.label })}
+            className="flex h-12 w-12 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-wait disabled:opacity-50"
+            title={accessibleDeleteLabel}
+            aria-label={accessibleDeleteLabel}
+          >
+            <IconX className="h-4 w-4" />
+          </button>
+        </div>
+      }
+    />
+  );
+}
+
+export function PresetsSidebar({
+  selected,
+  onSelect,
+  savedPresets,
+  onDeleteSaved,
+  canSaveCurrent,
+  onSaveCurrent,
+  onToggleSavedDefault,
+  defaultMutationPendingId,
+  prPresets = PR_PRESETS,
+  issuePresets = ISSUE_PRESETS,
+  savedQueryLoad,
+}: PresetsSidebarProps) {
+  const { t } = useTranslation();
+  const presets = selected.kind === "pr" ? prPresets : issuePresets;
+  const saved = savedPresets.filter((p) => p.kind === selected.kind);
+  const onKindChange = useCallback(
+    (kind: "pr" | "issue") => {
+      if (kind === selected.kind) return;
+      onSelect({ kind, source: "kind-switch" });
+    },
+    [onSelect, selected.kind],
+  );
+  return (
+    <nav className="flex w-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-3">
+      <KindToggle kind={selected.kind} onChange={onKindChange} />
+      <div
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-3"
+        data-testid="github-views-scroll"
+      >
+        <PresetGroupList
+          presets={presets}
+          group="inbox"
+          selected={selected}
+          onSelect={onSelect}
+          kind={selected.kind}
+        />
+        <PresetGroupList
+          presets={presets}
+          group="created"
+          selected={selected}
+          onSelect={onSelect}
+          kind={selected.kind}
+        />
+        <SavedSection
+          saved={saved}
+          selected={selected}
+          onSelect={onSelect}
+          onDelete={onDeleteSaved}
+          kind={selected.kind}
+          onToggleSavedDefault={onToggleSavedDefault}
+          defaultMutationPendingId={defaultMutationPendingId}
+          savedQueryLoad={savedQueryLoad}
+        />
+      </div>
+      <div className="shrink-0 border-t p-3">
+        <Button
+          variant="outline"
+          className="w-full cursor-pointer"
+          onClick={onSaveCurrent}
+          disabled={!canSaveCurrent}
+        >
+          <IconDeviceFloppy className="h-4 w-4 shrink-0" />
+          {t("github:saveCurrentQuery")}
+        </Button>
+      </div>
+    </nav>
+  );
+}

@@ -1,0 +1,892 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+var ErrWorkspaceSettingsValidation = errors.New("invalid workspace settings")
+
+const (
+	personalSearchFetchPageSize = 100
+	githubSearchResultLimit     = 1000
+)
+
+// TaskGitCredentialPolicy describes non-secret credential routing information
+// for one workspace. It is safe to persist in task-session metadata and render
+// in the Changes panel.
+type TaskGitCredentialPolicy struct {
+	Mode            string `json:"mode"`
+	WorkspaceMethod string `json:"workspace_method,omitempty"`
+	WorkspaceActor  string `json:"workspace_actor,omitempty"`
+}
+
+// DescribeTaskGitCredentialPolicy returns routing and known automation identity
+// without resolving a token, lease, or credential helper.
+func (s *Service) DescribeTaskGitCredentialPolicy(ctx context.Context, workspaceID string) (TaskGitCredentialPolicy, error) {
+	settings, err := s.GetWorkspaceSettings(ctx, workspaceID)
+	if err != nil {
+		return TaskGitCredentialPolicy{}, err
+	}
+	policy := TaskGitCredentialPolicy{Mode: settings.TaskGitCredentialsMode}
+	if s.store == nil {
+		return policy, nil
+	}
+	connection, err := s.store.GetWorkspaceConnection(ctx, workspaceID)
+	if err != nil || connection == nil {
+		return policy, nil
+	}
+	policy.WorkspaceMethod = string(connection.Source)
+	switch connection.Source {
+	case ConnectionSourcePAT, ConnectionSourceGHCLI:
+		policy.WorkspaceActor = connection.Login
+	case ConnectionSourceGitHubAppInstallation:
+		policy.WorkspaceActor = connection.InstallationAccountLogin
+	}
+	return policy, nil
+}
+
+// GetWorkspaceSettings returns the GitHub operational settings for a workspace.
+func (s *Service) GetWorkspaceSettings(ctx context.Context, workspaceID string) (*WorkspaceSettings, error) {
+	if err := s.authorizeWorkspaceAccess(ctx, workspaceID); err != nil {
+		return nil, err
+	}
+	if s.store == nil {
+		return defaultWorkspaceSettings(workspaceID), nil
+	}
+	return s.store.GetWorkspaceSettings(ctx, workspaceID)
+}
+
+// UpsertWorkspaceSettings stores the GitHub operational settings for a workspace.
+func (s *Service) UpsertWorkspaceSettings(ctx context.Context, settings *WorkspaceSettings) error {
+	if settings == nil {
+		return fmt.Errorf("workspace settings are required")
+	}
+	if err := s.authorizeWorkspaceAccess(ctx, settings.WorkspaceID); err != nil {
+		return err
+	}
+	if s.store == nil {
+		return fmt.Errorf("github store not configured")
+	}
+	return s.store.UpsertWorkspaceSettings(ctx, settings)
+}
+
+// UpdateWorkspaceSettings applies a partial update over the existing workspace
+// settings. Scope fields are intentionally updated as a set so switching to
+// All repos clears org/repo selections. Direct struct callers must set
+// SavedPresetsSet/DefaultQueriesSet when they intend to write those blobs;
+// JSON-bound requests set those flags in UpdateWorkspaceSettingsRequest.UnmarshalJSON.
+func (s *Service) UpdateWorkspaceSettings(ctx context.Context, req *UpdateWorkspaceSettingsRequest) (*WorkspaceSettings, error) {
+	if req == nil || strings.TrimSpace(req.WorkspaceID) == "" {
+		return nil, fmt.Errorf("%w: workspace_id is required", ErrWorkspaceSettingsValidation)
+	}
+	if err := s.authorizeWorkspaceAccess(ctx, req.WorkspaceID); err != nil {
+		return nil, err
+	}
+	if req.RepoScopeMode != nil && !isValidRepoScopeMode(*req.RepoScopeMode) {
+		return nil, fmt.Errorf("%w: invalid repo_scope_mode %q", ErrWorkspaceSettingsValidation, *req.RepoScopeMode)
+	}
+	if req.TaskGitCredentialsMode != nil && !isValidTaskGitCredentialsMode(*req.TaskGitCredentialsMode) {
+		return nil, fmt.Errorf("%w: invalid task_git_credentials_mode %q", ErrWorkspaceSettingsValidation, *req.TaskGitCredentialsMode)
+	}
+	if s.store == nil {
+		return nil, fmt.Errorf("github store not configured")
+	}
+	return s.store.PatchWorkspaceSettings(ctx, req)
+}
+
+func isValidTaskGitCredentialsMode(mode string) bool {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case TaskGitCredentialsModeManaged, TaskGitCredentialsModeExecutor:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) SearchUserPRsPagedForWorkspace(
+	ctx context.Context,
+	workspaceID string,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*PRSearchPage, error) {
+	return s.SearchUserPRsPagedForWorkspaceUser(ctx, workspaceID, "", filter, customQuery, page, perPage)
+}
+
+//nolint:dupl // The PR and issue adapters preserve their strongly typed public response contracts.
+func (s *Service) SearchUserPRsPagedForWorkspaceUser(
+	ctx context.Context,
+	workspaceID string,
+	userID string,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*PRSearchPage, error) {
+	return searchPersonalWorkspacePageResult(
+		ctx, s, workspaceID, userID, page, perPage,
+		func(resolved *resolvedServiceClient, settings *WorkspaceSettings, providerPage, providerPerPage int) ([]*PR, int, error) {
+			result, fetchErr := s.searchPersonalPRPage(ctx, resolved, settings, filter, customQuery, providerPage, providerPerPage)
+			if fetchErr != nil || result == nil {
+				return nil, 0, fetchErr
+			}
+			return result.PRs, result.TotalCount, nil
+		},
+		func(items []*PR) ([]*PR, error) { return s.filterPersonalPRsByAutomation(ctx, workspaceID, items) },
+		func(result filteredPersonalSearchPage[*PR], page, perPage int) *PRSearchPage {
+			return &PRSearchPage{PRs: result.items, TotalCount: result.total, Page: page, PerPage: perPage}
+		},
+	)
+}
+
+func (s *Service) SearchUserIssuesPagedForWorkspace(
+	ctx context.Context,
+	workspaceID string,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*IssueSearchPage, error) {
+	return s.SearchUserIssuesPagedForWorkspaceUser(ctx, workspaceID, "", filter, customQuery, page, perPage)
+}
+
+//nolint:dupl // The PR and issue adapters preserve their strongly typed public response contracts.
+func (s *Service) SearchUserIssuesPagedForWorkspaceUser(
+	ctx context.Context,
+	workspaceID string,
+	userID string,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*IssueSearchPage, error) {
+	return searchPersonalWorkspacePageResult(
+		ctx, s, workspaceID, userID, page, perPage,
+		func(resolved *resolvedServiceClient, settings *WorkspaceSettings, providerPage, providerPerPage int) ([]*Issue, int, error) {
+			result, fetchErr := s.searchPersonalIssuePage(ctx, resolved, settings, filter, customQuery, providerPage, providerPerPage)
+			if fetchErr != nil || result == nil {
+				return nil, 0, fetchErr
+			}
+			return result.Issues, result.TotalCount, nil
+		},
+		func(items []*Issue) ([]*Issue, error) {
+			return s.filterPersonalIssuesByAutomation(ctx, workspaceID, items)
+		},
+		func(result filteredPersonalSearchPage[*Issue], page, perPage int) *IssueSearchPage {
+			return &IssueSearchPage{
+				Issues: result.items, TotalCount: result.total, Page: page, PerPage: perPage,
+			}
+		},
+	)
+}
+
+func (s *Service) resolvePersonalSearchContext(
+	ctx context.Context, workspaceID, userID string,
+) (*resolvedServiceClient, *WorkspaceSettings, error) {
+	resolved, err := s.resolvePersonalReadClient(ctx, workspaceID, userID, "", "")
+	if err != nil {
+		return nil, nil, err
+	}
+	settings, err := s.GetWorkspaceSettings(ctx, workspaceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resolved, settings, nil
+}
+
+func (s *Service) searchPersonalPRPage(
+	ctx context.Context,
+	resolved *resolvedServiceClient,
+	settings *WorkspaceSettings,
+	filter, customQuery string,
+	page, perPage int,
+) (*PRSearchPage, error) {
+	if !workspaceSettingsHasScope(settings) {
+		return s.searchUserPRsPagedWithClient(
+			ctx, resolved.Client, resolved.CacheScope, filter, customQuery, page, perPage,
+		)
+	}
+	return s.searchUserPRsPagedScoped(
+		ctx, resolved.Client, resolved.CacheScope, settings, filter, customQuery, page, perPage,
+	)
+}
+
+func (s *Service) searchPersonalIssuePage(
+	ctx context.Context,
+	resolved *resolvedServiceClient,
+	settings *WorkspaceSettings,
+	filter, customQuery string,
+	page, perPage int,
+) (*IssueSearchPage, error) {
+	if !workspaceSettingsHasScope(settings) {
+		return s.searchUserIssuesPagedWithClient(
+			ctx, resolved.Client, resolved.CacheScope, filter, customQuery, page, perPage,
+		)
+	}
+	return s.searchUserIssuesPagedScoped(
+		ctx, resolved.Client, resolved.CacheScope, settings, filter, customQuery, page, perPage,
+	)
+}
+
+type filteredPersonalSearchPage[T any] struct {
+	items []T
+	total int
+}
+
+func searchPersonalWorkspacePageResult[T any, R any](
+	ctx context.Context,
+	service *Service,
+	workspaceID, userID string,
+	page, perPage int,
+	fetch func(*resolvedServiceClient, *WorkspaceSettings, int, int) ([]T, int, error),
+	filter func([]T) ([]T, error),
+	build func(filteredPersonalSearchPage[T], int, int) R,
+) (R, error) {
+	result, page, perPage, err := searchPersonalWorkspacePage(
+		ctx, service, workspaceID, userID, page, perPage, fetch, filter,
+	)
+	if err != nil {
+		var zero R
+		return zero, err
+	}
+	return build(result, page, perPage), nil
+}
+
+func searchPersonalWorkspacePage[T any](
+	ctx context.Context,
+	service *Service,
+	workspaceID, userID string,
+	page, perPage int,
+	fetch func(*resolvedServiceClient, *WorkspaceSettings, int, int) ([]T, int, error),
+	filter func([]T) ([]T, error),
+) (filteredPersonalSearchPage[T], int, int, error) {
+	resolved, settings, err := service.resolvePersonalSearchContext(ctx, workspaceID, userID)
+	if err != nil {
+		return filteredPersonalSearchPage[T]{}, page, perPage, err
+	}
+	page, perPage = clampSearchPage(page, perPage)
+	if resolved.Principal.UserID == "" {
+		items, total, fetchErr := fetch(resolved, settings, page, perPage)
+		return filteredPersonalSearchPage[T]{items: items, total: total}, page, perPage, fetchErr
+	}
+	result, err := searchFilteredPersonalPage(page, perPage, func(providerPage int) ([]T, int, error) {
+		return fetch(resolved, settings, providerPage, personalSearchFetchPageSize)
+	}, filter)
+	return result, page, perPage, err
+}
+
+// searchFilteredPersonalPage scans GitHub's bounded Search API result window
+// before applying the workspace automation boundary. Filtering one requested
+// provider page at a time can otherwise produce empty pages while permitted
+// results remain later in the search.
+func searchFilteredPersonalPage[T any](
+	page, perPage int,
+	fetch func(providerPage int) ([]T, int, error),
+	filter func([]T) ([]T, error),
+) (filteredPersonalSearchPage[T], error) {
+	all := make([]T, 0, personalSearchFetchPageSize)
+	resultLimit := githubSearchResultLimit
+	for providerPage := 1; (providerPage-1)*personalSearchFetchPageSize < resultLimit; providerPage++ {
+		items, total, err := fetch(providerPage)
+		if err != nil {
+			return filteredPersonalSearchPage[T]{}, err
+		}
+		if providerPage == 1 && total < resultLimit {
+			resultLimit = max(total, 0)
+		}
+		all = append(all, items...)
+		if providerPage*personalSearchFetchPageSize >= resultLimit {
+			break
+		}
+	}
+	filtered, err := filter(all)
+	if err != nil {
+		return filteredPersonalSearchPage[T]{}, err
+	}
+	return filteredPersonalSearchPage[T]{
+		items: paginateSearchResults(filtered, page, perPage),
+		total: len(filtered),
+	}, nil
+}
+
+func (s *Service) filterPersonalPRsByAutomation(
+	ctx context.Context, workspaceID string, prs []*PR,
+) ([]*PR, error) {
+	repositories := make([]RepoFilter, 0, len(prs))
+	for _, pr := range prs {
+		if pr != nil {
+			repositories = append(repositories, RepoFilter{Owner: pr.RepoOwner, Name: pr.RepoName})
+		}
+	}
+	visible, err := s.automationRepositoryVisibility(ctx, workspaceID, repositories)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]*PR, 0, len(prs))
+	for _, pr := range prs {
+		if pr != nil && visible[repositoryIdentityKey(pr.RepoOwner, pr.RepoName)] {
+			filtered = append(filtered, pr)
+		}
+	}
+	return filtered, nil
+}
+
+func (s *Service) filterPersonalIssuesByAutomation(
+	ctx context.Context, workspaceID string, issues []*Issue,
+) ([]*Issue, error) {
+	repositories := make([]RepoFilter, 0, len(issues))
+	for _, issue := range issues {
+		if issue != nil {
+			repositories = append(repositories, RepoFilter{Owner: issue.RepoOwner, Name: issue.RepoName})
+		}
+	}
+	visible, err := s.automationRepositoryVisibility(ctx, workspaceID, repositories)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]*Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue != nil && visible[repositoryIdentityKey(issue.RepoOwner, issue.RepoName)] {
+			filtered = append(filtered, issue)
+		}
+	}
+	return filtered, nil
+}
+
+func (s *Service) searchUserPRsPagedScoped(
+	ctx context.Context,
+	client Client,
+	cacheScope string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*PRSearchPage, error) {
+	if workspaceSettingsHasEmptyScope(settings) {
+		return &PRSearchPage{PRs: []*PR{}, TotalCount: 0, Page: page, PerPage: perPage}, nil
+	}
+	qualifiers := workspaceScopeQualifiers(settings)
+	if len(qualifiers) > 1 {
+		return s.searchUserPRsPagedScopedAcrossQualifiers(ctx, client, cacheScope, settings, filter, customQuery, page, perPage, qualifiers)
+	}
+	filter, customQuery = appendWorkspaceScopeToSearch(filter, customQuery, settings)
+	v, err := s.searchUserPagedScoped(cacheScope, "pr", settings, filter, customQuery, page, perPage, func(page, perPage int) (any, error) {
+		result, err := client.SearchPRsPaged(ctx, filter, customQuery, page, perPage)
+		if err != nil {
+			return nil, err
+		}
+		return scopedPRSearchPage(result, settings, page, perPage), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*PRSearchPage), nil
+}
+
+func (s *Service) searchUserIssuesPagedScoped(
+	ctx context.Context,
+	client Client,
+	cacheScope string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+) (*IssueSearchPage, error) {
+	if workspaceSettingsHasEmptyScope(settings) {
+		return &IssueSearchPage{Issues: []*Issue{}, TotalCount: 0, Page: page, PerPage: perPage}, nil
+	}
+	qualifiers := workspaceScopeQualifiers(settings)
+	if len(qualifiers) > 1 {
+		return s.searchUserIssuesPagedScopedAcrossQualifiers(ctx, client, cacheScope, settings, filter, customQuery, page, perPage, qualifiers)
+	}
+	filter, customQuery = appendWorkspaceScopeToSearch(filter, customQuery, settings)
+	v, err := s.searchUserPagedScoped(cacheScope, "issue", settings, filter, customQuery, page, perPage, func(page, perPage int) (any, error) {
+		result, err := client.ListIssuesPaged(ctx, filter, customQuery, page, perPage)
+		if err != nil {
+			return nil, err
+		}
+		return scopedIssueSearchPage(result, settings, page, perPage), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*IssueSearchPage), nil
+}
+
+func (s *Service) searchUserPagedScoped(
+	cacheScope string,
+	kind string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	fetch func(page int, perPage int) (any, error),
+) (any, error) {
+	page, perPage = clampSearchPage(page, perPage)
+	scopeKey := workspaceSearchScopeKey(settings)
+	key := scopedCacheKey(cacheScope, searchCacheKey(kind+":"+scopeKey, filter, customQuery, page, perPage))
+	return s.searchCache.doOrFetch(key, func() (any, error) {
+		return fetch(page, perPage)
+	})
+}
+
+func (s *Service) searchUserPRsPagedScopedAcrossQualifiers(
+	ctx context.Context,
+	client Client,
+	cacheScope string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	qualifiers []string,
+) (*PRSearchPage, error) {
+	result, err := cachedScopedSearchAcrossQualifiers(client, s.searchCache, cacheScope+":pr", settings, filter, customQuery, page, perPage, func(page, perPage int) ([]*PR, int, error) {
+		return s.fetchScopedPRsAcrossQualifiers(ctx, client, settings, filter, customQuery, page, perPage, qualifiers)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &PRSearchPage{PRs: result.items, TotalCount: result.total, Page: result.page, PerPage: result.perPage}, nil
+}
+
+func (s *Service) searchUserIssuesPagedScopedAcrossQualifiers(
+	ctx context.Context,
+	client Client,
+	cacheScope string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	qualifiers []string,
+) (*IssueSearchPage, error) {
+	result, err := cachedScopedSearchAcrossQualifiers(client, s.searchCache, cacheScope+":issue", settings, filter, customQuery, page, perPage, func(page, perPage int) ([]*Issue, int, error) {
+		return s.fetchScopedIssuesAcrossQualifiers(ctx, client, settings, filter, customQuery, page, perPage, qualifiers)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &IssueSearchPage{Issues: result.items, TotalCount: result.total, Page: result.page, PerPage: result.perPage}, nil
+}
+
+type scopedFanoutResult[T any] struct {
+	items   []T
+	total   int
+	page    int
+	perPage int
+}
+
+func cachedScopedSearchAcrossQualifiers[T any](
+	client Client,
+	cache *ttlCache,
+	kind string,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	fetch func(page int, perPage int) ([]T, int, error),
+) (scopedFanoutResult[T], error) {
+	if client == nil {
+		return scopedFanoutResult[T]{}, fmt.Errorf("github client not available")
+	}
+	page, perPage = clampSearchPage(page, perPage)
+	scopeKey := workspaceSearchScopeKey(settings)
+	key := searchCacheKey(kind+":"+scopeKey+":fanout", filter, customQuery, page, perPage)
+	v, err := cache.doOrFetch(key, func() (any, error) {
+		items, total, err := fetch(page, perPage)
+		if err != nil {
+			return nil, err
+		}
+		return scopedFanoutResult[T]{
+			items:   paginateSearchResults(items, page, perPage),
+			total:   total,
+			page:    page,
+			perPage: perPage,
+		}, nil
+	})
+	if err != nil {
+		return scopedFanoutResult[T]{}, err
+	}
+	return v.(scopedFanoutResult[T]), nil
+}
+
+func (s *Service) fetchScopedPRsAcrossQualifiers(
+	ctx context.Context,
+	client Client,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	qualifiers []string,
+) ([]*PR, int, error) {
+	return fetchScopedResultsAcrossQualifiers(settings, filter, customQuery, page, perPage, qualifiers, prScopeKey, func(scopedFilter, scopedCustomQuery string, providerPage, fetchPerPage int) ([]*PR, int, error) {
+		result, err := client.SearchPRsPaged(ctx, scopedFilter, scopedCustomQuery, providerPage, fetchPerPage)
+		if err != nil {
+			return nil, 0, err
+		}
+		if result == nil {
+			return []*PR{}, 0, nil
+		}
+		return filterPRsByWorkspaceScope(result.PRs, settings), result.TotalCount, nil
+	})
+}
+
+func (s *Service) fetchScopedIssuesAcrossQualifiers(
+	ctx context.Context,
+	client Client,
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	qualifiers []string,
+) ([]*Issue, int, error) {
+	return fetchScopedResultsAcrossQualifiers(settings, filter, customQuery, page, perPage, qualifiers, issueScopeKey, func(scopedFilter, scopedCustomQuery string, providerPage, fetchPerPage int) ([]*Issue, int, error) {
+		result, err := client.ListIssuesPaged(ctx, scopedFilter, scopedCustomQuery, providerPage, fetchPerPage)
+		if err != nil {
+			return nil, 0, err
+		}
+		if result == nil {
+			return []*Issue{}, 0, nil
+		}
+		return filterIssuesByWorkspaceScope(result.Issues, settings), result.TotalCount, nil
+	})
+}
+
+func fetchScopedResultsAcrossQualifiers[T any](
+	settings *WorkspaceSettings,
+	filter string,
+	customQuery string,
+	page int,
+	perPage int,
+	qualifiers []string,
+	resultKey func(T) string,
+	fetch func(scopedFilter string, scopedCustomQuery string, providerPage int, fetchPerPage int) ([]T, int, error),
+) ([]T, int, error) {
+	seen := make(map[string]struct{})
+	all := make([]T, 0, perPage)
+	fetchPerPage := workspaceScopeFanoutFetchPerPage(page, perPage)
+	pagesToFetch := workspaceScopeFanoutPagesToFetch(page, perPage, fetchPerPage)
+	counts := make([]int, 0, len(qualifiers))
+	for _, qualifier := range qualifiers {
+		scopedFilter, scopedCustomQuery := appendWorkspaceScopeQualifierToSearch(filter, customQuery, qualifier)
+		qualifierCount := 0
+		for providerPage := 1; providerPage <= pagesToFetch; providerPage++ {
+			items, count, err := fetch(scopedFilter, scopedCustomQuery, providerPage, fetchPerPage)
+			if err != nil {
+				return nil, 0, err
+			}
+			if providerPage == 1 {
+				qualifierCount = count
+			}
+			for _, item := range items {
+				key := resultKey(item)
+				if key == "" {
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				all = append(all, item)
+			}
+			if workspaceScopeFanoutFetchedAll(providerPage, fetchPerPage, count, len(items)) {
+				break
+			}
+		}
+		counts = append(counts, qualifierCount)
+	}
+	return all, workspaceScopeFanoutTotal(settings, counts, len(all)), nil
+}
+
+func workspaceScopeFanoutFetchPerPage(page, perPage int) int {
+	fetchPerPage := page * perPage
+	if fetchPerPage < perPage {
+		return perPage
+	}
+	if fetchPerPage > 100 {
+		return 100
+	}
+	return fetchPerPage
+}
+
+func workspaceScopeFanoutPagesToFetch(page, perPage, fetchPerPage int) int {
+	if fetchPerPage <= 0 {
+		return 1
+	}
+	target := page * perPage
+	if target < perPage {
+		target = perPage
+	}
+	pages := target / fetchPerPage
+	if target%fetchPerPage != 0 {
+		pages++
+	}
+	if pages < 1 {
+		return 1
+	}
+	return pages
+}
+
+func workspaceScopeFanoutFetchedAll(providerPage, fetchPerPage, totalCount, itemCount int) bool {
+	if itemCount == 0 {
+		return true
+	}
+	if itemCount < fetchPerPage {
+		return true
+	}
+	return totalCount > 0 && providerPage*fetchPerPage >= totalCount
+}
+
+func workspaceScopeFanoutTotal(settings *WorkspaceSettings, counts []int, uniqueFetched int) int {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil || settings.RepoScopeMode != RepoScopeModeOrgs {
+		return sumInts(counts)
+	}
+	total := 0
+	for i := 0; i < len(counts); i += 2 {
+		if i+1 >= len(counts) {
+			total += counts[i]
+			continue
+		}
+		total += max(counts[i], counts[i+1])
+	}
+	if uniqueFetched > total {
+		return uniqueFetched
+	}
+	return total
+}
+
+func sumInts(values []int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func paginateSearchResults[T any](items []T, page, perPage int) []T {
+	if len(items) == 0 {
+		return []T{}
+	}
+	start := (page - 1) * perPage
+	if start >= len(items) {
+		return []T{}
+	}
+	end := start + perPage
+	if end > len(items) {
+		end = len(items)
+	}
+	return append([]T(nil), items[start:end]...)
+}
+
+func prScopeKey(pr *PR) string {
+	if pr == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(fmt.Sprintf("%s/%s#%d", pr.RepoOwner, pr.RepoName, pr.Number)))
+}
+
+func issueScopeKey(issue *Issue) string {
+	if issue == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(fmt.Sprintf("%s/%s#%d", issue.RepoOwner, issue.RepoName, issue.Number)))
+}
+
+func scopedPRSearchPage(result *PRSearchPage, settings *WorkspaceSettings, page int, perPage int) *PRSearchPage {
+	if result == nil {
+		result = &PRSearchPage{Page: page, PerPage: perPage}
+	}
+	result.PRs = filterPRsByWorkspaceScope(result.PRs, settings)
+	result.Page = page
+	result.PerPage = perPage
+	return result
+}
+
+func scopedIssueSearchPage(result *IssueSearchPage, settings *WorkspaceSettings, page int, perPage int) *IssueSearchPage {
+	if result == nil {
+		result = &IssueSearchPage{Page: page, PerPage: perPage}
+	}
+	result.Issues = filterIssuesByWorkspaceScope(result.Issues, settings)
+	result.Page = page
+	result.PerPage = perPage
+	return result
+}
+
+func workspaceSettingsHasScope(settings *WorkspaceSettings) bool {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil {
+		return false
+	}
+	switch settings.RepoScopeMode {
+	case RepoScopeModeOrgs, RepoScopeModeRepos:
+		return true
+	default:
+		return false
+	}
+}
+
+func workspaceSettingsHasEmptyScope(settings *WorkspaceSettings) bool {
+	return workspaceSettingsHasScope(settings) && len(workspaceScopeQualifiers(settings)) == 0
+}
+
+func isValidRepoScopeMode(mode string) bool {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case RepoScopeModeAll, RepoScopeModeOrgs, RepoScopeModeRepos:
+		return true
+	default:
+		return false
+	}
+}
+
+func appendWorkspaceScopeToSearch(filter, customQuery string, settings *WorkspaceSettings) (string, string) {
+	qualifiers := workspaceScopeQualifiers(settings)
+	if len(qualifiers) == 0 {
+		return filter, customQuery
+	}
+	return appendWorkspaceScopeQualifierToSearch(filter, customQuery, qualifiers[0])
+}
+
+func appendWorkspaceScopeQualifierToSearch(filter, customQuery, qualifier string) (string, string) {
+	if strings.TrimSpace(customQuery) != "" {
+		return filter, appendWorkspaceScopeQualifier(customQuery, qualifier)
+	}
+	return appendWorkspaceScopeQualifier(filter, qualifier), customQuery
+}
+
+func appendWorkspaceScopeQualifier(query, qualifier string) string {
+	return strings.TrimSpace(strings.Join([]string{query, qualifier}, " "))
+}
+
+func workspaceScopeQualifiers(settings *WorkspaceSettings) []string {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil {
+		return nil
+	}
+	switch settings.RepoScopeMode {
+	case RepoScopeModeOrgs:
+		qualifiers := make([]string, 0, len(settings.RepoScopeOrgs)*2)
+		for _, org := range settings.RepoScopeOrgs {
+			if org = strings.TrimSpace(org); org != "" {
+				qualifiers = append(qualifiers, "org:"+org)
+				qualifiers = append(qualifiers, "user:"+org)
+			}
+		}
+		return qualifiers
+	case RepoScopeModeRepos:
+		qualifiers := make([]string, 0, len(settings.RepoScopeRepos))
+		for _, repo := range settings.RepoScopeRepos {
+			if repo.Owner != "" && repo.Name != "" {
+				qualifiers = append(qualifiers, repoFilterToQualifier(repo))
+			}
+		}
+		return qualifiers
+	default:
+		return nil
+	}
+}
+
+func workspaceScopeRepoFilters(settings *WorkspaceSettings) []RepoFilter {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil {
+		return nil
+	}
+	switch settings.RepoScopeMode {
+	case RepoScopeModeOrgs:
+		repos := make([]RepoFilter, 0, len(settings.RepoScopeOrgs))
+		for _, org := range settings.RepoScopeOrgs {
+			if org = strings.TrimSpace(org); org != "" {
+				repos = append(repos, RepoFilter{Owner: org})
+			}
+		}
+		return repos
+	case RepoScopeModeRepos:
+		return append([]RepoFilter(nil), settings.RepoScopeRepos...)
+	default:
+		return nil
+	}
+}
+
+func workspaceSearchScopeKey(settings *WorkspaceSettings) string {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil {
+		return RepoScopeModeAll
+	}
+	var parts []string
+	switch settings.RepoScopeMode {
+	case RepoScopeModeOrgs:
+		parts = append(parts, settings.RepoScopeOrgs...)
+	case RepoScopeModeRepos:
+		for _, repo := range settings.RepoScopeRepos {
+			parts = append(parts, repo.Owner+"/"+repo.Name)
+		}
+	}
+	return settings.RepoScopeMode + ":" + strings.Join(parts, ",")
+}
+
+func filterPRsByWorkspaceScope(prs []*PR, settings *WorkspaceSettings) []*PR {
+	if !workspaceSettingsHasScope(settings) {
+		if prs == nil {
+			return []*PR{}
+		}
+		return prs
+	}
+	out := make([]*PR, 0, len(prs))
+	for _, pr := range prs {
+		if pr != nil && repoAllowedByWorkspaceScope(pr.RepoOwner, pr.RepoName, settings) {
+			out = append(out, pr)
+		}
+	}
+	return out
+}
+
+func filterIssuesByWorkspaceScope(issues []*Issue, settings *WorkspaceSettings) []*Issue {
+	if !workspaceSettingsHasScope(settings) {
+		if issues == nil {
+			return []*Issue{}
+		}
+		return issues
+	}
+	out := make([]*Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue != nil && repoAllowedByWorkspaceScope(issue.RepoOwner, issue.RepoName, settings) {
+			out = append(out, issue)
+		}
+	}
+	return out
+}
+
+func repoAllowedByWorkspaceScope(owner, name string, settings *WorkspaceSettings) bool {
+	settings = normalizeWorkspaceSettings(settings)
+	if settings == nil || settings.RepoScopeMode == RepoScopeModeAll {
+		return true
+	}
+	owner = strings.ToLower(strings.TrimSpace(owner))
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch settings.RepoScopeMode {
+	case RepoScopeModeOrgs:
+		for _, org := range settings.RepoScopeOrgs {
+			if strings.ToLower(org) == owner {
+				return true
+			}
+		}
+	case RepoScopeModeRepos:
+		for _, repo := range settings.RepoScopeRepos {
+			if strings.ToLower(repo.Owner) == owner && strings.ToLower(repo.Name) == name {
+				return true
+			}
+		}
+	}
+	return false
+}

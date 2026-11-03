@@ -1,0 +1,538 @@
+package executor
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/task/models"
+	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+)
+
+// helper: a task v1 used by the office tests below.
+func officeTestTask() *v1.Task {
+	return &v1.Task{
+		ID:          "task-office",
+		WorkspaceID: "ws-office",
+		Title:       "Office task",
+	}
+}
+
+type officeRebindRaceRepository struct {
+	*mockRepository
+	beforeGuardedUpdate func()
+}
+
+func (r *officeRebindRaceRepository) UpdateTaskSessionIfCurrentState(
+	ctx context.Context,
+	session *models.TaskSession,
+	expected models.TaskSessionState,
+) (bool, error) {
+	return r.mockRepository.UpdateTaskSessionIfCurrentState(ctx, session, expected)
+}
+
+func (r *officeRebindRaceRepository) UpdateTaskSessionIfCurrentStateRemovingMetadataKeys(
+	ctx context.Context,
+	session *models.TaskSession,
+	expected models.TaskSessionState,
+	keys []string,
+) (bool, error) {
+	if r.beforeGuardedUpdate != nil {
+		hook := r.beforeGuardedUpdate
+		r.beforeGuardedUpdate = nil
+		hook()
+	}
+	return r.mockRepository.UpdateTaskSessionIfCurrentStateRemovingMetadataKeys(ctx, session, expected, keys)
+}
+
+func TestEnsureSessionForAgent_CreatesWhenMissing(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	task := officeTestTask()
+	ctx := context.Background()
+
+	got, err := exec.EnsureSessionForAgent(ctx, task, "agent-1", "profile-1", "exec-1", "")
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if got == nil || got.ID == "" {
+		t.Fatal("expected new session")
+	}
+	if got.AgentProfileID != "agent-1" {
+		t.Errorf("agent_profile_id: got %q want agent-1", got.AgentProfileID)
+	}
+	if got.ExecutionProfileID != "profile-1" {
+		t.Errorf("execution_profile_id: got %q want profile-1", got.ExecutionProfileID)
+	}
+	if got.State != models.TaskSessionStateCreated {
+		t.Errorf("state: got %q want CREATED", got.State)
+	}
+	if got.Metadata[models.SessionMetaKeyOrigin] != models.SessionOriginTaskInitial {
+		t.Errorf("origin marker = %#v, want %q", got.Metadata[models.SessionMetaKeyOrigin], models.SessionOriginTaskInitial)
+	}
+	if len(repo.createTaskSessionCalls) != 1 {
+		t.Fatalf("expected 1 CreateTaskSession call, got %d", len(repo.createTaskSessionCalls))
+	}
+}
+
+func TestEnsureSessionForAgentRetriesTaskRunnerChangedAfterReload(t *testing.T) {
+	repo := newOfficeTaskSessionCreatingRepository()
+	taskID := "task-office-runner-retry"
+	task := &v1.Task{
+		ID:          taskID,
+		WorkspaceID: "ws-office-runner-retry",
+		Title:       "Office runner retry",
+		Metadata:    map[string]interface{}{models.MetaKeyExecutorProfileID: "profile-old"},
+	}
+	repo.tasks[taskID] = &models.Task{
+		ID:          taskID,
+		WorkspaceID: task.WorkspaceID,
+		Metadata:    map[string]interface{}{models.MetaKeyExecutorProfileID: "profile-old"},
+	}
+	createAttempts := 0
+	repo.createTaskSessionFunc = func(_ context.Context, session *models.TaskSession) error {
+		createAttempts++
+		if createAttempts == 1 {
+			repo.mu.Lock()
+			repo.tasks[taskID].Metadata[models.MetaKeyExecutorProfileID] = "profile-new"
+			repo.mu.Unlock()
+			return models.ErrTaskRunnerChanged
+		}
+		repo.mu.Lock()
+		repo.sessions[session.ID] = session
+		repo.mu.Unlock()
+		return nil
+	}
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	ctx := WithTaskRunnerProfileExplicit(context.Background(), false)
+
+	created, wasCreated, err := exec.EnsureSessionForAgentWithCreation(
+		ctx, task, "agent-office-runner-retry", "agent-profile", "executor", "profile-old",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgentWithCreation: %v", err)
+	}
+	if !wasCreated {
+		t.Fatal("wasCreated = false, want true")
+	}
+	if createAttempts != 2 {
+		t.Fatalf("CreateTaskSession attempts = %d, want 2", createAttempts)
+	}
+	if created == nil || created.ExecutorProfileID != "profile-new" {
+		t.Fatalf("created session = %#v, want executor profile profile-new", created)
+	}
+}
+
+func TestEnsureSessionForAgentRejectsManagedIdentityBeforeCreatingSession(t *testing.T) {
+	repo := newMockRepository()
+	seedPreflightTaskRepository(repo, "task-office", "repo-1", &models.Repository{
+		ID: "repo-1", Provider: "acme-forge", RemoteURL: "https://forge.example/acme/widgets.git",
+	})
+	exec := newPreflightTestExecutor(t, repo)
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-1", "profile-1", "", "",
+	)
+	if err == nil {
+		t.Fatal("EnsureSessionForAgent() error = nil, want managed identity rejection")
+	}
+	if got != nil {
+		t.Fatalf("session = %#v, want nil", got)
+	}
+	if len(repo.createTaskSessionCalls) != 0 {
+		t.Fatalf("CreateTaskSession calls = %d, want 0", len(repo.createTaskSessionCalls))
+	}
+}
+
+func TestEnsureSessionForAgentRejectsManagedIdentityBeforeRebindingIdleSession(t *testing.T) {
+	repo := newMockRepository()
+	seedPreflightTaskRepository(repo, "task-office", "repo-1", &models.Repository{
+		ID: "repo-1", Provider: "acme-forge", RemoteURL: "https://forge.example/acme/widgets.git",
+	})
+	existing := &models.TaskSession{
+		ID: "sess-existing", TaskID: "task-office", AgentProfileID: "agent-1",
+		ExecutionProfileID: "profile-old", State: models.TaskSessionStateIdle, StartedAt: time.Now().UTC(),
+	}
+	repo.sessions[existing.ID] = existing
+	exec := newPreflightTestExecutor(t, repo)
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-1", "profile-new", "", "",
+	)
+	if err == nil {
+		t.Fatal("EnsureSessionForAgent() error = nil, want managed identity rejection")
+	}
+	if got != nil {
+		t.Fatalf("session = %#v, want nil", got)
+	}
+	stored := repo.sessions[existing.ID]
+	if stored.State != models.TaskSessionStateIdle {
+		t.Fatalf("session state = %q, want IDLE", stored.State)
+	}
+	if stored.ExecutionProfileID != "profile-old" {
+		t.Fatalf("execution profile = %q, want profile-old", stored.ExecutionProfileID)
+	}
+}
+
+func TestEnsureSessionForAgent_DoesNotMarkExistingTaskSessionAsOrigin(t *testing.T) {
+	repo := newMockRepository()
+	repo.sessions["sess-existing"] = &models.TaskSession{
+		ID:             "sess-existing",
+		TaskID:         "task-office",
+		AgentProfileID: "agent-existing",
+		State:          models.TaskSessionStateIdle,
+		StartedAt:      time.Now().UTC(),
+	}
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-new", "profile-1", "exec-1", "",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if _, marked := got.Metadata[models.SessionMetaKeyOrigin]; marked {
+		t.Fatalf("new Office session metadata = %#v, must not claim task origin when another session exists", got.Metadata)
+	}
+}
+
+func TestEnsureSessionForAgent_RebindsExecutionProfileOnReuse(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	existing := &models.TaskSession{
+		ID:                 "sess-existing",
+		TaskID:             "task-office",
+		AgentProfileID:     "agent-1",
+		ExecutionProfileID: "codex-profile",
+		State:              models.TaskSessionStateIdle,
+		StartedAt:          time.Now().UTC(),
+		Metadata: map[string]interface{}{
+			"acp_session_id":                            "codex-session",
+			models.SessionMetaKeySessionMode:            "default",
+			models.SessionMetaKeyRuntimeConfig:          models.SessionRuntimeConfig{Model: "codex-model"},
+			models.SessionMetaKeyRuntimeConfigOverrides: models.SessionRuntimeConfig{Mode: "default"},
+			models.SessionMetaKeyACPConfigBaseline:      map[string]string{"model": "codex-model"},
+			models.SessionMetaKeyACPModelState:          map[string]interface{}{"current_model_id": "codex-model"},
+			"context_window":                            map[string]interface{}{"size": int64(200000)},
+			models.SessionMetaKeyLastAgentError:         models.LastAgentError{Message: "old provider failed"},
+			models.SessionMetaKeyPendingStepCompletion:  true,
+		},
+	}
+	repo.sessions[existing.ID] = existing
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-1", "claude-profile", "exec-1", "",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if got.AgentProfileID != "agent-1" {
+		t.Fatalf("office identity changed: %q", got.AgentProfileID)
+	}
+	if got.ExecutionProfileID != "claude-profile" {
+		t.Fatalf("execution profile = %q, want claude-profile", got.ExecutionProfileID)
+	}
+	for _, key := range []string{
+		"acp_session_id",
+		models.SessionMetaKeySessionMode,
+		models.SessionMetaKeyRuntimeConfig,
+		models.SessionMetaKeyRuntimeConfigOverrides,
+		models.SessionMetaKeyACPConfigBaseline,
+		models.SessionMetaKeyACPModelState,
+		"context_window",
+		models.SessionMetaKeyLastAgentError,
+	} {
+		if _, exists := got.Metadata[key]; exists {
+			t.Errorf("provider runtime metadata %q survived execution profile change", key)
+		}
+	}
+	if got.Metadata[models.SessionMetaKeyPendingStepCompletion] != true {
+		t.Fatal("unrelated Office session metadata was not preserved")
+	}
+}
+
+func TestEnsureSessionForAgent_RebindDoesNotOverwriteConcurrentCancellation(t *testing.T) {
+	baseRepo := newMockRepository()
+	existing := &models.TaskSession{
+		ID:                 "sess-existing",
+		TaskID:             "task-office",
+		AgentProfileID:     "agent-1",
+		ExecutionProfileID: "codex-profile",
+		State:              models.TaskSessionStateIdle,
+		StartedAt:          time.Now().UTC(),
+	}
+	baseRepo.sessions[existing.ID] = existing
+	raceRepo := &officeRebindRaceRepository{mockRepository: baseRepo}
+	raceRepo.beforeGuardedUpdate = func() {
+		baseRepo.mu.Lock()
+		cancelled := *baseRepo.sessions[existing.ID]
+		cancelled.State = models.TaskSessionStateCancelled
+		cancelled.ErrorMessage = "stopped by parent task via MCP"
+		baseRepo.sessions[existing.ID] = &cancelled
+		baseRepo.mu.Unlock()
+	}
+	exec := newTestExecutor(t, &mockAgentManager{}, baseRepo)
+	exec.repo = raceRepo
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-1", "claude-profile", "exec-1", "",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if got.ID == existing.ID {
+		t.Fatalf("cancelled session %q was reused", existing.ID)
+	}
+
+	baseRepo.mu.Lock()
+	stored := baseRepo.sessions[existing.ID]
+	baseRepo.mu.Unlock()
+	if stored.State != models.TaskSessionStateCancelled {
+		t.Fatalf("existing session state = %q, want CANCELLED", stored.State)
+	}
+	if stored.ErrorMessage != "stopped by parent task via MCP" {
+		t.Fatalf("existing session error = %q, want coordinator stop reason", stored.ErrorMessage)
+	}
+	if stored.ExecutionProfileID != "codex-profile" {
+		t.Fatalf("cancelled session profile = %q, want original profile", stored.ExecutionProfileID)
+	}
+}
+
+func TestEnsureSessionForAgent_RebindsExecutionProfileAfterCreateRace(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	winner := &models.TaskSession{
+		ID:                 "sess-winner",
+		TaskID:             "task-office",
+		AgentProfileID:     "agent-1",
+		ExecutionProfileID: "codex-profile",
+		State:              models.TaskSessionStateIdle,
+		StartedAt:          time.Now().UTC(),
+	}
+	repo.createTaskSessionFunc = func(_ context.Context, _ *models.TaskSession) error {
+		repo.mu.Lock()
+		repo.sessions[winner.ID] = winner
+		repo.mu.Unlock()
+		return fmt.Errorf("%w: concurrent insert", taskrepo.ErrOfficeSessionRaceConflict)
+	}
+
+	got, err := exec.EnsureSessionForAgent(
+		context.Background(), officeTestTask(), "agent-1", "claude-profile", "exec-1", "",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if got.ID != winner.ID {
+		t.Fatalf("session = %q, want race winner %q", got.ID, winner.ID)
+	}
+	if got.AgentProfileID != "agent-1" {
+		t.Fatalf("office identity changed: %q", got.AgentProfileID)
+	}
+	if got.ExecutionProfileID != "claude-profile" {
+		t.Fatalf("execution profile = %q, want claude-profile", got.ExecutionProfileID)
+	}
+}
+
+// TestEnsureSessionForAgent_RefusalThenRecoveryFlipsIdleWinnerAndClearsMetadata
+// covers the full refusal-then-recovery shape end to end (AC-001.9): this
+// caller's own create attempt loses the race and is refused with
+// ErrOfficeSessionRaceConflict, the bounded-recovery re-read then observes
+// the winning row — which by the time it's read has already gone IDLE, not
+// RUNNING — on a different execution profile with stale provider metadata
+// still attached. Unlike TestEnsureSessionForAgent_RebindsExecutionProfileAfterCreateRace
+// (which only asserts the rebound ExecutionProfileID) and
+// TestEnsureSessionForAgent_RebindsExecutionProfileOnReuse (which asserts the
+// metadata clear but reaches rebind via a direct initial lookup, never
+// through a forced refusal), this test proves rebindOfficeSessionExecutionProfile's
+// metadata clear AND tryFlipIdleSessionToRunning's CAS flip to RUNNING both
+// happen together on the specific row recovered after a refusal.
+func TestEnsureSessionForAgent_RefusalThenRecoveryFlipsIdleWinnerAndClearsMetadata(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	winner := &models.TaskSession{
+		ID:                 "sess-refusal-recovery-winner",
+		TaskID:             "task-office",
+		AgentProfileID:     "agent-1",
+		ExecutionProfileID: "codex-profile",
+		State:              models.TaskSessionStateIdle,
+		StartedAt:          time.Now().UTC(),
+		Metadata: map[string]interface{}{
+			"acp_session_id":                 "codex-session",
+			models.SessionMetaKeySessionMode: "default",
+		},
+	}
+	repo.createTaskSessionFunc = func(_ context.Context, _ *models.TaskSession) error {
+		// Simulate a concurrent creator: this caller's own create attempt is
+		// refused, but the row it lost the race to is written here, as the
+		// AC-003.7 tests in office_session_race_guard_test.go already do.
+		repo.mu.Lock()
+		repo.sessions[winner.ID] = winner
+		repo.mu.Unlock()
+		return fmt.Errorf("%w: concurrent insert", taskrepo.ErrOfficeSessionRaceConflict)
+	}
+
+	got, wasCreated, err := exec.EnsureSessionForAgentWithCreation(
+		context.Background(), officeTestTask(), "agent-1", "claude-profile", "exec-1", "",
+	)
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgentWithCreation: %v", err)
+	}
+	if wasCreated {
+		t.Fatal("wasCreated = true, want false (this caller reused the recovered winner, it did not create)")
+	}
+	if got == nil || got.ID != winner.ID {
+		t.Fatalf("session = %#v, want the recovered winner row %q", got, winner.ID)
+	}
+	if got.State != models.TaskSessionStateRunning {
+		t.Fatalf("state = %q, want RUNNING (the recovery-reused row must still flip IDLE->RUNNING)", got.State)
+	}
+	if got.ExecutionProfileID != "claude-profile" {
+		t.Fatalf("execution profile = %q, want claude-profile", got.ExecutionProfileID)
+	}
+	if _, exists := got.Metadata["acp_session_id"]; exists {
+		t.Error("acp_session_id metadata survived the execution profile rebind on the recovered row")
+	}
+	if _, exists := got.Metadata[models.SessionMetaKeySessionMode]; exists {
+		t.Error("session mode metadata survived the execution profile rebind on the recovered row")
+	}
+	stored := repo.sessions[winner.ID]
+	if stored.State != models.TaskSessionStateRunning {
+		t.Fatalf("stored session state = %q, want RUNNING", stored.State)
+	}
+	if _, exists := stored.Metadata["acp_session_id"]; exists {
+		t.Error("stored session metadata still carries acp_session_id after the rebind+flip")
+	}
+}
+
+// TestEnsureSessionForAgent_ReusesIdleAndFlipsRunning covers the canonical
+// reuse path: the second run for the same (task, agent) reuses the existing
+// row and flips IDLE → RUNNING. No new row is inserted.
+func TestEnsureSessionForAgent_ReusesIdleAndFlipsRunning(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	ctx := context.Background()
+
+	existing := &models.TaskSession{
+		ID:             "sess-existing",
+		TaskID:         "task-office",
+		AgentProfileID: "agent-1",
+		State:          models.TaskSessionStateIdle,
+		StartedAt:      time.Now().UTC(),
+	}
+	repo.sessions[existing.ID] = existing
+
+	got, err := exec.EnsureSessionForAgent(ctx, officeTestTask(), "agent-1", "profile-1", "exec-1", "")
+	if err != nil {
+		t.Fatalf("EnsureSessionForAgent: %v", err)
+	}
+	if got.ID != existing.ID {
+		t.Errorf("expected reuse of %q, got %q", existing.ID, got.ID)
+	}
+	if got.State != models.TaskSessionStateRunning {
+		t.Errorf("state: got %q want RUNNING", got.State)
+	}
+	if len(repo.createTaskSessionCalls) != 0 {
+		t.Errorf("expected zero create calls, got %d", len(repo.createTaskSessionCalls))
+	}
+}
+
+// TestEnsureSessionForAgent_ReusesActiveStates covers RUNNING / STARTING /
+// CREATED / WAITING_FOR_INPUT — each is returned as-is, idempotent.
+func TestEnsureSessionForAgent_ReusesActiveStates(t *testing.T) {
+	for _, st := range []models.TaskSessionState{
+		models.TaskSessionStateCreated,
+		models.TaskSessionStateStarting,
+		models.TaskSessionStateRunning,
+		models.TaskSessionStateWaitingForInput,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			repo := newMockRepository()
+			exec := newTestExecutor(t, &mockAgentManager{}, repo)
+
+			existing := &models.TaskSession{
+				ID:             "sess-" + string(st),
+				TaskID:         "task-office",
+				AgentProfileID: "agent-1",
+				State:          st,
+				StartedAt:      time.Now().UTC(),
+			}
+			repo.sessions[existing.ID] = existing
+
+			got, err := exec.EnsureSessionForAgent(context.Background(), officeTestTask(), "agent-1", "profile-1", "", "")
+			if err != nil {
+				t.Fatalf("EnsureSessionForAgent: %v", err)
+			}
+			if got.ID != existing.ID {
+				t.Errorf("expected reuse of %q, got %q", existing.ID, got.ID)
+			}
+			if got.State != st {
+				t.Errorf("state mutated: got %q want %q", got.State, st)
+			}
+			if len(repo.createTaskSessionCalls) != 0 {
+				t.Errorf("expected zero create calls, got %d", len(repo.createTaskSessionCalls))
+			}
+		})
+	}
+}
+
+// TestEnsureSessionForAgent_TerminalRowsCreateFresh covers the "agent was
+// removed and re-added" case: a prior COMPLETED / FAILED / CANCELLED row is
+// preserved and a new row is created on the next run.
+func TestEnsureSessionForAgent_TerminalRowsCreateFresh(t *testing.T) {
+	for _, st := range []models.TaskSessionState{
+		models.TaskSessionStateCompleted,
+		models.TaskSessionStateFailed,
+		models.TaskSessionStateCancelled,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			repo := newMockRepository()
+			exec := newTestExecutor(t, &mockAgentManager{}, repo)
+
+			existing := &models.TaskSession{
+				ID:             "sess-old-" + string(st),
+				TaskID:         "task-office",
+				AgentProfileID: "agent-1",
+				State:          st,
+				StartedAt:      time.Now().UTC(),
+			}
+			repo.sessions[existing.ID] = existing
+
+			got, err := exec.EnsureSessionForAgent(context.Background(), officeTestTask(), "agent-1", "profile-1", "", "")
+			if err != nil {
+				t.Fatalf("EnsureSessionForAgent: %v", err)
+			}
+			if got.ID == existing.ID {
+				t.Errorf("expected fresh row, got reuse of %q", existing.ID)
+			}
+			if got.State != models.TaskSessionStateCreated {
+				t.Errorf("state: got %q want CREATED", got.State)
+			}
+			if len(repo.createTaskSessionCalls) != 1 {
+				t.Errorf("expected 1 CreateTaskSession call, got %d", len(repo.createTaskSessionCalls))
+			}
+		})
+	}
+}
+
+// TestEnsureSessionForAgent_RejectsMissingAgentID reports an error rather
+// than silently creating an unkeyed row that the per-agent lookup cannot
+// reuse.
+func TestEnsureSessionForAgent_RejectsMissingAgentID(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	if _, err := exec.EnsureSessionForAgent(context.Background(), officeTestTask(), "", "profile-1", "", ""); err == nil {
+		t.Error("expected error when agent_profile_id is empty")
+	}
+}
+
+// TestEnsureSessionForAgent_RejectsMissingProfile mirrors PrepareSession's
+// ErrNoAgentProfileID guard.
+func TestEnsureSessionForAgent_RejectsMissingProfile(t *testing.T) {
+	repo := newMockRepository()
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	if _, err := exec.EnsureSessionForAgent(context.Background(), officeTestTask(), "agent-1", "", "", ""); err == nil {
+		t.Error("expected ErrNoAgentProfileID, got nil")
+	}
+}

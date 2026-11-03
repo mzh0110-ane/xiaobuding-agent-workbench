@@ -1,0 +1,128 @@
+"use client";
+
+import { useId } from "react";
+import { Badge } from "@kandev/ui/badge";
+import { Label } from "@kandev/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@kandev/ui/select";
+import type {
+  ExecutionProfileSummary,
+  ProviderProfile,
+  Tier,
+  TierMap,
+} from "@/lib/state/slices/office/types";
+import { providerLabel } from "./provider-order-editor";
+import { TIER_NAME_KEYS } from "../../../lib/label-keys";
+import { useTranslation } from "react-i18next";
+
+const UNMAPPED = "__unmapped__";
+// `label` holds the wire `Tier` id; the visible text resolves through
+// TIER_NAME_KEYS at render so the row is not labelled with an identifier.
+const TIERS: Array<{ key: keyof TierMap; label: Tier }> = [
+  { key: "frontier", label: "frontier" },
+  { key: "balanced", label: "balanced" },
+  { key: "economy", label: "economy" },
+];
+
+type Props = {
+  providerId: string;
+  profile: ProviderProfile;
+  executionProfiles: ExecutionProfileSummary[];
+  defaultTier: Tier;
+  onChange: (next: ProviderProfile) => void;
+  disabled?: boolean;
+};
+
+export function ProviderTierMapping(props: Props) {
+  const { t } = useTranslation();
+  const fieldsetId = useId();
+  const available = profilesForProvider(props.executionProfiles, props.providerId);
+  const selectedIDs = props.profile.execution_profile_ids ?? props.profile.tier_profile_ids ?? {};
+
+  const setTier = (tier: Tier, profileId: string) => {
+    props.onChange(applyExecutionProfileSelection(props.profile, available, tier, profileId));
+  };
+
+  return (
+    <div className="rounded-lg border border-border p-4 space-y-3">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <p className="text-sm font-medium">{providerLabel(props.providerId)}</p>
+        <span className="text-xs text-muted-foreground font-mono">{props.providerId}</span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {TIERS.map(({ key, label }) => {
+          const value = selectedIDs[label] ?? UNMAPPED;
+          const selectId = `${fieldsetId}-${label}`;
+          return (
+            <div key={key} className="min-w-0">
+              <div className="flex items-center gap-1 mb-1">
+                <Label htmlFor={selectId} className="text-xs uppercase">
+                  {t(TIER_NAME_KEYS[label])}
+                </Label>
+                {label === props.defaultTier && value === UNMAPPED && (
+                  <Badge variant="destructive" className="text-[10px]">
+                    {t("office:required")}
+                  </Badge>
+                )}
+              </div>
+              <Select
+                value={value}
+                onValueChange={(next) => setTier(label, next)}
+                disabled={props.disabled}
+              >
+                <SelectTrigger
+                  id={selectId}
+                  className="w-full cursor-pointer"
+                  data-testid={`tier-profile-${props.providerId}-${label}`}
+                >
+                  <SelectValue placeholder={t("office:selectExecutionProfile")} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={UNMAPPED}>{t("office:notConfigured")}</SelectItem>
+                  {available.map((item) => (
+                    <SelectItem key={item.id} value={item.id}>
+                      {item.name} · {item.model}
+                      {item.mode ? ` · ${item.mode}` : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          );
+        })}
+      </div>
+      {available.length === 0 && (
+        <p className="text-xs text-destructive">
+          {t("office:noActiveExecutionProfilesAreAvailable")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function profilesForProvider(
+  profiles: ExecutionProfileSummary[],
+  providerId: string,
+): ExecutionProfileSummary[] {
+  return profiles.filter((item) => item.provider_id === providerId);
+}
+
+export function applyExecutionProfileSelection(
+  profile: ProviderProfile,
+  available: ExecutionProfileSummary[],
+  tier: Tier,
+  profileId: string,
+): ProviderProfile {
+  const selected = available.find((item) => item.id === profileId);
+  const selectedIDs = profile.execution_profile_ids ?? profile.tier_profile_ids ?? {};
+  return {
+    ...profile,
+    tier_map: { ...profile.tier_map, [tier]: selected?.model },
+    execution_profile_ids: { ...selectedIDs, [tier]: selected?.id },
+    tier_profile_ids: undefined,
+    // Concrete execution profiles own CLI mode, flags, and environment.
+    // Clear conflicting legacy workspace-level copies on explicit selection.
+    mode: undefined,
+    flags: undefined,
+    env: undefined,
+  };
+}

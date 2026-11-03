@@ -1,0 +1,166 @@
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useResponsiveBreakpoint } from "./use-responsive-breakpoint";
+
+type Listener = (event: MediaQueryListEvent) => void;
+
+function matchesWidthQuery(query: string, width: number) {
+  const minWidth = query.match(/min-width:\s*(\d+)px/);
+  const maxWidth = query.match(/max-width:\s*(\d+)px/);
+  if (!minWidth && !maxWidth) return false;
+
+  const minMatches = !minWidth || width >= Number(minWidth[1]);
+  const maxMatches = !maxWidth || width <= Number(maxWidth[1]);
+  return minMatches && maxMatches;
+}
+
+function setViewport(
+  width: number,
+  pointer: "fine" | "coarse" = "fine",
+  hover: "hover" | "none" = pointer === "fine" ? "hover" : "none",
+) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+
+  window.matchMedia = vi.fn((query: string) => {
+    const mql = {
+      media: query,
+      matches:
+        (query.includes("pointer: fine") && pointer === "fine") ||
+        (query.includes("hover: hover") && hover === "hover") ||
+        (query.includes("pointer: coarse") && pointer === "coarse") ||
+        matchesWidthQuery(query, width),
+      onchange: null,
+      addEventListener: vi.fn((_event: string, listener: Listener) => {
+        listeners.add(listener);
+      }),
+      removeEventListener: vi.fn((_event: string, listener: Listener) => {
+        listeners.delete(listener);
+      }),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    };
+    return mql as unknown as MediaQueryList;
+  });
+}
+
+const listeners = new Set<Listener>();
+
+function notifyResize(width: number, pointer: "fine" | "coarse" = "fine") {
+  setViewport(width, pointer);
+  act(() => {
+    for (const listener of listeners) {
+      listener({ matches: true } as MediaQueryListEvent);
+    }
+  });
+}
+
+describe("useResponsiveBreakpoint", () => {
+  beforeEach(() => {
+    listeners.clear();
+    setViewport(1024, "fine");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("treats half-screen fine-pointer widths as compact desktop workbench", () => {
+    setViewport(900, "fine");
+
+    const { result } = renderHook(() => useResponsiveBreakpoint());
+
+    expect(result.current.breakpoint).toBe("compactDesktop");
+    expect(result.current.isDesktop).toBe(true);
+    expect(result.current.isTablet).toBe(false);
+    expect(result.current.usesDesktopWorkbench).toBe(true);
+  });
+
+  it("keeps coarse-pointer half-screen widths in tablet fallback", () => {
+    setViewport(900, "coarse");
+
+    const { result } = renderHook(() => useResponsiveBreakpoint());
+
+    expect(result.current.breakpoint).toBe("tablet");
+    expect(result.current.isTablet).toBe(true);
+    expect(result.current.usesDesktopWorkbench).toBe(false);
+  });
+
+  it("keeps hover-only hybrid half-screen widths in tablet fallback", () => {
+    setViewport(900, "coarse", "hover");
+
+    const { result } = renderHook(() => useResponsiveBreakpoint());
+
+    expect(result.current.breakpoint).toBe("tablet");
+    expect(result.current.isFinePointer).toBe(false);
+    expect(result.current.usesDesktopWorkbench).toBe(false);
+  });
+
+  it("uses mobile composition until the desktop sidebar becomes available", () => {
+    setViewport(767, "fine");
+    const { result } = renderHook(() => useResponsiveBreakpoint());
+
+    expect(result.current.breakpoint).toBe("mobile");
+    expect(result.current.usesDesktopWorkbench).toBe(false);
+
+    notifyResize(768, "fine");
+
+    expect(result.current.breakpoint).toBe("compactDesktop");
+    expect(result.current.usesDesktopWorkbench).toBe(true);
+  });
+
+  it("updates pointer mode while the subscription remains mounted", () => {
+    const { result } = renderHook(() => useResponsiveBreakpoint());
+
+    expect(result.current.isFinePointer).toBe(true);
+
+    notifyResize(1024, "coarse");
+
+    expect(result.current.isFinePointer).toBe(false);
+    expect(result.current.breakpoint).toBe("desktop");
+
+    notifyResize(1024, "fine");
+    expect(result.current.isFinePointer).toBe(true);
+  });
+
+  it("does not read viewport geometry or media queries on ordinary consumer rerenders", () => {
+    const first = renderHook(() => useResponsiveBreakpoint());
+    const second = renderHook(() => useResponsiveBreakpoint());
+    const snapshot = first.result.current;
+    const readWidth = vi.fn(() => 1024);
+    Object.defineProperty(window, "innerWidth", { configurable: true, get: readWidth });
+    vi.mocked(window.matchMedia).mockClear();
+
+    first.rerender();
+    second.rerender();
+
+    expect(first.result.current).toBe(snapshot);
+    expect(second.result.current).toBe(snapshot);
+    expect(readWidth).not.toHaveBeenCalled();
+    expect(window.matchMedia).not.toHaveBeenCalled();
+
+    notifyResize(767, "coarse");
+    expect(first.result.current.isMobile).toBe(true);
+    expect(second.result.current).toBe(first.result.current);
+    first.unmount();
+    notifyResize(900, "fine");
+    expect(second.result.current.breakpoint).toBe("compactDesktop");
+    second.unmount();
+    expect(listeners.size).toBe(0);
+  });
+
+  it("reads the current viewport after all consumers have unmounted", () => {
+    const first = renderHook(() => useResponsiveBreakpoint());
+    first.unmount();
+    setViewport(390, "coarse");
+
+    const second = renderHook(() => useResponsiveBreakpoint());
+    expect(second.result.current.isMobile).toBe(true);
+    expect(second.result.current.isFinePointer).toBe(false);
+  });
+});

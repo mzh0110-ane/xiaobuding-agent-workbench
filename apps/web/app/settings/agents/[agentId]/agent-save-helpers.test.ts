@@ -1,0 +1,605 @@
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import {
+  createAgentAction,
+  createAgentProfileAction,
+  updateAgentProfileAction,
+  updateAgentProfileMcpConfigAction,
+} from "@/app/actions/agents";
+import { agentProfileId as toAgentProfileId, type AgentProfile } from "@/lib/types/http";
+import {
+  isProfileDirty,
+  mergeSavedAgentDraft,
+  saveExistingAgent,
+  saveNewAgent,
+  toAgentProfilePatch,
+  type SaveAgentCallbacks,
+  type DraftAgent,
+  type DraftProfile,
+} from "./agent-save-helpers";
+import type { ProfileFormData } from "@/components/settings/profile-form-fields";
+
+vi.mock("@/app/actions/agents", () => ({
+  createAgentAction: vi.fn(),
+  createAgentProfileAction: vi.fn(),
+  deleteAgentProfileAction: vi.fn(),
+  updateAgentAction: vi.fn(),
+  updateAgentProfileAction: vi.fn(),
+  updateAgentProfileMcpConfigAction: vi.fn(),
+}));
+
+const baseProfile: AgentProfile = {
+  id: toAgentProfileId("p1"),
+  agentId: "a1",
+  name: "Profile",
+  agentDisplayName: "Mock",
+  model: "mock-fast",
+  mode: "default",
+  allowIndexing: false,
+  autoApprove: false,
+  cliFlags: [],
+  cliPassthrough: false,
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-01-01T00:00:00Z",
+};
+
+const draftFrom = (saved: AgentProfile, overrides: Partial<DraftProfile> = {}): DraftProfile => ({
+  ...saved,
+  ...overrides,
+});
+
+const ALLOW_ALL_TOOLS_FLAG = "--allow-all-tools";
+const COMMAND_PREFIX = "greywall --";
+const PERSISTED_PROFILE_ID = toAgentProfileId("persisted-profile");
+const DRAFT_PROFILE_ID = toAgentProfileId("draft-profile");
+const NEW_PROFILE_ID = toAgentProfileId("draft-new-profile");
+const NEW_PROFILE_NAME = "New profile";
+const PLAYWRIGHT_MCP_SERVERS = '{"mcpServers":{"playwright":{"command":"npx"}}}';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+function createTestCallbacks(initialDraft: DraftAgent) {
+  let currentDraft = initialDraft;
+  const upsertAgent = vi.fn();
+  const replaceRoute = vi.fn();
+  const callbacks: SaveAgentCallbacks = {
+    onToastError: vi.fn(),
+    currentAgentModelConfig: {
+      default_model: "mock-fast",
+      available_models: [],
+      supports_dynamic_models: false,
+    },
+    permissionSettings: {},
+    resolveDisplayName: () => "Mock",
+    upsertAgent,
+    setDraftAgent: (value) => {
+      currentDraft = typeof value === "function" ? value(currentDraft) : value;
+    },
+    ensureProfiles: (agent) => agent,
+    cloneAgent: (agent) => ({
+      ...agent,
+      profiles: agent.profiles.map((profile) => ({ ...profile })),
+    }),
+    replaceRoute,
+  };
+  return { callbacks, upsertAgent, replaceRoute, getDraft: () => currentDraft };
+}
+
+describe("toAgentProfilePatch", () => {
+  it("maps snake_case form keys to camelCase AgentProfile fields", () => {
+    const patch: Partial<ProfileFormData> = {
+      name: "CLI",
+      model: "claude-sonnet",
+      mode: "default",
+      allow_indexing: true,
+      auto_approve: true,
+      cli_passthrough: true,
+      cursor_mcp_auth_enabled: false,
+      cursor_plugins_mcp_enabled: false,
+      mcp_selection_mode: "selected",
+      mcp_selected_servers: ["server-a"],
+      cli_flags: [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: true, description: "" }],
+    };
+    expect(toAgentProfilePatch(patch)).toEqual({
+      name: "CLI",
+      model: "claude-sonnet",
+      mode: "default",
+      allowIndexing: true,
+      autoApprove: true,
+      cliPassthrough: true,
+      cursorMcpAuthEnabled: false,
+      cursorPluginsMcpEnabled: false,
+      mcpSelectionMode: "selected",
+      mcpSelectedServers: ["server-a"],
+      cliFlags: [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: true, description: "" }],
+    });
+  });
+
+  it("maps fallback_model and auto_fallback to camelCase fields", () => {
+    expect(toAgentProfilePatch({ fallback_model: "gpt-5", auto_fallback: true })).toEqual({
+      fallbackModel: "gpt-5",
+      autoFallback: true,
+    });
+  });
+
+  it("maps require_exact_model to the camelCase field", () => {
+    expect(toAgentProfilePatch({ require_exact_model: true })).toEqual({
+      requireExactModel: true,
+    });
+  });
+
+  it("omits undefined keys so partial patches do not clobber unrelated fields", () => {
+    expect(toAgentProfilePatch({ cli_passthrough: false })).toEqual({ cliPassthrough: false });
+    expect(toAgentProfilePatch({})).toEqual({});
+  });
+
+  it("maps command_prefix to commandPrefix", () => {
+    expect(toAgentProfilePatch({ command_prefix: COMMAND_PREFIX })).toEqual({
+      commandPrefix: COMMAND_PREFIX,
+    });
+  });
+
+  it("maps a cleared command_prefix (empty string) rather than dropping it", () => {
+    expect(toAgentProfilePatch({ command_prefix: "" })).toEqual({ commandPrefix: "" });
+  });
+});
+
+describe("isProfileDirty", () => {
+  it("returns false when draft equals saved", () => {
+    expect(isProfileDirty(draftFrom(baseProfile), baseProfile)).toBe(false);
+  });
+
+  it("returns true when only the Cursor MCP auth preference changes", () => {
+    expect(
+      isProfileDirty(draftFrom(baseProfile, { cursorMcpAuthEnabled: false }), baseProfile),
+    ).toBe(true);
+  });
+
+  it("returns true when only mode changes", () => {
+    const draft = draftFrom(baseProfile, { mode: "plan-mock" });
+    expect(isProfileDirty(draft, baseProfile)).toBe(true);
+  });
+
+  it("treats undefined mode as equal to empty string", () => {
+    const saved: AgentProfile = { ...baseProfile, mode: undefined };
+    const draft = draftFrom(saved, { mode: "" });
+    expect(isProfileDirty(draft, saved)).toBe(false);
+  });
+
+  it("returns true when mode changes from empty to a value", () => {
+    const saved: AgentProfile = { ...baseProfile, mode: "" };
+    const draft = draftFrom(saved, { mode: "plan-mock" });
+    expect(isProfileDirty(draft, saved)).toBe(true);
+  });
+
+  it("returns true when mode changes from a value to empty (cleared)", () => {
+    const saved: AgentProfile = { ...baseProfile, mode: "plan-mock" };
+    const draft = draftFrom(saved, { mode: "" });
+    expect(isProfileDirty(draft, saved)).toBe(true);
+  });
+
+  it("returns true when fallbackModel or autoFallback changes", () => {
+    expect(isProfileDirty(draftFrom(baseProfile, { fallbackModel: "gpt-5" }), baseProfile)).toBe(
+      true,
+    );
+    expect(isProfileDirty(draftFrom(baseProfile, { autoFallback: true }), baseProfile)).toBe(true);
+    const saved: AgentProfile = { ...baseProfile, fallbackModel: "gpt-5", autoFallback: true };
+    expect(isProfileDirty(draftFrom(saved), saved)).toBe(false);
+  });
+
+  it("returns true when there is no saved profile", () => {
+    expect(isProfileDirty(draftFrom(baseProfile))).toBe(true);
+  });
+
+  it("returns true when cliFlags list changes", () => {
+    const draft = draftFrom(baseProfile, {
+      cliFlags: [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: true, description: "" }],
+    });
+    expect(isProfileDirty(draft, baseProfile)).toBe(true);
+  });
+
+  it("returns true when a cliFlag enabled state changes", () => {
+    const saved: AgentProfile = {
+      ...baseProfile,
+      cliFlags: [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: false, description: "" }],
+    };
+    const draft = draftFrom(saved, {
+      cliFlags: [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: true, description: "" }],
+    });
+    expect(isProfileDirty(draft, saved)).toBe(true);
+  });
+
+  it("returns false when cliFlags are equal", () => {
+    const flags = [{ flag: ALLOW_ALL_TOOLS_FLAG, enabled: true, description: "desc" }];
+    const saved: AgentProfile = { ...baseProfile, cliFlags: flags };
+    const draft = draftFrom(saved, { cliFlags: [...flags] });
+    expect(isProfileDirty(draft, saved)).toBe(false);
+  });
+
+  it("returns true when autoApprove changes via camelCase draft field", () => {
+    const draft = draftFrom(baseProfile, { autoApprove: true });
+    expect(isProfileDirty(draft, baseProfile)).toBe(true);
+  });
+
+  it("returns false when stale snake_case auto_approve disagrees with camelCase", () => {
+    const draft = draftFrom(baseProfile, { auto_approve: true, autoApprove: false });
+    expect(isProfileDirty(draft, baseProfile)).toBe(false);
+  });
+
+  it("returns true when a command prefix is set on a profile that had none", () => {
+    const draft = draftFrom(baseProfile, { commandPrefix: COMMAND_PREFIX });
+    expect(isProfileDirty(draft, baseProfile)).toBe(true);
+  });
+
+  it("returns true when a previously saved command prefix is cleared", () => {
+    const saved: AgentProfile = { ...baseProfile, commandPrefix: COMMAND_PREFIX };
+    const draft = draftFrom(saved, { commandPrefix: "" });
+    expect(isProfileDirty(draft, saved)).toBe(true);
+  });
+
+  it("treats an undefined command prefix as equal to an empty string", () => {
+    const saved: AgentProfile = { ...baseProfile, commandPrefix: undefined };
+    const draft = draftFrom(saved, { commandPrefix: "" });
+    expect(isProfileDirty(draft, saved)).toBe(false);
+  });
+
+  it("returns false when the command prefix is unchanged", () => {
+    const saved: AgentProfile = { ...baseProfile, commandPrefix: COMMAND_PREFIX };
+    const draft = draftFrom(saved, { commandPrefix: COMMAND_PREFIX });
+    expect(isProfileDirty(draft, saved)).toBe(false);
+  });
+});
+
+describe("mergeSavedAgentDraft", () => {
+  it("remaps created profile IDs while preserving edits made during save", () => {
+    const submittedProfile = draftFrom(baseProfile, {
+      id: DRAFT_PROFILE_ID,
+      name: "Submitted name",
+    });
+    const submitted = agentWithProfiles([submittedProfile]);
+    const current = {
+      ...submitted,
+      workspace_id: "newer-workspace",
+      profiles: [{ ...submittedProfile, name: "Newer name" }],
+    };
+    const saved = agentWithProfiles([{ ...submittedProfile, id: PERSISTED_PROFILE_ID }]);
+
+    const merged = mergeSavedAgentDraft(
+      current,
+      submitted,
+      saved,
+      new Map([[submittedProfile.id, PERSISTED_PROFILE_ID]]),
+    );
+
+    expect(merged.workspace_id).toBe("newer-workspace");
+    expect(merged.profiles[0].id).toBe(PERSISTED_PROFILE_ID);
+    expect(merged.profiles[0].name).toBe("Newer name");
+  });
+
+  it("keeps existing profiles while remapping a newly created profile", () => {
+    const existing = draftFrom(baseProfile, { id: toAgentProfileId("existing") });
+    const submittedProfile = draftFrom(baseProfile, {
+      id: DRAFT_PROFILE_ID,
+      name: "Submitted",
+    });
+    const persisted = { ...submittedProfile, id: PERSISTED_PROFILE_ID };
+    const submitted = agentWithProfiles([submittedProfile]);
+    const current = agentWithProfiles([{ ...submittedProfile, name: "Newer" }]);
+    const saved = agentWithProfiles([existing, persisted]);
+
+    const merged = mergeSavedAgentDraft(
+      current,
+      submitted,
+      saved,
+      new Map([[submittedProfile.id, persisted.id]]),
+    );
+
+    expect(merged.profiles.map((profile) => profile.id)).toEqual([existing.id, persisted.id]);
+    expect(merged.profiles[1].name).toBe("Newer");
+  });
+});
+
+describe("saveNewAgent", () => {
+  it("reconciles a created agent so a failed MCP write retries without another create", async () => {
+    const draftProfile = draftFrom(baseProfile, {
+      id: DRAFT_PROFILE_ID,
+      mcp_config: {
+        enabled: true,
+        servers: PLAYWRIGHT_MCP_SERVERS,
+        dirty: true,
+        error: null,
+      },
+    });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const created = agentWithProfiles([
+      { ...draftProfile, id: PERSISTED_PROFILE_ID, mcp_config: undefined },
+    ]);
+    const { callbacks, upsertAgent, replaceRoute, getDraft } = createTestCallbacks(draftAgent);
+    const failure = new Error("MCP unavailable");
+    vi.mocked(createAgentAction).mockResolvedValue(created);
+    vi.mocked(updateAgentProfileMcpConfigAction)
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce({
+        profile_id: PERSISTED_PROFILE_ID,
+        enabled: true,
+        servers: {},
+        meta: {},
+      });
+
+    await expect(saveNewAgent(draftAgent, callbacks)).rejects.toBe(failure);
+
+    const reconciled = upsertAgent.mock.calls[0][0];
+    expect(reconciled.profiles[0]).toMatchObject({
+      id: PERSISTED_PROFILE_ID,
+      mcp_config: { dirty: true },
+    });
+    expect(getDraft().profiles[0]).toMatchObject({
+      id: PERSISTED_PROFILE_ID,
+      mcp_config: { dirty: true },
+    });
+    expect(replaceRoute).toHaveBeenCalledWith("/settings/agents/mock-agent");
+
+    const savedDraft = await saveExistingAgent(getDraft(), reconciled, false, callbacks);
+
+    expect(createAgentAction).toHaveBeenCalledOnce();
+    expect(createAgentProfileAction).not.toHaveBeenCalled();
+    expect(updateAgentProfileMcpConfigAction).toHaveBeenCalledTimes(2);
+    expect(savedDraft.profiles[0].mcp_config).toBeUndefined();
+  });
+});
+
+describe("saveExistingAgent", () => {
+  it("reconciles a created profile so a failed MCP write retries without duplication", async () => {
+    const newProfile = draftFrom(baseProfile, {
+      id: NEW_PROFILE_ID,
+      name: NEW_PROFILE_NAME,
+      mcp_config: {
+        enabled: true,
+        servers: PLAYWRIGHT_MCP_SERVERS,
+        dirty: true,
+        error: null,
+      },
+    });
+    const updatedExisting = { ...baseProfile, name: "Updated existing profile" };
+    const savedAgent = agentWithProfiles([baseProfile]);
+    const draftAgent = agentWithProfiles([updatedExisting, newProfile]);
+    const createdProfile = { ...newProfile, id: PERSISTED_PROFILE_ID, mcp_config: undefined };
+    const { callbacks, upsertAgent, getDraft } = createTestCallbacks(draftAgent);
+    const failure = new Error("MCP unavailable");
+    vi.mocked(updateAgentProfileAction).mockResolvedValue(updatedExisting);
+    vi.mocked(createAgentProfileAction).mockResolvedValue(createdProfile);
+    vi.mocked(updateAgentProfileMcpConfigAction)
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce({
+        profile_id: PERSISTED_PROFILE_ID,
+        enabled: true,
+        servers: {},
+      });
+
+    await expect(saveExistingAgent(draftAgent, savedAgent, false, callbacks)).rejects.toBe(failure);
+
+    const reconciled = upsertAgent.mock.calls[0][0];
+    expect(reconciled.profiles[0].name).toBe("Updated existing profile");
+    expect(reconciled.profiles[1]).toMatchObject({
+      id: PERSISTED_PROFILE_ID,
+      mcp_config: { dirty: true },
+    });
+    expect(getDraft().profiles[0].name).toBe("Updated existing profile");
+    expect(getDraft().profiles[1]).toMatchObject({
+      id: PERSISTED_PROFILE_ID,
+      mcp_config: { dirty: true },
+    });
+
+    const savedDraft = await saveExistingAgent(getDraft(), reconciled, false, callbacks);
+
+    expect(createAgentProfileAction).toHaveBeenCalledOnce();
+    expect(updateAgentProfileAction).toHaveBeenCalledOnce();
+    expect(updateAgentProfileMcpConfigAction).toHaveBeenCalledTimes(2);
+    expect(savedDraft.profiles[1].mcp_config).toBeUndefined();
+  });
+});
+
+describe("command prefix save payloads", () => {
+  it("includes the command prefix when saving a dirty existing profile", async () => {
+    const savedAgent = agentWithProfiles([baseProfile]);
+    const draftProfile = draftFrom(baseProfile, { commandPrefix: COMMAND_PREFIX });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(updateAgentProfileAction).mockResolvedValue({
+      ...baseProfile,
+      commandPrefix: COMMAND_PREFIX,
+    });
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(updateAgentProfileAction).toHaveBeenCalledWith(
+      baseProfile.id,
+      expect.objectContaining({ command_prefix: COMMAND_PREFIX }),
+    );
+  });
+
+  it("saves an empty command prefix when a previously-saved prefix is cleared", async () => {
+    const savedProfileWithPrefix: AgentProfile = { ...baseProfile, commandPrefix: COMMAND_PREFIX };
+    const savedAgent = agentWithProfiles([savedProfileWithPrefix]);
+    const draftProfile = draftFrom(savedProfileWithPrefix, { commandPrefix: "" });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(updateAgentProfileAction).mockResolvedValue({ ...baseProfile, commandPrefix: "" });
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(updateAgentProfileAction).toHaveBeenCalledWith(
+      baseProfile.id,
+      expect.objectContaining({ command_prefix: "" }),
+    );
+  });
+
+  it("includes the command prefix when creating a new agent's profile", async () => {
+    const draftProfile = draftFrom(baseProfile, {
+      id: DRAFT_PROFILE_ID,
+      commandPrefix: COMMAND_PREFIX,
+    });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(createAgentAction).mockResolvedValue(
+      agentWithProfiles([{ ...draftProfile, id: PERSISTED_PROFILE_ID }]),
+    );
+
+    await saveNewAgent(draftAgent, callbacks);
+
+    expect(createAgentAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profiles: [expect.objectContaining({ command_prefix: COMMAND_PREFIX })],
+      }),
+    );
+  });
+
+  it("includes the command prefix when adding a new profile to an existing agent", async () => {
+    const savedAgent = agentWithProfiles([baseProfile]);
+    const newProfile = draftFrom(baseProfile, {
+      id: NEW_PROFILE_ID,
+      name: NEW_PROFILE_NAME,
+      commandPrefix: COMMAND_PREFIX,
+    });
+    const draftAgent = agentWithProfiles([baseProfile, newProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(createAgentProfileAction).mockResolvedValue({
+      ...newProfile,
+      id: PERSISTED_PROFILE_ID,
+    });
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(createAgentProfileAction).toHaveBeenCalledWith(
+      savedAgent.id,
+      expect.objectContaining({ command_prefix: COMMAND_PREFIX }),
+    );
+  });
+});
+
+describe("Cursor MCP auth preference save payloads", () => {
+  it("omits an unchanged preference when saving another existing profile field", async () => {
+    const savedProfile = { ...baseProfile, cursorMcpAuthEnabled: true };
+    const savedAgent = agentWithProfiles([savedProfile]);
+    const draftProfile = draftFrom(savedProfile, { name: "Renamed profile" });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(updateAgentProfileAction).mockResolvedValue(draftProfile);
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(updateAgentProfileAction).toHaveBeenCalledWith(
+      baseProfile.id,
+      expect.objectContaining({ cursor_mcp_auth_enabled: undefined }),
+    );
+  });
+
+  it("preserves false when updating an existing profile", async () => {
+    const savedProfile = {
+      ...baseProfile,
+      cursorMcpAuthEnabled: true,
+      cursorPluginsMcpEnabled: true,
+    };
+    const savedAgent = agentWithProfiles([savedProfile]);
+    const draftProfile = draftFrom(savedProfile, {
+      cursorMcpAuthEnabled: false,
+      cursorPluginsMcpEnabled: false,
+    });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(updateAgentProfileAction).mockResolvedValue(draftProfile);
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(updateAgentProfileAction).toHaveBeenCalledWith(
+      baseProfile.id,
+      expect.objectContaining({
+        cursor_mcp_auth_enabled: false,
+        cursor_plugins_mcp_enabled: false,
+      }),
+    );
+  });
+
+  it("saves an explicit selected-server set and omits unchanged selection fields", async () => {
+    const savedProfile = {
+      ...baseProfile,
+      mcpSelectionMode: "inherit" as const,
+      mcpSelectedServers: [],
+    };
+    const selectedProfile = draftFrom(savedProfile, {
+      mcpSelectionMode: "selected",
+      mcpSelectedServers: ["server-b", "server-a"],
+    });
+    const savedAgent = agentWithProfiles([savedProfile]);
+    const draftAgent = agentWithProfiles([selectedProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(updateAgentProfileAction).mockResolvedValue(selectedProfile);
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(updateAgentProfileAction).toHaveBeenCalledWith(
+      baseProfile.id,
+      expect.objectContaining({
+        mcp_selection_mode: "selected",
+        mcp_selected_servers: ["server-b", "server-a"],
+      }),
+    );
+  });
+
+  it("defaults new agent profile payloads to enabled", async () => {
+    const draftProfile = draftFrom(baseProfile, { id: DRAFT_PROFILE_ID });
+    const draftAgent = agentWithProfiles([draftProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(createAgentAction).mockResolvedValue(
+      agentWithProfiles([{ ...draftProfile, id: PERSISTED_PROFILE_ID }]),
+    );
+
+    await saveNewAgent(draftAgent, callbacks);
+
+    expect(createAgentAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profiles: [
+          expect.objectContaining({
+            cursor_mcp_auth_enabled: true,
+            mcp_selection_mode: "inherit",
+            mcp_selected_servers: [],
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("preserves false when creating an additional profile", async () => {
+    const savedAgent = agentWithProfiles([baseProfile]);
+    const newProfile = draftFrom(baseProfile, {
+      id: NEW_PROFILE_ID,
+      name: NEW_PROFILE_NAME,
+      cursorMcpAuthEnabled: false,
+    });
+    const draftAgent = agentWithProfiles([baseProfile, newProfile]);
+    const { callbacks } = createTestCallbacks(draftAgent);
+    vi.mocked(createAgentProfileAction).mockResolvedValue({
+      ...newProfile,
+      id: PERSISTED_PROFILE_ID,
+    });
+
+    await saveExistingAgent(draftAgent, savedAgent, false, callbacks);
+
+    expect(createAgentProfileAction).toHaveBeenCalledWith(
+      savedAgent.id,
+      expect.objectContaining({ cursor_mcp_auth_enabled: false }),
+    );
+  });
+});
+
+function agentWithProfiles(profiles: DraftProfile[]): DraftAgent {
+  return {
+    id: "agent-1",
+    name: "mock-agent",
+    supports_mcp: true,
+    profiles,
+    created_at: "",
+    updated_at: "",
+  };
+}

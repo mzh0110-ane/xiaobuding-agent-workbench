@@ -1,0 +1,87 @@
+package routingerr
+
+import "regexp"
+
+type rule struct {
+	id         string
+	pattern    *regexp.Regexp
+	code       Code
+	confidence Confidence
+}
+
+var providerRules = map[string][]rule{
+	"claude-acp": {
+		mustRule("claude.stderr.quota.v1", `(?i)anthropic_quota_exceeded|credit balance|insufficient credits`, CodeQuotaLimited, ConfHigh),
+		mustRule("claude.stderr.session_limit.v1", `(?i)\b(?:you['’]ve|you\s+have)\s+hit\s+your\s+session\s+limit\b`, CodeQuotaLimited, ConfHigh),
+		mustRule("claude.stderr.rate.v1", `(?i)rate.?limit`, CodeRateLimited, ConfHigh),
+		// A proxy can reject every account credential before it sends a request
+		// upstream. This is a hard credential condition; a retry or a switch
+		// back to the same proxy cannot repair it. Require proxy_error plus the
+		// proxy's explicit credential/entitlement wording to avoid treating
+		// ordinary Anthropic auth messages as proxy failures.
+		mustRule("claude.proxy.credentials_refused.v1", `(?i)\bproxy_error\b[^\n]{0,512}\b(?:credentials?\s+(?:were\s+)?refused|oauth\s+entitlement)\b`, CodeMissingCredentials, ConfHigh),
+		mustRule("claude.stderr.auth.v1", `(?i)not authenticated|please log in|run `+"`"+`claude`+"`"+` to authenticate`, CodeAuthRequired, ConfHigh),
+		mustRule("claude.stderr.subscription.v1", `(?i)subscription`, CodeSubscriptionRequired, ConfMedium),
+		mustRule("claude.stderr.model.v1", `(?i)model.*not found|unknown model`, CodeModelUnavailable, ConfHigh),
+		mustRule("claude.stderr.notinstalled.v1", `(?i)command not found|no such file`, CodeProviderNotConfigured, ConfMedium),
+	},
+	"codex-acp": {
+		mustRule(
+			"codex.stderr.quota.v1",
+			`(?i)insufficient_quota|quota_exceeded|usagelimitexceeded|(?:you['’]ve|you have)\s+hit\s+your\s+usage\s+limit`,
+			CodeQuotaLimited, ConfHigh,
+		),
+		mustRule("codex.stderr.rate.v1", `(?i)rate_limit_exceeded|too many requests`, CodeRateLimited, ConfHigh),
+		mustRule("codex.stderr.auth.v1", `(?i)invalid api key|incorrect api key|missing api key`, CodeMissingCredentials, ConfHigh),
+		mustRule("codex.stderr.model.v1", `(?i)model_not_found`, CodeModelUnavailable, ConfHigh),
+	},
+	"opencode-acp": {
+		mustRule("opencode.stderr.usage_limit.v1", `(?i)\b(?:\d+[- ]hour(?:s)?|daily|weekly|monthly)\s+usage\s+limit\s+reached\b`, CodeQuotaLimited, ConfHigh),
+		// Explicit credit exhaustion takes precedence over generic payment wording.
+		mustRule("opencode.stderr.credit.v1", `(?i)\b(?:credit\s+limit\s+reached|out\s+of\s+credits?|insufficient\s+credits?|insufficient\s+balance)\b`, CodeQuotaLimited, ConfHigh),
+		mustRule("opencode.stderr.subscription.v1", `(?i)\bpayment\s+required\b`, CodeSubscriptionRequired, ConfHigh),
+		mustRule("opencode.stderr.quota.v1", `(?i)quota`, CodeQuotaLimited, ConfMedium),
+		mustRule("opencode.stderr.rate.v1", `(?i)rate.?limit`, CodeRateLimited, ConfHigh),
+		mustRule("opencode.stderr.auth.v1", `(?i)unauthorized|invalid token`, CodeAuthRequired, ConfHigh),
+	},
+	"copilot-acp": {
+		mustRule("copilot.stderr.subscription.v1", `(?i)not entitled|subscription required|copilot is disabled`, CodeSubscriptionRequired, ConfHigh),
+		mustRule("copilot.stderr.auth.v1", `(?i)please.*sign in|gh auth login`, CodeAuthRequired, ConfHigh),
+		mustRule("copilot.stderr.rate.v1", `(?i)rate.?limit`, CodeRateLimited, ConfHigh),
+	},
+	"amp-acp": {
+		mustRule("amp.stderr.auth.v1", `(?i)unauthorized|invalid token`, CodeAuthRequired, ConfHigh),
+		mustRule("amp.stderr.rate.v1", `(?i)rate.?limit`, CodeRateLimited, ConfHigh),
+		mustRule("amp.stderr.quota.v1", `(?i)quota`, CodeQuotaLimited, ConfMedium),
+	},
+}
+
+func mustRule(id, pat string, code Code, conf Confidence) rule {
+	return rule{id: id, pattern: regexp.MustCompile(pat), code: code, confidence: conf}
+}
+
+// HasProviderRules reports whether providerID is a rules catalogue key (an
+// agent ID such as "opencode-acp"). Diagnostics can carry a different
+// provider identity, e.g. OpenCode's model-provider ID "opencode-go", which
+// must not be used for rule lookup.
+func HasProviderRules(providerID string) bool {
+	_, ok := providerRules[providerID]
+	return ok
+}
+
+func matchProviderRules(providerID, text string) (*Error, bool) {
+	rules, ok := providerRules[providerID]
+	if !ok || text == "" {
+		return nil, false
+	}
+	for _, r := range rules {
+		if r.pattern.MatchString(text) {
+			return &Error{
+				Code:           r.code,
+				Confidence:     r.confidence,
+				ClassifierRule: r.id,
+			}, true
+		}
+	}
+	return nil, false
+}

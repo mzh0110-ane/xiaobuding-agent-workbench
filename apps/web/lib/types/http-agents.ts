@@ -1,0 +1,626 @@
+// Agent, model, clarification, plan, and stats types extracted from http.ts.
+//
+// Per ADR 0005 Wave E the canonical `AgentProfile` lives in
+// `./agent-profile.ts` (camelCase, single source of truth for both kanban and
+// office consumers). The kanban HTTP payload shape (snake_case wire format) is
+// `AgentProfilePayload`, also exported from there.
+
+export type {
+  AgentProfile,
+  AgentProfilePayload,
+  AgentRole,
+  AgentStatus,
+  BillingType,
+  CLIFlag,
+  UtilizationWindow,
+  ProviderUsage,
+} from "./agent-profile";
+
+import type { AgentProfile } from "./agent-profile";
+import type { CLIFlag } from "./agent-profile";
+import type { BackendMessage } from "./backend-message";
+
+/**
+ * How kandev drives a custom agent's command. Absent means terminal
+ * passthrough, which is what every definition stored before the field existed
+ * decodes to.
+ */
+export type CustomAgentProtocol = "acp";
+
+export type TUIConfig = {
+  command: string;
+  display_name: string;
+  model?: string;
+  description?: string;
+  command_args?: string[];
+  wait_for_terminal: boolean;
+  /**
+   * How kandev injects its per-session MCP server into the wrapped CLI.
+   * Empty/absent means no injection — the agent gets no kandev task tools.
+   * Keys come from `GET /api/v1/agents/tui/mcp-strategies`; never hardcode a
+   * list here, or a strategy added in Go silently stops being selectable.
+   */
+  mcp_strategy?: string;
+  /**
+   * Runtime kandev drives the command with. Absent means terminal passthrough;
+   * `"acp"` means kandev speaks the Agent Client Protocol to it on standard
+   * input and output, which is what gives the agent structured chat, tool
+   * calls, models, and modes.
+   */
+  protocol?: CustomAgentProtocol;
+  /** Use paced unframed writes for TUIs that reject bracketed-paste markers. */
+  disable_bracketed_paste?: boolean;
+};
+
+/** One selectable MCP injection mechanism, served by the backend. */
+export type MCPStrategyOption = {
+  key: string;
+  /** The strategy's own description of the mechanism it uses. */
+  description: string;
+};
+
+export type Agent = {
+  id: string;
+  name: string;
+  workspace_id?: string | null;
+  supports_mcp: boolean;
+  mcp_config_path?: string | null;
+  tui_config?: TUIConfig | null;
+  profiles: AgentProfile[];
+  /**
+   * Host utility probe status for this agent type — mirrors
+   * `ModelConfig.status`. Populated by the backend from the host utility
+   * cache so clients can flag profiles that need login or reinstallation
+   * without fetching the full model config separately.
+   */
+  capability_status?: CapabilityStatus;
+  capability_error?: string;
+  /** Whether this agent supports sessionless host-utility inference. */
+  inference_capable?: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type McpServerType = "stdio" | "http" | "sse" | "streamable_http";
+export type McpServerMode = "shared" | "per_session" | "auto";
+
+export type McpServerDef = {
+  type?: McpServerType;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  mode?: McpServerMode;
+  meta?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
+};
+
+export type AgentProfileMcpConfig = {
+  profile_id: string;
+  enabled: boolean;
+  servers: Record<string, McpServerDef>;
+  meta?: Record<string, unknown>;
+};
+
+export type AgentDiscovery = {
+  name: string;
+  supports_mcp: boolean;
+  mcp_config_path?: string | null;
+  installation_paths: string[];
+  available: boolean;
+  matched_path?: string | null;
+  login_command?: LoginCommand;
+};
+
+export type AgentCapabilities = {
+  supports_session_resume: boolean;
+  supports_shell: boolean;
+  supports_workspace_only: boolean;
+};
+
+export type ModelEntry = {
+  id: string;
+  name: string;
+  description?: string;
+  provider?: string;
+  context_window?: number;
+  is_default?: boolean;
+  source?: "static" | "dynamic";
+  /**
+   * Agent-specific extras from ACP's `_meta` field. GitHub Copilot exposes
+   * `copilotUsage` (e.g. "1x", "0.33x", "0x" — premium-request multiplier)
+   * and `copilotEnablement`.
+   */
+  meta?: Record<string, unknown>;
+};
+
+export type ModeEntry = {
+  id: string;
+  name: string;
+  description?: string;
+  meta?: Record<string, unknown>;
+};
+
+export type CommandEntry = {
+  name: string;
+  description?: string;
+};
+
+export type ConfigOptionEntry = {
+  type: string;
+  id: string;
+  name: string;
+  description?: string;
+  current_value: string;
+  category?: string;
+  options?: { value: string; name: string; description?: string }[];
+};
+
+// CapabilityStatus mirrors the host utility probe status. "probing" is the
+// in-flight state; "ok" is populated; the remaining values signal errors the
+// UI can surface directly (auth, install, generic failure, not started yet).
+export type CapabilityStatus =
+  | "probing"
+  | "ok"
+  | "auth_required"
+  | "not_installed"
+  | "failed"
+  | "not_configured"
+  | "unsupported";
+
+export type ProfileLaunchSettingsRequest = {
+  env_vars: { key: string; value?: string; secret_id?: string }[];
+  cli_flags: CLIFlag[];
+  command_prefix: string;
+};
+
+export type ProfileCapabilityRequest = {
+  profile_id?: string;
+  launch_settings?: ProfileLaunchSettingsRequest;
+  refresh?: boolean;
+};
+
+export type ModelConfig = {
+  default_model: string;
+  available_models: ModelEntry[];
+  current_model_id?: string;
+  available_modes?: ModeEntry[];
+  current_mode_id?: string;
+  available_commands?: CommandEntry[];
+  config_options?: ConfigOptionEntry[];
+  supports_dynamic_models: boolean;
+  status?: CapabilityStatus;
+  error?: string;
+};
+
+export type DynamicModelsResponse = {
+  agent_name: string;
+  status: CapabilityStatus;
+  models: ModelEntry[];
+  current_model_id?: string;
+  modes?: ModeEntry[];
+  current_mode_id?: string;
+  commands?: CommandEntry[];
+  error: string | null;
+  context_revision?: string;
+};
+
+export type ResolveAgentModelConfigRequest = {
+  model: string;
+  mode?: string;
+  config_options?: Record<string, string>;
+  refresh?: boolean;
+  profile_id?: string;
+  launch_settings?: ProfileLaunchSettingsRequest;
+};
+
+export type AgentModelConfigResponse = {
+  agent_name: string;
+  model: string;
+  status: CapabilityStatus;
+  config_options: ConfigOptionEntry[];
+  error: string | null;
+  context_revision?: string;
+};
+
+export type PermissionSetting = {
+  supported: boolean;
+  default: boolean;
+  label: string;
+  description: string;
+  apply_method?: string;
+  cli_flag?: string;
+  cli_flag_value?: string;
+};
+
+export type PassthroughConfig = {
+  supported: boolean;
+  label: string;
+  description: string;
+  auto_inject_prompt?: boolean;
+  submit_sequence?: string;
+  /**
+   * Short human-readable phrase describing how kandev injects MCP servers into
+   * this agent's CLI in passthrough mode (e.g. "an MCP config file passed via
+   * the --mcp-config flag"). Absent when the agent declares no MCP strategy.
+   */
+  mcp_injection?: string;
+};
+
+export type ToolStatus = {
+  name: string;
+  display_name: string;
+  available: boolean;
+  matched_path?: string;
+  install_script?: string;
+  description?: string;
+  info_url?: string;
+};
+
+export type LoginCommand = {
+  cmd: string[];
+  variants?: Record<string, string[]>;
+  description?: string;
+};
+
+export type RuntimeUpdate = {
+  managed_fallback?: boolean;
+  supported: boolean;
+  package: string;
+  current_version?: string;
+  default_version?: string;
+  active_version?: string;
+  effective_version?: string;
+};
+
+export type AvailableAgent = {
+  name: string;
+  display_name: string;
+  description?: string;
+  install_script?: string;
+  supports_mcp: boolean;
+  mcp_config_path?: string | null;
+  installation_paths: string[];
+  available: boolean;
+  matched_path?: string | null;
+  capabilities: AgentCapabilities;
+  model_config: ModelConfig;
+  permission_settings?: Record<string, PermissionSetting>;
+  passthrough_config?: PassthroughConfig;
+  login_command?: LoginCommand;
+  runtime_update?: RuntimeUpdate;
+  updated_at: string;
+};
+
+export type ListAgentsResponse = {
+  agents: Agent[];
+  total: number;
+};
+
+export type ListAgentDiscoveryResponse = {
+  agents: AgentDiscovery[];
+  total: number;
+};
+
+export type ListAvailableAgentsResponse = {
+  agents: AvailableAgent[];
+  tools?: ToolStatus[];
+  total: number;
+};
+
+// Clarification request types (for ask_user_question feature)
+export type ClarificationOption = {
+  option_id: string;
+  label: string;
+  description: string;
+};
+
+export type ClarificationQuestion = {
+  id: string;
+  title: string;
+  prompt: string;
+  options: ClarificationOption[];
+  /** Omitted for existing agents, which retain the custom-answer field. */
+  allow_custom_text?: boolean;
+};
+
+// Each per-question chat message carries its own metadata. For multi-question
+// bundles, every message in the group shares the same pending_id and includes
+// question_index/question_total so the renderer can show "Question 2 of 3"
+// progress chips.
+export type ClarificationRequestMetadata = {
+  pending_id: string;
+  session_id: string;
+  task_id?: string;
+  question: ClarificationQuestion;
+  question_id?: string;
+  question_index?: number;
+  question_total?: number;
+  context?: string;
+  status?: "pending" | "answered" | "rejected" | "expired" | "cancelled";
+  response?: ClarificationAnswer;
+  agent_disconnected?: boolean;
+};
+
+export type ClarificationAnswer = {
+  question_id: string;
+  selected_options?: string[];
+  custom_text?: string;
+};
+
+export type ClarificationResponse = {
+  pending_id: string;
+  answers: ClarificationAnswer[];
+  rejected?: boolean;
+  reject_reason?: string;
+};
+
+// Task Plan types (for session artifacts)
+export type TaskPlan = {
+  id: string;
+  task_id: string;
+  title: string;
+  content: string;
+  created_by: "agent" | "user";
+  created_at: string;
+  updated_at: string;
+  implementation_started_at?: string | null;
+  implementation_started_session_id?: string | null;
+  implementation_started_by?: string | null;
+  comments_revision?: number;
+};
+
+export type TaskPlanResponse = {
+  plan: TaskPlan | null;
+};
+
+export type TaskPlanComment = {
+  id: string;
+  task_id: string;
+  plan_id: string;
+  body: string;
+  selected_text: string;
+  anchor_from: number;
+  anchor_to: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TaskPlanCommentSnapshot = {
+  task_id: string;
+  plan_id: string;
+  revision: number;
+  comments: TaskPlanComment[];
+};
+
+export type TaskPlanCommentRef = Pick<TaskPlanComment, "id" | "version">;
+
+export type PreviewCaptureRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  document_x?: number;
+  document_y?: number;
+  scroll_x?: number;
+  scroll_y?: number;
+  viewport_width?: number;
+  viewport_height?: number;
+  device_pixel_ratio?: number;
+};
+
+export type PreviewElementSnapshot = {
+  tag: string;
+  id?: string;
+  classes: string[];
+  role?: string;
+  accessible_label?: string;
+  visible_text?: string;
+  selector?: string;
+  outer_html: string;
+};
+
+export type PreviewTextEndpoint = {
+  selector?: string;
+  node_path: number[];
+  offset: number;
+};
+
+export type PreviewTextAnchor = {
+  start: PreviewTextEndpoint;
+  end: PreviewTextEndpoint;
+  rects?: PreviewCaptureRect[];
+  union_rect?: PreviewCaptureRect;
+  scroll_x?: number;
+  scroll_y?: number;
+  viewport_width?: number;
+  viewport_height?: number;
+  device_pixel_ratio?: number;
+  containing_element?: PreviewElementSnapshot;
+};
+
+export type TaskPreviewScreenshot = {
+  attachment_id: string;
+  name: string;
+  mime_type: string;
+  kind: string;
+  delivery_mode: string;
+  size_bytes: number;
+  state: string;
+};
+
+export type TaskPreviewFeedback = {
+  id: string;
+  task_id: string;
+  kind: "text" | "element" | "screenshot";
+  comment: string;
+  source_kind: "browser" | "html_file";
+  source_session_id?: string;
+  source_label: string;
+  source_path?: string;
+  page_route: string;
+  page_title: string;
+  selected_text?: string;
+  text_anchor?: PreviewTextAnchor;
+  element_snapshot?: PreviewElementSnapshot;
+  capture_rect?: PreviewCaptureRect;
+  screenshot_attachment_id?: string;
+  screenshot_attachment?: TaskPreviewScreenshot;
+  version: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TaskPreviewFeedbackSnapshot = {
+  task_id: string;
+  revision: number;
+  items: TaskPreviewFeedback[];
+};
+
+export type TaskPreviewFeedbackRef = Pick<TaskPreviewFeedback, "id" | "version">;
+
+/** A single anchored stop in a code walkthrough. */
+export type WalkthroughStep = {
+  title?: string;
+  repo?: string;
+  file: string;
+  line: number;
+  line_end?: number;
+  text: string;
+};
+
+/** An agent-authored guided code tour attached to a task. */
+export type TaskWalkthrough = {
+  id: string;
+  task_id: string;
+  title: string;
+  steps: WalkthroughStep[];
+  created_by: "agent";
+  created_at: string;
+  updated_at: string;
+};
+
+// Backend WS message map for walkthrough events, kept here (rather than in
+// backend.ts) so backend.ts stays under its line cap — mirrors the way office
+// events live in office-events.ts and fold into BackendMessageMap.
+export type WalkthroughBackendMessageMap = {
+  "task.walkthrough.created": BackendMessage<"task.walkthrough.created", TaskWalkthrough>;
+  "task.walkthrough.updated": BackendMessage<"task.walkthrough.updated", TaskWalkthrough>;
+  "task.walkthrough.deleted": BackendMessage<"task.walkthrough.deleted", TaskWalkthrough>;
+};
+
+// A single revision in the task plan history. `content` is optional because
+// list responses/WS broadcasts omit it for size; fetch detail separately.
+export type TaskPlanRevision = {
+  id: string;
+  task_id: string;
+  revision_number: number;
+  title: string;
+  content?: string;
+  // Character count of `content`, computed server-side so it survives even
+  // when list/WS payloads omit `content` for size.
+  content_length?: number;
+  author_kind: "agent" | "user";
+  author_name: string;
+  revert_of_revision_id?: string | null;
+  // Workflow step snapshot at write time; empty for revisions written before
+  // this stamping existed.
+  workflow_step_id?: string;
+  workflow_step_name?: string;
+  workflow_step_color?: string;
+  coalesced?: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+// Stats types
+export type TaskStatsDTO = {
+  task_id: string;
+  task_title: string;
+  workspace_id: string;
+  workflow_id: string;
+  state: string;
+  session_count: number;
+  turn_count: number;
+  message_count: number;
+  user_message_count: number;
+  tool_call_count: number;
+  total_duration_ms: number;
+  active_duration_ms: number;
+  elapsed_span_ms: number;
+  created_at: string;
+  completed_at?: string;
+};
+
+export type GlobalStatsDTO = {
+  total_tasks: number;
+  completed_tasks: number;
+  in_progress_tasks: number;
+  total_sessions: number;
+  total_turns: number;
+  total_messages: number;
+  total_user_messages: number;
+  total_tool_calls: number;
+  total_duration_ms: number;
+  avg_turns_per_task: number;
+  avg_messages_per_task: number;
+  avg_duration_ms_per_task: number;
+  avg_turn_duration_ms: number;
+  avg_messages_per_turn: number;
+};
+
+export type DailyActivityDTO = {
+  date: string;
+  turn_count: number;
+  message_count: number;
+  task_count: number;
+};
+
+export type CompletedTaskActivityDTO = {
+  date: string;
+  completed_tasks: number;
+};
+
+export type ModelUsageDTO = {
+  model: string;
+  session_count: number;
+  turn_count: number;
+  total_duration_ms: number;
+};
+
+export type RepositoryStatsDTO = {
+  repository_id: string;
+  repository_name: string;
+  total_tasks: number;
+  completed_tasks: number;
+  in_progress_tasks: number;
+  session_count: number;
+  turn_count: number;
+  message_count: number;
+  user_message_count: number;
+  tool_call_count: number;
+  total_duration_ms: number;
+  total_commits: number;
+  total_files_changed: number;
+  total_insertions: number;
+  total_deletions: number;
+};
+
+export type GitStatsDTO = {
+  total_commits: number;
+  total_files_changed: number;
+  total_insertions: number;
+  total_deletions: number;
+};
+
+export type StatsResponse = {
+  global: GlobalStatsDTO;
+  task_stats: TaskStatsDTO[];
+  daily_activity: DailyActivityDTO[];
+  completed_activity: CompletedTaskActivityDTO[];
+  model_usage: ModelUsageDTO[];
+  repository_stats: RepositoryStatsDTO[];
+  git_stats: GitStatsDTO;
+};

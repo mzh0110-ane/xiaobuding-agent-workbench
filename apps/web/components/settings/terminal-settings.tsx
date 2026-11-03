@@ -1,0 +1,361 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { IconTerminal2 } from "@tabler/icons-react";
+import { Badge } from "@kandev/ui/badge";
+import { CardContent, CardHeader, CardTitle } from "@kandev/ui/card";
+import { Input } from "@kandev/ui/input";
+import { Label } from "@kandev/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@kandev/ui/select";
+import { Separator } from "@kandev/ui/separator";
+import { SettingsSection } from "@/components/settings/settings-section";
+import { SettingsCard } from "@/components/settings/settings-card";
+import { ShellSettingsCard } from "@/components/settings/shell-settings-card";
+import { useAppStore, useAppStoreApi } from "@/components/state-provider";
+import { updateUserSettings } from "@/lib/api";
+import { useShellSettings } from "@/hooks/domains/settings/use-shell-settings";
+import { useSettingsSaveContributor } from "./settings-save-provider";
+import { TERMINAL_FONT_PRESETS } from "@/lib/terminal/terminal-font";
+import type { FontCategory } from "@/lib/terminal/terminal-font";
+import { useTranslation } from "react-i18next";
+import {
+  TERMINAL_FONT_FAMILY_TARGET,
+  TERMINAL_FONT_SIZE_TARGET,
+  TERMINAL_LINKS_TARGET,
+} from "@/lib/settings-discovery/catalog/preferences";
+
+const CUSTOM_VALUE = "__custom__";
+/**
+ * Catalog KEYS, not copy: a `t()` in a module-scope table freezes at the boot
+ * locale, and neither the lint guard nor the pseudo-locale can see that.
+ * Resolved at render in `FontGroupOptions`; the record keys are data.
+ */
+export const CATEGORY_LABEL_KEYS: Record<FontCategory, string> = {
+  icons: "settings:nerdFonts",
+  ligatures: "settings:programming",
+  system: "common:system",
+};
+export const CATEGORY_BADGE_KEYS: Partial<Record<FontCategory, string>> = {
+  icons: "settings:icons",
+  ligatures: "settings:ligatures",
+};
+const FONT_GROUPS: Record<string, typeof TERMINAL_FONT_PRESETS> = TERMINAL_FONT_PRESETS.reduce(
+  (acc, p) => {
+    (acc[p.category] ??= []).push(p);
+    return acc;
+  },
+  {} as Record<string, typeof TERMINAL_FONT_PRESETS>,
+);
+const FONT_CATEGORIES: FontCategory[] = ["icons", "ligatures", "system"];
+
+export function normalizeTerminalFontSize(value: number, fallback: number): number {
+  const base = Number.isFinite(value) ? value : fallback;
+  return Math.min(24, Math.max(8, base));
+}
+
+function FontGroupOptions() {
+  const { t } = useTranslation();
+  return FONT_CATEGORIES.map((category) => {
+    const badgeKey = CATEGORY_BADGE_KEYS[category];
+    return (
+      <SelectGroup key={category}>
+        <SelectLabel className="flex items-center gap-2">
+          {t(CATEGORY_LABEL_KEYS[category])}
+          {badgeKey && (
+            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+              {t(badgeKey)}
+            </Badge>
+          )}
+        </SelectLabel>
+        {/* Preset labels are font family names - data, never translated. The
+            one entry naming no typeface carries `labelKey` instead. */}
+        {(FONT_GROUPS[category] ?? []).map((preset) => (
+          <SelectItem key={preset.value} value={preset.value}>
+            {preset.labelKey ? t(preset.labelKey) : preset.label}
+          </SelectItem>
+        ))}
+      </SelectGroup>
+    );
+  });
+}
+
+function TerminalFontSizeCard({
+  fontSize,
+  isDirty,
+  onChange,
+}: {
+  fontSize: number;
+  isDirty: boolean;
+  onChange: (value: number) => void;
+}) {
+  const { t } = useTranslation();
+  const handleFontSizeBlur = () => {
+    onChange(normalizeTerminalFontSize(fontSize, 13));
+  };
+
+  return (
+    <SettingsCard
+      isDirty={isDirty}
+      discoveryTargetId={TERMINAL_FONT_SIZE_TARGET}
+      data-testid="terminal-font-size-card"
+    >
+      <CardHeader>
+        <CardTitle className="text-base">{t("settings:terminalFontSize")}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-2">
+          <Label htmlFor="terminal-font-size">{t("settings:fontSize")}</Label>
+          <div className="flex items-center gap-3">
+            <Input
+              id="terminal-font-size"
+              type="number"
+              min={8}
+              max={24}
+              value={fontSize}
+              data-settings-dirty={isDirty}
+              onChange={(e) => onChange(Number(e.target.value))}
+              onBlur={handleFontSizeBlur}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleFontSizeBlur();
+              }}
+              className="w-20"
+              data-testid="terminal-font-size-input"
+            />
+            <span className="text-xs text-muted-foreground">{t("settings:pxRange")}</span>
+          </div>
+          <p className="text-xs text-muted-foreground">{t("settings:setTheFontSizeForThe")}</p>
+        </div>
+      </CardContent>
+    </SettingsCard>
+  );
+}
+
+function TerminalFontCard({
+  fontFamily,
+  isDirty,
+  onChange,
+}: {
+  fontFamily: string | null;
+  isDirty: boolean;
+  onChange: (value: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const [isCustom, setIsCustom] = useState(() => {
+    const current = fontFamily;
+    if (!current) return false;
+    return !TERMINAL_FONT_PRESETS.some((p) => p.value === current);
+  });
+  const [customValue, setCustomValue] = useState(() => (isCustom ? fontFamily : "") ?? "");
+
+  useEffect(() => {
+    const nextIsCustom = Boolean(
+      fontFamily && !TERMINAL_FONT_PRESETS.some((preset) => preset.value === fontFamily),
+    );
+    setIsCustom(nextIsCustom);
+    setCustomValue(nextIsCustom ? (fontFamily ?? "") : "");
+  }, [fontFamily]);
+
+  const handleSelectChange = (value: string) => {
+    if (value === CUSTOM_VALUE) {
+      setIsCustom(true);
+      return;
+    }
+    setIsCustom(false);
+    setCustomValue("");
+    onChange(value === "default" ? null : value);
+  };
+
+  const handleCustomBlur = () => {
+    const trimmed = customValue.trim();
+    if (trimmed) onChange(trimmed);
+  };
+
+  const selectValue = isCustom ? CUSTOM_VALUE : fontFamily || "default";
+
+  return (
+    <SettingsCard
+      isDirty={isDirty}
+      discoveryTargetId={TERMINAL_FONT_FAMILY_TARGET}
+      data-testid="terminal-font-card"
+    >
+      <CardHeader>
+        <CardTitle className="text-base">{t("settings:terminalFont")}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3">
+          <Label htmlFor="terminal-font">{t("settings:fontFamily")}</Label>
+          <Select value={selectValue} onValueChange={handleSelectChange}>
+            <SelectTrigger
+              id="terminal-font"
+              data-testid="terminal-font-select"
+              data-settings-dirty={isDirty}
+            >
+              <SelectValue placeholder={t("settings:default")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="default">{t("settings:defaultMenloMonaco")}</SelectItem>
+              <FontGroupOptions />
+              <SelectSeparator />
+              <SelectItem value={CUSTOM_VALUE}>{t("settings:customEllipsis")}</SelectItem>
+            </SelectContent>
+          </Select>
+          {isCustom && (
+            <Input
+              placeholder={t("settings:customFontExample")}
+              value={customValue}
+              data-settings-dirty={isDirty}
+              onChange={(e) => setCustomValue(e.target.value)}
+              onBlur={handleCustomBlur}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleCustomBlur();
+              }}
+              data-testid="terminal-font-custom-input"
+            />
+          )}
+          <p className="text-xs text-muted-foreground">
+            {t("settings:chooseAMonospaceFontForThe")}
+          </p>
+        </div>
+      </CardContent>
+    </SettingsCard>
+  );
+}
+
+function TerminalLinksCard({
+  value,
+  isDirty,
+  onChange,
+}: {
+  value: "new_tab" | "browser_panel";
+  isDirty: boolean;
+  onChange: (value: "new_tab" | "browser_panel") => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <SettingsCard
+      isDirty={isDirty}
+      discoveryTargetId={TERMINAL_LINKS_TARGET}
+      data-testid="terminal-links-card"
+    >
+      <CardHeader>
+        <CardTitle className="text-base">{t("settings:terminalLinks")}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-2">
+          <Label htmlFor="terminal-link-behavior">{t("settings:openLinksIn")}</Label>
+          <Select
+            value={value}
+            onValueChange={(next) => onChange(next as "new_tab" | "browser_panel")}
+          >
+            <SelectTrigger id="terminal-link-behavior" data-settings-dirty={isDirty}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="new_tab">{t("settings:newBrowserTab")}</SelectItem>
+              <SelectItem value="browser_panel">{t("settings:builtInBrowserPanel")}</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">{t("settings:clickAUrlInTheTerminal")}</p>
+        </div>
+      </CardContent>
+    </SettingsCard>
+  );
+}
+
+export function TerminalSettings() {
+  const { t } = useTranslation();
+  const userSettings = useAppStore((state) => state.userSettings);
+  const setUserSettings = useAppStore((state) => state.setUserSettings);
+  const storeApi = useAppStoreApi();
+  const shellSettings = useShellSettings();
+  const [saved, setSaved] = useState(() => ({
+    preferredShell: shellSettings.preferredShell ?? "",
+    terminalFontFamily: userSettings.terminalFontFamily,
+    terminalFontSize: userSettings.terminalFontSize ?? 13,
+    terminalLinkBehavior: userSettings.terminalLinkBehavior,
+  }));
+  const [draft, setDraft] = useState(saved);
+  const revision = JSON.stringify(draft);
+  const validFontSize = normalizeTerminalFontSize(draft.terminalFontSize, 13);
+
+  useSettingsSaveContributor({
+    id: "general-terminal",
+    revision,
+    isDirty: revision !== JSON.stringify(saved),
+    canSave: Number.isFinite(draft.terminalFontSize),
+    invalidReason: t("settings:terminalFontSizeMustBeA"),
+    save: async () => {
+      const submitted = { ...draft, terminalFontSize: validFontSize };
+      const current = storeApi.getState().userSettings;
+      await updateUserSettings({
+        workspace_id: current.workspaceId || "",
+        repository_ids: current.repositoryIds || [],
+        preferred_shell: submitted.preferredShell.trim(),
+        terminal_font_family: submitted.terminalFontFamily ?? "",
+        terminal_font_size: submitted.terminalFontSize,
+        terminal_link_behavior: submitted.terminalLinkBehavior,
+      });
+      setSaved(submitted);
+      setDraft((latest) => (latest === draft ? submitted : latest));
+      setUserSettings({
+        ...storeApi.getState().userSettings,
+        preferredShell: submitted.preferredShell.trim() || null,
+        terminalFontFamily: submitted.terminalFontFamily,
+        terminalFontSize: submitted.terminalFontSize,
+        terminalLinkBehavior: submitted.terminalLinkBehavior,
+      });
+    },
+    discard: () => setDraft(saved),
+  });
+
+  return (
+    <div className="space-y-8">
+      <ShellSettingsCard
+        preferredShell={draft.preferredShell}
+        isDirty={draft.preferredShell !== saved.preferredShell}
+        onPreferredShellChange={(preferredShell) =>
+          setDraft((current) => ({ ...current, preferredShell }))
+        }
+        shellLoaded={shellSettings.loaded}
+        shellOptions={shellSettings.shellOptions ?? []}
+      />
+
+      <Separator />
+
+      <SettingsSection
+        icon={<IconTerminal2 className="h-5 w-5" />}
+        title={t("settings:terminal")}
+        description={t("settings:configureTerminalAppearanceAndBehavior")}
+      >
+        <TerminalFontCard
+          fontFamily={draft.terminalFontFamily}
+          isDirty={draft.terminalFontFamily !== saved.terminalFontFamily}
+          onChange={(terminalFontFamily) =>
+            setDraft((current) => ({ ...current, terminalFontFamily }))
+          }
+        />
+        <TerminalFontSizeCard
+          fontSize={draft.terminalFontSize}
+          isDirty={draft.terminalFontSize !== saved.terminalFontSize}
+          onChange={(terminalFontSize) => setDraft((current) => ({ ...current, terminalFontSize }))}
+        />
+        <TerminalLinksCard
+          value={draft.terminalLinkBehavior}
+          isDirty={draft.terminalLinkBehavior !== saved.terminalLinkBehavior}
+          onChange={(terminalLinkBehavior) =>
+            setDraft((current) => ({ ...current, terminalLinkBehavior }))
+          }
+        />
+      </SettingsSection>
+    </div>
+  );
+}

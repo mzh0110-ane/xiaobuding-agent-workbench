@@ -1,0 +1,593 @@
+"use client";
+
+import React from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  IconChevronRight,
+  IconChevronDown,
+  IconFolder,
+  IconFolderOpen,
+  IconRefresh,
+  IconDotsVertical,
+  IconTrash,
+} from "@tabler/icons-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@kandev/ui/dropdown-menu";
+import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
+import { FileIcon } from "@/components/ui/file-icon";
+import { SymlinkIndicator } from "@/components/shared/symlink-indicator";
+import type { FileTreeNode } from "@/lib/types/backend";
+import type { FileInfo } from "@/lib/state/store";
+import type { WorkspaceRestorationAttempt } from "@/lib/state/slices/session-runtime/workspace-restoration";
+import type { FileBrowserRow } from "./file-browser-hooks";
+import { areTreeNodeRowPropsEqual, type TreeNodeRowProps } from "./file-tree-row-props";
+import { measureFileTreeElement, observeFileTreeRect } from "./file-tree-measurement";
+import { InlineFileInput } from "./inline-file-input";
+import {
+  FileContextMenu,
+  useFileDeleteAction,
+  useFileRename,
+  TreeNodeName,
+  getGitStatusTextClass,
+} from "./file-context-menu";
+
+export {
+  compareTreeNodes,
+  mergeTreeNodes,
+  insertNodeInTree,
+  removeNodeFromTree,
+  renameNodeInTree,
+} from "./file-tree-utils";
+
+type GitFileStatus = FileInfo["status"] | undefined;
+
+export function shouldShowFileTreeTouchActions(isMobile: boolean, isFinePointer: boolean) {
+  return isMobile || !isFinePointer;
+}
+
+function treeNodePaddingLeft(depth: number, isDir: boolean): string {
+  return `${depth * 12 + 8 + (isDir ? 0 : 20)}px`;
+}
+
+function handleTreeNodeClick(
+  node: FileTreeNode,
+  onToggleExpand: (node: FileTreeNode) => void,
+  onOpenFile: (path: string) => void,
+) {
+  if (node.is_dir) {
+    onToggleExpand(node);
+    return;
+  }
+  onOpenFile(node.path);
+}
+
+/** Expand/collapse chevron for directory nodes. */
+function TreeNodeExpandChevron({
+  isLoading,
+  isExpanded,
+}: {
+  isLoading: boolean;
+  isExpanded: boolean;
+}) {
+  if (isLoading)
+    return <IconRefresh className="h-4 w-4 animate-spin text-muted-foreground shrink-0" />;
+  if (isExpanded) return <IconChevronDown className="h-3 w-3 text-muted-foreground/60" />;
+  return <IconChevronRight className="h-3 w-3 text-muted-foreground/60" />;
+}
+
+/** Directory or file icon for a tree node. */
+function TreeNodeFileIcon({
+  node,
+  isExpanded,
+  isActive,
+}: {
+  node: FileTreeNode;
+  isExpanded: boolean;
+  isActive: boolean;
+}) {
+  if (node.is_symlink) return <SymlinkIndicator isSymlink />;
+  if (node.is_dir) {
+    return isExpanded ? (
+      <IconFolderOpen className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+    ) : (
+      <IconFolder className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+    );
+  }
+  return (
+    <FileIcon
+      fileName={node.name}
+      filePath={node.path}
+      className="flex-shrink-0"
+      style={{ width: "14px", height: "14px", opacity: isActive ? 1 : 0.7 }}
+    />
+  );
+}
+
+function getTreeNodeRowClass(
+  isActive: boolean,
+  isActiveFolder: boolean,
+  isSelected: boolean,
+  isDragging: boolean | undefined,
+  isDropTarget: boolean,
+) {
+  return cn(
+    "group flex w-full items-center gap-1 border border-transparent px-2 py-0.5 text-left text-sm cursor-pointer",
+    isSelected ? "border-primary/50 bg-card text-foreground hover:bg-muted/70" : "hover:bg-muted",
+    isActive && !isSelected && "bg-muted",
+    isActiveFolder && !isSelected && "bg-muted/50",
+    isDragging && isSelected && "opacity-50",
+    isDropTarget && "bg-accent/40 ring-1 ring-accent",
+  );
+}
+
+export function FileTreeNodeTouchActions({
+  node,
+  showTouchActions,
+  onAddToChatContext,
+}: {
+  node: FileTreeNode;
+  showTouchActions?: boolean;
+  onAddToChatContext?: (node: FileTreeNode) => void;
+}) {
+  const { t } = useTranslation();
+  const deleteAction = useFileDeleteAction();
+  const deletePendingRef = React.useRef(false);
+  if (!showTouchActions || (!onAddToChatContext && !deleteAction)) return null;
+
+  const stopRowInteraction = (event: React.SyntheticEvent) => event.stopPropagation();
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          ref={deleteAction?.triggerRef}
+          type="button"
+          data-testid="file-tree-node-actions"
+          data-path={node.path}
+          aria-label={t("chat:fileTreeActions")}
+          className="absolute top-1/2 right-0 z-10 flex min-h-11 min-w-11 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
+          onPointerDown={stopRowInteraction}
+          onMouseDown={stopRowInteraction}
+          onClick={stopRowInteraction}
+          onKeyDown={stopRowInteraction}
+        >
+          <IconDotsVertical className="h-4 w-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        data-testid="file-tree-touch-menu"
+        onClick={stopRowInteraction}
+        onCloseAutoFocus={(event) => {
+          if (!deletePendingRef.current) return;
+          event.preventDefault();
+          deletePendingRef.current = false;
+          deleteAction?.onDelete();
+        }}
+      >
+        {onAddToChatContext && (
+          <DropdownMenuItem
+            data-testid="file-tree-touch-add-to-chat"
+            className="min-h-11 cursor-pointer"
+            onSelect={() => onAddToChatContext(node)}
+          >
+            {t("chat:addToChatContext")}
+          </DropdownMenuItem>
+        )}
+        {deleteAction && (
+          <DropdownMenuItem
+            data-testid="file-tree-touch-delete"
+            variant="destructive"
+            className="min-h-11 cursor-pointer"
+            onSelect={() => {
+              if (!deleteAction.isBulk) deletePendingRef.current = true;
+              else deleteAction.onDelete();
+            }}
+          >
+            <IconTrash className="h-3.5 w-3.5" />
+            {deleteAction.isBulk
+              ? t("task:deleteItemsLabel", { count: deleteAction.selectedCount })
+              : t("task:delete")}
+          </DropdownMenuItem>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+export const TreeNodeItem = React.memo(function TreeNodeItem(props: TreeNodeRowProps) {
+  const { row, activeFolderPath, activeFilePath, visibleLoadingPaths } = props;
+  const {
+    fileStatuses,
+    tree,
+    onToggleExpand,
+    onOpenFile,
+    onDeleteFile,
+    onRenameFile,
+    onDownloadFile,
+    onUploadFilesHere,
+    setTree,
+    showTouchActions,
+    onAddToChatContext,
+  } = props;
+  const node = row.node;
+
+  const isExpanded = row.isExpanded;
+  const isActive = !node.is_dir && activeFilePath === node.path;
+  const isActiveFolder = node.is_dir && activeFolderPath === node.path;
+  const gitStatus = node.is_dir ? undefined : fileStatuses.get(node.path);
+  const rename = useFileRename(node, tree, setTree, onRenameFile, props.treeRef);
+  const isSelected = props.isSelectedFn?.(node.path) ?? false;
+  const isDropTarget = node.is_dir && props.dragOverPath === node.path;
+  const rowAnchorRef = React.useRef<HTMLDivElement>(null);
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (e.button === 2) return;
+    const consumed = props.onSelect?.(node.path, e);
+    if (!consumed) {
+      handleTreeNodeClick(node, onToggleExpand, onOpenFile);
+    }
+  };
+
+  // Inline the row JSX so ContextMenuTrigger asChild can attach directly to the DOM div
+  const rowContent = (
+    <div
+      ref={rowAnchorRef}
+      data-testid="file-tree-node"
+      data-path={node.path}
+      data-is-dir={node.is_dir ? "true" : "false"}
+      data-active={isActive ? "true" : "false"}
+      data-selected={isSelected ? "true" : "false"}
+      aria-selected={isSelected}
+      role="treeitem"
+      className={cn(
+        getTreeNodeRowClass(isActive, isActiveFolder, isSelected, props.isDragging, isDropTarget),
+        showTouchActions &&
+          "relative min-h-11 pr-11 has-[[data-testid=file-delete-inline-confirmation]]:flex-wrap has-[[data-testid=file-delete-inline-confirmation]]:pr-2",
+      )}
+      style={{ paddingLeft: treeNodePaddingLeft(row.depth, node.is_dir) }}
+      onClick={handleClick}
+      draggable={!!props.onDragStart}
+      onDragStart={(e) => props.onDragStart?.(node.path, e)}
+      onDragEnd={() => props.onDragEnd?.()}
+      onDragOver={(e) => {
+        if (node.is_dir) props.onDragOver?.(node.path, e);
+      }}
+      onDragLeave={(e) => props.onDragLeave?.(e)}
+      onDrop={(e) => {
+        if (node.is_dir) props.onDrop?.(node.path, e);
+      }}
+    >
+      {node.is_dir && (
+        <span className="flex-shrink-0">
+          <TreeNodeExpandChevron
+            isLoading={visibleLoadingPaths.has(node.path)}
+            isExpanded={isExpanded}
+          />
+        </span>
+      )}
+      <TreeNodeFileIcon node={node} isExpanded={isExpanded} isActive={isActive} />
+      <TreeNodeName node={node} isActive={isActive} gitStatus={gitStatus} rename={rename} />
+      <FileTreeNodeTouchActions
+        node={node}
+        showTouchActions={showTouchActions}
+        onAddToChatContext={onAddToChatContext}
+      />
+    </div>
+  );
+
+  return (
+    <FileContextMenu
+      node={node}
+      tree={tree}
+      treeRef={props.treeRef}
+      setTree={setTree}
+      onDeleteFile={onDeleteFile}
+      onRenameFile={onRenameFile}
+      onDownloadFile={onDownloadFile}
+      onUploadFilesHere={onUploadFilesHere}
+      onStartRename={rename.handleStartRename}
+      onAddToChatContext={onAddToChatContext}
+      selectedCount={props.selectedCount}
+      selectedPaths={props.selectedPaths}
+      anchorRef={rowAnchorRef}
+    >
+      {rowContent}
+    </FileContextMenu>
+  );
+}, areTreeNodeRowPropsEqual);
+
+type SearchResultsListProps = {
+  searchResults: string[] | null;
+  fileStatuses: Map<string, GitFileStatus>;
+  onOpenFile: (path: string) => void;
+  showTouchActions?: boolean;
+  onAddToChatContext?: (node: FileTreeNode) => void;
+};
+
+function searchResultNode(path: string): FileTreeNode {
+  return {
+    name: path.split("/").pop() || path,
+    path,
+    is_dir: false,
+    size: 0,
+  };
+}
+
+export function SearchResultsList({
+  searchResults,
+  fileStatuses,
+  onOpenFile,
+  showTouchActions,
+  onAddToChatContext,
+}: SearchResultsListProps) {
+  const { t } = useTranslation();
+  if (!searchResults) return null;
+
+  if (searchResults.length === 0) {
+    return (
+      <div className="p-4 text-sm text-muted-foreground text-center">{t("task:noFilesFound")}</div>
+    );
+  }
+
+  return (
+    <div className="pb-2">
+      {searchResults.map((path) => {
+        const node = searchResultNode(path);
+        const name = node.name;
+        const folder = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+        const gitStatus = fileStatuses.get(path);
+        const row = (
+          <div
+            data-testid="file-search-result"
+            data-path={path}
+            className={cn(
+              "group flex w-full items-center gap-1 px-2 py-0.5 text-left text-sm cursor-pointer",
+              "hover:bg-muted",
+              showTouchActions && "relative min-h-11 pr-11",
+            )}
+            onClick={() => onOpenFile(path)}
+          >
+            <FileIcon
+              fileName={name}
+              filePath={path}
+              className="flex-shrink-0"
+              style={{ width: "14px", height: "14px" }}
+            />
+            <span
+              className={cn(
+                "min-w-0 flex-1 truncate group-hover:text-foreground",
+                getGitStatusTextClass(gitStatus) || "text-muted-foreground",
+              )}
+            >
+              {folder && <span>{folder}/</span>}
+              <span>{name}</span>
+            </span>
+            <FileTreeNodeTouchActions
+              node={node}
+              showTouchActions={showTouchActions}
+              onAddToChatContext={onAddToChatContext}
+            />
+          </div>
+        );
+
+        return (
+          <FileContextMenu
+            key={path}
+            node={node}
+            tree={null}
+            setTree={() => {}}
+            onStartRename={() => {}}
+            onAddToChatContext={onAddToChatContext}
+          >
+            {row}
+          </FileContextMenu>
+        );
+      })}
+    </div>
+  );
+}
+
+export { FileBrowserToolbar } from "./file-browser-toolbar";
+
+export type FileBrowserContentAreaProps = {
+  sessionId?: string;
+  isSearchActive: boolean;
+  searchResults: string[] | null;
+  isSessionFailed: boolean;
+  sessionError?: string | null;
+  loadState: string;
+  isLoadingTree: boolean;
+  tree: FileTreeNode | null;
+  loadError: string | null;
+  creatingInPath: string | null;
+  fileStatuses: Map<string, GitFileStatus>;
+  visibleRows: FileBrowserRow[];
+  scrollViewportRef?: React.RefObject<HTMLDivElement | null>;
+  treeRef?: React.RefObject<FileTreeNode | null>;
+  activeFolderPath: string;
+  activeFilePath?: string | null;
+  visibleLoadingPaths: Set<string>;
+  onOpenFile: (path: string) => void;
+  onToggleExpand: (node: FileTreeNode) => void;
+  onDeleteFile?: (path: string) => Promise<boolean>;
+  onRenameFile?: (oldPath: string, newPath: string) => Promise<boolean>;
+  onDownloadFile?: (path: string) => Promise<boolean>;
+  onUploadFilesHere?: (path: string) => void;
+  onCreateFileSubmit: (parentPath: string, name: string) => void;
+  onCancelCreate: () => void;
+  onRetry: () => void;
+  workspaceRestoration?: WorkspaceRestorationAttempt | null;
+  onRestoreWorkspace?: () => void;
+  restoreWorkspaceDisabled?: boolean;
+  setTree: React.Dispatch<React.SetStateAction<FileTreeNode | null>>;
+  isSelectedFn?: (path: string) => boolean;
+  onSelect?: (path: string, e: React.MouseEvent) => boolean;
+  isDragging?: boolean;
+  dragOverPath?: string | null;
+  onDragStart?: (path: string, e: React.DragEvent) => void;
+  onDragEnd?: () => void;
+  onDragOver?: (path: string, e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void;
+  onDrop?: (targetPath: string, e: React.DragEvent) => void;
+  selectedCount?: number;
+  selectedPaths?: Set<string>;
+  showTouchActions?: boolean;
+  onAddToChatContext?: (node: FileTreeNode) => void;
+};
+
+function rowToItemProps(
+  props: FileBrowserContentAreaProps,
+  row: FileBrowserRow,
+  treeRef: React.RefObject<FileTreeNode | null> | undefined = props.treeRef,
+): TreeNodeRowProps {
+  return {
+    row,
+    activeFolderPath: props.activeFolderPath,
+    activeFilePath: props.activeFilePath,
+    visibleLoadingPaths: props.visibleLoadingPaths,
+    fileStatuses: props.fileStatuses,
+    tree: props.tree,
+    treeRef,
+    onToggleExpand: props.onToggleExpand,
+    onOpenFile: props.onOpenFile,
+    onDeleteFile: props.onDeleteFile,
+    onRenameFile: props.onRenameFile,
+    onDownloadFile: props.onDownloadFile,
+    onUploadFilesHere: props.onUploadFilesHere,
+    setTree: props.setTree,
+    isSelectedFn: props.isSelectedFn,
+    onSelect: props.onSelect,
+    isDragging: props.isDragging,
+    dragOverPath: props.dragOverPath,
+    onDragStart: props.onDragStart,
+    onDragEnd: props.onDragEnd,
+    onDragOver: props.onDragOver,
+    onDragLeave: props.onDragLeave,
+    onDrop: props.onDrop,
+    selectedCount: props.selectedCount,
+    selectedPaths: props.selectedPaths,
+    showTouchActions: props.showTouchActions,
+    onAddToChatContext: props.onAddToChatContext,
+  };
+}
+
+type FileTreeVirtualRow =
+  | { type: "node"; row: FileBrowserRow }
+  | { type: "create"; parentPath: string; depth: number };
+
+function scheduleVirtualRowReveal(reveal: () => void): () => void {
+  let settleFrame: number | null = null;
+  const frame = requestAnimationFrame(() => {
+    reveal();
+    settleFrame = requestAnimationFrame(reveal);
+  });
+  return () => {
+    cancelAnimationFrame(frame);
+    if (settleFrame !== null) cancelAnimationFrame(settleFrame);
+  };
+}
+
+export function FileTreeView(props: FileBrowserContentAreaProps) {
+  if (!props.tree) return null;
+  return <VirtualizedFileTreeView {...props} />;
+}
+
+function VirtualizedFileTreeView(props: FileBrowserContentAreaProps) {
+  const { tree, visibleRows, creatingInPath, onCreateFileSubmit, onCancelCreate } = props;
+  const internalScrollViewportRef = React.useRef<HTMLDivElement>(null);
+  const scrollViewportRef = props.scrollViewportRef ?? internalScrollViewportRef;
+  const treeRef = React.useRef(tree);
+  treeRef.current = tree;
+  const virtualRows = React.useMemo<FileTreeVirtualRow[]>(() => {
+    const rows: FileTreeVirtualRow[] = [];
+    if (creatingInPath === "") rows.push({ type: "create", parentPath: "", depth: 0 });
+    for (const row of visibleRows) {
+      rows.push({ type: "node", row });
+      if (creatingInPath === row.path && row.isDir && row.isExpanded) {
+        rows.push({ type: "create", parentPath: row.path, depth: row.depth + 1 });
+      }
+    }
+    return rows;
+  }, [creatingInPath, visibleRows]);
+  const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
+    count: virtualRows.length,
+    getScrollElement: () => scrollViewportRef.current,
+    estimateSize: (index) => {
+      const row = virtualRows[index];
+      if (row?.type === "create") return 44;
+      return props.showTouchActions ? 48 : 28;
+    },
+    getItemKey: (index) => {
+      const row = virtualRows[index];
+      return row?.type === "create" ? `create:${row.parentPath}` : (row?.row.path ?? index);
+    },
+    measureElement: measureFileTreeElement,
+    observeElementRect: observeFileTreeRect,
+    overscan: 5,
+  });
+
+  const revealedActiveFileRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (revealedActiveFileRef.current !== props.activeFilePath) {
+      revealedActiveFileRef.current = null;
+    }
+    if (!props.activeFilePath || revealedActiveFileRef.current === props.activeFilePath) return;
+    const index = virtualRows.findIndex(
+      (row) => row.type === "node" && row.row.path === props.activeFilePath,
+    );
+    if (index < 0) return;
+    revealedActiveFileRef.current = props.activeFilePath;
+    return scheduleVirtualRowReveal(() => virtualizer.scrollToIndex(index, { align: "auto" }));
+  }, [props.activeFilePath, virtualRows, virtualizer]);
+
+  const revealedCreatePathRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (revealedCreatePathRef.current !== creatingInPath) {
+      revealedCreatePathRef.current = null;
+    }
+    if (creatingInPath === null || revealedCreatePathRef.current === creatingInPath) return;
+    const index = virtualRows.findIndex(
+      (row) => row.type === "create" && row.parentPath === creatingInPath,
+    );
+    if (index < 0) return;
+    revealedCreatePathRef.current = creatingInPath;
+    return scheduleVirtualRowReveal(() => virtualizer.scrollToIndex(index, { align: "auto" }));
+  }, [creatingInPath, virtualRows, virtualizer]);
+
+  return (
+    <div
+      className="relative w-full min-w-0 max-w-full pb-2"
+      style={{ height: `${virtualizer.getTotalSize()}px` }}
+    >
+      {virtualizer.getVirtualItems().map((virtualItem) => {
+        const row = virtualRows[virtualItem.index];
+        if (!row) return null;
+        return (
+          <div
+            key={virtualItem.key}
+            ref={virtualizer.measureElement}
+            data-index={virtualItem.index}
+            className="absolute left-0 top-0 w-full"
+            style={{ transform: `translateY(${virtualItem.start}px)` }}
+          >
+            {row.type === "node" ? (
+              <TreeNodeItem {...rowToItemProps(props, row.row, treeRef)} />
+            ) : (
+              <InlineFileInput
+                depth={row.depth}
+                onSubmit={(name) => onCreateFileSubmit(row.parentPath, name)}
+                onCancel={onCancelCreate}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

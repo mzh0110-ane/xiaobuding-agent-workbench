@@ -1,0 +1,930 @@
+// Package agentctl provides a client for communicating with agentctl running inside containers
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/kandev/kandev/internal/agentctl/tracing"
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/mcp/plugintools"
+	ws "github.com/kandev/kandev/pkg/websocket"
+	"go.uber.org/zap"
+)
+
+// Client communicates with agentctl via HTTP and WebSocket
+type Client struct {
+	baseURL    string
+	httpClient *http.Client
+	// longRunningHTTPClient is used for long-running operations like inference prompts.
+	// It has a much longer timeout (5 minutes) to accommodate LLM API calls.
+	longRunningHTTPClient *http.Client
+	logger                *logger.Logger
+	executionID           string
+	sessionID             string
+	authToken             string // shared secret for Bearer auth
+	processGeneration     uint64
+
+	// Optional trace context for session-scoped spans in background goroutines.
+	// When set, stream read loops use this as parent context for tracing instead of context.Background().
+	traceCtx context.Context
+
+	// WebSocket connections for streaming
+	agentStreamConn     *websocket.Conn
+	workspaceStreamConn *websocket.Conn
+	// workspaceStream is the most-recent workspace stream returned by
+	// StreamWorkspace, retained so Client.Close can wait for its read/write
+	// goroutines to drain. Cleared by readWorkspaceStream's defer once the
+	// stream tears down.
+	workspaceStream *WorkspaceStream
+	// closed flips to true on Client.Close and prevents new StreamWorkspace
+	// dials from leaking goroutines past the close barrier. Agent (updates)
+	// stream is not gated on this flag because the cascade flow legitimately
+	// stops + restarts the agent stream on the same client; gating it would
+	// strand workflow step transitions on a closed client.
+	closed bool
+	mu     sync.RWMutex
+	// endpointTransport is present only for plugin-managed remote environments.
+	// It resolves a short-lived connection lease for every new request.
+	endpointTransport *endpointRoundTripper
+
+	// Shared write mutex for agent stream (used by StreamUpdates and sendStreamRequest)
+	streamWriteMu sync.Mutex
+
+	// Pending request/response tracking for agent stream
+	pendingRequests     map[string]chan *ws.Message
+	pendingRequestConns map[string]*websocket.Conn
+	pendingMu           sync.Mutex
+
+	// lastSessionModelState is populated by session/new, session/reset, and
+	// session/load responses and by asynchronous session_models events. Lifecycle
+	// policy evaluation can use it before the event reaches its handler.
+	lastSessionModelState *streams.SessionModelState
+}
+
+func (c *Client) setLastSessionModelState(state *streams.SessionModelState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSessionModelState = cloneSessionModelState(state)
+}
+
+// GetLastSessionModelState returns the latest session model catalog observed
+// in a session response or asynchronous session_models event.
+func (c *Client) GetLastSessionModelState() *streams.SessionModelState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneSessionModelState(c.lastSessionModelState)
+}
+
+func cloneSessionModelState(state *streams.SessionModelState) *streams.SessionModelState {
+	if state == nil {
+		return nil
+	}
+	cloned := &streams.SessionModelState{
+		CurrentModelID:       state.CurrentModelID,
+		Models:               append([]streams.SessionModelInfo(nil), state.Models...),
+		ConfigOptions:        append([]streams.ConfigOption(nil), state.ConfigOptions...),
+		ConfigOptionsSettled: state.ConfigOptionsSettled,
+	}
+	for i, model := range cloned.Models {
+		if model.Meta == nil {
+			continue
+		}
+		cloned.Models[i].Meta = make(map[string]any, len(model.Meta))
+		for key, value := range model.Meta {
+			cloned.Models[i].Meta[key] = value
+		}
+	}
+	for i, option := range cloned.ConfigOptions {
+		cloned.ConfigOptions[i].Options = append([]streams.ConfigOptionValue(nil), option.Options...)
+	}
+	return cloned
+}
+
+// ClientOption configures optional Client settings.
+type ClientOption func(*Client)
+
+// WithExecutionID sets the execution ID used for tracing spans.
+func WithExecutionID(id string) ClientOption {
+	return func(c *Client) {
+		c.executionID = id
+	}
+}
+
+// WithSessionID sets the session ID used for tracing spans.
+func WithSessionID(id string) ClientOption {
+	return func(c *Client) {
+		c.sessionID = id
+	}
+}
+
+// WithAuthToken sets the Bearer token for authenticating requests to agentctl.
+func WithAuthToken(token string) ClientOption {
+	return func(c *Client) {
+		c.authToken = token
+	}
+}
+
+// SetTraceContext sets the trace context used as parent for spans created in
+// background goroutines (stream read loops). Thread-safe: can be called after construction.
+func (c *Client) SetTraceContext(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.traceCtx = ctx
+}
+
+// ProcessGeneration returns the most recent child generation started by this client.
+func (c *Client) ProcessGeneration() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.processGeneration
+}
+
+// getTraceCtx returns the trace context for background operations.
+// Returns context.Background() when no trace context is set.
+func (c *Client) getTraceCtx() context.Context {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.traceCtx != nil {
+		return c.traceCtx
+	}
+	return context.Background()
+}
+
+// StatusResponse from agentctl
+type StatusResponse struct {
+	AgentStatus string                 `json:"agent_status"`
+	ProcessInfo map[string]interface{} `json:"process_info"`
+}
+
+// IsAgentRunning returns true if the agent process is running or starting
+// (i.e., the agent is active and should not be considered stale)
+func (s *StatusResponse) IsAgentRunning() bool {
+	return s.AgentStatus == "running" || s.AgentStatus == "starting"
+}
+
+// NewClient creates a new agentctl client
+func NewClient(host string, port int, log *logger.Logger, opts ...ClientOption) *Client {
+	return newClient(fmt.Sprintf("http://%s:%d", host, port), log, opts...)
+}
+
+func newClient(baseURL string, log *logger.Logger, opts ...ClientOption) *Client {
+	c := &Client{
+		baseURL: baseURL,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second,
+		},
+		// Long-running HTTP client for inference prompts and other operations that may take minutes.
+		// LLM inference calls can take 1-5 minutes depending on model, prompt complexity, and API load.
+		longRunningHTTPClient: &http.Client{
+			Timeout: 5 * time.Minute,
+		},
+		logger:              log.WithFields(zap.String("component", "agentctl-client")),
+		pendingRequests:     make(map[string]chan *ws.Message),
+		pendingRequestConns: make(map[string]*websocket.Conn),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	// Install auth transport after options are applied so WithAuthToken takes effect.
+	if c.authToken != "" {
+		c.httpClient.Transport = &authTransport{token: c.authToken, base: c.httpClient.Transport}
+		c.longRunningHTTPClient.Transport = &authTransport{token: c.authToken, base: c.longRunningHTTPClient.Transport}
+	}
+	// Stamp every outgoing request with the execution/instance ID so the
+	// agentctl-server's middleware can reject stale clients whose port
+	// was recycled to a new instance. The header is informational —
+	// see instanceIDGuard in apps/backend/internal/agentctl/server/api.
+	if c.executionID != "" {
+		c.httpClient.Transport = &instanceIDTransport{instanceID: c.executionID, base: c.httpClient.Transport}
+		c.longRunningHTTPClient.Transport = &instanceIDTransport{instanceID: c.executionID, base: c.longRunningHTTPClient.Transport}
+	}
+	return c
+}
+
+// ProxyTransport returns the same authenticated upstream transport used by
+// agentctl HTTP requests. Gateway proxies use it so provider leases, host
+// authentication, and instance fencing are applied to HTTP and upgrades alike.
+func (c *Client) ProxyTransport() http.RoundTripper {
+	if c.endpointTransport != nil {
+		return c.endpointTransport
+	}
+	if c.httpClient.Transport != nil {
+		return c.httpClient.Transport
+	}
+	return http.DefaultTransport
+}
+
+// authTransport is an http.RoundTripper that injects an Authorization header.
+type authTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set("Authorization", "Bearer "+t.token)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r)
+}
+
+// instanceIDTransport is an http.RoundTripper that injects the
+// X-Instance-ID header so the agentctl-server can reject requests
+// whose port has been recycled to a different instance.
+type instanceIDTransport struct {
+	instanceID string
+	base       http.RoundTripper
+}
+
+func (t *instanceIDTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set("X-Instance-ID", t.instanceID)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r)
+}
+
+// wsAuthHeaders returns HTTP headers for WebSocket dial calls.
+func (c *Client) wsAuthHeaders() http.Header {
+	if c.authToken == "" && c.executionID == "" {
+		return nil
+	}
+	h := http.Header{}
+	if c.authToken != "" {
+		h.Set("Authorization", "Bearer "+c.authToken)
+	}
+	if c.executionID != "" {
+		h.Set("X-Instance-ID", c.executionID)
+	}
+	return h
+}
+
+// Health checks if agentctl is healthy
+func (c *Client) Health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/health", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health check failed: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// GetStatus returns the agent status
+func (c *Client) GetStatus(ctx context.Context) (*StatusResponse, error) {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "GET", "/api/v1/status", c.executionID)
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/status", nil)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := fmt.Errorf("status request failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return nil, httpErr
+	}
+
+	var status StatusResponse
+	if err := json.Unmarshal(respBody, &status); err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return nil, fmt.Errorf("failed to parse status response (status %d, body: %s): %w", resp.StatusCode, truncateBody(respBody), err)
+	}
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return &status, nil
+}
+
+// ConfigureAgent configures the agent command. Must be called before Start().
+// continueCommand is optional — when set, the adapter uses it for one-shot follow-up prompts.
+func (c *Client) ConfigureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string) error {
+	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, false)
+}
+
+// ConfigureAgentWithEnvironment configures the agent with a complete effective
+// environment. The agentctl instance replaces its indexed Git configuration
+// block while preserving ordinary instance variables. Use this when the
+// caller has already composed inherited and generated environment sources.
+func (c *Client) ConfigureAgentWithEnvironment(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string) error {
+	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, true)
+}
+
+func (c *Client) configureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string, replaceEnv bool) error {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "POST", "/api/v1/agent/configure", c.executionID)
+	defer span.End()
+
+	payload := struct {
+		Command         string            `json:"command"`
+		AgentArgs       *[]string         `json:"agent_args,omitempty"`
+		ContinueCommand string            `json:"continue_command,omitempty"`
+		ContinueArgs    *[]string         `json:"continue_args,omitempty"`
+		Env             map[string]string `json:"env,omitempty"`
+		ReplaceEnv      bool              `json:"replace_env,omitempty"`
+	}{
+		Command:         command,
+		ContinueCommand: continueCommand,
+		Env:             env,
+		ReplaceEnv:      replaceEnv,
+	}
+	if agentArgs != nil {
+		payload.AgentArgs = &agentArgs
+	}
+	if continueArgs != nil {
+		payload.ContinueArgs = &continueArgs
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/agent/configure", bytes.NewReader(body))
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := fmt.Errorf("configure request failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return httpErr
+	}
+
+	var result struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return fmt.Errorf("failed to parse configure response (status %d, body: %s): %w", resp.StatusCode, truncateBody(respBody), err)
+	}
+	if !result.Success {
+		cfgErr := fmt.Errorf("configure failed: %s", result.Error)
+		tracing.TraceHTTPResponse(span, resp.StatusCode, cfgErr)
+		return cfgErr
+	}
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return nil
+}
+
+// SetMcpMode changes the MCP tool mode on the agentctl instance.
+// This reconfigures which MCP tools are available to the agent.
+func (c *Client) SetMcpMode(ctx context.Context, mode string) error {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "PUT", "/api/v1/mcp/mode", c.executionID)
+	defer span.End()
+
+	body, err := json.Marshal(struct {
+		Mode string `json:"mode"`
+	}{Mode: mode})
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.baseURL+"/api/v1/mcp/mode", bytes.NewReader(body))
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := readResponseBody(resp)
+		httpErr := fmt.Errorf("set MCP mode failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return httpErr
+	}
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return nil
+}
+
+// SetMcpProviders replaces the provider capabilities advertised by task-mode
+// MCP tools on the agentctl instance.
+func (c *Client) SetMcpProviders(ctx context.Context, providers []string) error {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "PUT", "/api/v1/mcp/providers", c.executionID)
+	defer span.End()
+
+	body, err := json.Marshal(struct {
+		Providers []string `json:"mcp_providers"`
+	}{Providers: providers})
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.baseURL+"/api/v1/mcp/providers", bytes.NewReader(body))
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := readResponseBody(resp)
+		httpErr := fmt.Errorf("set MCP providers failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return httpErr
+	}
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return nil
+}
+
+// SetPluginTools replaces the plugin-contributed MCP catalog on agentctl.
+func (c *Client) SetPluginTools(ctx context.Context, snapshot plugintools.Snapshot) error {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "PUT", "/api/v1/mcp/plugin-tools", c.executionID)
+	defer span.End()
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.baseURL+"/api/v1/mcp/plugin-tools", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := readResponseBody(resp)
+		return fmt.Errorf("set plugin tools failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// StreamCanvasSource requests the assigned canvas source root from agentctl.
+// The response is a bounded tar stream and must be closed by the caller. The
+// route is deliberately kept in the agentctl client so every executor type
+// uses the same authenticated transfer contract.
+func (c *Client) StreamCanvasSource(ctx context.Context, root string) (io.ReadCloser, error) {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "POST", types.CanvasSourceTransferPath, c.executionID)
+	defer span.End()
+
+	body, err := json.Marshal(types.CanvasSourceTransferRequest{Root: root})
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+types.CanvasSourceTransferPath, bytes.NewReader(body))
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			tracing.TraceHTTPResponse(span, resp.StatusCode, readErr)
+			return nil, fmt.Errorf("canvas source request failed with status %d: %w", resp.StatusCode, readErr)
+		}
+		httpErr := fmt.Errorf("canvas source request failed with status %d: %s", resp.StatusCode, string(responseBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return nil, httpErr
+	}
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return resp.Body, nil
+}
+
+// Start starts the agent process and returns the full command that was executed.
+func (c *Client) Start(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	c.processGeneration = 0
+	c.mu.Unlock()
+	ctx, span := tracing.TraceHTTPRequest(ctx, "POST", "/api/v1/start", c.executionID)
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/start", nil)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return "", err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := fmt.Errorf("start request failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return "", httpErr
+	}
+
+	var result struct {
+		Success           bool   `json:"success"`
+		Command           string `json:"command,omitempty"`
+		ProcessGeneration uint64 `json:"process_generation,omitempty"`
+		Error             string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return "", fmt.Errorf("failed to parse start response (status %d, body: %s): %w", resp.StatusCode, truncateBody(respBody), err)
+	}
+	if !result.Success {
+		startErr := fmt.Errorf("start failed: %s", result.Error)
+		tracing.TraceHTTPResponse(span, resp.StatusCode, startErr)
+		return "", startErr
+	}
+	c.mu.Lock()
+	c.processGeneration = result.ProcessGeneration
+	c.mu.Unlock()
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return result.Command, nil
+}
+
+// Stop stops the agent process
+func (c *Client) Stop(ctx context.Context) error {
+	ctx, span := tracing.TraceHTTPRequest(ctx, "POST", "/api/v1/stop", c.executionID)
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/stop", nil)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, 0, err)
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := fmt.Errorf("stop request failed with status %d: %s", resp.StatusCode, string(respBody))
+		tracing.TraceHTTPResponse(span, resp.StatusCode, httpErr)
+		return httpErr
+	}
+
+	var result struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		tracing.TraceHTTPResponse(span, resp.StatusCode, err)
+		return fmt.Errorf("failed to parse stop response (status %d, body: %s): %w", resp.StatusCode, truncateBody(respBody), err)
+	}
+	if !result.Success {
+		stopErr := fmt.Errorf("stop failed: %s", result.Error)
+		tracing.TraceHTTPResponse(span, resp.StatusCode, stopErr)
+		return stopErr
+	}
+
+	tracing.TraceHTTPResponse(span, resp.StatusCode, nil)
+	return nil
+}
+
+// WaitForReady waits until agentctl is ready to accept requests
+func (c *Client) WaitForReady(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for agentctl to be ready")
+			}
+
+			if err := c.Health(ctx); err == nil {
+				c.logger.Info("agentctl is ready")
+				return nil
+			}
+		}
+	}
+}
+
+// Re-export VS Code types from shared types package.
+type (
+	VscodeStartResponse  = types.VscodeStartResponse
+	VscodeStatusResponse = types.VscodeStatusResponse
+	VscodeStopResponse   = types.VscodeStopResponse
+)
+
+// StartVscode starts the code-server with the given theme.
+// The port is allocated by agentctl using an OS-assigned random port.
+func (c *Client) StartVscode(ctx context.Context, theme string) (*VscodeStartResponse, error) {
+	payload := struct {
+		Theme string `json:"theme,omitempty"`
+	}{Theme: theme}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/vscode/start", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vscode start failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result VscodeStartResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse vscode start response: %w", err)
+	}
+	return &result, nil
+}
+
+// StopVscode stops the code-server.
+func (c *Client) StopVscode(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/vscode/stop", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := readResponseBody(resp)
+		return fmt.Errorf("vscode stop failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// VscodeOpenFile opens a file in the running VS Code instance via agentctl.
+func (c *Client) VscodeOpenFile(ctx context.Context, path string, line, col int) error {
+	payload := types.VscodeOpenFileRequest{
+		Path: path,
+		Line: line,
+		Col:  col,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/v1/vscode/open-file", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("vscode open-file failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result types.VscodeOpenFileResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return fmt.Errorf("failed to parse vscode open-file response: %w", err)
+	}
+	if !result.Success {
+		return fmt.Errorf("vscode open-file failed: %s", result.Error)
+	}
+	return nil
+}
+
+// VscodeStatus returns the current code-server state.
+func (c *Client) VscodeStatus(ctx context.Context) (*VscodeStatusResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/vscode/status", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vscode status failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result VscodeStatusResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse vscode status response: %w", err)
+	}
+	return &result, nil
+}
+
+// BaseURL returns the base URL of the agentctl client
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
+// AuthToken returns the Bearer token used for authenticating requests to agentctl.
+// Returns empty string if no token is configured.
+func (c *Client) AuthToken() string {
+	if c.endpointTransport != nil {
+		return c.endpointTransport.authTokenValue()
+	}
+	return c.authToken
+}
+
+// Host returns the host portion (without port) of the agentctl client URL.
+func (c *Client) Host() string {
+	parsed, err := url.Parse(c.baseURL)
+	if err != nil {
+		return c.baseURL
+	}
+	return parsed.Hostname()
+}
+
+// Re-export types from types package for convenience.
+// These types are defined in the streams subpackage and re-exported through types.
+type (
+	GitStatusUpdate             = types.GitStatusUpdate
+	GitCommitNotification       = types.GitCommitNotification
+	GitResetNotification        = types.GitResetNotification
+	GitBranchSwitchNotification = types.GitBranchSwitchNotification
+	FileInfo                    = types.FileInfo
+	FileEntry                   = types.FileEntry
+	FileTreeNode                = types.FileTreeNode
+	FileTreeRequest             = types.FileTreeRequest
+	FileTreeResponse            = types.FileTreeResponse
+	FileContentRequest          = types.FileContentRequest
+	FileContentResponse         = types.FileContentResponse
+	FileChangeNotification      = types.FileChangeNotification
+	ShellMessage                = types.ShellMessage
+	ShellStatusResponse         = types.ShellStatusResponse
+	ShellBufferResponse         = types.ShellBufferResponse
+	ProcessKind                 = types.ProcessKind
+	ProcessStatus               = types.ProcessStatus
+	ProcessOutput               = types.ProcessOutput
+	ProcessStatusUpdate         = types.ProcessStatusUpdate
+)
+
+// Close closes all connections and releases resources. It is a drain
+// barrier for workspace stream goroutines: when Close returns, the workspace
+// read/write loops have fully exited and future StreamWorkspace calls return
+// immediately with an error. The agent (updates) stream is closed but not
+// drained synchronously — the cascade flow legitimately calls Close on a
+// client whose updates stream is still mid-event, and blocking would stall
+// workflow step transitions.
+func (c *Client) Close() {
+	c.mu.Lock()
+	c.closed = true
+	ws := c.workspaceStream
+	c.mu.Unlock()
+
+	c.CloseUpdatesStream()
+	// CloseWorkspaceStream closes the raw conn to wake the blocked read loop.
+	// ws.Close (below) is needed to close the writeLoop's closeCh; closeOnce
+	// makes ws.Close idempotent so the duplicate conn.Close it issues just
+	// logs at Debug. Both calls together wake both goroutines deterministically.
+	c.CloseWorkspaceStream()
+
+	// Wait for the workspace stream's read/write goroutines to fully unwind.
+	if ws != nil {
+		ws.Close()
+		ws.Wait()
+	}
+
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
+	if c.longRunningHTTPClient != nil {
+		c.longRunningHTTPClient.CloseIdleConnections()
+	}
+}
+
+// readResponseBody reads and returns the response body
+func readResponseBody(resp *http.Response) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// truncateBody truncates body for error messages to avoid huge logs
+func truncateBody(body []byte) string {
+	const maxLen = 200
+	if len(body) > maxLen {
+		return string(body[:maxLen]) + "..."
+	}
+	return string(body)
+}

@@ -1,0 +1,1009 @@
+import type { Page } from "@playwright/test";
+import { test, expect } from "../../fixtures/test-base";
+import { useRegularMode } from "../../helpers/regular-mode";
+import { KanbanPage } from "../../pages/kanban-page";
+import { SessionPage } from "../../pages/session-page";
+import { createEmptyRemoteRepository } from "../../helpers/empty-remote-repository";
+import { waitForHttp } from "../../helpers/causal-waits";
+import { configureGitHubOrigin } from "../../helpers/github-origin";
+import { makeGitEnv } from "../../helpers/git-helper";
+import {
+  cleanupPRLinkForkLaunchFixture,
+  createPRLinkForkLaunchFixture,
+  expectForkPRLaunchState,
+} from "./pr-link-fork-launch-helpers";
+
+// Exercises the regular task-create dialog (New Task in the sidebar); run with office off.
+useRegularMode();
+
+/**
+ * Helper: switch the create-task dialog to the Remote tab and type a URL
+ * into the (newly nested) chip popover and submit it with Enter. Replaces the old "click
+ * toggle-github-url + fill github-url-input" pair after Task 5/8 swapped the
+ * top-level URL input for a per-row chip + popover.
+ */
+async function openRemoteAndPasteURL(testPage: Page, url: string): Promise<void> {
+  await testPage.getByTestId("source-mode-remote").click();
+  // The chip popover holds the paste input. Open the first chip.
+  await testPage.getByTestId("remote-repo-chip-trigger").first().click();
+  const urlInput = testPage.getByTestId("remote-repo-input");
+  await expect(urlInput).toBeVisible();
+  await urlInput.fill(url);
+  await urlInput.press("Enter");
+}
+
+test.describe("Task creation from GitHub URL", () => {
+  const restoreOrigins: Array<() => void> = [];
+  test.afterEach(() => {
+    for (const restore of restoreOrigins.splice(0).reverse()) restore();
+  });
+  // Allow one retry for transient backend port-allocation issues on cold start.
+  test.describe.configure({ retries: 1 });
+
+  test("can create a task using a GitHub URL with workspace interaction", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    // Pre-seed a repository with GitHub provider info pointing to the real local git repo.
+    // This lets FindOrCreateRepository find the repo (with its local_path) when the
+    // GitHub URL is submitted, avoiding an actual clone.
+    const repoDir = `${backend.tmpDir}/repos/e2e-repo`;
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/test-owner/test-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "test-owner/test-repo",
+      provider: "github",
+      provider_owner: "test-owner",
+      provider_name: "test-repo",
+      pull_before_worktree: false,
+    });
+
+    // Seed mock GitHub branches for the repo we'll reference
+    await apiClient.mockGitHubAddBranches("test-owner", "test-repo", [
+      { name: "main" },
+      { name: "develop" },
+      { name: "feature/test" },
+    ]);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the URL into the chip popover.
+    await openRemoteAndPasteURL(testPage, "https://github.com/test-owner/test-repo");
+
+    // Fill in title and description
+    await testPage.getByTestId("task-title-input").fill("GitHub URL Task");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    // Wait for the start button to become enabled (branches + agent profile resolved)
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+
+    // Click "Start task"
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    // Wait for the agent to complete
+    await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    // Session transitions to idle
+    await expect(session.idleInput()).toBeVisible({ timeout: 15_000 });
+
+    // ── Workspace interaction: terminal + changes ──
+    await expect(session.terminal).toBeVisible({ timeout: 15_000 });
+
+    // Create a file via the terminal
+    const testFileName = "ghtest";
+    await session.typeInTerminal(`touch ${testFileName}`);
+
+    // Switch to the Changes tab — the new file proves the terminal command worked
+    await session.clickTab("Changes");
+    await expect(session.changes).toBeVisible({ timeout: 10_000 });
+    await expect(session.changes.getByText(testFileName)).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("can create a GitHub URL task with worktree executor", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    // Pre-seed the GitHub-backed repository
+    const repoDir = `${backend.tmpDir}/repos/e2e-repo`;
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/test-owner/test-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "test-owner/test-repo",
+      provider: "github",
+      provider_owner: "test-owner",
+      provider_name: "test-repo",
+      pull_before_worktree: false,
+    });
+
+    await apiClient.mockGitHubAddBranches("test-owner", "test-repo", [
+      { name: "main" },
+      { name: "develop" },
+    ]);
+
+    // Look up the worktree executor profile
+    const { executors } = await apiClient.listExecutors();
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    const worktreeProfile = worktreeExec?.profiles?.[0];
+    if (!worktreeProfile) {
+      test.skip(true, "No worktree executor profile available");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the URL into the chip popover.
+    await openRemoteAndPasteURL(testPage, "https://github.com/test-owner/test-repo");
+
+    // Fill in title and description
+    await testPage.getByTestId("task-title-input").fill("Worktree GitHub Task");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    // Wait for selectors to be ready
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+
+    // Select the worktree executor profile
+    const executorSelector = testPage.getByTestId("executor-profile-selector");
+    await executorSelector.click();
+    await testPage.getByRole("option", { name: /Worktree/i }).click();
+
+    // Submit
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("starts a target-attached fork PR from its URL", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+    const fixture = await createPRLinkForkLaunchFixture(
+      apiClient,
+      seedData.workspaceId,
+      backend.tmpDir,
+    );
+    let taskId: string | undefined;
+
+    try {
+      const { executors } = await apiClient.listExecutors();
+      const worktreeExec = executors.find((executor) => executor.type === "worktree");
+      if (!worktreeExec?.profiles?.[0]) {
+        test.skip(true, "No worktree executor profile available");
+        return;
+      }
+
+      const taskTitle = `Fork PR launch ${fixture.repositoryName}`;
+      const kanban = new KanbanPage(testPage);
+      await kanban.goto();
+      await kanban.createTaskButton.first().click();
+      const dialog = testPage.getByTestId("create-task-dialog");
+      await expect(dialog).toBeVisible();
+      await openRemoteAndPasteURL(testPage, fixture.prURL);
+      await expect(testPage.getByTestId("remote-branch-chip-trigger").first()).toContainText(
+        fixture.headBranch,
+      );
+      await testPage.getByTestId("task-title-input").fill(taskTitle);
+      await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+      const startButton = testPage.getByTestId("submit-start-agent");
+      await expect(startButton).toBeEnabled();
+      await testPage.getByTestId("executor-profile-selector").click();
+      await testPage.getByRole("option", { name: /Worktree/i }).click();
+      const createdTaskResponse = waitForHttp(testPage, "POST", /\/api\/v1\/tasks$/);
+      await startButton.click();
+      const response = await createdTaskResponse;
+      const responseBody = await response.text();
+      expect(response.status(), responseBody).toBe(200);
+      const created = JSON.parse(responseBody) as { id: string };
+      taskId = created.id;
+      const requestBody = response.request().postDataJSON() as {
+        repositories?: Array<Record<string, unknown>>;
+      };
+      expect(requestBody.repositories?.[0]).not.toHaveProperty("remote_contribution");
+      expect(requestBody.repositories?.[0]).not.toHaveProperty("comparison_target");
+
+      await expect(dialog).not.toBeVisible();
+      await expect(testPage).toHaveURL(new RegExp(`/t/${taskId}$`));
+      const session = new SessionPage(testPage);
+      await session.waitForLoad();
+      await session.waitForChatIdle({ requireEditable: true });
+      await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible();
+      await expect(session.idleInput()).toBeVisible();
+
+      await session.clickTab("Terminal", { force: true });
+      await expect(session.terminal).toBeVisible({ timeout: 15_000 });
+      await session.expectTerminalConnected();
+      await expectForkPRLaunchState(testPage, session, apiClient, fixture, taskId);
+      await expect(session.prTopbarButton()).toContainText("#3879", { timeout: 15_000 });
+    } finally {
+      await cleanupPRLinkForkLaunchFixture(apiClient, fixture, taskId);
+    }
+  });
+
+  // Three tests previously asserted the top-level `github-url-error` testid
+  // surfaced on invalid URL, nonexistent repo, and "clears on valid URL".
+  // After Task 5/8 the URL input moved into a per-chip popover and no
+  // top-level error display is rendered. The behaviors are now covered by
+  // unit tests in `task-create-dialog-remote-repo-chip.test.tsx` and by the
+  // new `create-task-remote-repo.spec.ts` happy-path specs; deleted here
+  // rather than rewritten because the rendered UI no longer matches what
+  // they were asserting.
+
+  test("uses correct repository when creating tasks from different GitHub URLs", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    // Seed two distinct GitHub-backed repositories
+    const repoDirA = `${backend.tmpDir}/repos/e2e-repo`;
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDirA,
+        "https://github.com/owner-a/repo-a.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDirA, "main", {
+      name: "owner-a/repo-a",
+      provider: "github",
+      provider_owner: "owner-a",
+      provider_name: "repo-a",
+      pull_before_worktree: false,
+    });
+    await apiClient.mockGitHubAddBranches("owner-a", "repo-a", [{ name: "main" }]);
+
+    const repoDirB = `${backend.tmpDir}/repos/e2e-repo-b`;
+    const { execSync } = await import("child_process");
+    const fs = await import("fs");
+    fs.mkdirSync(repoDirB, { recursive: true });
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+    execSync("git init -b main", { cwd: repoDirB, env: gitEnv });
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDirB, env: gitEnv });
+    execSync("git remote add origin https://github.com/owner-b/repo-b.git", {
+      cwd: repoDirB,
+      env: gitEnv,
+    });
+    await apiClient.createRepository(seedData.workspaceId, repoDirB, "main", {
+      name: "owner-b/repo-b",
+      provider: "github",
+      provider_owner: "owner-b",
+      provider_name: "repo-b",
+      pull_before_worktree: false,
+    });
+    await apiClient.mockGitHubAddBranches("owner-b", "repo-b", [{ name: "main" }]);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    // ── First task from repo-a ──
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+    await openRemoteAndPasteURL(testPage, "https://github.com/owner-a/repo-a");
+    await testPage.getByTestId("task-title-input").fill("Task A");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    await kanban.goto();
+
+    // ── Second task from repo-b (different URL) ──
+    await kanban.createTaskButton.first().click();
+    await expect(dialog).toBeVisible();
+    await openRemoteAndPasteURL(testPage, "https://github.com/owner-b/repo-b");
+    await testPage.getByTestId("task-title-input").fill("Task B");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    // Task B created successfully on its own repo; sidebar navigates directly to its session.
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+    await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+  });
+
+  test("PR URL auto-selects the PR head branch", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    // Pre-seed a GitHub-backed repository
+    const repoDir = `${backend.tmpDir}/repos/e2e-repo`;
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/test-owner/test-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "test-owner/test-repo",
+      provider: "github",
+      provider_owner: "test-owner",
+      provider_name: "test-repo",
+      pull_before_worktree: false,
+    });
+
+    // Seed branches including the PR head branch
+    await apiClient.mockGitHubAddBranches("test-owner", "test-repo", [
+      { name: "main" },
+      { name: "feature/pr-branch" },
+    ]);
+
+    // Seed a PR pointing to the feature branch
+    await apiClient.mockGitHubAddPRs([
+      {
+        number: 42,
+        title: "Test PR",
+        state: "open",
+        head_branch: "feature/pr-branch",
+        base_branch: "main",
+        author_login: "test-user",
+        repo_owner: "test-owner",
+        repo_name: "test-repo",
+      },
+    ]);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the PR URL.
+    await openRemoteAndPasteURL(testPage, "https://github.com/test-owner/test-repo/pull/42");
+
+    // The PR head branch should be auto-selected and rendered inside the
+    // per-chip branch pill. `useBranchAutoSelectEffect` mirrors the resolved
+    // PR head into `remoteRepos[0].branch` so the pill's trigger label
+    // reflects the active branch (not just the singleton submit payload).
+    await expect(
+      testPage.locator('[data-testid="remote-branch-chip-trigger"]').first(),
+    ).toContainText("feature/pr-branch", { timeout: 10_000 });
+
+    await testPage.getByTestId("task-title-input").fill("PR auto-select test");
+    await testPage.getByTestId("task-description-input").fill("test");
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+  });
+
+  test("creates task from PR URL with local executor end-to-end", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    const { execSync } = await import("child_process");
+    const gitEnv = {
+      ...process.env,
+      HOME: backend.tmpDir,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+
+    // Create the feature/pr-branch in the local repo so git checkout works
+    const repoDir = `${backend.tmpDir}/repos/e2e-repo`;
+    execSync("git checkout -b feature/pr-branch", { cwd: repoDir, env: gitEnv });
+    execSync('git commit --allow-empty -m "pr commit"', { cwd: repoDir, env: gitEnv });
+    execSync("git push origin feature/pr-branch:refs/pull/99/head", {
+      cwd: repoDir,
+      env: gitEnv,
+    });
+    execSync("git checkout main", { cwd: repoDir, env: gitEnv });
+
+    // Pre-seed a GitHub-backed repository
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/test-owner/test-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "test-owner/test-repo",
+      provider: "github",
+      provider_owner: "test-owner",
+      provider_name: "test-repo",
+      pull_before_worktree: false,
+    });
+
+    await apiClient.mockGitHubAddBranches("test-owner", "test-repo", [
+      { name: "main" },
+      { name: "feature/pr-branch" },
+    ]);
+
+    await apiClient.mockGitHubAddPRs([
+      {
+        number: 99,
+        title: "Feature PR",
+        state: "open",
+        head_branch: "feature/pr-branch",
+        base_branch: "main",
+        author_login: "test-user",
+        repo_owner: "test-owner",
+        repo_name: "test-repo",
+      },
+    ]);
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the PR URL.
+    await openRemoteAndPasteURL(testPage, "https://github.com/test-owner/test-repo/pull/99");
+
+    // PR-info fetch resolves asynchronously; downstream the submit-button
+    // becomes enabled once branches + agent profile are ready. The terminal
+    // assertion later confirms the PR head branch is actually checked out.
+
+    // Fill in title and description
+    await testPage.getByTestId("task-title-input").fill("PR Task Local");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    // Wait for the start button to become enabled
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+
+    // Submit (default executor is local/standalone)
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 15_000 });
+
+    // Verify the local executor checked out the PR branch.
+    await expect(session.terminal).toBeVisible({ timeout: 15_000 });
+    await session.typeInTerminal("git branch --show-current");
+    await session.expectTerminalHasText("feature/pr-branch");
+
+    // Restore the shared worker-scoped repo to main so the next test's
+    // local-executor branch detection sees a clean baseline. The agent
+    // session above checked out feature/pr-branch on this repo; without
+    // this cleanup the next test that reads currentLocalBranch (e.g.
+    // create-task.spec.ts's "dialog pre-selects" check) sees the wrong
+    // branch and asserts against "main" fail.
+    execSync("git checkout -f main", { cwd: repoDir, env: gitEnv });
+  });
+
+  test("creates task from PR URL with worktree executor and verifies branch", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    const { execSync } = await import("child_process");
+    const gitEnv = {
+      ...process.env,
+      HOME: backend.tmpDir,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+
+    // Create a fresh repo with an offline origin that publishes the PR
+    // snapshot ref used by the worktree manager.
+    const repository = createEmptyRemoteRepository(backend.tmpDir, "pr-wt");
+    const repoDir = repository.localPath;
+
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env: gitEnv });
+    execSync("git push origin main", { cwd: repoDir, env: gitEnv });
+
+    // Create the PR branch locally and switch back to main
+    execSync("git checkout -b feature/pr-branch", { cwd: repoDir, env: gitEnv });
+    execSync('git commit --allow-empty -m "pr branch commit"', { cwd: repoDir, env: gitEnv });
+    execSync("git push origin feature/pr-branch:refs/pull/77/head", {
+      cwd: repoDir,
+      env: gitEnv,
+    });
+    execSync("git checkout main", { cwd: repoDir, env: gitEnv });
+
+    // Register the repo with a unique provider name to avoid collisions with
+    // other tests that also register repos as test-owner/test-repo.
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/pr-owner/pr-wt-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "pr-owner/pr-wt-repo",
+      provider: "github",
+      provider_owner: "pr-owner",
+      provider_name: "pr-wt-repo",
+      pull_before_worktree: false,
+    });
+
+    // Seed mock GitHub branches and PR
+    await apiClient.mockGitHubAddBranches("pr-owner", "pr-wt-repo", [
+      { name: "main" },
+      { name: "feature/pr-branch" },
+    ]);
+
+    await apiClient.mockGitHubAddPRs([
+      {
+        number: 77,
+        title: "Worktree PR",
+        state: "open",
+        head_branch: "feature/pr-branch",
+        base_branch: "main",
+        author_login: "test-user",
+        repo_owner: "pr-owner",
+        repo_name: "pr-wt-repo",
+      },
+    ]);
+
+    // Look up the worktree executor profile
+    const { executors } = await apiClient.listExecutors();
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    const worktreeProfile = worktreeExec?.profiles?.[0];
+    if (!worktreeProfile) {
+      test.skip(true, "No worktree executor profile available");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the PR URL.
+    await openRemoteAndPasteURL(testPage, "https://github.com/pr-owner/pr-wt-repo/pull/77");
+
+    // PR-info fetch resolves asynchronously; downstream the submit-button
+    // becomes enabled once branches + agent profile are ready. The terminal
+    // assertion later confirms the PR head branch is actually checked out.
+
+    // Fill in title and description
+    await testPage.getByTestId("task-title-input").fill("PR Worktree Task");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    // Wait for selectors to be ready
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+
+    // Select the worktree executor profile
+    const executorSelector = testPage.getByTestId("executor-profile-selector");
+    await executorSelector.click();
+    await testPage.getByRole("option", { name: /Worktree/i }).click();
+
+    // Submit
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 15_000 });
+
+    // Verify the worktree checked out the PR branch directly.
+    await expect(session.terminal).toBeVisible({ timeout: 15_000 });
+    await session.typeInTerminal("git branch --show-current");
+    await session.expectTerminalHasText("feature/pr-branch");
+  });
+
+  test("shows a launch error when the PR branch has no remote snapshot", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+
+    const { execSync } = await import("child_process");
+    const gitEnv = {
+      ...process.env,
+      HOME: backend.tmpDir,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+
+    // Create a repo with the PR branch locally but no published PR snapshot. PR launches must
+    // fail closed when the immutable pull-request snapshot cannot be fetched.
+    const repository = createEmptyRemoteRepository(backend.tmpDir, "pr-missing-snapshot");
+    const repoDir = repository.localPath;
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env: gitEnv });
+    execSync("git checkout -b feature/warn-branch", { cwd: repoDir, env: gitEnv });
+    execSync('git commit --allow-empty -m "feature commit"', { cwd: repoDir, env: gitEnv });
+    execSync("git checkout main", { cwd: repoDir, env: gitEnv });
+
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/warn-owner/warn-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "warn-owner/warn-repo",
+      provider: "github",
+      provider_owner: "warn-owner",
+      provider_name: "warn-repo",
+      pull_before_worktree: false,
+    });
+
+    await apiClient.mockGitHubAddBranches("warn-owner", "warn-repo", [
+      { name: "main" },
+      { name: "feature/warn-branch" },
+    ]);
+
+    await apiClient.mockGitHubAddPRs([
+      {
+        number: 200,
+        title: "Warning PR",
+        state: "open",
+        head_branch: "feature/warn-branch",
+        base_branch: "main",
+        author_login: "test-user",
+        repo_owner: "warn-owner",
+        repo_name: "warn-repo",
+      },
+    ]);
+
+    // Need worktree executor to exercise the authenticated PR snapshot fetch.
+    const { executors } = await apiClient.listExecutors();
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    const worktreeProfile = worktreeExec?.profiles?.[0];
+    if (!worktreeProfile) {
+      test.skip(true, "No worktree executor profile available");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // Switch to Remote tab and paste the PR URL.
+    await openRemoteAndPasteURL(testPage, "https://github.com/warn-owner/warn-repo/pull/200");
+
+    // PR-info fetch resolves asynchronously; downstream the submit-button
+    // becomes enabled once branches + agent profile are ready.
+
+    await testPage.getByTestId("task-title-input").fill("Warning Test Task");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+
+    // Select worktree executor
+    const executorSelector = testPage.getByTestId("executor-profile-selector");
+    await executorSelector.click();
+    await testPage.getByRole("option", { name: /Worktree/i }).click();
+
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    const sharedError = testPage.getByTestId("task-shared-error");
+    await expect(sharedError).toBeVisible({ timeout: 30_000 });
+    await sharedError.getByTestId("task-shared-error-details").click();
+    const launchError = testPage.getByTestId("task-launch-error-entry");
+    await expect(launchError).toBeVisible({ timeout: 30_000 });
+    await expect(launchError).toContainText(/launch needs attention/i);
+
+    const detailsToggle = launchError.locator("summary").filter({ hasText: "Show details" });
+    await expect(detailsToggle).toBeVisible();
+    await detailsToggle.click();
+    await expect(launchError.getByTestId("task-launch-error-details")).toContainText(
+      /pull request head 200|no remote ref|workspace checkout failed/i,
+    );
+    await expect(testPage.getByTestId("prepare-warning-banner")).toHaveCount(0);
+  });
+
+  test("two tasks from the same PR URL create independent worktrees", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+
+    const { execSync } = await import("child_process");
+    const gitEnv = {
+      ...process.env,
+      HOME: backend.tmpDir,
+      GIT_AUTHOR_NAME: "E2E Test",
+      GIT_AUTHOR_EMAIL: "e2e@test.local",
+      GIT_COMMITTER_NAME: "E2E Test",
+      GIT_COMMITTER_EMAIL: "e2e@test.local",
+    };
+
+    // Create a repo whose offline origin publishes the immutable PR snapshot
+    // used by both independent worktrees.
+    const repository = createEmptyRemoteRepository(backend.tmpDir, "shared-pr");
+    const repoDir = repository.localPath;
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir, env: gitEnv });
+    execSync("git push origin main", { cwd: repoDir, env: gitEnv });
+    execSync("git checkout -b feature/shared-pr", { cwd: repoDir, env: gitEnv });
+    execSync('git commit --allow-empty -m "shared pr commit"', { cwd: repoDir, env: gitEnv });
+    execSync("git push origin feature/shared-pr:refs/pull/50/head", {
+      cwd: repoDir,
+      env: gitEnv,
+    });
+    execSync("git checkout main", { cwd: repoDir, env: gitEnv });
+
+    restoreOrigins.push(
+      configureGitHubOrigin(
+        repoDir,
+        "https://github.com/shared-owner/shared-repo.git",
+        makeGitEnv(backend.tmpDir),
+      ),
+    );
+    await apiClient.createRepository(seedData.workspaceId, repoDir, "main", {
+      name: "shared-owner/shared-repo",
+      provider: "github",
+      provider_owner: "shared-owner",
+      provider_name: "shared-repo",
+      pull_before_worktree: false,
+    });
+
+    await apiClient.mockGitHubAddBranches("shared-owner", "shared-repo", [
+      { name: "main" },
+      { name: "feature/shared-pr" },
+    ]);
+
+    await apiClient.mockGitHubAddPRs([
+      {
+        number: 50,
+        title: "Shared PR",
+        state: "open",
+        head_branch: "feature/shared-pr",
+        base_branch: "main",
+        author_login: "test-user",
+        repo_owner: "shared-owner",
+        repo_name: "shared-repo",
+      },
+    ]);
+
+    // Look up the worktree executor profile
+    const { executors } = await apiClient.listExecutors();
+    const worktreeExec = executors.find((e) => e.type === "worktree");
+    const worktreeProfile = worktreeExec?.profiles?.[0];
+    if (!worktreeProfile) {
+      test.skip(true, "No worktree executor profile available");
+      return;
+    }
+
+    const kanban = new KanbanPage(testPage);
+    const currentTaskId = () => {
+      const taskId = new URL(testPage.url()).pathname.match(/^\/t\/([^/]+)$/)?.[1];
+      if (!taskId) throw new Error(`Expected task route, got ${testPage.url()}`);
+      return taskId;
+    };
+    const waitForWorktree = async (taskId: string) => {
+      await expect
+        .poll(async () => (await apiClient.getTaskEnvironment(taskId))?.status ?? null, {
+          timeout: 30_000,
+          message: `Task ${taskId} has a ready worktree environment`,
+        })
+        .toBe("ready");
+      const environment = await apiClient.getTaskEnvironment(taskId);
+      if (!environment) throw new Error(`Task ${taskId} has no environment`);
+      return environment;
+    };
+    await kanban.goto();
+
+    // Helper: select worktree executor in the create dialog
+    const selectWorktreeExecutor = async () => {
+      const selector = testPage.getByTestId("executor-profile-selector");
+      // Only click if the selector doesn't already show "Worktree"
+      const selectorText = await selector.textContent();
+      if (!selectorText?.includes("Worktree")) {
+        await selector.click();
+        await testPage.getByRole("option", { name: /Worktree/i }).click();
+      }
+    };
+
+    // --- Task A: first task from PR URL ---
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    await openRemoteAndPasteURL(testPage, "https://github.com/shared-owner/shared-repo/pull/50");
+    // PR-info fetch resolves asynchronously; the chip's branch pill renders
+    // the resolved PR head once `useBranchAutoSelectEffect` mirrors it into
+    // `remoteRepos[0].branch`, which is also the trigger that enables submit.
+    await expect(
+      testPage.locator('[data-testid="remote-branch-chip-trigger"]').first(),
+    ).toContainText("feature/shared-pr", { timeout: 10_000 });
+
+    await testPage.getByTestId("task-title-input").fill("Shared PR Task A");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    const startBtn = testPage.getByTestId("submit-start-agent");
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+    await selectWorktreeExecutor();
+
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    // Wait for Task A agent to complete before creating Task B.
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+    const sessionA = new SessionPage(testPage);
+    await sessionA.waitForLoad();
+    await expect(sessionA.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(sessionA.idleInput()).toBeVisible({ timeout: 15_000 });
+
+    const taskAId = currentTaskId();
+    const environmentA = await waitForWorktree(taskAId);
+    const repoA = environmentA.repos?.find((repo) => repo.repository_id);
+    expect(repoA?.worktree_branch).toMatch(/^feature\/shared-pr-/);
+    const worktreePathA = repoA?.worktree_path ?? environmentA.worktree_path;
+    expect(worktreePathA).toBeTruthy();
+
+    // --- Task B: second task from the same PR URL ---
+    await testPage.goto("/");
+    await kanban.board.waitFor({ state: "visible" });
+
+    await kanban.createTaskButton.first().click();
+    await expect(dialog).toBeVisible();
+
+    await openRemoteAndPasteURL(testPage, "https://github.com/shared-owner/shared-repo/pull/50");
+    // PR-info fetch resolves asynchronously; the chip's branch pill renders
+    // the resolved PR head once `useBranchAutoSelectEffect` mirrors it into
+    // `remoteRepos[0].branch`, which is also the trigger that enables submit.
+    await expect(
+      testPage.locator('[data-testid="remote-branch-chip-trigger"]').first(),
+    ).toContainText("feature/shared-pr", { timeout: 10_000 });
+
+    await testPage.getByTestId("task-title-input").fill("Shared PR Task B");
+    await testPage.getByTestId("task-description-input").fill("/e2e:simple-message");
+
+    await expect(startBtn).toBeEnabled({ timeout: 15_000 });
+    await selectWorktreeExecutor();
+
+    await startBtn.click();
+    await expect(dialog).not.toBeVisible({ timeout: 10_000 });
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+    const sessionB = new SessionPage(testPage);
+    await sessionB.waitForLoad();
+    await expect(sessionB.chat.getByText("simple mock response", { exact: false })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    const taskBId = currentTaskId();
+    const environmentB = await waitForWorktree(taskBId);
+    const repoB = environmentB.repos?.find((repo) => repo.repository_id);
+    expect(repoB?.worktree_branch).toMatch(/^feature\/shared-pr-/);
+    expect(repoB?.worktree_branch).not.toBe(repoA?.worktree_branch);
+    const worktreePathB = repoB?.worktree_path ?? environmentB.worktree_path;
+    expect(worktreePathB).toBeTruthy();
+    expect(worktreePathB).not.toBe(worktreePathA);
+  });
+
+  test("can toggle between GitHub URL and repository selector", async ({ testPage }) => {
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    // The source-mode segmented control: Repo (workspace), Remote (chip
+    // picker / paste), None (scratch).
+    const urlModeBtn = testPage.getByTestId("source-mode-remote");
+    const repoModeBtn = testPage.getByTestId("source-mode-workspace");
+
+    // Default state: workspace mode, remote chips row not rendered.
+    await expect(repoModeBtn).toHaveAttribute("aria-checked", "true");
+    await expect(testPage.getByTestId("remote-repo-chips-row")).not.toBeVisible();
+
+    // Switch to Remote mode — chip row appears, Remote button is selected.
+    await urlModeBtn.click();
+    await expect(testPage.getByTestId("remote-repo-chips-row")).toBeVisible();
+    await expect(urlModeBtn).toHaveAttribute("aria-checked", "true");
+    await expect(repoModeBtn).toHaveAttribute("aria-checked", "false");
+
+    // Switch back to workspace mode — chip row disappears.
+    await repoModeBtn.click();
+    await expect(testPage.getByTestId("remote-repo-chips-row")).not.toBeVisible();
+    await expect(repoModeBtn).toHaveAttribute("aria-checked", "true");
+    await expect(urlModeBtn).toHaveAttribute("aria-checked", "false");
+  });
+});

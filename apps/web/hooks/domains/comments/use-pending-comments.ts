@@ -1,0 +1,130 @@
+import { useMemo } from "react";
+import { useCommentsStore } from "@/lib/state/slices/comments";
+import type {
+  Comment,
+  DiffComment,
+  PlanComment,
+  PRFeedbackComment,
+  WalkthroughComment,
+  AgentMessageComment,
+} from "@/lib/state/slices/comments";
+import {
+  isDiffComment,
+  isPRFeedbackComment,
+  isWalkthroughComment,
+  isAgentMessageComment,
+} from "@/lib/state/slices/comments";
+import { usePlanComments } from "./use-plan-comments";
+
+const EMPTY_COMMENTS: Comment[] = [];
+const EMPTY_DIFF_COMMENTS: DiffComment[] = [];
+const EMPTY_PR_FEEDBACK_COMMENTS: PRFeedbackComment[] = [];
+const EMPTY_WALKTHROUGH_COMMENTS: WalkthroughComment[] = [];
+const EMPTY_AGENT_MESSAGE_COMMENTS: AgentMessageComment[] = [];
+
+/**
+ * Get all pending comments (any source).
+ */
+export function usePendingComments(): Comment[] {
+  const byId = useCommentsStore((state) => state.byId);
+  const pendingForChat = useCommentsStore((state) => state.pendingForChat);
+
+  return useMemo(() => {
+    if (pendingForChat.length === 0) return EMPTY_COMMENTS;
+    const pending: Comment[] = [];
+    for (const id of pendingForChat) {
+      const comment = byId[id];
+      if (comment) pending.push(comment);
+    }
+    return pending.length === 0 ? EMPTY_COMMENTS : pending;
+  }, [byId, pendingForChat]);
+}
+
+/**
+ * Get all pending diff comments.
+ */
+export function usePendingDiffComments(): DiffComment[] {
+  const byId = useCommentsStore((state) => state.byId);
+  const pendingForChat = useCommentsStore((state) => state.pendingForChat);
+
+  return useMemo(() => {
+    if (pendingForChat.length === 0) return EMPTY_DIFF_COMMENTS;
+    const pending: DiffComment[] = [];
+    for (const id of pendingForChat) {
+      const comment = byId[id];
+      if (comment && isDiffComment(comment)) pending.push(comment);
+    }
+    return pending.length === 0 ? EMPTY_DIFF_COMMENTS : pending;
+  }, [byId, pendingForChat]);
+}
+
+/**
+ * Get the current task plan's shared pending comments.
+ */
+export function usePendingPlanComments(taskId?: string | null): PlanComment[] {
+  return usePlanComments(taskId).comments;
+}
+
+/**
+ * Get all pending PR feedback comments.
+ * If sessionId is provided, only returns comments belonging to that session.
+ */
+export function usePendingPRFeedback(sessionId?: string | null): PRFeedbackComment[] {
+  const byId = useCommentsStore((state) => state.byId);
+  const pendingForChat = useCommentsStore((state) => state.pendingForChat);
+
+  return useMemo(() => {
+    if (pendingForChat.length === 0) return EMPTY_PR_FEEDBACK_COMMENTS;
+    const pending: PRFeedbackComment[] = [];
+    for (const id of pendingForChat) {
+      const comment = byId[id];
+      if (comment && isPRFeedbackComment(comment)) {
+        // Filter by sessionId if provided
+        if (sessionId && comment.sessionId !== sessionId) continue;
+        pending.push(comment);
+      }
+    }
+    return pending.length === 0 ? EMPTY_PR_FEEDBACK_COMMENTS : pending;
+  }, [byId, pendingForChat, sessionId]);
+}
+
+/**
+ * Get all pending walkthrough comments.
+ * If sessionId is provided, only returns comments belonging to that session.
+ */
+export function usePendingWalkthroughComments(sessionId?: string | null): WalkthroughComment[] {
+  const byId = useCommentsStore((state) => state.byId);
+  const pendingForChat = useCommentsStore((state) => state.pendingForChat);
+
+  return useMemo(() => {
+    if (pendingForChat.length === 0) return EMPTY_WALKTHROUGH_COMMENTS;
+    const pending: WalkthroughComment[] = [];
+    for (const id of pendingForChat) {
+      const comment = byId[id];
+      if (comment && isWalkthroughComment(comment)) {
+        if (sessionId && comment.sessionId !== sessionId) continue;
+        pending.push(comment);
+      }
+    }
+    return pending.length === 0 ? EMPTY_WALKTHROUGH_COMMENTS : pending;
+  }, [byId, pendingForChat, sessionId]);
+}
+
+/** Get pending inline comments attached to settled agent replies. */
+export function usePendingAgentMessageComments(sessionId?: string | null): AgentMessageComment[] {
+  const byId = useCommentsStore((state) => state.byId);
+  const pendingForChat = useCommentsStore((state) => state.pendingForChat);
+
+  return useMemo(() => {
+    if (!sessionId || pendingForChat.length === 0) return EMPTY_AGENT_MESSAGE_COMMENTS;
+    const pending: AgentMessageComment[] = [];
+    for (const id of pendingForChat) {
+      const comment = byId[id];
+      if (comment && isAgentMessageComment(comment)) {
+        if (comment.sessionId !== sessionId) continue;
+        pending.push(comment);
+      }
+    }
+    return pending.length === 0 ? EMPTY_AGENT_MESSAGE_COMMENTS : pending;
+  }, [byId, pendingForChat, sessionId]);
+}

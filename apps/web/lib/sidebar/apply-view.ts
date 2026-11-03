@@ -1,0 +1,612 @@
+import type { TaskSwitcherItem } from "@/components/task/task-switcher";
+import { getExecutorLabel } from "@/lib/executor-icons";
+import { t } from "@/lib/i18n";
+import type {
+  FilterClause,
+  FilterDimension,
+  FilterOp,
+  FilterValue,
+  GroupKey,
+  SidebarView,
+  SortKey,
+  SortSpec,
+} from "@/lib/state/slices/ui/sidebar-view-types";
+import {
+  getStateBucket,
+  getTaskStateGroup,
+  resolveEffectiveStateMap,
+  STATE_BUCKET_ORDER,
+  STATE_GROUP_ORDER,
+  type EffectiveTaskTreeState,
+} from "./effective-task-tree-state";
+import {
+  compareActivityTimestamps,
+  resolveTaskTreeActivity,
+  taskActivitySortValue,
+} from "./task-tree-activity";
+
+export type SidebarGroup = {
+  key: string;
+  label: string;
+  tasks: TaskSwitcherItem[];
+  matchingCount?: number;
+  isContinuation?: boolean;
+};
+
+export type GroupedSidebarList = {
+  groups: SidebarGroup[];
+  subTasksByParentId: Map<string, TaskSwitcherItem[]>;
+  /**
+   * Which dimension produced `groups`. Rows read it to decide whether their own
+   * repository label is redundant: grouped by repository, the section header
+   * already names it. Optional so a hand-built list (tests, fixtures) keeps
+   * meaning "unknown grouping" and falls back to showing the label.
+   */
+  groupKey?: GroupKey;
+};
+
+export type SidebarTaskPrefs = {
+  pinnedTaskIds: string[];
+  orderedTaskIds: string[];
+  subtaskOrderByParentId?: Record<string, string[]>;
+};
+
+type DimensionExtractor = (task: TaskSwitcherItem) => FilterValue | undefined;
+
+const dimensionExtractors: Record<FilterDimension, DimensionExtractor> = {
+  archived: (t) => t.isArchived === true,
+  // State filters intentionally use the action buckets exposed by the filter UI.
+  state: (t) => getStateBucket(t),
+  workflow: (t) => t.workflowId,
+  workflowStep: (t) => t.workflowStepId,
+  executorType: (t) => t.remoteExecutorType,
+  // Repository filters keep the primary compatibility value. Grouping uses
+  // the complete combination separately in `groupExtractors` below.
+  repository: (t) => t.repositoryPath,
+  hasDiff: (t) => {
+    const ds = t.diffStats;
+    return !!ds && (ds.additions > 0 || ds.deletions > 0);
+  },
+  hasPR: (t) => !!t.prInfo,
+  isPRReview: (t) => t.isPRReview === true,
+  isIssueWatch: (t) => t.isIssueWatch === true,
+  titleMatch: (t) => t.title ?? "",
+};
+
+export function viewRequiresArchivedTasks(
+  view: Pick<SidebarView, "filters"> | null | undefined,
+): boolean {
+  return (
+    view?.filters.some(
+      (clause) =>
+        clause.dimension === "archived" &&
+        ((clause.op === "is" && clause.value === true) ||
+          (clause.op === "is_not" && clause.value === false)),
+    ) ?? false
+  );
+}
+
+function toStringArray(v: FilterValue): string[] {
+  if (Array.isArray(v)) return v.map(String);
+  return [String(v)];
+}
+
+function evaluateClause(task: TaskSwitcherItem, clause: FilterClause): boolean {
+  const extract = dimensionExtractors[clause.dimension];
+  const actual = extract(task);
+
+  switch (clause.op) {
+    case "is":
+      return String(actual) === String(clause.value);
+    case "is_not":
+      return String(actual) !== String(clause.value);
+    case "in":
+      return toStringArray(clause.value).includes(String(actual));
+    case "not_in":
+      return !toStringArray(clause.value).includes(String(actual));
+    case "matches": {
+      const hay = String(actual ?? "").toLowerCase();
+      const needle = String(clause.value).toLowerCase();
+      return needle === "" || hay.includes(needle);
+    }
+    case "not_matches": {
+      const hay = String(actual ?? "").toLowerCase();
+      const needle = String(clause.value).toLowerCase();
+      return needle !== "" && !hay.includes(needle);
+    }
+    default:
+      return true;
+  }
+}
+
+export function applyFilters(
+  tasks: TaskSwitcherItem[],
+  clauses: FilterClause[],
+): TaskSwitcherItem[] {
+  if (clauses.length === 0) return tasks;
+  return tasks.filter((task) => clauses.every((clause) => evaluateClause(task, clause)));
+}
+
+type SortComparator = (a: TaskSwitcherItem, b: TaskSwitcherItem) => number;
+
+const SORT_COMPARATORS: Record<Exclude<SortKey, "custom">, SortComparator> = {
+  state: (a, b) => {
+    const bucket = STATE_BUCKET_ORDER[getStateBucket(a)] - STATE_BUCKET_ORDER[getStateBucket(b)];
+    if (bucket !== 0) return bucket;
+    // Tiebreak: newest createdAt first (preserves historical sidebar ordering)
+    return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+  },
+  updatedAt: (a, b) => (a.updatedAt ?? "").localeCompare(b.updatedAt ?? ""),
+  lastActivityAt: (a, b) =>
+    compareActivityTimestamps(taskActivitySortValue(a), taskActivitySortValue(b)),
+  createdAt: (a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""),
+  title: (a, b) => (a.title ?? "").localeCompare(b.title ?? ""),
+};
+
+function customComparator(orderedTaskIds: string[]): SortComparator {
+  const order = new Map<string, number>();
+  for (let i = 0; i < orderedTaskIds.length; i++) order.set(orderedTaskIds[i], i);
+  return (a, b) => {
+    const ai = order.get(a.id);
+    const bi = order.get(b.id);
+    if (ai !== undefined && bi !== undefined) return ai - bi;
+    if (ai !== undefined) return -1;
+    if (bi !== undefined) return 1;
+    // Fallback for tasks the user hasn't placed yet: newest createdAt first.
+    return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+  };
+}
+
+export function applySort(
+  tasks: TaskSwitcherItem[],
+  spec: SortSpec,
+  orderedTaskIds: string[] = [],
+  subTasksByParentId?: Map<string, TaskSwitcherItem[]>,
+  effectiveStateByTaskId?: ReadonlyMap<string, EffectiveTaskTreeState>,
+): TaskSwitcherItem[] {
+  let cmp: SortComparator;
+  if (spec.key === "state" && subTasksByParentId) {
+    const resolvedStates =
+      effectiveStateByTaskId ?? resolveEffectiveStateMap(tasks, subTasksByParentId);
+    const effectiveOrder = new Map<string, number>();
+    for (const t of tasks) {
+      effectiveOrder.set(
+        t.id,
+        STATE_BUCKET_ORDER[resolvedStates.get(t.id)?.bucket ?? getStateBucket(t)],
+      );
+    }
+    cmp = (a, b) => {
+      const bucket = effectiveOrder.get(a.id)! - effectiveOrder.get(b.id)!;
+      if (bucket !== 0) return bucket;
+      return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+    };
+  } else if (spec.key === "lastActivityAt" && subTasksByParentId) {
+    const latestActivityByTaskId = resolveTaskTreeActivity(tasks, subTasksByParentId);
+    cmp = (a, b) =>
+      compareActivityTimestamps(
+        latestActivityByTaskId.get(a.id) ?? taskActivitySortValue(a),
+        latestActivityByTaskId.get(b.id) ?? taskActivitySortValue(b),
+      );
+  } else {
+    cmp = spec.key === "custom" ? customComparator(orderedTaskIds) : SORT_COMPARATORS[spec.key];
+  }
+  // "Custom" is a manual order — reversing it on direction=desc would flip
+  // the user's drag, which has no intuitive meaning. The picker hides the
+  // direction toggle for custom; this guard keeps the data layer consistent
+  // even if a stored view ends up with desc direction.
+  const sign = spec.key !== "custom" && spec.direction === "desc" ? -1 : 1;
+  const withIndex = tasks.map((t, i) => ({ t, i }));
+  withIndex.sort((a, b) => {
+    const primary = cmp(a.t, b.t) * sign;
+    if (primary !== 0) return primary;
+    return a.i - b.i;
+  });
+  return withIndex.map((x) => x.t);
+}
+
+/**
+ * Catalog keys, not resolved labels: a `t()` at module scope would freeze at the
+ * boot locale. `applyGroup` runs inside its callers' render, so it resolves
+ * through the module-level `t` at call time — both `useGroupedSidebarView` and
+ * the mobile task-switcher sheet already carry `i18n.language` in their memo
+ * deps for the same reason.
+ *
+ * Only `label` is copy. The group `key`s below (`__multi__`, the
+ * `__repo_combination__:<json>` keys, `__unassigned__`, `__all__`) are identity:
+ * they are compared in `mergeSingleRepoUnassigned` / `sortRepoGroups` and are
+ * persisted in the view's `collapsedGroups`. They are never translated.
+ */
+const UNASSIGNED_LABEL_KEY = "sidebar:groupUnassigned";
+const MULTI_REPO_LABEL_KEY = "sidebar:groupMultiRepo";
+const ALL_GROUP_LABEL_KEY = "sidebar:groupAll";
+const REPOSITORY_COMBINATION_PREFIX = "__repo_combination__:";
+
+type GroupExtractor = (task: TaskSwitcherItem) => { key: string; label: string };
+
+function repositoryLinkIds(task: TaskSwitcherItem): string[] {
+  const ids = new Set<string>();
+  for (const link of task.repositoryLinks ?? []) ids.add(String(link.repository_id));
+  return [...ids];
+}
+
+function isCompleteRepositoryCombination(task: TaskSwitcherItem): boolean {
+  const repositories = task.repositories ?? [];
+  const linkedRepositoryIds = repositoryLinkIds(task);
+  return repositories.length >= 2 && repositories.length === linkedRepositoryIds.length;
+}
+
+function hasMultipleRepositoryLinks(task: TaskSwitcherItem): boolean {
+  return (task.repositories?.length ?? 0) > 1 || repositoryLinkIds(task).length > 1;
+}
+
+function repositoryCombinationKey(repositories: string[]): string {
+  return `${REPOSITORY_COMBINATION_PREFIX}${JSON.stringify(repositories)}`;
+}
+
+const groupExtractors: Record<Exclude<GroupKey, "none">, GroupExtractor> = {
+  // Parameter named `task`, not `t`: this file's other extractors and loops use
+  // `t` for a task, which shadows the imported translator. These four resolve
+  // copy, so they must not. Rename the parameter before adding a `t()` call to
+  // any of the others.
+  repository: (task) => {
+    if (isCompleteRepositoryCombination(task)) {
+      const repositories = task.repositories!;
+      return {
+        key: repositoryCombinationKey(repositories),
+        label: repositories.join(", "),
+      };
+    }
+    if (hasMultipleRepositoryLinks(task)) {
+      return { key: "__multi__", label: t(MULTI_REPO_LABEL_KEY) };
+    }
+    if (task.repositoryPath) return { key: task.repositoryPath, label: task.repositoryPath };
+    return { key: "__unassigned__", label: t(UNASSIGNED_LABEL_KEY) };
+  },
+  workflow: (task) => {
+    if (task.workflowId)
+      return { key: task.workflowId, label: task.workflowName ?? task.workflowId };
+    return { key: "__unassigned__", label: t(UNASSIGNED_LABEL_KEY) };
+  },
+  workflowStep: (task) => {
+    if (task.workflowStepId) {
+      return { key: task.workflowStepId, label: task.workflowStepTitle ?? task.workflowStepId };
+    }
+    return { key: "__unassigned__", label: t(UNASSIGNED_LABEL_KEY) };
+  },
+  executorType: (task) => {
+    if (task.remoteExecutorType) {
+      return { key: task.remoteExecutorType, label: getExecutorLabel(task.remoteExecutorType) };
+    }
+    return { key: "__unassigned__", label: t(UNASSIGNED_LABEL_KEY) };
+  },
+  // State groups use persisted task states so headings match task status labels.
+  state: getTaskStateGroup,
+};
+
+function separateSubtasks(tasks: TaskSwitcherItem[]): {
+  rootTasks: TaskSwitcherItem[];
+  subTasksByParentId: Map<string, TaskSwitcherItem[]>;
+} {
+  const allIds = new Set(tasks.map((t) => t.id));
+  const subMap = new Map<string, TaskSwitcherItem[]>();
+  const rootTasks: TaskSwitcherItem[] = [];
+  for (const t of tasks) {
+    if (t.parentTaskId && allIds.has(t.parentTaskId)) {
+      const arr = subMap.get(t.parentTaskId) ?? [];
+      arr.push(t);
+      subMap.set(t.parentTaskId, arr);
+    } else {
+      rootTasks.push(t);
+    }
+  }
+  return { rootTasks, subTasksByParentId: subMap };
+}
+
+export function applyGroup(
+  tasks: TaskSwitcherItem[],
+  groupKey: GroupKey,
+  effectiveStateSubMap?: Map<string, TaskSwitcherItem[]>,
+  effectiveStateByTaskId?: ReadonlyMap<string, EffectiveTaskTreeState>,
+): GroupedSidebarList {
+  const { rootTasks, subTasksByParentId } = separateSubtasks(tasks);
+
+  if (groupKey === "none") {
+    return {
+      groups: [{ key: "__all__", label: t(ALL_GROUP_LABEL_KEY), tasks: rootTasks }],
+      subTasksByParentId,
+      groupKey,
+    };
+  }
+
+  const extract = groupExtractors[groupKey];
+  const resolvedStates =
+    groupKey === "state" && effectiveStateSubMap
+      ? (effectiveStateByTaskId ?? resolveEffectiveStateMap(tasks, effectiveStateSubMap))
+      : undefined;
+  const buckets = new Map<string, SidebarGroup>();
+  for (const task of rootTasks) {
+    const resolved = resolvedStates?.get(task.id);
+    const { key, label } = resolved
+      ? { key: resolved.groupKey, label: resolved.label }
+      : extract(task);
+    let group = buckets.get(key);
+    if (!group) {
+      group = { key, label, tasks: [] };
+      buckets.set(key, group);
+    }
+    group.tasks.push(task);
+  }
+
+  const groups = [...buckets.values()];
+  if (groupKey === "repository") {
+    mergeSingleRepoUnassigned(groups);
+    sortRepoGroups(groups);
+  }
+  if (groupKey === "state") sortStateGroups(groups);
+  return { groups, subTasksByParentId, groupKey };
+}
+
+function mergeSingleRepoUnassigned(groups: SidebarGroup[]): void {
+  const repoGroups = groups.filter(
+    (g) =>
+      g.key !== "__multi__" &&
+      g.key !== "__unassigned__" &&
+      !g.key.startsWith(REPOSITORY_COMBINATION_PREFIX),
+  );
+  if (repoGroups.length !== 1) return;
+  const unassignedIdx = groups.findIndex((g) => g.key === "__unassigned__");
+  if (unassignedIdx === -1) return;
+  const unassigned = groups[unassignedIdx];
+  repoGroups[0].tasks.push(...unassigned.tasks);
+  groups.splice(unassignedIdx, 1);
+}
+
+function sortRepoGroups(groups: SidebarGroup[]): void {
+  groups.sort((a, b) => {
+    if (a.key === "__multi__") return -1;
+    if (b.key === "__multi__") return 1;
+    const aIsCombination = a.key.startsWith(REPOSITORY_COMBINATION_PREFIX);
+    const bIsCombination = b.key.startsWith(REPOSITORY_COMBINATION_PREFIX);
+    if (aIsCombination && !bIsCombination && b.key !== "__unassigned__") return -1;
+    if (bIsCombination && !aIsCombination && a.key !== "__unassigned__") return 1;
+    if (a.key === "__unassigned__") return 1;
+    if (b.key === "__unassigned__") return -1;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function sortStateGroups(groups: SidebarGroup[]): void {
+  groups.sort((a, b) => {
+    const order = (STATE_GROUP_ORDER[a.key] ?? 99) - (STATE_GROUP_ORDER[b.key] ?? 99);
+    if (order !== 0) return order;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+/**
+ * Float pinned tasks to the top within a group, preserving the order the user
+ * pinned them in. The active sort still determines the order of unpinned
+ * tasks (and acts as a tiebreaker among pinned tasks not in pinIndex).
+ */
+function floatPinnedToTop(
+  tasks: TaskSwitcherItem[],
+  pinnedSet: Set<string>,
+  pinIndex: Map<string, number>,
+): TaskSwitcherItem[] {
+  if (pinnedSet.size === 0) return tasks;
+  const withSortIndex = tasks.map((t, i) => ({ t, sortIdx: i }));
+  withSortIndex.sort((a, b) => {
+    const ap = pinnedSet.has(a.t.id);
+    const bp = pinnedSet.has(b.t.id);
+    if (ap !== bp) return ap ? -1 : 1;
+    if (ap && bp) {
+      const ai = pinIndex.get(a.t.id) ?? 0;
+      const bi = pinIndex.get(b.t.id) ?? 0;
+      if (ai !== bi) return ai - bi;
+    }
+    return a.sortIdx - b.sortIdx;
+  });
+  return withSortIndex.map((x) => x.t);
+}
+
+/**
+ * Splice a group's reordered task IDs back into the global manual-order list,
+ * preserving the position of *other* groups. Without an anchor, repeatedly
+ * appending the dragged group to the end shuffles section headers (the next
+ * `applyGroup` pass keys section order off first encounter, so the dragged
+ * group always ends up last).
+ *
+ * Anchor: index of the first existing group task in `current`. If the group
+ * is being placed for the first time (`firstIdx === -1`), append at the end —
+ * subsequent drags will pin its position via the anchor.
+ */
+export function mergeGroupOrder(current: string[], groupTaskIds: string[]): string[] {
+  const groupSet = new Set(groupTaskIds);
+  let firstIdx = -1;
+  for (let i = 0; i < current.length; i++) {
+    if (groupSet.has(current[i])) {
+      firstIdx = i;
+      break;
+    }
+  }
+  const remaining = current.filter((id) => !groupSet.has(id));
+  if (firstIdx === -1) return [...remaining, ...groupTaskIds];
+  // Items before `firstIdx` in `current` are all non-group (firstIdx is the
+  // first group occurrence), so translation to `remaining` is identity.
+  return [...remaining.slice(0, firstIdx), ...groupTaskIds, ...remaining.slice(firstIdx)];
+}
+
+/** Replace the order slots occupied by visible siblings and retain off-page slots. */
+export function mergeVisibleOrder(current: string[], visibleTaskIds: string[]): string[] {
+  const visibleSet = new Set(visibleTaskIds);
+  const positions = current.flatMap((id, index) => (visibleSet.has(id) ? [index] : []));
+  if (positions.length === 0) return [...current, ...visibleTaskIds];
+  const result = [...current];
+  const placedCount = Math.min(positions.length, visibleTaskIds.length);
+  for (let index = 0; index < placedCount; index++) {
+    result[positions[index]] = visibleTaskIds[index];
+  }
+  if (visibleTaskIds.length > placedCount) {
+    result.splice(positions[placedCount - 1] + 1, 0, ...visibleTaskIds.slice(placedCount));
+  }
+  return result;
+}
+
+function buildIndex(ids: string[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (let i = 0; i < ids.length; i++) m.set(ids[i], i);
+  return m;
+}
+
+/**
+ * Sort subtasks of a single parent by the user's manual order. Listed
+ * subtasks come first in their stored order; unlisted ones keep their incoming
+ * order (which reflects the active sort) afterwards.
+ */
+export function applySubtaskOrder(
+  subtasks: TaskSwitcherItem[],
+  orderedSubtaskIds: string[],
+): TaskSwitcherItem[] {
+  const orderIndex = buildIndex(orderedSubtaskIds);
+  const withSortIndex = subtasks.map((t, i) => ({ t, sortIdx: i }));
+  withSortIndex.sort((a, b) => {
+    const ai = orderIndex.get(a.t.id);
+    const bi = orderIndex.get(b.t.id);
+    if (ai !== undefined && bi !== undefined) return ai - bi;
+    if (ai !== undefined) return -1;
+    if (bi !== undefined) return 1;
+    return a.sortIdx - b.sortIdx;
+  });
+  return withSortIndex.map((x) => x.t);
+}
+
+/**
+ * Count a group's tasks including every nested descendant. The sidebar renders
+ * an arbitrarily deep tree, so the header count walks `subTasksByParentId`
+ * recursively rather than counting only root + direct children.
+ */
+export function countGroupTasks(
+  rootTasks: TaskSwitcherItem[],
+  subTasksByParentId: Map<string, TaskSwitcherItem[]>,
+): number {
+  let total = 0;
+  const visited = new Set<string>();
+  const stack = [...rootTasks];
+  while (stack.length > 0) {
+    const task = stack.pop()!;
+    if (visited.has(task.id)) continue;
+    visited.add(task.id);
+    total += 1;
+    const children = subTasksByParentId.get(task.id);
+    if (children) stack.push(...children);
+  }
+  return total;
+}
+
+/**
+ * Flatten the grouped sidebar tree into the exact top-to-bottom order of the
+ * task rows the user currently sees, honoring collapsed groups and collapsed
+ * subtask parents. This is the ordered list shift-click range selection walks.
+ */
+export function flattenVisibleTaskIds(
+  grouped: GroupedSidebarList,
+  collapsedGroupKeys: string[],
+  collapsedSubtaskParentIds: string[],
+): string[] {
+  const collapsedGroups = new Set(collapsedGroupKeys);
+  const collapsedSubs = new Set(collapsedSubtaskParentIds);
+  const out: string[] = [];
+  const visit = (task: TaskSwitcherItem) => {
+    out.push(task.id);
+    if (collapsedSubs.has(task.id)) return;
+    const subs = grouped.subTasksByParentId.get(task.id);
+    if (subs) for (const sub of subs) visit(sub);
+  };
+  for (const group of grouped.groups) {
+    if (collapsedGroups.has(group.key)) continue;
+    for (const task of group.tasks) visit(task);
+  }
+  return out;
+}
+
+/**
+ * Order `ids` by their position in the rendered `visibleTaskIds` list. Used
+ * before bulk moves so a backward range selection (anchor after target, which
+ * leaves the selection Set in insertion rather than visible order) still lands
+ * top-to-bottom at the destination. Ids absent from the visible list sort last
+ * so they never displace the visible-ordered ones.
+ */
+export function sortIdsByVisibleOrder(ids: string[], visibleTaskIds: string[]): string[] {
+  const order = new Map(visibleTaskIds.map((id, i) => [id, i]));
+  return [...ids].sort(
+    (a, b) =>
+      (order.get(a) ?? Number.POSITIVE_INFINITY) - (order.get(b) ?? Number.POSITIVE_INFINITY),
+  );
+}
+
+/**
+ * Decide whether a selection can be bulk-moved to a single step. A selected row
+ * with no workflow (e.g. the archived placeholder) can't move, so flag the
+ * selection as "mixed" (disables "Move to step") and report the movable subset.
+ */
+export function computeMixedWorkflowSelection(
+  displayTasks: Array<{ id: string; workflowId?: string }>,
+  selectedIds: Set<string>,
+): { isMixedWorkflowSelection: boolean; movableSelectedIds: Set<string> } {
+  const wfIds = new Set<string>();
+  const movable = new Set<string>();
+  let hasWorkflowless = false;
+  for (const t of displayTasks) {
+    if (!selectedIds.has(t.id)) continue;
+    if (t.workflowId) {
+      wfIds.add(t.workflowId);
+      movable.add(t.id);
+    } else {
+      hasWorkflowless = true;
+    }
+  }
+  return {
+    isMixedWorkflowSelection: hasWorkflowless || wfIds.size > 1,
+    movableSelectedIds: movable,
+  };
+}
+
+export function applyView(
+  tasks: TaskSwitcherItem[],
+  view: SidebarView,
+  prefs?: SidebarTaskPrefs,
+): GroupedSidebarList {
+  const filtered = applyFilters(tasks, view.filters);
+  const { subTasksByParentId } = separateSubtasks(filtered);
+  const effectiveStateByTaskId =
+    view.sort.key === "state" || view.group === "state"
+      ? resolveEffectiveStateMap(filtered, subTasksByParentId)
+      : undefined;
+  const sorted = applySort(
+    filtered,
+    view.sort,
+    prefs?.orderedTaskIds,
+    subTasksByParentId,
+    effectiveStateByTaskId,
+  );
+  const grouped = applyGroup(sorted, view.group, subTasksByParentId, effectiveStateByTaskId);
+  const subOrderMap = prefs?.subtaskOrderByParentId;
+  if (subOrderMap) {
+    for (const [parentId, orderedIds] of Object.entries(subOrderMap)) {
+      const subs = grouped.subTasksByParentId.get(parentId);
+      if (!subs) continue;
+      grouped.subTasksByParentId.set(parentId, applySubtaskOrder(subs, orderedIds));
+    }
+  }
+  if (!prefs || prefs.pinnedTaskIds.length === 0) return grouped;
+  const pinnedSet = new Set(prefs.pinnedTaskIds);
+  const pinIndex = buildIndex(prefs.pinnedTaskIds);
+  for (const group of grouped.groups) {
+    group.tasks = floatPinnedToTop(group.tasks, pinnedSet, pinIndex);
+  }
+  return grouped;
+}
+
+export function opIsNegative(op: FilterOp): boolean {
+  return op === "is_not" || op === "not_in" || op === "not_matches";
+}

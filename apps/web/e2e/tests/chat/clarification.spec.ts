@@ -1,0 +1,1533 @@
+import { type Page } from "@playwright/test";
+import { test, expect } from "../../fixtures/test-base";
+import { useRegularMode } from "../../helpers/regular-mode";
+import type { SeedData } from "../../fixtures/test-base";
+import type { ApiClient } from "../../helpers/api-client";
+import { activeSessionId, seedClarificationSession } from "../../helpers/clarification";
+import { waitForSessionState } from "../../helpers/session";
+import { dwell, waitForHttp } from "../../helpers/causal-waits";
+import { SessionPage } from "../../pages/session-page";
+import { KanbanPage } from "../../pages/kanban-page";
+import { SidebarFilterPopoverPage } from "../../pages/sidebar-filter-popover";
+
+/**
+ * Seed a task + session with a clarification scenario and navigate to the session page.
+ * Does NOT wait for idle input — the agent will be blocked on the clarification MCP call.
+ */
+function seedClarificationTask(
+  testPage: Page,
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+  scenario: string,
+): Promise<SessionPage> {
+  return seedClarificationSession(testPage, apiClient, seedData, title, { scenario });
+}
+
+async function waitForPendingClarificationMessages(
+  apiClient: ApiClient,
+  sessionId: string,
+  expectedCount: number,
+  message: string,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const { messages } = await apiClient.listSessionMessages(sessionId);
+        return messages.filter(
+          (candidate) =>
+            candidate.type === "clarification_request" && candidate.metadata?.status === "pending",
+        ).length;
+      },
+      { message, timeout: 60_000 },
+    )
+    .toBe(expectedCount);
+}
+
+const PLAN_WITH_CLARIFICATION_SCRIPT = [
+  'e2e:mcp:kandev:create_task_plan_kandev({"task_id":"{task_id}","content":"## Plan\\n\\nEdit 1 item","title":"Implementation Plan"})',
+  "e2e:delay(100)",
+  'e2e:mcp:kandev:ask_user_question_kandev({"questions":[{"id":"db","prompt":"Which database should we use?","options":[{"label":"PostgreSQL","description":"Relational"},{"label":"SQLite","description":"Embedded"}]},{"id":"language","prompt":"Which language should we use?","options":[{"label":"Go","description":"Compiled"},{"label":"TypeScript","description":"Web"}]},{"id":"deploy","prompt":"How should we deploy?","options":[{"label":"Docker","description":"Containerized"},{"label":"Bare metal","description":"Direct"}]}]})',
+].join("\n");
+
+const CLARIFICATION_WITH_POST_ANSWER_DELAY_SCRIPT = [
+  'e2e:mcp:kandev:ask_user_question_kandev({"questions":[{"id":"db","prompt":"Which database should we use?","options":[{"label":"PostgreSQL","description":"Relational"},{"label":"SQLite","description":"Embedded"}]}]})',
+  // Keep the resumed turn active long enough to observe the transient
+  // REVIEW → IN_PROGRESS transition even on a loaded shard. Mock delays are
+  // cancellation-aware, so test teardown does not wait out this interval.
+  "e2e:delay(30000)",
+  'e2e:message("The clarification answer resumed the active turn.")',
+].join("\n");
+
+// Exercises the regular task-create dialog (New Task in the sidebar); run with office off.
+useRegularMode();
+
+test.describe("Clarification flow", () => {
+  test.describe.configure({ retries: 1 });
+
+  test("Auto-run ON does not bypass a pending clarification", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Composer Queue",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    const composer = session.activeChat().getByTestId("chat-input-editor");
+    await expect(composer).toHaveAttribute("contenteditable", "true", { timeout: 30_000 });
+    await expect(testPage.getByTestId("cancel-agent-button")).toBeVisible();
+
+    await composer.pressSequentially("Queue this after I answer 1", { timeout: 30_000 });
+    await expect(composer).toContainText("Queue this after I answer 1");
+    await expect(session.clarificationOverlay()).toBeVisible();
+    await testPage.getByTestId("submit-message-button").click();
+
+    await expect(testPage.getByTestId("queue-chip")).toBeVisible({ timeout: 10_000 });
+    await expect(session.clarificationOverlay()).toBeVisible();
+    await testPage.getByTestId("queue-chip").click();
+    const panel = testPage.getByTestId("queued-ghost-list");
+    await expect(panel).toBeVisible();
+    const autoRun = panel.getByTestId("queue-auto-run");
+    await expect(autoRun).toHaveAttribute("data-state", "checked");
+    await autoRun.click();
+    await expect(autoRun).toHaveAttribute("data-state", "unchecked");
+    await autoRun.click();
+    await expect(autoRun).toHaveAttribute("data-state", "checked");
+    await expect(panel.getByTestId("queue-entry")).toHaveCount(1);
+    await expect(session.clarificationOverlay()).toBeVisible();
+  });
+
+  test("select option (happy path)", async ({ testPage, apiClient, seedData }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Happy Path",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await expect(session.clarificationOverlay()).toContainText("Which database");
+    await expect(session.clarificationContext()).toHaveCount(0);
+
+    // Single-question bundles still expose option click → instant resolve.
+    await session.clarificationOption("PostgreSQL").click();
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText(/You answered|selected_option/);
+  });
+
+  test("shows the header submitting status for a single-question answer", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Single Submit Feedback",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    const header = session.clarificationOverlay().getByTestId("clarification-overlay-header");
+    const status = session.clarificationSubmittingStatus();
+    await expect(status).toHaveCount(0);
+
+    let releaseResponse = () => undefined;
+    const heldResponse = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      await heldResponse;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ success: true }),
+      });
+    });
+
+    try {
+      await session.clarificationOption("PostgreSQL").click();
+      await expect(status).toBeVisible();
+      await expect(status).toHaveAttribute("aria-label", "Submitting…");
+      await expect(status).toHaveCount(1);
+      await expect(session.clarificationSkip()).toBeDisabled();
+
+      const statusPrecedesSkip = await header.evaluate((node) => {
+        const submitting = node.querySelector('[data-testid="clarification-submitting-status"]');
+        const skip = node.querySelector('[data-testid="clarification-skip"]');
+        return Boolean(
+          submitting &&
+          skip &&
+          submitting.compareDocumentPosition(skip) & Node.DOCUMENT_POSITION_FOLLOWING,
+        );
+      });
+      expect(statusPrecedesSkip).toBe(true);
+    } finally {
+      releaseResponse();
+    }
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+  });
+
+  // R2/R11 + W3: a duplicate submit is a 200 with claimed: false, not a 409 —
+  // the losing client must apply the winner's own answer instead of stranding
+  // the overlay on "pending" or rendering its own (overwritten) submission.
+  test("losing a race renders the winner's answer and closes the overlay", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Lost Race",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          success: true,
+          claimed: false,
+          status: "answered",
+          response: {
+            pending_id: "lost-race-pending-id",
+            answers: [
+              {
+                question_id: "db",
+                selected_options: [],
+                custom_text: "SQLite, decided by another answerer",
+              },
+            ],
+            rejected: false,
+          },
+          resume: "published",
+        }),
+      });
+    });
+
+    // The user picks a different option locally; the response above must win.
+    await session.clarificationOption("PostgreSQL").click();
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("SQLite, decided by another answerer");
+    await expect(session.chat).not.toContainText("PostgreSQL");
+  });
+
+  test("moves answered task from Review to In progress without reload", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      "Clarification State Group",
+      seedData.agentProfileId,
+      {
+        description: CLARIFICATION_WITH_POST_ANSWER_DELAY_SCRIPT,
+        workflow_id: seedData.workflowId,
+        workflow_step_id: seedData.startStepId,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+    if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+    await waitForPendingClarificationMessages(
+      apiClient,
+      task.session_id,
+      1,
+      "custom clarification should be durably pending before navigation",
+    );
+    await waitForSessionState(apiClient, {
+      taskId: task.id,
+      sessionId: task.session_id,
+      expectedState: "WAITING_FOR_INPUT",
+      message: "custom clarification should park its session before navigation",
+      timeout: 60_000,
+    });
+
+    await testPage.goto(`/t/${task.id}`);
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // The pending overlay is durable while the session may legitimately stay
+    // RUNNING when the primary MCP response path remains connected.
+    await apiClient.updateTaskState(task.id, "REVIEW");
+    await expect.poll(async () => (await apiClient.getTask(task.id)).state).toBe("REVIEW");
+
+    const filters = new SidebarFilterPopoverPage(testPage);
+    await filters.open();
+    await filters.setGroup("State");
+    await filters.close();
+
+    const reviewGroup = session.sidebar.locator(
+      '[data-testid="sidebar-group-header"][data-group-key="REVIEW"]',
+    );
+    await expect(reviewGroup).toBeVisible();
+
+    await session.clarificationOption("PostgreSQL").click();
+
+    await expect(
+      session.sidebar.locator('[data-testid="sidebar-group-header"][data-group-key="IN_PROGRESS"]'),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(reviewGroup).toHaveCount(0);
+  });
+
+  test("custom answer accepts multiple lines via Shift+Enter", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Multiline",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // The custom answer is a textarea: Shift+Enter inserts a newline, plain
+    // Enter submits the whole multi-line draft.
+    const input = session.clarificationInput();
+    await input.click();
+    await input.pressSequentially("first line");
+    await input.press("Shift+Enter");
+    await input.pressSequentially("second line");
+    await expect(input).toHaveValue("first line\nsecond line");
+
+    await input.press("Enter");
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("first line");
+    await expect(session.chat).toContainText("second line");
+    // The two lines must stay separated: if the newline were dropped the reply
+    // would render as the fused "first linesecond line".
+    await expect(session.chat).not.toContainText("linesecond line");
+  });
+
+  test("custom answer row ignores a hidden stale session chat", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Active Chat Locator",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Dockview can retain a prior session's chat in the DOM after its tab is
+    // hidden. The custom-answer row must come from the visible chat only.
+    await testPage.locator("body").evaluate((body) => {
+      body.insertAdjacentHTML(
+        "beforeend",
+        '<div data-testid="session-chat" style="display: none"><div data-testid="clarification-custom-input">stale custom answer</div></div>',
+      );
+    });
+
+    await expect(session.clarificationCustomInput()).toHaveCount(1);
+  });
+
+  test("skip clarification", async ({ testPage, apiClient, seedData }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Skip",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await session.clarificationSkip().click();
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("inactive dismissal removes the stale panel and does not retry", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Inactive Dismissal",
+      "clarification",
+    );
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    let attempts = 0;
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      attempts += 1;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "not_active" }),
+      });
+    });
+
+    const inactiveResponse = waitForHttp(
+      testPage,
+      "POST",
+      /\/api\/v1\/clarification\/[^/]+\/respond$/,
+    );
+    await session.clarificationSkip().click();
+    await expect((await inactiveResponse).status()).toBe(409);
+
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+    await expect(session.anyIdleInput()).toBeVisible();
+    await dwell(
+      testPage,
+      250,
+      "negative-assertion",
+      "observe that an inactive clarification is not submitted a second time",
+    );
+    expect(attempts).toBe(1);
+  });
+
+  test("late answer from an inactive historical question sends a new message", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(60_000);
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Late Answer",
+      "clarification",
+    );
+    const sessionId = await activeSessionId(testPage);
+    if (!sessionId) throw new Error("expected an active session for late clarification answer");
+
+    let responseAttempts = 0;
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      responseAttempts += 1;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "not_active" }),
+      });
+    });
+
+    const inactiveResponse = waitForHttp(
+      testPage,
+      "POST",
+      /\/api\/v1\/clarification\/[^/]+\/respond$/,
+    );
+    await session.clarificationSkip().click();
+    await expect((await inactiveResponse).status()).toBe(409);
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+
+    const answerAction = testPage.getByTestId("clarification-answer-as-new-message");
+    await expect(answerAction).toBeVisible({ timeout: 15_000 });
+    await answerAction.click();
+    await expect(testPage.getByTestId("clarification-late-submit")).toBeDisabled();
+    await testPage.getByTestId("clarification-option").filter({ hasText: "PostgreSQL" }).click();
+    await expect(testPage.getByTestId("clarification-late-submit")).toBeEnabled();
+
+    await testPage.getByTestId("clarification-late-submit").click();
+
+    await expect
+      .poll(
+        async () => {
+          const { messages } = await apiClient.listSessionMessages(sessionId);
+          return messages.some(
+            (message) =>
+              message.author_type === "user" &&
+              message.content.includes("Question 1") &&
+              message.content.includes("PostgreSQL"),
+          );
+        },
+        { timeout: 30_000, message: "late clarification answer should be admitted as a message" },
+      )
+      .toBe(true);
+    expect(responseAttempts).toBe(1);
+  });
+
+  test("timeout detaches clarification and accepts a custom deferred answer", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const workflow = await apiClient.createWorkflow(
+      seedData.workspaceId,
+      "Clarification Timeout Workflow",
+    );
+    const timeoutStep = await apiClient.createWorkflowStep(workflow.id, "Timeout Step", 0);
+    await apiClient.createWorkflowStep(workflow.id, "Should Not Advance", 1);
+
+    await apiClient.updateWorkflowStep(timeoutStep.id, {
+      events: {
+        on_turn_complete: [{ type: "move_to_next" }],
+      },
+    });
+
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      "Clarification Timeout",
+      seedData.agentProfileId,
+      {
+        description: "/e2e:clarification-timeout",
+        workflow_id: workflow.id,
+        workflow_step_id: timeoutStep.id,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+    if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+    await waitForSessionState(apiClient, {
+      taskId: task.id,
+      sessionId: task.session_id,
+      expectedState: "WAITING_FOR_INPUT",
+      message: "timed-out clarification should be ready for a deferred answer before navigation",
+      timeout: 60_000,
+    });
+
+    await testPage.goto(`/t/${task.id}`);
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Question timed out", { timeout: 30_000 });
+    await expect(session.clarificationDeferredNotice()).toBeVisible({ timeout: 10_000 });
+    await expect(session.clarificationExpiredNotice()).not.toBeVisible();
+
+    await expect
+      .poll(async () => (await apiClient.getTask(task.id)).workflow_step_id, {
+        timeout: 10_000,
+        message: "clarification timeout must not run on_turn_complete auto-advance",
+      })
+      .toBe(timeoutStep.id);
+
+    // Agent moved on; a late custom answer remains editable and goes through
+    // the event fallback as a new prompt.
+    const input = session.clarificationInput();
+    const inputRow = session.clarificationCustomInput();
+    await expect(input).toBeEnabled();
+    await expect(input).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    const [inputBox, inputRowBox] = await Promise.all([
+      input.boundingBox(),
+      inputRow.boundingBox(),
+    ]);
+    if (!inputBox || !inputRowBox) {
+      throw new Error("expected the custom answer input and row to have bounding boxes");
+    }
+    expect(Math.abs(inputBox.x - inputRowBox.x)).toBeLessThanOrEqual(16);
+
+    await inputRow.click({ position: { x: 4, y: 4 } });
+    await expect(input).toBeFocused();
+    await input.pressSequentially("Use the embedded database for this task");
+    await expect(input).toHaveValue("Use the embedded database for this task");
+    const [filledInputBox, filledInputRowBox] = await Promise.all([
+      input.boundingBox(),
+      inputRow.boundingBox(),
+    ]);
+    if (!filledInputBox || !filledInputRowBox) {
+      throw new Error("expected the filled custom answer input and row to have bounding boxes");
+    }
+    const inputCenter = filledInputBox.y + filledInputBox.height / 2;
+    const rowCenter = filledInputRowBox.y + filledInputRowBox.height / 2;
+    expect(Math.abs(inputCenter - rowCenter)).toBeLessThanOrEqual(1);
+
+    await input.press("Enter");
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Use the embedded database for this task");
+  });
+
+  test("Escape after the clarification detaches still doesn't reject, and the question stays answerable", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const workflow = await apiClient.createWorkflow(
+      seedData.workspaceId,
+      "Clarification Timeout Esc Workflow",
+    );
+    const timeoutStep = await apiClient.createWorkflowStep(workflow.id, "Timeout Step", 0);
+
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      "Clarification Timeout Esc",
+      seedData.agentProfileId,
+      {
+        description: "/e2e:clarification-timeout",
+        workflow_id: workflow.id,
+        workflow_step_id: timeoutStep.id,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+    if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+    await waitForSessionState(apiClient, {
+      taskId: task.id,
+      sessionId: task.session_id,
+      expectedState: "WAITING_FOR_INPUT",
+      message: "timed-out clarification should be ready for a deferred answer before navigation",
+      timeout: 60_000,
+    });
+
+    await testPage.goto(`/t/${task.id}`);
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Question timed out", { timeout: 30_000 });
+    await expect(session.clarificationDeferredNotice()).toBeVisible({ timeout: 10_000 });
+
+    let respondCalls = 0;
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      respondCalls += 1;
+      await route.continue();
+    });
+
+    // The MCP wait already detached (agent_disconnected cleanup ran), but
+    // Escape must still be a local-only dismiss — not a rejection — and the
+    // deferred question must stay answerable after restoring it.
+    await session.chat.focus();
+    await testPage.keyboard.press("Escape");
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+    await expect(session.clarificationBar()).toBeVisible();
+
+    await dwell(
+      testPage,
+      300,
+      "negative-assertion",
+      "asserts Escape never posts a rejection after detach; there is no event for the request that must not fire",
+    );
+    expect(respondCalls).toBe(0);
+
+    await session.clarificationCollapseToggle().click();
+    await expect(session.clarificationOverlay()).toBeVisible();
+
+    const input = session.clarificationInput();
+    const inputRow = session.clarificationCustomInput();
+    await expect(input).toBeEnabled();
+    await inputRow.click({ position: { x: 4, y: 4 } });
+    await expect(input).toBeFocused();
+    await input.pressSequentially("Use the embedded database for this task");
+    await input.press("Enter");
+
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Use the embedded database for this task");
+  });
+
+  test("options render label and description on separate rows", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Layout",
+      "clarification",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    const labels = session.clarificationOptionLabels();
+    const descriptions = session.clarificationOptionDescriptions();
+    await expect(labels).toHaveCount(3);
+    await expect(descriptions).toHaveCount(3);
+    const labelBox = await labels.first().boundingBox();
+    const descriptionBox = await descriptions.first().boundingBox();
+    if (!labelBox || !descriptionBox) {
+      throw new Error("expected both label and description to have bounding boxes");
+    }
+    expect(descriptionBox.y).toBeGreaterThanOrEqual(labelBox.y + labelBox.height - 1);
+  });
+
+  test("renders lightweight markdown across active and resolved clarification text", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification Markdown",
+      "clarification-markdown",
+    );
+
+    const overlay = session.clarificationOverlay();
+    await expect(overlay).toBeVisible();
+    const card = session.clarificationQuestionCardById("markdown");
+    const firstOption = session.clarificationOption("Postgres");
+
+    await expect(card.getByTestId("clarification-question-title").locator("code")).toHaveText("DB");
+    await expect(card.locator("strong").filter({ hasText: "one" })).toBeVisible();
+    await expect(card.locator("ol > li")).toHaveCount(2);
+    const guidance = card.getByRole("link", { name: "storage guidance" });
+    await expect(guidance).toHaveAttribute("href", "https://example.com/storage");
+    await expect(guidance).toHaveAttribute("rel", "noopener noreferrer");
+
+    await expect(firstOption.getByTestId("clarification-option-label").locator("code")).toHaveText(
+      "Postgres",
+    );
+    await expect(
+      firstOption.getByTestId("clarification-option-description").locator("strong"),
+    ).toHaveText("production");
+    await expect(firstOption.locator("a")).toHaveCount(0);
+
+    const context = session.clarificationContext();
+    await expect(context).toContainText("Keep `context` literal.");
+    await expect(context.locator("code")).toHaveCount(0);
+
+    await firstOption.locator("code").click();
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+
+    const resolved = session.activeChat().getByTestId("clarification-request-message");
+    await expect(resolved).toBeVisible();
+    await expect(resolved.locator("code").filter({ hasText: "DB" })).toBeVisible();
+    await expect(resolved.locator("strong").filter({ hasText: "one" })).toBeVisible();
+    await expect(resolved.locator("ol > li")).toHaveCount(2);
+    await expect(resolved.locator("code").filter({ hasText: "Postgres" })).toBeVisible();
+  });
+
+  test("plan mode + clarification does not leave pointer-events stuck on body", async ({
+    testPage,
+  }) => {
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await kanban.createTaskButton.first().click();
+    const dialog = testPage.getByTestId("create-task-dialog");
+    await expect(dialog).toBeVisible();
+
+    await testPage.getByTestId("task-title-input").fill("Plan Mode Clarification PE");
+
+    const descriptionInput = dialog.getByRole("textbox", {
+      name: "Write a prompt for the agent...",
+    });
+    await descriptionInput.click();
+    await descriptionInput.fill("/e2e:clarification");
+
+    await testPage.getByTestId("submit-start-agent-chevron").click();
+    await testPage.getByTestId("submit-plan-mode").click();
+
+    await expect(testPage).toHaveURL(/\/t\//, { timeout: 15_000 });
+
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    const pointerEvents = await testPage.evaluate(() => document.body.style.pointerEvents);
+    expect(pointerEvents).not.toBe("none");
+
+    await session.clarificationOption("PostgreSQL").click();
+    await expect(session.planModeInput()).toBeVisible({ timeout: 30_000 });
+  });
+});
+
+// Multi-question carousel UX. Each scenario uses the mock-agent's
+// `clarification-multi` scenario which sends 3 questions in a single MCP call.
+test.describe("Multi-question clarification carousel", () => {
+  test.describe.configure({ retries: 1 });
+
+  test("renders stepper with 3 steps and shows the first question", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q stepper",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // 3 stepper buttons rendered; the first is active and unanswered.
+    await expect(session.clarificationSteps()).toHaveCount(3);
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "false");
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "false");
+
+    // Group progress + per-question chip both rendered.
+    await expect(session.clarificationGroupProgress()).toContainText("0 of 3 answered");
+    await expect(session.clarificationOverlay()).toContainText("Question 1 of 3");
+
+    // Only one card is visible at a time (carousel UX, not stacked).
+    await expect(session.clarificationQuestionCards()).toHaveCount(1);
+    await expect(session.clarificationOverlay()).toContainText("Which database");
+  });
+
+  test("renders shared context once above the active question", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q shared context",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    const context = session.clarificationContext();
+    await expect(context).toHaveCount(1);
+    await expect(context).toHaveText(
+      "Picking the foundational stack.\n\nAnswer all three so we can move forward.",
+    );
+    await expect(context).not.toContainText(String.raw`\n`);
+    await expect(context).toHaveCSS("margin-top", "12px");
+    await expect(context).toHaveCSS("padding", "0px");
+    await expect(context).toHaveCSS("border-width", "0px");
+    await expect(context).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(
+      session.clarificationQuestionCards().getByTestId("clarification-context"),
+    ).toHaveCount(0);
+
+    const [contextBox, questionBox] = await Promise.all([
+      context.boundingBox(),
+      session.clarificationQuestionCards().boundingBox(),
+    ]);
+    if (!contextBox || !questionBox) {
+      throw new Error("expected shared context and question card to have bounding boxes");
+    }
+    expect(contextBox.y + contextBox.height).toBeLessThanOrEqual(questionBox.y + 1);
+
+    await session.clarificationStep(1).click();
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "true");
+    await expect(context).toHaveCount(1);
+    await expect(context).toHaveText(
+      "Picking the foundational stack.\n\nAnswer all three so we can move forward.",
+    );
+  });
+
+  test("answering option auto-advances to next step and marks step as answered", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q advance",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Pick an option on step 1; auto-advances to step 2.
+    await session.clarificationOption("PostgreSQL").click();
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+    await expect(session.clarificationOverlay()).toContainText("Question 2 of 3");
+    await expect(session.clarificationOverlay()).toContainText("Which language");
+  });
+
+  test("Back button restores the previous question and the prior selection", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q back",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "true");
+
+    await session.clarificationPrev().click();
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-active", "true");
+
+    // Previous answer is still selected.
+    const selectedOption = session
+      .clarificationQuestionCardById("db")
+      .locator('[data-testid="clarification-option"][data-selected="true"]');
+    await expect(selectedOption).toContainText("PostgreSQL");
+  });
+
+  test("clicking a step in the stepper jumps directly to that question", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q jump",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationStep(2).click();
+    await expect(session.clarificationStep(2)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationOverlay()).toContainText("Question 3 of 3");
+    await expect(session.clarificationOverlay()).toContainText("How should we deploy");
+  });
+
+  test("Submit button disabled until every question is answered", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q submit gating",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Jump to last step without answering.
+    await session.clarificationStep(2).click();
+    const submit = session.clarificationSubmit();
+    await expect(submit).toBeVisible();
+    await expect(submit).toBeDisabled();
+  });
+
+  test("happy path: answer all 3 then Submit unblocks the agent", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q happy path",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+
+    // We're on the last step; Submit is enabled.
+    const submit = session.clarificationSubmit();
+    await expect(submit).toBeEnabled();
+    await submit.click();
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("selected_option");
+  });
+
+  test("mix custom text + option selections round-trips", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q mixed",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Q1: option click → advances.
+    await session.clarificationOption("SQLite").click();
+
+    // Q2: custom text via Enter → advances.
+    const langInput = session.clarificationInputForQuestion("language");
+    await langInput.click();
+    await langInput.fill("Elixir");
+    await langInput.press("Enter");
+    await expect(session.clarificationGroupProgress()).toContainText("2 of 3 answered");
+
+    // Q3: option click; submit batch.
+    await session.clarificationOption("Bare metal").click();
+    await session.clarificationSubmit().click();
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Elixir");
+  });
+
+  test("revising an answer via stepper jump updates the response", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q revise",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+
+    // Jump back to Q1 and pick a different option.
+    await session.clarificationStep(0).click();
+    await session.clarificationOption("MongoDB").click();
+    // Auto-advance brings us to Q2; jump to last step to submit.
+    await session.clarificationStep(2).click();
+
+    await session.clarificationSubmit().click();
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("MongoDB");
+  });
+
+  test("skip rejects the entire bundle from any step", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q skip mid",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Answer the first one then skip from step 2.
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationSkip().click();
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("rejected");
+  });
+
+  test("number key shortcuts pick options on the active step", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q kbd",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Press "1" → first option of the first question, auto-advance.
+    await session.chat.focus();
+    await testPage.keyboard.press("1");
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+
+    // Press "2" → second option of Q2.
+    await testPage.keyboard.press("2");
+    await expect(session.clarificationStep(2)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("2 of 3 answered");
+
+    // Press "1" → first option of Q3 (last step, no advance).
+    await testPage.keyboard.press("1");
+    await expect(session.clarificationGroupProgress()).toContainText("3 of 3 answered");
+
+    // ArrowRight on the last step with all answered → submits.
+    await testPage.keyboard.press("ArrowRight");
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("question shortcuts only fire while the chat panel has focus", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      "Clarification shortcuts stay in chat",
+      seedData.agentProfileId,
+      {
+        description: PLAN_WITH_CLARIFICATION_SCRIPT,
+        workflow_id: seedData.workflowId,
+        workflow_step_id: seedData.startStepId,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+    if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+    await waitForPendingClarificationMessages(
+      apiClient,
+      task.session_id,
+      3,
+      "plan clarification bundle should be durably pending before navigation",
+    );
+
+    await testPage.goto(`/t/${task.id}`);
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    if (!(await session.planPanel.isVisible())) await session.togglePlanMode();
+    await expect(session.planEditor()).toBeVisible({ timeout: 15_000 });
+
+    const planEditor = session.planEditor();
+    await planEditor.click();
+    await testPage.keyboard.press("1");
+    await expect(planEditor).toContainText("Edit 1 item1");
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-active", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("0 of 3 answered");
+
+    await session.chat.focus();
+    await testPage.keyboard.press("1");
+    await expect(session.clarificationStep(1)).toHaveAttribute("data-active", "true");
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+    await expect(session.clarificationGroupProgress()).toContainText("3 of 3 answered");
+
+    await planEditor.focus();
+    await testPage.keyboard.press("ControlOrMeta+Enter");
+    await expect(session.clarificationOverlay()).toBeVisible();
+
+    await session.chat.focus();
+    await testPage.keyboard.press("ControlOrMeta+Enter");
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+  });
+
+  test("action tooltips show their keyboard shortcuts", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification shortcut hints",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await testPage.getByTestId("clarification-submit-shortcut").hover();
+    const submitTooltip = testPage.getByRole("tooltip", { name: /Submit answers/ });
+    await expect(submitTooltip).toContainText(/Ctrl|⌘/);
+    await expect(submitTooltip).toContainText("Enter");
+
+    // Skip has no keyboard shortcut: Escape only dismisses the bundle locally
+    // (see the "Escape dismisses" tests below), so its tooltip must not claim "Esc".
+    await testPage.getByTestId("clarification-skip-shortcut").hover();
+    const skipTooltip = testPage.getByRole("tooltip", { name: /Skip all questions/ });
+    await expect(skipTooltip).toBeVisible();
+    await expect(skipTooltip).not.toContainText("Esc");
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationPrev().hover();
+    const previousTooltip = testPage.getByRole("tooltip", { name: /Previous question/ });
+    await expect(previousTooltip).toContainText("←");
+
+    await session.clarificationNext().hover();
+    const nextTooltip = testPage.getByRole("tooltip", { name: /Next question/ });
+    await expect(nextTooltip).toContainText("→");
+  });
+
+  test("question shortcuts stay disabled while answers are submitting", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Clarification shortcuts while submitting",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+
+    let releaseResponse = () => undefined;
+    const heldResponse = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      await heldResponse;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ success: true }),
+      });
+    });
+
+    try {
+      await session.chat.focus();
+      await testPage.keyboard.press("ControlOrMeta+Enter");
+      const submit = session.clarificationSubmit();
+      const header = session.clarificationOverlay().getByTestId("clarification-overlay-header");
+      const status = session.clarificationSubmittingStatus();
+      await expect(submit).toContainText("Submitting");
+      await expect(submit).toBeDisabled();
+      await expect(status).toBeVisible();
+      await expect(status).toHaveAttribute("aria-label", "Submitting…");
+      await expect(status).not.toHaveAttribute("aria-hidden");
+      await expect(submit).toHaveAttribute("aria-label", "Submit");
+      await expect(submit.locator('[role="status"]')).toHaveCount(0);
+      await expect(submit.locator("svg.tabler-icon-check")).toHaveCount(0);
+
+      const statusPrecedesSkip = await header.evaluate((node) => {
+        const submitting = node.querySelector('[data-testid="clarification-submitting-status"]');
+        const skip = node.querySelector('[data-testid="clarification-skip"]');
+        return Boolean(
+          submitting &&
+          skip &&
+          submitting.compareDocumentPosition(skip) & Node.DOCUMENT_POSITION_FOLLOWING,
+        );
+      });
+      expect(statusPrecedesSkip).toBe(true);
+
+      await testPage.keyboard.press("ArrowLeft");
+      await expect(session.clarificationStep(2)).toHaveAttribute("data-active", "true");
+
+      await testPage.getByTestId("clarification-submit-shortcut").hover();
+      await expect(testPage.getByRole("tooltip", { name: /Submit answers/ })).not.toBeVisible();
+    } finally {
+      releaseResponse();
+    }
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+  });
+
+  test("Escape dismisses the bundle locally from anywhere in the carousel, without rejecting it", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q esc dismiss",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    let respondCalls = 0;
+    await testPage.route("**/api/v1/clarification/*/respond", async (route) => {
+      respondCalls += 1;
+      await route.continue();
+    });
+
+    await session.clarificationStep(1).click();
+    await testPage.keyboard.press("Escape");
+
+    // The overlay collapses locally, but the bar stays put — the bundle is
+    // still pending and reachable, not answered or rejected.
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+    await expect(session.clarificationBar()).toBeVisible();
+    await expect(session.clarificationCollapseToggle()).toBeVisible();
+
+    await dwell(
+      testPage,
+      300,
+      "negative-assertion",
+      "asserts Escape never posts a rejection; there is no event for the request that must not fire",
+    );
+    expect(respondCalls).toBe(0);
+    await expect(session.chat).not.toContainText("rejected");
+  });
+
+  test("Escape leaves the agent blocked on the pending clarification", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      "Clarification esc keeps agent blocked",
+      seedData.agentProfileId,
+      {
+        description: "/e2e:clarification-multi",
+        workflow_id: seedData.workflowId,
+        workflow_step_id: seedData.startStepId,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+    if (!task.session_id) throw new Error("createTaskWithAgent did not return a session_id");
+
+    await waitForSessionState(apiClient, {
+      taskId: task.id,
+      sessionId: task.session_id,
+      expectedState: "WAITING_FOR_INPUT",
+      message: "multi-question clarification should block the agent before navigation",
+      timeout: 60_000,
+    });
+
+    await testPage.goto(`/t/${task.id}`);
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    const { sessions: before } = await apiClient.listTaskSessions(task.id);
+    const stateBeforeEscape = before.find((s) => s.id === task.session_id)?.state;
+    if (!stateBeforeEscape) throw new Error("expected to find the seeded session's state");
+
+    await session.chat.focus();
+    await testPage.keyboard.press("Escape");
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+
+    await dwell(
+      testPage,
+      500,
+      "negative-assertion",
+      "asserts Escape never resumes the blocked turn; there is no event for the state transition that must not happen",
+    );
+
+    const { sessions: after } = await apiClient.listTaskSessions(task.id);
+    expect(after.find((s) => s.id === task.session_id)?.state).toBe(stateBeforeEscape);
+  });
+
+  test("dismissing with Escape and restoring lets the user answer normally", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q esc restore answer",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.chat.focus();
+    await testPage.keyboard.press("Escape");
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+    await expect(session.clarificationBar()).toBeVisible();
+
+    await session.clarificationCollapseToggle().click();
+    await expect(session.clarificationOverlay()).toBeVisible();
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+    await session.clarificationSubmit().click();
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("dismissing mid-bundle preserves recorded answers through the round trip", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q esc preserves answers",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+
+    await session.chat.focus();
+    await testPage.keyboard.press("Escape");
+    await expect(session.clarificationOverlay()).not.toBeVisible();
+
+    await session.clarificationCollapseToggle().click();
+    await expect(session.clarificationOverlay()).toBeVisible();
+
+    // Both the stepper's answered mark and the recorded answer itself must
+    // survive the dismiss/restore round trip.
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+
+    await session.clarificationStep(0).click();
+    const selectedOption = session
+      .clarificationQuestionCardById("db")
+      .locator('[data-testid="clarification-option"][data-selected="true"]');
+    await expect(selectedOption).toContainText("PostgreSQL");
+  });
+
+  test("Back button is disabled on the first step", async ({ testPage, apiClient, seedData }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q back disabled",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    await expect(session.clarificationPrev()).toBeDisabled();
+  });
+
+  test("typing in the custom input auto-selects it and deselects the picked option", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q custom auto-selects",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    // Pick an option on Q1 (auto-advances to Q2), then jump back to Q1.
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationStep(0).click();
+    const selectedBefore = session
+      .clarificationQuestionCardById("db")
+      .locator('[data-testid="clarification-option"][data-selected="true"]');
+    await expect(selectedBefore).toContainText("PostgreSQL");
+
+    // Type into the custom input — it should light up and the option should
+    // deselect, while the stepper keeps step 0 marked as answered.
+    const input = session.clarificationInputForQuestion("db");
+    await input.click();
+    await input.fill("Bespoke KV store");
+
+    const customContainer = session.clarificationCustomInputContainerForQuestion("db");
+    await expect(customContainer).toHaveAttribute("data-active", "true");
+    await expect(
+      session
+        .clarificationQuestionCardById("db")
+        .locator('[data-testid="clarification-option"][data-selected="true"]'),
+    ).toHaveCount(0);
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+  });
+
+  test("emptying the custom draft clears the answer and reverts the stepper", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q draft clears answer",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    const input = session.clarificationInputForQuestion("db");
+    await input.click();
+    await input.fill("Bespoke KV store");
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "true");
+    await expect(session.clarificationGroupProgress()).toContainText("1 of 3 answered");
+
+    await input.fill("");
+    await expect(session.clarificationStep(0)).toHaveAttribute("data-answered", "false");
+    await expect(session.clarificationGroupProgress()).toContainText("0 of 3 answered");
+    await expect(session.clarificationCustomInputContainerForQuestion("db")).toHaveAttribute(
+      "data-active",
+      "false",
+    );
+  });
+
+  test("Cmd+Enter from the last step's custom input submits the bundle", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q cmd+enter from input",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+
+    const deployInput = session.clarificationInputForQuestion("deploy");
+    await deployInput.click();
+    await deployInput.fill("Nomad cluster");
+    await deployInput.press("ControlOrMeta+Enter");
+
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+    await expect(session.chat).toContainText("Nomad cluster");
+  });
+
+  test("Cmd+Enter from outside the input submits when all questions are answered", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationTask(
+      testPage,
+      apiClient,
+      seedData,
+      "Multi-q cmd+enter global",
+      "clarification-multi",
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+
+    await session.clarificationOption("PostgreSQL").click();
+    await session.clarificationOption("Go").click();
+    await session.clarificationOption("Docker").click();
+
+    // Focus is on the last option button, not the input.
+    await testPage.keyboard.press("ControlOrMeta+Enter");
+    await expect(session.clarificationOverlay()).not.toBeVisible({ timeout: 30_000 });
+    await expect(session.idleInput()).toBeVisible({ timeout: 30_000 });
+  });
+});

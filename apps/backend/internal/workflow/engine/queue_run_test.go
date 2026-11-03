@@ -1,0 +1,894 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
+
+// fakeRunQueue records every QueueRun call.
+type fakeRunQueue struct {
+	calls   []QueueRunRequest
+	err     error
+	outcome QueueOutcome
+}
+
+func (f *fakeRunQueue) QueueRun(_ context.Context, req QueueRunRequest) (QueueOutcome, error) {
+	f.calls = append(f.calls, req)
+	if f.err != nil {
+		return "", f.err
+	}
+	if f.outcome == "" {
+		return QueueOutcomeQueued, nil
+	}
+	return f.outcome, nil
+}
+
+// fakePrimary returns a fixed agent profile id for any step.
+type fakePrimary struct {
+	id            string
+	err           error
+	taskStepID    string
+	stepID        *string
+	taskID        *string
+	resolveTaskID *string
+}
+
+func (f fakePrimary) PrimaryAgentProfileID(_ context.Context, stepID, taskID string) (string, error) {
+	if f.stepID != nil {
+		*f.stepID = stepID
+	}
+	if f.taskID != nil {
+		*f.taskID = taskID
+	}
+	return f.id, f.err
+}
+
+func (f fakePrimary) WorkflowStepIDForTask(_ context.Context, taskID string) (string, error) {
+	if f.resolveTaskID != nil {
+		*f.resolveTaskID = taskID
+	}
+	return f.taskStepID, f.err
+}
+
+type sequencePrimary struct {
+	ids []string
+	i   int
+}
+
+func (s *sequencePrimary) PrimaryAgentProfileID(_ context.Context, _, _ string) (string, error) {
+	if s.i >= len(s.ids) {
+		return "", nil
+	}
+	id := s.ids[s.i]
+	s.i++
+	return id, nil
+}
+
+func (s *sequencePrimary) WorkflowStepIDForTask(_ context.Context, _ string) (string, error) {
+	return "step-1", nil
+}
+
+// fakeParticipants returns a static slice for any step. ListStepParticipants
+// and ListTaskParticipants both return the same f.list, matching (and
+// exercising) the union/dedupe path that gatherParticipantSlate feeds into
+// canonicalizeByTaskRoleAgent/collapseByRoleAgent.
+type fakeParticipants struct {
+	list              []ParticipantInfo
+	err               error
+	taskStepID        string
+	stepID            *string
+	taskID            *string
+	resolveTaskID     *string
+	taskParticipantID *string
+}
+
+func (f fakeParticipants) ListStepParticipants(_ context.Context, stepID, taskID string) ([]ParticipantInfo, error) {
+	if f.stepID != nil {
+		*f.stepID = stepID
+	}
+	if f.taskID != nil {
+		*f.taskID = taskID
+	}
+	return f.list, f.err
+}
+
+func (f fakeParticipants) WorkflowStepIDForTask(_ context.Context, taskID string) (string, error) {
+	if f.resolveTaskID != nil {
+		*f.resolveTaskID = taskID
+	}
+	return f.taskStepID, f.err
+}
+
+func (f fakeParticipants) ListTaskParticipants(_ context.Context, taskID string) ([]ParticipantInfo, error) {
+	if f.taskParticipantID != nil {
+		*f.taskParticipantID = taskID
+	}
+	return f.list, f.err
+}
+
+// fakeCEO returns a fixed agent profile id (or empty / err).
+type fakeCEO struct {
+	id  string
+	err error
+}
+
+func (f fakeCEO) ResolveCEOAgentProfileID(_ context.Context, _ string) (string, error) {
+	return f.id, f.err
+}
+
+type fakeTaskSteps struct {
+	id     string
+	err    error
+	taskID *string
+}
+
+func (f fakeTaskSteps) WorkflowStepIDForTask(_ context.Context, taskID string) (string, error) {
+	if f.taskID != nil {
+		*f.taskID = taskID
+	}
+	return f.id, f.err
+}
+
+func newQueueRunInput(target, taskID string) ActionInput {
+	return ActionInput{
+		Trigger: TriggerOnComment,
+		State:   MachineState{TaskID: "task-1", SessionID: "sess-1"},
+		Step:    StepSpec{ID: "step-1"},
+		Action: Action{
+			Kind: ActionQueueRun,
+			QueueRun: &QueueRunAction{
+				Target:  target,
+				TaskID:  taskID,
+				Reason:  "task_comment",
+				Payload: map[string]any{"comment_id": "c-1"},
+			},
+		},
+		OperationID: "op-1",
+	}
+}
+
+func TestQueueRunCallback_TargetPrimary(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "agent-primary"}}
+	if _, err := cb.Execute(context.Background(), newQueueRunInput("primary", "this")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 queue run call, got %d", len(q.calls))
+	}
+	got := q.calls[0]
+	if got.AgentProfileID != "agent-primary" {
+		t.Fatalf("agent_profile_id = %q, want agent-primary", got.AgentProfileID)
+	}
+	if got.TaskID != "task-1" {
+		t.Fatalf("task_id = %q, want task-1 (resolved from 'this')", got.TaskID)
+	}
+	if got.WorkflowStepID != "step-1" {
+		t.Fatalf("workflow_step_id = %q, want step-1", got.WorkflowStepID)
+	}
+	if got.Reason != "task_comment" {
+		t.Fatalf("reason = %q, want task_comment", got.Reason)
+	}
+	if got.IdempotencyKey == "" {
+		t.Fatalf("expected non-empty idempotency key when OperationID is set")
+	}
+	if got.Payload["comment_id"] != "c-1" {
+		t.Fatalf("payload not propagated: %#v", got.Payload)
+	}
+}
+
+func TestQueueRunCallback_OnCommentUsesCommentPayloadAndStableKey(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "agent-primary"}}
+	in := newQueueRunInput("primary", "this")
+	in.OperationID = "task_comment:c-1"
+	in.Payload = OnCommentPayload{
+		CommentID: "c-1",
+		AuthorID:  "user-1",
+	}
+	in.Action.QueueRun.Payload = nil
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 queue run call, got %d", len(q.calls))
+	}
+	got := q.calls[0]
+	if got.IdempotencyKey == "task_comment:c-1" {
+		t.Fatalf("idempotency_key dropped agent/action salt")
+	}
+	if !strings.HasPrefix(got.IdempotencyKey, "task_comment:c-1:step-1:task-1:agent-primary:") {
+		t.Fatalf("idempotency_key = %q, want salted task_comment key", got.IdempotencyKey)
+	}
+	if got.Payload["comment_id"] != "c-1" {
+		t.Fatalf("payload comment_id = %v, want c-1 (payload=%#v)", got.Payload["comment_id"], got.Payload)
+	}
+	if got.Payload["author_id"] != "user-1" {
+		t.Fatalf("payload author_id = %v, want user-1 (payload=%#v)", got.Payload["author_id"], got.Payload)
+	}
+}
+
+func TestQueueRunCallback_OnCommentPrimaryKeysIncludeResolvedAgent(t *testing.T) {
+	q := &fakeRunQueue{}
+	primary := &sequencePrimary{ids: []string{"agent-a", "agent-b"}}
+	cb := QueueRunCallback{Adapter: q, Primary: primary}
+	in := newQueueRunInput("primary", "this")
+	in.OperationID = "task_comment:c-1"
+	in.Payload = OnCommentPayload{CommentID: "c-1"}
+	in.Action.QueueRun.Payload = nil
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("first queue_run: %v", err)
+	}
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("second queue_run: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 queue run calls, got %d", len(q.calls))
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("resolved agent must salt comment idempotency keys: %#v", q.calls)
+	}
+	if !strings.Contains(q.calls[0].IdempotencyKey, ":agent-a:") ||
+		!strings.Contains(q.calls[1].IdempotencyKey, ":agent-b:") {
+		t.Fatalf("idempotency keys missing resolved agents: %#v", q.calls)
+	}
+}
+
+func TestQueueRunCallback_ActionPayloadOverridesTriggerCommentIdentity(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "agent-primary"}}
+	in := newQueueRunInput("primary", "this")
+	in.OperationID = "task_comment:c-trigger"
+	in.Payload = OnCommentPayload{
+		CommentID: "c-trigger",
+		AuthorID:  "user-trigger",
+	}
+	in.Action.QueueRun.Payload = map[string]any{
+		"comment_id": "c-action",
+		"author_id":  "user-action",
+	}
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 queue run call, got %d", len(q.calls))
+	}
+	got := q.calls[0].Payload
+	if got["comment_id"] != "c-action" || got["author_id"] != "user-action" {
+		t.Fatalf("action payload should override trigger comment identity: %#v", got)
+	}
+}
+
+func TestQueueRunCallback_OnCommentCustomReasonsKeepActionSalt(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "agent-primary"}}
+
+	first := newQueueRunInput("primary", "this")
+	first.OperationID = "task_comment:c-1"
+	first.Action.QueueRun.Payload = nil
+	first.Action.QueueRun.Reason = "follow_up"
+	second := newQueueRunInput("primary", "this")
+	second.OperationID = "task_comment:c-1"
+	second.Action.QueueRun.Payload = nil
+	second.Action.QueueRun.Reason = "notify_observer"
+
+	if _, err := cb.Execute(context.Background(), first); err != nil {
+		t.Fatalf("first queue_run: %v", err)
+	}
+	if _, err := cb.Execute(context.Background(), second); err != nil {
+		t.Fatalf("second queue_run: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 queue run calls, got %d", len(q.calls))
+	}
+	for i, call := range q.calls {
+		if call.IdempotencyKey == "task_comment:c-1" {
+			t.Fatalf("call %d idempotency_key dropped action salt", i)
+		}
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("custom reason actions must not share idempotency keys: %#v", q.calls)
+	}
+}
+
+func TestQueueRunCallback_OnCommentCustomPayloadsKeepActionSalt(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "agent-primary"}}
+
+	first := newQueueRunInput("primary", "this")
+	first.OperationID = "task_comment:c-1"
+	first.Action.QueueRun.Payload = map[string]any{"source": "first"}
+	second := newQueueRunInput("primary", "this")
+	second.OperationID = "task_comment:c-1"
+	second.Action.QueueRun.Payload = map[string]any{"source": "second"}
+
+	if _, err := cb.Execute(context.Background(), first); err != nil {
+		t.Fatalf("first queue_run: %v", err)
+	}
+	if _, err := cb.Execute(context.Background(), second); err != nil {
+		t.Fatalf("second queue_run: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 queue run calls, got %d", len(q.calls))
+	}
+	for i, call := range q.calls {
+		if call.IdempotencyKey == "task_comment:c-1" {
+			t.Fatalf("call %d idempotency_key dropped action payload salt", i)
+		}
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("custom payload actions must not share idempotency keys: %#v", q.calls)
+	}
+}
+
+func TestQueueRunCallback_PrimaryUsesResolvedTargetTask(t *testing.T) {
+	q := &fakeRunQueue{}
+	var resolvedStepID string
+	var lookupTaskID string
+	var stepResolverTaskID string
+	cb := QueueRunCallback{
+		Adapter: q,
+		Primary: fakePrimary{
+			id:            "agent-for-target-task",
+			taskStepID:    "target-step",
+			stepID:        &resolvedStepID,
+			taskID:        &lookupTaskID,
+			resolveTaskID: &stepResolverTaskID,
+		},
+	}
+	in := newQueueRunInput("primary", "target-task")
+	in.OperationID = "task_comment:c-1"
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 queue run call, got %d", len(q.calls))
+	}
+	if stepResolverTaskID != "target-task" {
+		t.Fatalf("target step resolved against task %q, want target-task", stepResolverTaskID)
+	}
+	if lookupTaskID != "target-task" {
+		t.Fatalf("primary resolved against task %q, want target-task", lookupTaskID)
+	}
+	if resolvedStepID != "target-step" {
+		t.Fatalf("primary resolved against step %q, want target-step", resolvedStepID)
+	}
+	got := q.calls[0]
+	if got.TaskID != "target-task" {
+		t.Fatalf("queued task_id = %q, want target-task", got.TaskID)
+	}
+	if got.WorkflowStepID != "target-step" {
+		t.Fatalf("workflow_step_id = %q, want target-step", got.WorkflowStepID)
+	}
+	if got.AgentProfileID != "agent-for-target-task" {
+		t.Fatalf("agent_profile_id = %q, want agent-for-target-task", got.AgentProfileID)
+	}
+	if got.IdempotencyKey == "task_comment:c-1" {
+		t.Fatalf("literal-task primary comment wake must keep action/task/agent salt")
+	}
+	if got.Payload["comment_id"] != "c-1" {
+		t.Fatalf("payload comment_id = %v, want c-1", got.Payload["comment_id"])
+	}
+	if got.Payload["source_task_id"] != "task-1" {
+		t.Fatalf("payload source_task_id = %v, want task-1", got.Payload["source_task_id"])
+	}
+}
+
+func TestQueueRunCallback_TargetParticipantRole(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+		{ID: "p3", Role: "approver", AgentProfileID: "app-A"},
+	}}
+	cb := QueueRunCallback{Adapter: q, Participants: parts}
+	if _, err := cb.Execute(context.Background(), newQueueRunInput("participant_role:reviewer", "")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 queue run calls, got %d", len(q.calls))
+	}
+	for i, want := range []string{"rev-A", "rev-B"} {
+		if q.calls[i].AgentProfileID != want {
+			t.Fatalf("call %d agent_profile_id = %q, want %q", i, q.calls[i].AgentProfileID, want)
+		}
+		if q.calls[i].TaskID != "task-1" {
+			t.Fatalf("call %d task_id = %q, want task-1 (resolved from blank)", i, q.calls[i].TaskID)
+		}
+	}
+}
+
+// A cross-task participant_role target must stay step-scoped to the target
+// task's resolved current step (WO-30 review round 1: the any-step slate is
+// only safe for the same-task case, since only there does in.State.WorkflowID
+// scope the read to the task's actual current workflow — see
+// resolveParticipantRoleStepScoped). This asserts the single
+// ListStepParticipants(stepID, taskID) call the pre-WO-30 code made, and that
+// the any-step/any-workflow ListTaskParticipants query is never reached.
+func TestQueueRunCallback_ParticipantRoleUsesResolvedTargetStep(t *testing.T) {
+	q := &fakeRunQueue{}
+	var listedStepID string
+	var listedStepTaskID string
+	var listedPerTaskID string
+	var stepResolverTaskID string
+	parts := fakeParticipants{
+		list: []ParticipantInfo{
+			{ID: "p-target", Role: "reviewer", AgentProfileID: "rev-target"},
+		},
+		taskStepID:        "target-step",
+		stepID:            &listedStepID,
+		taskID:            &listedStepTaskID,
+		resolveTaskID:     &stepResolverTaskID,
+		taskParticipantID: &listedPerTaskID,
+	}
+	cb := QueueRunCallback{Adapter: q, Participants: parts}
+	in := newQueueRunInput("participant_role:reviewer", "target-task")
+	in.OperationID = "task_comment:c-1"
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 queue run call, got %d", len(q.calls))
+	}
+	if stepResolverTaskID != "target-task" {
+		t.Fatalf("target step resolved against task %q, want target-task", stepResolverTaskID)
+	}
+	if listedStepID != "target-step" {
+		t.Fatalf("participants listed for step %q, want target-step", listedStepID)
+	}
+	if listedStepTaskID != "target-task" {
+		t.Fatalf("cross-task participant lookup must stay step-scoped to task_id=target-task, got %q", listedStepTaskID)
+	}
+	if listedPerTaskID != "" {
+		t.Fatalf("cross-task participant_role must not reach the any-step/any-workflow ListTaskParticipants query, got task_id %q", listedPerTaskID)
+	}
+	got := q.calls[0]
+	if got.WorkflowStepID != "target-step" {
+		t.Fatalf("workflow_step_id = %q, want target-step", got.WorkflowStepID)
+	}
+	if got.TaskID != "target-task" {
+		t.Fatalf("task_id = %q, want target-task", got.TaskID)
+	}
+	if got.AgentProfileID != "rev-target" {
+		t.Fatalf("agent_profile_id = %q, want rev-target", got.AgentProfileID)
+	}
+}
+
+func TestQueueRunCallback_OnCommentParticipantRoleKeepsPerAgentKeys(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+	}}
+	cb := QueueRunCallback{Adapter: q, Participants: parts}
+	in := newQueueRunInput("participant_role:reviewer", "")
+	in.OperationID = "task_comment:c-1"
+	in.Payload = OnCommentPayload{CommentID: "c-1", AuthorID: "user-1"}
+	in.Action.QueueRun.Payload = nil
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 queue run calls, got %d", len(q.calls))
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("fan-out idempotency keys must be per-agent: %#v", q.calls)
+	}
+	for i, call := range q.calls {
+		if call.IdempotencyKey == "task_comment:c-1" {
+			t.Fatalf("call %d idempotency_key dropped per-agent salt", i)
+		}
+		if call.Payload["comment_id"] != "c-1" || call.Payload["author_id"] != "user-1" {
+			t.Fatalf("call %d payload missing comment identity: %#v", i, call.Payload)
+		}
+	}
+}
+
+func TestQueueRunCallback_TargetSpecificAgent(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, TaskSteps: fakeTaskSteps{id: "target-step"}}
+	if _, err := cb.Execute(context.Background(), newQueueRunInput("agent_profile_id:some-agent", "task-2")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(q.calls))
+	}
+	if q.calls[0].AgentProfileID != "some-agent" {
+		t.Fatalf("agent_profile_id = %q", q.calls[0].AgentProfileID)
+	}
+	if q.calls[0].TaskID != "task-2" {
+		t.Fatalf("task_id = %q, want task-2 (literal)", q.calls[0].TaskID)
+	}
+	if q.calls[0].WorkflowStepID != "target-step" {
+		t.Fatalf("workflow_step_id = %q, want target-step", q.calls[0].WorkflowStepID)
+	}
+}
+
+func TestQueueRunCallback_TargetSpecificAgentCrossTaskNoStepResolverErrors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}}
+	_, err := cb.Execute(context.Background(), newQueueRunInput("agent_profile_id:some-agent", "task-2"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_TargetWorkspaceCEO(t *testing.T) {
+	q := &fakeRunQueue{}
+	cb := QueueRunCallback{Adapter: q, CEOResolver: fakeCEO{id: "ceo-agent"}}
+	if _, err := cb.Execute(context.Background(), newQueueRunInput("workspace.ceo_agent", "this")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(q.calls))
+	}
+	if q.calls[0].AgentProfileID != "ceo-agent" {
+		t.Fatalf("agent_profile_id = %q, want ceo-agent", q.calls[0].AgentProfileID)
+	}
+}
+
+func TestQueueRunCallback_TargetWorkspaceCEOCrossTaskNoStepResolverErrors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}, CEOResolver: fakeCEO{id: "ceo-agent"}}
+	_, err := cb.Execute(context.Background(), newQueueRunInput("workspace.ceo_agent", "target-task"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_TargetWorkspaceCEOUsesResolvedTargetStep(t *testing.T) {
+	q := &fakeRunQueue{}
+	var resolvedTaskID string
+	cb := QueueRunCallback{
+		Adapter:     q,
+		CEOResolver: fakeCEO{id: "ceo-agent"},
+		TaskSteps:   fakeTaskSteps{id: "target-step", taskID: &resolvedTaskID},
+	}
+	in := newQueueRunInput("workspace.ceo_agent", "target-task")
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(q.calls))
+	}
+	if resolvedTaskID != "target-task" {
+		t.Fatalf("target step resolved for task %q, want target-task", resolvedTaskID)
+	}
+	got := q.calls[0]
+	if got.TaskID != "target-task" {
+		t.Fatalf("task_id = %q, want target-task", got.TaskID)
+	}
+	if got.WorkflowStepID != "target-step" {
+		t.Fatalf("workflow_step_id = %q, want target-step", got.WorkflowStepID)
+	}
+	if got.AgentProfileID != "ceo-agent" {
+		t.Fatalf("agent_profile_id = %q, want ceo-agent", got.AgentProfileID)
+	}
+}
+
+func TestQueueRunCallback_MissingAdapter_Errors(t *testing.T) {
+	cb := QueueRunCallback{} // no Adapter
+	_, err := cb.Execute(context.Background(), newQueueRunInput("primary", "this"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_UnknownTarget_Errors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}}
+	_, err := cb.Execute(context.Background(), newQueueRunInput("nonsense_target", "this"))
+	if err == nil {
+		t.Fatalf("expected error for unknown target")
+	}
+}
+
+func TestQueueRunCallback_TargetPrimaryNoResolver_Errors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}} // missing Primary
+	_, err := cb.Execute(context.Background(), newQueueRunInput("primary", "this"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_ParticipantRoleNoStore_Errors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}}
+	_, err := cb.Execute(context.Background(), newQueueRunInput("participant_role:reviewer", "this"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_CEONoResolver_Errors(t *testing.T) {
+	cb := QueueRunCallback{Adapter: &fakeRunQueue{}}
+	_, err := cb.Execute(context.Background(), newQueueRunInput("workspace.ceo_agent", "this"))
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+func TestQueueRunCallback_TaskIDResolution(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"", "task-1"},
+		{"this", "task-1"},
+		{"task-99", "task-99"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			q := &fakeRunQueue{}
+			cb := QueueRunCallback{Adapter: q, Primary: fakePrimary{id: "p", taskStepID: "target-step"}}
+			if _, err := cb.Execute(context.Background(), newQueueRunInput("primary", tc.input)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := q.calls[0].TaskID; got != tc.want {
+				t.Fatalf("TaskID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_FansOut(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+		{ID: "p3", Role: "watcher", AgentProfileID: "watch-A"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	in := ActionInput{
+		Trigger:     TriggerOnEnter,
+		State:       MachineState{TaskID: "task-1"},
+		Step:        StepSpec{ID: "step-1"},
+		OperationID: "op-1",
+		Action: Action{
+			Kind: ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+				Role:   "reviewer",
+				Reason: "review_started",
+			},
+		},
+	}
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 fan-out calls, got %d", len(q.calls))
+	}
+	for i, want := range []string{"rev-A", "rev-B"} {
+		if q.calls[i].AgentProfileID != want {
+			t.Fatalf("call %d agent_profile_id = %q, want %q", i, q.calls[i].AgentProfileID, want)
+		}
+		if q.calls[i].Reason != "review_started" {
+			t.Fatalf("call %d reason = %q", i, q.calls[i].Reason)
+		}
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_CarriesCausingAgentProfileID(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	in := ActionInput{
+		Trigger:     TriggerOnEnter,
+		State:       MachineState{TaskID: "task-1", AgentProfileID: "executing-agent"},
+		Step:        StepSpec{ID: "step-1"},
+		OperationID: "op-1",
+		Action: Action{
+			Kind: ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+				Role:   "reviewer",
+				Reason: "review_started",
+			},
+		},
+	}
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 fan-out calls, got %d", len(q.calls))
+	}
+	for i, call := range q.calls {
+		if call.CausingAgentProfileID != "executing-agent" {
+			t.Fatalf("call %d causing_agent_profile_id = %q, want %q", i, call.CausingAgentProfileID, "executing-agent")
+		}
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_OnCommentKeepsPerAgentKeys(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	in := ActionInput{
+		Trigger:     TriggerOnComment,
+		State:       MachineState{TaskID: "task-1"},
+		Step:        StepSpec{ID: "step-1"},
+		OperationID: "task_comment:c-1",
+		Payload:     OnCommentPayload{CommentID: "c-1", AuthorID: "user-1"},
+		Action: Action{
+			Kind: ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+				Role:   "reviewer",
+				Reason: "task_comment",
+			},
+		},
+	}
+
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 fan-out calls, got %d", len(q.calls))
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("fan-out idempotency keys must be per-agent: %#v", q.calls)
+	}
+	for i, call := range q.calls {
+		if call.IdempotencyKey == "task_comment:c-1" {
+			t.Fatalf("call %d idempotency_key dropped per-agent salt", i)
+		}
+		if call.Payload["comment_id"] != "c-1" || call.Payload["author_id"] != "user-1" {
+			t.Fatalf("call %d payload missing comment identity: %#v", i, call.Payload)
+		}
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_DifferentActionsKeepActionSalt(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "same-agent"},
+		{ID: "p2", Role: "observer", AgentProfileID: "same-agent"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	base := ActionInput{
+		Trigger:     TriggerOnComment,
+		State:       MachineState{TaskID: "task-1"},
+		Step:        StepSpec{ID: "step-1"},
+		OperationID: "task_comment:c-1",
+		Payload:     OnCommentPayload{CommentID: "c-1", AuthorID: "user-1"},
+	}
+	first := base
+	first.Action = Action{
+		Kind: ActionQueueRunForEachParticipant,
+		QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+			Role:    "reviewer",
+			Reason:  "follow_up",
+			Payload: map[string]any{"source": "reviewer"},
+		},
+	}
+	second := base
+	second.Action = Action{
+		Kind: ActionQueueRunForEachParticipant,
+		QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+			Role:    "observer",
+			Reason:  "follow_up",
+			Payload: map[string]any{"source": "observer"},
+		},
+	}
+
+	if _, err := cb.Execute(context.Background(), first); err != nil {
+		t.Fatalf("first queue_run_for_each_participant: %v", err)
+	}
+	if _, err := cb.Execute(context.Background(), second); err != nil {
+		t.Fatalf("second queue_run_for_each_participant: %v", err)
+	}
+	if len(q.calls) != 2 {
+		t.Fatalf("expected 2 fan-out calls, got %d", len(q.calls))
+	}
+	if q.calls[0].AgentProfileID != "same-agent" || q.calls[1].AgentProfileID != "same-agent" {
+		t.Fatalf("test setup expected both actions to target same agent: %#v", q.calls)
+	}
+	if q.calls[0].IdempotencyKey == q.calls[1].IdempotencyKey {
+		t.Fatalf("different for-each action configs must not share idempotency keys: %#v", q.calls)
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_NoMatchingRole_NoCalls(t *testing.T) {
+	q := &fakeRunQueue{}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p3", Role: "watcher", AgentProfileID: "watch-A"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	in := ActionInput{
+		Step: StepSpec{ID: "step-1"},
+		Action: Action{
+			Kind: ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+				Role: "approver",
+			},
+		},
+	}
+	if _, err := cb.Execute(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(q.calls) != 0 {
+		t.Fatalf("expected no calls when no participant matches, got %d", len(q.calls))
+	}
+}
+
+func TestQueueRunForEachParticipantCallback_MissingDeps_Errors(t *testing.T) {
+	cb := QueueRunForEachParticipantCallback{} // no deps
+	_, err := cb.Execute(context.Background(), ActionInput{
+		Action: Action{
+			Kind:                       ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{Role: "reviewer"},
+		},
+	})
+	if err == nil || !errors.Is(err, ErrActionNotYetWired) {
+		t.Fatalf("expected ErrActionNotYetWired, got %v", err)
+	}
+}
+
+// selectiveFailRunQueue fails QueueRun only for the agent profile ids listed
+// in failFor, recording every call (including the ones it fails) so a test
+// can assert the fan-out kept going past the failure.
+type selectiveFailRunQueue struct {
+	calls   []QueueRunRequest
+	failFor map[string]error
+}
+
+func (f *selectiveFailRunQueue) QueueRun(_ context.Context, req QueueRunRequest) (QueueOutcome, error) {
+	f.calls = append(f.calls, req)
+	if err, ok := f.failFor[req.AgentProfileID]; ok {
+		return "", err
+	}
+	return "", nil
+}
+
+// TestQueueRunForEachParticipantCallback_OneParticipantFailureDoesNotAbortFanOut
+// pins AC-C1: a single participant's QueueRun error must not stop the
+// remaining participants from being queued. Before this fix the loop
+// returned on the first error, so rev-B and rev-C never got a call.
+func TestQueueRunForEachParticipantCallback_OneParticipantFailureDoesNotAbortFanOut(t *testing.T) {
+	boom := errors.New("boom")
+	q := &selectiveFailRunQueue{failFor: map[string]error{"rev-A": boom}}
+	parts := fakeParticipants{list: []ParticipantInfo{
+		{ID: "p1", Role: "reviewer", AgentProfileID: "rev-A"},
+		{ID: "p2", Role: "reviewer", AgentProfileID: "rev-B"},
+		{ID: "p3", Role: "reviewer", AgentProfileID: "rev-C"},
+	}}
+	cb := QueueRunForEachParticipantCallback{Adapter: q, Participants: parts}
+	in := ActionInput{
+		Trigger: TriggerOnEnter,
+		State:   MachineState{TaskID: "task-1"},
+		Step:    StepSpec{ID: "step-1"},
+		Action: Action{
+			Kind: ActionQueueRunForEachParticipant,
+			QueueRunForEachParticipant: &QueueRunForEachParticipantAction{
+				Role: "reviewer",
+			},
+		},
+	}
+
+	_, err := cb.Execute(context.Background(), in)
+	if err == nil {
+		t.Fatalf("expected the joined error from rev-A's failure to be returned")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("expected the returned error to wrap the participant failure, got %v", err)
+	}
+	if len(q.calls) != 3 {
+		t.Fatalf("expected all 3 participants to receive a QueueRun attempt despite rev-A's failure, got %d calls: %#v", len(q.calls), q.calls)
+	}
+	got := []string{q.calls[0].AgentProfileID, q.calls[1].AgentProfileID, q.calls[2].AgentProfileID}
+	want := []string{"rev-A", "rev-B", "rev-C"}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("call %d agent = %q, want %q (order: %#v)", i, got[i], w, got)
+		}
+	}
+}

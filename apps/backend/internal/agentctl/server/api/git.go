@@ -1,0 +1,1756 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/kandev/kandev/internal/agentctl/server/process"
+	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/common/subproc"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+)
+
+// safeBranchRefPattern mirrors the one in workspace_git_status.go so the
+// HTTP handlers can perform an inline allowlist check at the request
+// boundary without the extra hop through a helper that would obscure the
+// barrier from CodeQL's `go/command-injection` taint tracker.
+var safeBranchRefPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*$`)
+
+// queryParamTrue is the string value used to indicate a true boolean in query parameters.
+const queryParamTrue = "true"
+
+const gitStatusDetailsUnavailableErrorCode = "details_unavailable"
+
+const (
+	gitStatusReadyState       = "ready"
+	gitStatusUnavailableState = "unavailable"
+)
+
+// sortCommitsByCommittedAtDesc sorts commits newest-first using committed_at.
+// Commits with unparseable timestamps preserve their original relative order
+// (sort.SliceStable). Used when merging logs from multiple repos so the
+// combined timeline reads chronologically.
+func sortCommitsByCommittedAtDesc(commits []*process.GitCommitInfo) {
+	sort.SliceStable(commits, func(i, j int) bool {
+		ti, errI := time.Parse(time.RFC3339, commits[i].CommittedAt)
+		tj, errJ := time.Parse(time.RFC3339, commits[j].CommittedAt)
+		if errI != nil || errJ != nil {
+			return false
+		}
+		return ti.After(tj)
+	})
+}
+
+// Repo selects a repository sub-directory of the workspace for multi-repo
+// task roots. Optional. Empty = workspace root (single-repo behavior).
+// All git request structs below embed this field via the standard `repo` JSON
+// key (or `repo` form key for GET endpoints).
+
+// GitPullRequest for POST /api/v1/git/pull
+type GitPullRequest struct {
+	Rebase bool   `json:"rebase"`
+	Repo   string `json:"repo,omitempty"`
+}
+
+// GitPushRequest for POST /api/v1/git/push
+//
+// Remote and ExpectedBranch are optional. Remote is a configured remote name or
+// a remote URL that must resolve to one; ExpectedBranch is the branch the
+// caller believes it is publishing. Both are passed through untouched: this
+// surface performs no destination logic of its own.
+type GitPushRequest struct {
+	Force          bool   `json:"force"`
+	SetUpstream    bool   `json:"set_upstream"`
+	Repo           string `json:"repo,omitempty"`
+	Remote         string `json:"remote,omitempty"`
+	ExpectedBranch string `json:"expected_branch,omitempty"`
+}
+
+// GitPushPreflightRequest for POST /api/v1/git/push-preflight.
+type GitPushPreflightRequest struct {
+	Repo           string `json:"repo,omitempty"`
+	Remote         string `json:"remote,omitempty"`
+	ExpectedBranch string `json:"expected_branch,omitempty"`
+}
+
+// GitContributionRequest is shared by the managed contribution replacement
+// and provider-adoption endpoints.
+type GitContributionRequest struct {
+	ExpectedRemoteHead string `json:"expected_remote_head"`
+	Repo               string `json:"repo,omitempty"`
+}
+
+// GitContributionHistoryExplanationRequest describes the selected local and
+// published heads for a read-only history observation.
+type GitContributionHistoryExplanationRequest struct {
+	Branch             string `json:"branch"`
+	ExpectedLocalHead  string `json:"expected_local_head"`
+	ExpectedRemoteHead string `json:"expected_remote_head"`
+	Repo               string `json:"repo,omitempty"`
+}
+
+// GitRebaseRequest for POST /api/v1/git/rebase
+type GitRebaseRequest struct {
+	BaseBranch string `json:"base_branch"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitMergeRequest for POST /api/v1/git/merge
+type GitMergeRequest struct {
+	BaseBranch string `json:"base_branch"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitAbortRequest for POST /api/v1/git/abort
+type GitAbortRequest struct {
+	Operation string `json:"operation"` // "merge" or "rebase"
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitCommitRequest for POST /api/v1/git/commit
+type GitCommitRequest struct {
+	Message  string `json:"message"`
+	StageAll bool   `json:"stage_all"`
+	Amend    bool   `json:"amend"`
+	Repo     string `json:"repo,omitempty"`
+}
+
+// GitRenameBranchRequest for POST /api/v1/git/rename-branch
+type GitRenameBranchRequest struct {
+	NewName string `json:"new_name"`
+	Repo    string `json:"repo,omitempty"`
+}
+
+// GitStageRequest for POST /api/v1/git/stage
+type GitStageRequest struct {
+	Paths []string `json:"paths"` // Empty = stage all
+	Repo  string   `json:"repo,omitempty"`
+}
+
+// GitUnstageRequest for POST /api/v1/git/unstage
+type GitUnstageRequest struct {
+	Paths []string `json:"paths"` // Empty = unstage all
+	Repo  string   `json:"repo,omitempty"`
+}
+
+// GitDiscardRequest for POST /api/v1/git/discard
+type GitDiscardRequest struct {
+	Paths []string `json:"paths"` // Required - files to discard
+	Repo  string   `json:"repo,omitempty"`
+}
+
+// GitShowCommitRequest for GET /api/v1/git/commit/:sha
+type GitShowCommitRequest struct {
+	CommitSHA string `uri:"sha" binding:"required"`
+}
+
+// GitRevertCommitRequest for POST /api/v1/git/revert-commit
+type GitRevertCommitRequest struct {
+	CommitSHA string `json:"commit_sha"`
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitCreatePRRequest for POST /api/v1/git/create-pr
+type GitCreatePRRequest struct {
+	Title      string `json:"title"`
+	Body       string `json:"body"`
+	BaseBranch string `json:"base_branch"`
+	Draft      bool   `json:"draft"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// GitResetRequest for POST /api/v1/git/reset
+type GitResetRequest struct {
+	CommitSHA string `json:"commit_sha"`
+	Mode      string `json:"mode"` // "soft", "mixed", or "hard"
+	Repo      string `json:"repo,omitempty"`
+}
+
+// GitLogRequest for GET /api/v1/git/log
+type GitLogRequest struct {
+	Since        string `form:"since"`         // Base commit SHA (exclusive)
+	TargetBranch string `form:"target_branch"` // Target branch for merge-base calculation (e.g., "origin/main")
+	Limit        int    `form:"limit"`         // Max commits to return
+	Repo         string `form:"repo"`
+}
+
+// GitCumulativeDiffRequest for GET /api/v1/git/cumulative-diff
+type GitCumulativeDiffRequest struct {
+	Base         string `form:"base" binding:"required"` // Base commit SHA (used as fallback when target_branch is empty or merge-base fails)
+	TargetBranch string `form:"target_branch"`           // When set, recompute base via merge-base HEAD <origin/target_branch> for live divergence
+	Repo         string `form:"repo"`
+}
+
+// gitOpForRepo resolves the optional repo subpath to a per-repo GitOperator.
+// On invalid subpath it writes a 400 response and returns nil so callers can
+// `return` immediately. Empty subpath returns the workspace-root operator.
+func (s *Server) gitOpForRepo(c *gin.Context, operation, subpath string) *process.GitOperator {
+	op, err := s.procMgr.GitOperatorFor(subpath)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: operation,
+			Error:     err.Error(),
+		})
+		return nil
+	}
+	return op
+}
+
+// handleGitPull handles POST /api/v1/git/pull
+func (s *Server) handleGitPull(c *gin.Context) {
+	var req GitPullRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "pull",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "pull", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Pull(c.Request.Context(), req.Rebase)
+	if err != nil {
+		s.handleGitError(c, "pull", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitPush handles POST /api/v1/git/push
+func (s *Server) handleGitPush(c *gin.Context) {
+	var req GitPushRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "push",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "push", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Push(c.Request.Context(), process.PushOptions{
+		Force:          req.Force,
+		SetUpstream:    req.SetUpstream,
+		Remote:         req.Remote,
+		ExpectedBranch: req.ExpectedBranch,
+	})
+	if err != nil {
+		s.handleGitError(c, "push", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) handleGitPushPreflight(c *gin.Context) {
+	var req GitPushPreflightRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success: false, Operation: "push_preflight", Error: "invalid request: " + err.Error(),
+		})
+		return
+	}
+	gitOp := s.gitOpForRepo(c, "push preflight", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.PushPreflight(c.Request.Context(), process.PushOptions{
+		Remote:         req.Remote,
+		ExpectedBranch: req.ExpectedBranch,
+	})
+	if err != nil {
+		s.handleGitError(c, "push preflight", err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) handleGitReplaceContribution(c *gin.Context) {
+	s.handleGitContribution(c, "replace_remote_contribution", func(gitOp *process.GitOperator, expected string) (*process.GitOperationResult, error) {
+		return gitOp.ReplaceRemoteContribution(c.Request.Context(), expected)
+	})
+}
+
+func (s *Server) handleGitUseContribution(c *gin.Context) {
+	s.handleGitContribution(c, "use_remote_contribution", func(gitOp *process.GitOperator, expected string) (*process.GitOperationResult, error) {
+		return gitOp.UseRemoteContribution(c.Request.Context(), expected)
+	})
+}
+
+func (s *Server) handleGitContributionHistoryExplanation(c *gin.Context) {
+	var req GitContributionHistoryExplanationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success: false, Operation: "contribution_history_explanation", Error: "invalid request: " + err.Error(),
+		})
+		return
+	}
+	for _, required := range []struct {
+		name  string
+		value string
+	}{
+		{name: "branch", value: req.Branch},
+		{name: "expected_local_head", value: req.ExpectedLocalHead},
+		{name: "expected_remote_head", value: req.ExpectedRemoteHead},
+	} {
+		if required.value == "" {
+			c.JSON(http.StatusBadRequest, process.GitOperationResult{
+				Success: false, Operation: "contribution_history_explanation", Error: required.name + " is required",
+			})
+			return
+		}
+	}
+
+	gitOp := s.gitOpForRepo(c, "contribution_history_explanation", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.ExplainContributionHistory(
+		c.Request.Context(), req.Branch, req.ExpectedLocalHead, req.ExpectedRemoteHead)
+	if err != nil {
+		s.handleGitError(c, "contribution_history_explanation", err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) handleGitContribution(c *gin.Context, operation string, action func(*process.GitOperator, string) (*process.GitOperationResult, error)) {
+	var req GitContributionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success: false, Operation: operation, Error: "invalid request: " + err.Error(),
+		})
+		return
+	}
+	if req.ExpectedRemoteHead == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success: false, Operation: operation, Error: "expected_remote_head is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, operation, req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := action(gitOp, req.ExpectedRemoteHead)
+	if err != nil {
+		s.handleGitError(c, operation, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitRebase handles POST /api/v1/git/rebase
+func (s *Server) handleGitRebase(c *gin.Context) {
+	var req GitRebaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "rebase",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.BaseBranch == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "rebase",
+			Error:     "base_branch is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "rebase", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Rebase(c.Request.Context(), req.BaseBranch)
+	if err != nil {
+		s.handleGitError(c, "rebase", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitMerge handles POST /api/v1/git/merge
+func (s *Server) handleGitMerge(c *gin.Context) {
+	var req GitMergeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "merge",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.BaseBranch == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "merge",
+			Error:     "base_branch is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "merge", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Merge(c.Request.Context(), req.BaseBranch)
+	if err != nil {
+		s.handleGitError(c, "merge", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitAbort handles POST /api/v1/git/abort
+func (s *Server) handleGitAbort(c *gin.Context) {
+	var req GitAbortRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "abort",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.Operation != "merge" && req.Operation != "rebase" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "abort",
+			Error:     "operation must be 'merge' or 'rebase'",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "abort", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Abort(c.Request.Context(), req.Operation)
+	if err != nil {
+		s.handleGitError(c, "abort", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitCommit handles POST /api/v1/git/commit
+func (s *Server) handleGitCommit(c *gin.Context) {
+	var req GitCommitRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "commit",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.Message == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "commit",
+			Error:     "message is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "commit", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Commit(c.Request.Context(), req.Message, req.StageAll, req.Amend)
+	if err != nil {
+		s.handleGitError(c, "commit", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitRenameBranch handles POST /api/v1/git/rename-branch
+func (s *Server) handleGitRenameBranch(c *gin.Context) {
+	var req GitRenameBranchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "rename_branch",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.NewName == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "rename_branch",
+			Error:     "new_name is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "rename_branch", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.RenameBranch(c.Request.Context(), req.NewName)
+	if err != nil {
+		s.handleGitError(c, "rename_branch", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitStage handles POST /api/v1/git/stage
+func (s *Server) handleGitStage(c *gin.Context) {
+	var req GitStageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "stage",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "stage", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Stage(c.Request.Context(), req.Paths)
+	if err != nil {
+		s.handleGitError(c, "stage", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitUnstage handles POST /api/v1/git/unstage
+func (s *Server) handleGitUnstage(c *gin.Context) {
+	var req GitUnstageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "unstage",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "unstage", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Unstage(c.Request.Context(), req.Paths)
+	if err != nil {
+		s.handleGitError(c, "unstage", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitDiscard handles POST /api/v1/git/discard
+func (s *Server) handleGitDiscard(c *gin.Context) {
+	var req GitDiscardRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "discard",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if len(req.Paths) == 0 {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "discard",
+			Error:     "paths are required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "discard", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Discard(c.Request.Context(), req.Paths)
+	if err != nil {
+		s.handleGitError(c, "discard", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitCreatePR handles POST /api/v1/git/create-pr
+func (s *Server) handleGitCreatePR(c *gin.Context) {
+	var req GitCreatePRRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.PRCreateResult{
+			Success: false,
+			Error:   "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.Title == "" {
+		c.JSON(http.StatusBadRequest, process.PRCreateResult{
+			Success: false,
+			Error:   "title is required",
+		})
+		return
+	}
+
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(req.Repo)
+	if gitOpErr != nil {
+		c.JSON(http.StatusBadRequest, process.PRCreateResult{
+			Success: false,
+			Error:   gitOpErr.Error(),
+		})
+		return
+	}
+	result, err := gitOp.CreatePR(c.Request.Context(), req.Title, req.Body, req.BaseBranch, req.Draft)
+	if err != nil {
+		if errors.Is(err, process.ErrOperationInProgress) {
+			c.JSON(http.StatusConflict, process.PRCreateResult{
+				Success: false,
+				Error:   "another git operation is already in progress",
+			})
+			return
+		}
+		s.logger.Error("git create-pr failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, process.PRCreateResult{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitRevertCommit handles POST /api/v1/git/revert-commit
+func (s *Server) handleGitRevertCommit(c *gin.Context) {
+	var req GitRevertCommitRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "revert_commit",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.CommitSHA == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "revert_commit",
+			Error:     "commit_sha is required",
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "revert_commit", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.RevertCommit(c.Request.Context(), req.CommitSHA)
+	if err != nil {
+		s.handleGitError(c, "revert_commit", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitShowCommit handles GET /api/v1/git/commit/:sha
+func (s *Server) handleGitShowCommit(c *gin.Context) {
+	var req GitShowCommitRequest
+	if err := c.ShouldBindUri(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.CommitDiffResult{
+			Success: false,
+			Error:   "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// ShowCommit accepts an optional ?repo= query param.
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(c.Query("repo"))
+	if gitOpErr != nil {
+		c.JSON(http.StatusBadRequest, process.CommitDiffResult{
+			Success:   false,
+			CommitSHA: req.CommitSHA,
+			Error:     gitOpErr.Error(),
+		})
+		return
+	}
+	result, err := gitOp.ShowCommit(c.Request.Context(), req.CommitSHA)
+	if err != nil {
+		s.logger.Error("git show commit failed", zap.String("commit_sha", req.CommitSHA), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, process.CommitDiffResult{
+			Success:   false,
+			CommitSHA: req.CommitSHA,
+			Error:     err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitReset handles POST /api/v1/git/reset
+func (s *Server) handleGitReset(c *gin.Context) {
+	var req GitResetRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "reset",
+			Error:     "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	if req.CommitSHA == "" {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "reset",
+			Error:     "commit_sha is required",
+		})
+		return
+	}
+
+	if req.Mode == "" {
+		req.Mode = "mixed"
+	}
+	validModes := map[string]bool{"soft": true, "mixed": true, "hard": true}
+	if !validModes[req.Mode] {
+		c.JSON(http.StatusBadRequest, process.GitOperationResult{
+			Success:   false,
+			Operation: "reset",
+			Error:     fmt.Sprintf("invalid reset mode: %s (must be soft, mixed, or hard)", req.Mode),
+		})
+		return
+	}
+
+	gitOp := s.gitOpForRepo(c, "reset", req.Repo)
+	if gitOp == nil {
+		return
+	}
+	result, err := gitOp.Reset(c.Request.Context(), req.CommitSHA, req.Mode)
+	if err != nil {
+		s.handleGitError(c, "reset", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitLog handles GET /api/v1/git/log.
+//
+// Multi-repo: when the caller doesn't pin a repo (?repo= empty) and the
+// workspace contains per-repo subdirs, fan out one log per repo and merge
+// the results, stamping RepositoryName on each commit so the frontend can
+// group them. Without this, the call would land on the workspace root which
+// for multi-repo task workspaces isn't a git repo and returns nothing.
+func (s *Server) handleGitLog(c *gin.Context) {
+	var req GitLogRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.GitLogResult{
+			Success: false,
+			Error:   "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// Bound limit to prevent expensive history scans
+	const (
+		defaultLogLimit = 100
+		maxLogLimit     = 500
+	)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultLogLimit
+	} else if limit > maxLogLimit {
+		c.JSON(http.StatusBadRequest, process.GitLogResult{
+			Success: false,
+			Error:   fmt.Sprintf("limit must be between 1 and %d", maxLogLimit),
+		})
+		return
+	}
+
+	if req.Repo == "" {
+		if scopes := s.procMgr.RepositoryScopes(); shouldFanOutRepositoryScopes(scopes) {
+			s.handleGitLogMultiRepo(c, req, scopes, limit)
+			return
+		}
+	}
+
+	// c.Request.Context(), not c: *gin.Context satisfies context.Context, so
+	// passing c compiles but hands over a context whose Done() is nil unless
+	// ContextWithFallback is set — which it is not here. The git subprocesses
+	// would then outlive a client disconnect.
+	result, err := s.runGitLogForRepo(c.Request.Context(), req, limit, req.Repo)
+	if err != nil {
+		s.handleGitError(c, "log", err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// computeMergeBase finds the merge-base between HEAD and the target branch.
+// It tries origin/<target_branch> first (the upstream source of truth) and
+// falls back to <target_branch> if the remote ref isn't present. Local refs
+// can lag arbitrarily far behind upstream on long-lived worktrees; using the
+// remote ref keeps the log/diff range anchored to live divergence.
+func (s *Server) computeMergeBase(
+	ctx context.Context,
+	gitOp *process.GitOperator,
+	targetBranch string,
+) (string, error) {
+	if mb, err := gitOp.GetMergeBase(ctx, "HEAD", "origin/"+targetBranch); err == nil {
+		return mb, nil
+	}
+	return gitOp.GetMergeBase(ctx, "HEAD", targetBranch)
+}
+
+func (s *Server) comparisonResolutionFor(repo string) (process.ComparisonResolution, error) {
+	tracker, err := s.procMgr.GetWorkspaceTrackerFor(repo)
+	if err != nil {
+		return process.ComparisonResolution{}, err
+	}
+	return tracker.ComparisonResolution(), nil
+}
+
+func comparisonUnavailableLogResult(code string) *process.GitLogResult {
+	return &process.GitLogResult{
+		Success:   false,
+		Commits:   []*process.GitCommitInfo{},
+		Error:     "comparison target unavailable",
+		ErrorCode: code,
+	}
+}
+
+func comparisonUnavailableDiffResult(code string) *process.CumulativeDiffResult {
+	return &process.CumulativeDiffResult{
+		Success:   false,
+		Files:     map[string]interface{}{},
+		Error:     "comparison target unavailable",
+		ErrorCode: code,
+	}
+}
+
+// runGitLogForRepo runs git log against a single repo subpath. Returns a
+// result-with-error or a non-nil error for transport failures.
+func (s *Server) runGitLogForRepo(
+	ctx context.Context,
+	req GitLogRequest,
+	limit int,
+	repo string,
+) (*process.GitLogResult, error) {
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(repo)
+	if gitOpErr != nil {
+		return nil, gitOpErr
+	}
+	comparison, comparisonErr := s.comparisonResolutionFor(repo)
+	if comparisonErr != nil {
+		return nil, comparisonErr
+	}
+	if comparison.Explicit {
+		if comparison.Status != lspStatusReady || comparison.Ref == "" {
+			return comparisonUnavailableLogResult(comparison.ErrorCode), nil
+		}
+		mergeBase, err := gitOp.GetMergeBase(ctx, "HEAD", comparison.Ref)
+		if err != nil || mergeBase == "" {
+			return comparisonUnavailableLogResult("comparison_merge_base_unavailable"), nil
+		}
+		return gitOp.GetLog(ctx, mergeBase, limit)
+	}
+
+	baseCommit := req.Since
+	// TargetBranch reaches this handler over HTTP and is interpolated into
+	// `git` arg lists below. Inline the securityutil.IsValidBranchName
+	// allowlist check at the sink call site so CodeQL's taint tracker
+	// sees the regex sanitiser barrier in the same function as the
+	// subprocess invocation. `origin/<name>` refs are split so the
+	// underlying validator (which disallows "/" as the first character)
+	// can validate the branch component.
+	check, hasOriginPrefix := strings.CutPrefix(req.TargetBranch, "origin/")
+	if !hasOriginPrefix {
+		check = req.TargetBranch
+	}
+	if !safeBranchRefPattern.MatchString(check) || strings.Contains(check, "..") || strings.HasSuffix(check, ".lock") {
+		req.TargetBranch = ""
+	}
+	if req.TargetBranch != "" {
+		mergeBase, err := s.computeMergeBase(ctx, gitOp, req.TargetBranch)
+		if err == nil && mergeBase != "" {
+			baseCommit = mergeBase
+		} else {
+			// merge-base failed (typically unrelated histories) — fall back
+			// to the branch tip so GetLog gets a real anchor and runs
+			// `git log <tip>..HEAD` instead of dropping into its open-ended
+			// "last N commits" path. Without this, picking a base that
+			// shares no history with HEAD silently turns the commits panel
+			// into the workspace's full HEAD history, mismatching the
+			// numstat-driven stats which fall through cleanly to per-file
+			// sums in the same scenario.
+			if tip, tipErr := gitOp.GetRevParse(ctx, req.TargetBranch); tipErr == nil && tip != "" {
+				baseCommit = tip
+			} else if err != nil {
+				s.logger.Warn("failed to compute merge-base and branch tip, falling back to since",
+					zap.String("target_branch", req.TargetBranch),
+					zap.String("repo", repo),
+					zap.Error(err))
+			}
+		}
+		// Re-anchor a stale stored base (merged/deleted stacked parent, rebase)
+		// to the live integration merge-base so the panel counts only the
+		// branch's own commits. Only fires when the target has no live upstream
+		// ref, so a live non-default target (e.g. origin/develop) keeps its own
+		// authoritative merge-base. No-op when the base is already current.
+		baseCommit = gitOp.CorrectStaleComparisonBase(
+			ctx,
+			baseCommit,
+			req.TargetBranch,
+		)
+	}
+
+	return gitOp.GetLog(ctx, baseCommit, limit)
+}
+
+// perRepoLogOutcome captures the outcome of running git log against a single
+// repo subpath. Exactly one of result/err is set; result.Success may still be
+// false if the per-repo command itself reported a failure.
+type perRepoLogOutcome struct {
+	subpath string
+	result  *process.GitLogResult
+	err     error
+}
+
+// mergeGitLogResults combines per-repo log outcomes into a single response
+// suitable for the multi-repo log endpoint. It is extracted from
+// handleGitLogMultiRepo so the merge/error-aggregation logic is unit-testable
+// without spinning up a real Manager.
+//
+// Behavior:
+//   - Successful repos contribute their commits (each tagged with RepositoryName).
+//   - Failed repos (transport error or result.Success=false) contribute an
+//     entry to PerRepoErrors so the frontend can render an "incomplete" warning.
+//   - Success=true iff at least one repo succeeded. If every repo failed,
+//     Success=false with a summary in Error.
+//   - Commits are sorted newest-first across repos and truncated to limit.
+func mergeGitLogResults(outcomes []perRepoLogOutcome, limit int) process.GitLogResult {
+	merged := make([]*process.GitCommitInfo, 0)
+	perRepoErrors := make([]process.GitLogRepoError, 0)
+	for _, o := range outcomes {
+		if o.err != nil {
+			perRepoErrors = append(perRepoErrors, process.GitLogRepoError{
+				RepositoryName: o.subpath,
+				Error:          o.err.Error(),
+			})
+			continue
+		}
+		if o.result == nil || !o.result.Success {
+			errMsg := ""
+			errorCode := ""
+			if o.result != nil {
+				errMsg = o.result.Error
+				errorCode = o.result.ErrorCode
+			}
+			perRepoErrors = append(perRepoErrors, process.GitLogRepoError{
+				RepositoryName: o.subpath,
+				Error:          errMsg,
+				ErrorCode:      errorCode,
+			})
+			continue
+		}
+		for _, commit := range o.result.Commits {
+			commit.RepositoryName = o.subpath
+			merged = append(merged, commit)
+		}
+	}
+
+	// Sort newest-first across repos. Falls back to insertion order if either
+	// timestamp is unparseable.
+	sortCommitsByCommittedAtDesc(merged)
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	resp := process.GitLogResult{Commits: merged}
+	if len(perRepoErrors) > 0 {
+		resp.PerRepoErrors = perRepoErrors
+		for _, repoErr := range perRepoErrors {
+			if repoErr.ErrorCode != "" {
+				resp.ErrorCode = repoErr.ErrorCode
+				break
+			}
+		}
+	}
+	// Success iff at least one repo succeeded. When every repo failed we mark
+	// the response failed and put a one-line summary in Error so callers that
+	// only check Success/Error keep working without inspecting PerRepoErrors.
+	switch {
+	case len(outcomes) > 0 && len(perRepoErrors) == len(outcomes):
+		resp.Success = false
+		resp.Error = fmt.Sprintf("git log failed for all %d repositories", len(outcomes))
+	default:
+		resp.Success = true
+	}
+	return resp
+}
+
+// handleGitLogMultiRepo fans the request out across every per-repo tracker,
+// stamps RepositoryName on each returned commit, and merges into a single
+// log sorted by committed_at descending. Per-repo limits are applied
+// individually; the merged result is then truncated to the request limit.
+//
+// Per-repo failures are surfaced via PerRepoErrors rather than silently
+// dropped, so the frontend can render an "incomplete" warning instead of
+// pretending the missing repo simply has no history. The merged response
+// stays Success=true as long as at least one repo succeeded; if every repo
+// failed, Success=false with a summary in Error.
+func (s *Server) handleGitLogMultiRepo(
+	c *gin.Context,
+	req GitLogRequest,
+	subpaths []string,
+	limit int,
+) {
+	// Parallel fan-out, mirroring handleGitStatusMulti. Each repo is an
+	// independent git invocation against its own worktree, so running them
+	// serially made latency the sum over repositories: on Windows, where a git
+	// spawn alone costs ~150ms, an 11-repo task could exceed the gateway's
+	// 60s singleflight budget and the caller would see a timeout rather than a
+	// slow answer. Writing by index keeps the merge order deterministic.
+	ctx := c.Request.Context()
+	outcomes := fanOutRepos(ctx, subpaths, func(ctx context.Context, sub string) perRepoLogOutcome {
+		return s.collectLogForRepo(ctx, req, limit, sub)
+	})
+
+	c.JSON(http.StatusOK, mergeGitLogResults(outcomes, limit))
+}
+
+// collectLogForRepo runs git log for one repository of a multi-repo fan-out.
+// It takes a plain context and never touches the gin context, which is what
+// makes it safe to call from several goroutines at once.
+func (s *Server) collectLogForRepo(
+	ctx context.Context,
+	req GitLogRequest,
+	limit int,
+	sub string,
+) perRepoLogOutcome {
+	// Multi-repo: the caller-supplied `since` is a SHA that only exists in
+	// the primary repo, and `target_branch` is the primary repo's base
+	// branch (e.g. "main"). Both can be wrong for sibling repos — running
+	// `git log <foreign-sha>..HEAD` in lvc fails outright and the repo's
+	// commits silently disappear from the merged response. Compute a
+	// per-repo base through the workspace tracker so the task's configured
+	// base branch and normal integration-branch fallbacks both work.
+	perRepoReq := req
+	perRepoReq.Since = ""
+	perRepoReq.TargetBranch = ""
+	if base := s.resolvePerRepoBase(ctx, sub); base != "" {
+		perRepoReq.Since = base
+	}
+	result, err := s.runGitLogForRepo(ctx, perRepoReq, limit, sub)
+	if err != nil {
+		s.logger.Warn("git log for repo failed",
+			zap.String("repo", sub), zap.Error(err))
+	} else if !result.Success {
+		s.logger.Warn("git log for repo returned failure",
+			zap.String("repo", sub), zap.String("error", result.Error))
+	}
+	return perRepoLogOutcome{subpath: sub, result: result, err: err}
+}
+
+// handleGitCumulativeDiff handles GET /api/v1/git/cumulative-diff.
+//
+// Multi-repo: when the caller doesn't pin a repo (?repo= empty) and the
+// workspace contains per-repo subdirs, fan out one cumulative diff per repo
+// and merge results, prefixing each file key with the repo subpath and
+// stamping repository_name onto each file's payload. Without this the call
+// would land on the workspace root which for multi-repo task workspaces
+// isn't a git repo — and `git diff` would silently ascend to whatever .git
+// encloses the task root (e.g. the user's outer kandev checkout) and return
+// hundreds of unrelated files.
+func (s *Server) handleGitCumulativeDiff(c *gin.Context) {
+	var req GitCumulativeDiffRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, process.CumulativeDiffResult{
+			Success: false,
+			Error:   "invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// Same untrusted-ref guard as handleGitLog: inline the
+	// securityutil.IsValidBranchName check at the sink so static analysis
+	// sees the regex barrier in the same function as the downstream
+	// subprocess call paths.
+	check, hasOriginPrefix := strings.CutPrefix(req.TargetBranch, "origin/")
+	if !hasOriginPrefix {
+		check = req.TargetBranch
+	}
+	if !safeBranchRefPattern.MatchString(check) || strings.Contains(check, "..") || strings.HasSuffix(check, ".lock") {
+		req.TargetBranch = ""
+	}
+
+	if req.Repo == "" {
+		if scopes := s.procMgr.RepositoryScopes(); shouldFanOutRepositoryScopes(scopes) {
+			s.handleGitCumulativeDiffMultiRepo(c, req, scopes)
+			return
+		}
+	}
+
+	result, status, err := s.runGitCumulativeDiffForRepo(c.Request.Context(), req.Base, req.TargetBranch, req.Repo)
+	if err != nil {
+		c.JSON(status, process.CumulativeDiffResult{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// runGitCumulativeDiffForRepo runs cumulative diff against a single repo
+// subpath. Returns nil after writing an error response on lookup failures;
+// otherwise returns the (possibly success=false) result for the caller.
+//
+// When targetBranch is non-empty the base is recomputed dynamically via
+// merge-base against origin/<targetBranch> (with a local-ref fallback). This
+// matches the COMMITS panel: anchor to live divergence with the upstream so
+// the diff updates as main moves forward and excludes file changes brought
+// in via merges from main.
+func (s *Server) runGitCumulativeDiffForRepo(
+	ctx context.Context,
+	base, targetBranch, repo string,
+) (*process.CumulativeDiffResult, int, error) {
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(repo)
+	if gitOpErr != nil {
+		return nil, http.StatusBadRequest, gitOpErr
+	}
+	comparison, comparisonErr := s.comparisonResolutionFor(repo)
+	if comparisonErr != nil {
+		return nil, http.StatusBadRequest, comparisonErr
+	}
+	return s.runGitCumulativeDiffForRepoResolved(ctx, gitOp, base, targetBranch, repo, comparison)
+}
+
+func (s *Server) runGitCumulativeDiffForRepoResolved(
+	ctx context.Context,
+	gitOp *process.GitOperator,
+	base, targetBranch, repo string,
+	comparison process.ComparisonResolution,
+) (*process.CumulativeDiffResult, int, error) {
+	if comparison.Explicit {
+		if comparison.Status != lspStatusReady || comparison.Ref == "" {
+			return comparisonUnavailableDiffResult(comparison.ErrorCode), http.StatusOK, nil
+		}
+		mergeBase, err := gitOp.GetMergeBase(ctx, "HEAD", comparison.Ref)
+		if err != nil || mergeBase == "" {
+			return comparisonUnavailableDiffResult("comparison_merge_base_unavailable"), http.StatusOK, nil
+		}
+		result, err := gitOp.GetCumulativeDiff(ctx, mergeBase)
+		return result, http.StatusOK, err
+	}
+	if targetBranch != "" {
+		switch mb, err := s.computeMergeBase(ctx, gitOp, targetBranch); {
+		case err != nil:
+			s.logger.Warn("cumulative diff: merge-base failed, using stored base",
+				zap.String("target_branch", targetBranch),
+				zap.String("repo", repo),
+				zap.Error(err))
+		case mb == "":
+			// merge-base returned no error but no SHA — happens when HEAD and
+			// targetBranch share no history. Log it so the silent fallback to
+			// the stored base is visible during diagnostics.
+			s.logger.Warn("cumulative diff: merge-base returned empty, using stored base",
+				zap.String("target_branch", targetBranch),
+				zap.String("repo", repo))
+		default:
+			base = mb
+		}
+		// Mirror the commits panel: re-anchor a stale stored base (merged/
+		// deleted stacked parent, rebase) to the live integration merge-base so
+		// the diff excludes changes that already landed on the integration
+		// branch. Only fires when the target has no live upstream ref. No-op
+		// when the base is already current.
+		base = gitOp.CorrectStaleComparisonBase(ctx, base, targetBranch)
+	}
+	result, err := gitOp.GetCumulativeDiff(ctx, base)
+	if err != nil {
+		s.logger.Error("git cumulative diff failed",
+			zap.String("base", base),
+			zap.String("repo", repo),
+			zap.Error(err))
+		return nil, http.StatusInternalServerError, err
+	}
+	return result, http.StatusOK, nil
+}
+
+// handleGitCumulativeDiffMultiRepo fans cumulative diff out across every
+// per-repo tracker. Each repo's base commit is resolved from its configured
+// task base branch — the caller-supplied base only makes sense for one repo at
+// a time, since each repo has its own commit graph. Files from each repo are
+// merged into a single map, keyed by
+// `<repoSubpath>/<path>` so paths that exist in multiple repos don't clash,
+// and tagged with `repository_name` so the frontend can group them.
+func (s *Server) handleGitCumulativeDiffMultiRepo(
+	c *gin.Context,
+	req GitCumulativeDiffRequest,
+	subpaths []string,
+) {
+	// Parallel fan-out for the same reason as handleGitLogMultiRepo: each repo
+	// is an independent git invocation, and serially the request took the sum
+	// over repositories, which on Windows is enough to blow the gateway's 60s
+	// budget on a task with many repos.
+	ctx := c.Request.Context()
+	outcomes := fanOutRepos(ctx, subpaths, func(ctx context.Context, sub string) perRepoDiffOutcome {
+		return s.collectCumulativeDiffForRepo(ctx, sub)
+	})
+
+	// Merging stays sequential: it writes into one shared map, and doing it in
+	// subpath order keeps the merged output independent of goroutine timing.
+	merged := process.CumulativeDiffResult{
+		Files:   make(map[string]interface{}),
+		Success: true,
+	}
+	anyOK := false
+	comparisonErrorCode := ""
+	for _, outcome := range outcomes {
+		// A hard failure still aborts the whole request, as it did serially.
+		// Reporting the first one in subpath order rather than the first to
+		// occur keeps the response deterministic now that the repos race.
+		if outcome.err != nil {
+			c.JSON(outcome.status, process.CumulativeDiffResult{
+				Success: false,
+				Error:   outcome.err.Error(),
+			})
+			return
+		}
+		if outcome.result == nil {
+			continue // no per-repo base; already logged
+		}
+		if !outcome.result.Success {
+			s.logger.Warn("cumulative diff for repo returned failure",
+				zap.String("repo", outcome.subpath),
+				zap.String("error", outcome.result.Error))
+			if comparisonErrorCode == "" {
+				comparisonErrorCode = outcome.result.ErrorCode
+			}
+			continue
+		}
+		anyOK = true
+		merged.TotalCommits += outcome.result.TotalCommits
+		mergeCumulativeFiles(
+			merged.Files,
+			outcome.result.Files,
+			outcome.subpath,
+			outcome.result.BaseCommit,
+			outcome.isSubmodule,
+		)
+	}
+	if !anyOK {
+		merged.Success = false
+		merged.Error = fmt.Sprintf("cumulative diff failed for all %d repositories", len(subpaths))
+		merged.ErrorCode = comparisonErrorCode
+	}
+	c.JSON(http.StatusOK, merged)
+}
+
+// perRepoDiffOutcome carries one repository's cumulative-diff result out of the
+// fan-out. A nil result with a nil error means the repo had no resolvable base
+// and was skipped; a non-nil error is a hard failure that aborts the request,
+// with status holding the code the serial version would have written.
+type perRepoDiffOutcome struct {
+	subpath     string
+	result      *process.CumulativeDiffResult
+	status      int
+	err         error
+	isSubmodule bool
+}
+
+// collectCumulativeDiffForRepo runs the cumulative diff for one repository of a
+// multi-repo fan-out. Like collectLogForRepo it takes a plain context and never
+// writes to the gin context, so it is safe to run concurrently.
+func (s *Server) collectCumulativeDiffForRepo(ctx context.Context, sub string) perRepoDiffOutcome {
+	comparison, comparisonErr := s.comparisonResolutionFor(sub)
+	if comparisonErr != nil {
+		return perRepoDiffOutcome{subpath: sub, status: http.StatusBadRequest, err: comparisonErr}
+	}
+	if comparison.Explicit {
+		gitOp, gitOpErr := s.procMgr.GitOperatorFor(sub)
+		if gitOpErr != nil {
+			return perRepoDiffOutcome{subpath: sub, status: http.StatusBadRequest, err: gitOpErr}
+		}
+		result, status, err := s.runGitCumulativeDiffForRepoResolved(ctx, gitOp, "", "", sub, comparison)
+		return perRepoDiffOutcome{subpath: sub, result: result, status: status, err: err}
+	}
+	base, isSubmodule := s.resolvePerRepoBaseAndScope(ctx, sub)
+	if base == "" {
+		s.logger.Warn("cumulative diff: no per-repo base, skipping",
+			zap.String("repo", sub))
+		return perRepoDiffOutcome{subpath: sub, isSubmodule: isSubmodule}
+	}
+	// Multi-repo: base is already resolved per-repo via resolvePerRepoBase,
+	// so we pass empty target_branch to skip the second merge-base attempt.
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(sub)
+	if gitOpErr != nil {
+		return perRepoDiffOutcome{subpath: sub, status: http.StatusBadRequest, err: gitOpErr, isSubmodule: isSubmodule}
+	}
+	result, status, err := s.runGitCumulativeDiffForRepoResolved(ctx, gitOp, base, "", sub, comparison)
+	return perRepoDiffOutcome{
+		subpath:     sub,
+		result:      result,
+		status:      status,
+		err:         err,
+		isSubmodule: isSubmodule,
+	}
+}
+
+// fanOutRepos runs collect once per repository, concurrently, and returns the
+// results in subpath order regardless of which finished first. Every repository
+// is an independent git invocation against its own worktree, so serial
+// execution made request latency the sum over repositories rather than the
+// slowest one — on Windows, where a git spawn costs ~150ms before doing any
+// work, a task with a dozen repositories could exceed the gateway's 60s budget
+// and the caller would see a timeout instead of a slow answer.
+//
+// Concurrency is bounded by the process-wide Git admission capacity shared with
+// background polling and lifecycle work. The admission controller remains the
+// authority on active subprocesses; this limit only bounds goroutines and queued
+// repository work created by one request.
+
+func fanOutRepos[T any](ctx context.Context, subpaths []string, collect func(context.Context, string) T) []T {
+	results := make([]T, len(subpaths))
+	var group errgroup.Group
+	limit := len(subpaths)
+	if capacity := subproc.GitCapacity(); capacity > 0 && capacity < limit {
+		limit = capacity
+	}
+	group.SetLimit(limit)
+	for i, sub := range subpaths {
+		group.Go(func() error {
+			// collect owns the per-repository result and never returns an
+			// errgroup error. Preserve the caller's context identity here so
+			// request cancellation and context-aware singleflight observers see
+			// the original request boundary rather than an internal wrapper.
+			results[i] = collect(ctx, sub)
+			return nil
+		})
+	}
+	// collect never returns an error — per-repository failures travel inside T
+	// so the merge can report them — so Wait only surfaces context cancellation.
+	_ = group.Wait()
+	return results
+}
+
+// resolvePerRepoBase returns the comparison anchor owned by the repository's
+// workspace tracker. Multi-repo tasks share no single base commit across
+// repos, and each tracker carries that repository's configured task base.
+//
+// The single-repo path re-anchors a stale stored base from req.TargetBranch,
+// but the multi-repo fan-out clears TargetBranch, so it must apply the shared
+// comparison policy here using the tracker's resolved base branch.
+// Without this, a repo whose base branch is a merged/deleted stacked parent
+// lingering only as a local ref keeps inflating the commit count and diff.
+func (s *Server) resolvePerRepoBase(ctx context.Context, repo string) string {
+	base, _ := s.resolvePerRepoBaseAndScope(ctx, repo)
+	return base
+}
+
+// resolvePerRepoBaseAndScope returns the repository's comparison anchor and
+// whether its workspace is a submodule. The metadata travels with cumulative
+// diff results so the frontend can distinguish nested repository scopes from
+// ordinary sibling repositories that merely happen to have a named path.
+func (s *Server) resolvePerRepoBaseAndScope(ctx context.Context, repo string) (string, bool) {
+	tracker, err := s.procMgr.GetWorkspaceTrackerFor(repo)
+	if err != nil {
+		return "", false
+	}
+	isSubmodule := tracker.IsSubmodule()
+	base, baseBranch := tracker.ResolveBaseAnchor(ctx)
+	if base == "" || baseBranch == "" {
+		return base, isSubmodule
+	}
+	if isSubmodule {
+		return base, true
+	}
+	gitOp, gitOpErr := s.procMgr.GitOperatorFor(repo)
+	if gitOpErr != nil {
+		return base, false
+	}
+	return gitOp.CorrectStaleComparisonBase(ctx, base, baseBranch), false
+}
+
+// mergeCumulativeFiles copies per-repo files into the merged map under a
+// `<repo> <path>` key (NUL-separated) and decorates each file payload
+// with `repository_name`, the repo-relative `path`, the exact old-side
+// `base_ref` used to produce its cumulative diff, and (for nested repository
+// scopes) `is_submodule`.
+// The composite key keeps `README.md` in two repos from clashing in the map;
+// the frontend reads `path` and `repository_name` off the payload so the
+// file tree groups under the repo header without the prefix bleeding into
+// the displayed path. NUL is impossible in real paths, so the key is
+// always uniquely splittable and the displayed path is unaffected.
+func mergeCumulativeFiles(dst, src map[string]interface{}, repo, baseRef string, isSubmodule bool) {
+	for path, payload := range src {
+		m, ok := payload.(map[string]interface{})
+		if !ok {
+			// Defensive: only known shape from parseCommitDiff is map[string]interface{}.
+			// If a future change emits something else, route it through unchanged
+			// rather than silently dropping the path/repo metadata.
+			dst[fmt.Sprintf("%s\x00%s", repo, path)] = payload
+			continue
+		}
+		// Shallow-copy the per-file map before stamping repository_name,
+		// path, and base_ref so the caller's source map isn't mutated. Earlier
+		// code wrote directly to `m`, which permanently rewrote the per-repo result
+		// before it could be reused (e.g. emitted to a second consumer).
+		copied := make(map[string]interface{}, len(m)+4)
+		for k, v := range m {
+			copied[k] = v
+		}
+		copied["repository_name"] = repo
+		copied["path"] = path
+		if baseRef != "" {
+			copied["base_ref"] = baseRef
+		}
+		if isSubmodule {
+			copied["is_submodule"] = true
+		}
+		dst[fmt.Sprintf("%s\x00%s", repo, path)] = copied
+	}
+}
+
+// GitStatusResult represents the result of a git status query.
+type GitStatusResult struct {
+	Success             bool                   `json:"success"`
+	StatusState         string                 `json:"status_state,omitempty"`
+	FilesComplete       bool                   `json:"files_complete"`
+	DetailState         string                 `json:"detail_state,omitempty"`
+	ErrorCode           string                 `json:"error_code,omitempty"`
+	TrackerID           string                 `json:"tracker_id,omitempty"`
+	TrackerEpoch        uint64                 `json:"tracker_epoch,omitempty"`
+	SnapshotRevision    uint64                 `json:"snapshot_revision,omitempty"`
+	RepositoryName      string                 `json:"repository_name,omitempty"`
+	IsSubmodule         bool                   `json:"is_submodule,omitempty"`
+	Branch              string                 `json:"branch"`
+	RemoteBranch        string                 `json:"remote_branch"`
+	HeadCommit          string                 `json:"head_commit"`
+	BaseCommit          string                 `json:"base_commit"` // Merge-base with origin branch
+	ComparisonTarget    string                 `json:"comparison_target,omitempty"`
+	ComparisonStatus    string                 `json:"comparison_status,omitempty"`
+	ComparisonErrorCode string                 `json:"comparison_error_code,omitempty"`
+	Ahead               int                    `json:"ahead"`
+	Behind              int                    `json:"behind"`
+	RemoteAhead         int                    `json:"remote_ahead"`
+	RemoteBehind        int                    `json:"remote_behind"`
+	RemoteHeadCommit    string                 `json:"remote_head_commit,omitempty"`
+	Modified            []string               `json:"modified"`
+	Added               []string               `json:"added"`
+	Deleted             []string               `json:"deleted"`
+	Untracked           []string               `json:"untracked"`
+	Renamed             []string               `json:"renamed"`
+	Files               map[string]interface{} `json:"files"`
+	Timestamp           string                 `json:"timestamp"`
+	BranchAdditions     int                    `json:"branch_additions,omitempty"`
+	BranchDeletions     int                    `json:"branch_deletions,omitempty"`
+	Error               string                 `json:"error,omitempty"`
+}
+
+// PerRepoGitStatus pairs a repository_name with its current status. Used by
+// the multi-repo status fan-out so callers (notably the gateway's session
+// subscribe handler) can deliver one stamped GitStatusUpdate per repo on
+// reconnect — without it the frontend would only see the workspace-root
+// (untagged) status and miss the per-repo grouping.
+type PerRepoGitStatus struct {
+	RepositoryName string          `json:"repository_name"`
+	Status         GitStatusResult `json:"status"`
+}
+
+// MultiRepoGitStatusResult is the response shape for /api/v1/git/status/multi.
+// For multi-repo task workspaces the response carries one entry per repo,
+// stamped with its name. Single-repo workspaces return a single entry with an
+// empty repository_name so callers can treat both shapes uniformly.
+type MultiRepoGitStatusResult struct {
+	Success bool               `json:"success"`
+	Repos   []PerRepoGitStatus `json:"repos"`
+	Error   string             `json:"error,omitempty"`
+}
+
+func shouldFanOutRepositoryScopes(scopes []string) bool {
+	if len(scopes) == 0 {
+		return false
+	}
+	return len(scopes) > 1 || scopes[0] != ""
+}
+
+func requiresExplicitRepositoryScope(scopes []string) bool {
+	return len(scopes) > 0 && scopes[0] != ""
+}
+
+// handleGitStatusMulti returns one git status entry per repo for multi-repo
+// task workspaces (or one untagged entry for single-repo). Used by the
+// session-subscribe handler in the main backend to seed per-repo state on
+// page reload — the legacy single GET /api/v1/git/status endpoint returns
+// only the workspace-root status, which is empty for multi-repo task roots
+// (the root isn't itself a git repo). Pass ?fresh=true to bypass the cached
+// status and run a fresh git query — used on WS subscribe so a new observer
+// always validates the cache against the live worktree.
+func (s *Server) handleGitStatusMulti(c *gin.Context) {
+	subpaths := s.procMgr.RepositoryScopes()
+	// Single-repo: fall back to the workspace-root status with an empty repo
+	// name so the response shape stays uniform.
+	if len(subpaths) == 0 {
+		subpaths = []string{""}
+	}
+	mode := c.Query("mode")
+	fresh := c.Query("fresh") == queryParamTrue || mode == "fresh" || mode == "recover"
+	replay := mode == "replay"
+	detailsWait := c.Query("details") == "wait" && !replay
+	if fresh {
+		s.procMgr.RetryUnavailableComparisonTargets()
+	}
+	// Parallel fan-out: fresh=true skips the cache, so serial scales linearly and would blow the 2s subscribe timeout for multi-repo workspaces.
+	result := MultiRepoGitStatusResult{Success: true, Repos: make([]PerRepoGitStatus, len(subpaths))}
+	ctx := c.Request.Context()
+	outcomes := fanOutRepos(ctx, subpaths, func(ctx context.Context, sub string) PerRepoGitStatus {
+		return s.collectStatusForRepo(ctx, sub, fresh, detailsWait, replay)
+	})
+	copy(result.Repos, outcomes)
+	c.JSON(http.StatusOK, result)
+}
+
+// collectStatusForRepo runs the status query for a single subpath and packs
+// it into a PerRepoGitStatus. When fresh is true the workspace tracker
+// re-runs `git status --porcelain` against the worktree instead of returning
+// the cached snapshot. Failures land in Status.Error / Status.Success so the
+// caller can render partial results instead of erroring out the whole fan-out
+// when one repo is misconfigured.
+func (s *Server) collectStatusForRepo(ctx context.Context, sub string, fresh, detailsWait, replay bool) PerRepoGitStatus {
+	wt, wtErr := s.procMgr.GetWorkspaceTrackerFor(sub)
+	if wtErr != nil {
+		result := unavailableGitStatusResult(wtErr)
+		result.ErrorCode = "repository_unavailable"
+		return PerRepoGitStatus{
+			RepositoryName: sub,
+			Status:         result,
+		}
+	}
+	if wt == nil {
+		return PerRepoGitStatus{
+			RepositoryName: sub,
+			Status:         unavailableGitStatusResult(nil),
+		}
+	}
+	var status types.GitStatusUpdate
+	var err error
+	switch {
+	case replay:
+		status, err = wt.GetGitStatusReplay(ctx)
+	case detailsWait:
+		status, err = wt.GetGitStatusWithDetails(ctx, fresh)
+	default:
+		status, err = wt.GetGitStatus(ctx, fresh)
+	}
+	if err != nil {
+		result := unavailableGitStatusResult(err)
+		if status.StatusState == gitStatusReadyState && status.FilesComplete {
+			markGitStatusDetailsUnavailable(&status)
+			result = gitStatusResult(status, sub)
+			result.Success = false
+			result.ErrorCode = gitStatusDetailsUnavailableErrorCode
+			result.Error = "Git status details are unavailable."
+		}
+		return PerRepoGitStatus{RepositoryName: sub, Status: result}
+	}
+	return PerRepoGitStatus{RepositoryName: sub, Status: gitStatusResult(status, sub)}
+}
+
+func unavailableGitStatusResult(err error) GitStatusResult {
+	code := "status_unavailable"
+	message := "Git status is unavailable."
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		code = "status_timeout"
+		message = "Git status request timed out."
+	case errors.Is(err, context.Canceled):
+		code = "status_canceled"
+		message = "Git status request canceled."
+	}
+	return GitStatusResult{Success: false, StatusState: gitStatusUnavailableState, DetailState: gitStatusUnavailableState, ErrorCode: code, Error: message}
+}
+
+func gitStatusResult(status types.GitStatusUpdate, repositoryName string) GitStatusResult {
+	filesMap := make(map[string]interface{}, len(status.Files))
+	for k, v := range status.Files {
+		filesMap[k] = v
+	}
+	return GitStatusResult{
+		Success:             status.StatusState == gitStatusReadyState,
+		StatusState:         status.StatusState,
+		FilesComplete:       status.FilesComplete,
+		DetailState:         status.DetailState,
+		ErrorCode:           status.ErrorCode,
+		TrackerID:           status.TrackerID,
+		TrackerEpoch:        status.TrackerEpoch,
+		SnapshotRevision:    status.SnapshotRevision,
+		RepositoryName:      repositoryName,
+		IsSubmodule:         status.IsSubmodule,
+		Branch:              status.Branch,
+		RemoteBranch:        status.RemoteBranch,
+		HeadCommit:          status.HeadCommit,
+		BaseCommit:          status.BaseCommit,
+		ComparisonTarget:    status.ComparisonTarget,
+		ComparisonStatus:    status.ComparisonStatus,
+		ComparisonErrorCode: status.ComparisonErrorCode,
+		Ahead:               status.Ahead,
+		Behind:              status.Behind,
+		RemoteAhead:         status.RemoteAhead,
+		RemoteBehind:        status.RemoteBehind,
+		RemoteHeadCommit:    status.RemoteHeadCommit,
+		Modified:            status.Modified,
+		Added:               status.Added,
+		Deleted:             status.Deleted,
+		Untracked:           status.Untracked,
+		Renamed:             status.Renamed,
+		Files:               filesMap,
+		Timestamp:           status.Timestamp.Format("2006-01-02T15:04:05.000Z07:00"),
+		BranchAdditions:     status.BranchAdditions,
+		BranchDeletions:     status.BranchDeletions,
+	}
+}
+
+func markGitStatusDetailsUnavailable(status *types.GitStatusUpdate) {
+	status.DetailState = gitStatusUnavailableState
+	status.ErrorCode = gitStatusDetailsUnavailableErrorCode
+	for path, file := range status.Files {
+		file.DiffState = gitStatusUnavailableState
+		if file.StagedChange != nil {
+			facet := *file.StagedChange
+			facet.DiffState = gitStatusUnavailableState
+			file.StagedChange = &facet
+		}
+		if file.UnstagedChange != nil {
+			facet := *file.UnstagedChange
+			facet.DiffState = gitStatusUnavailableState
+			file.UnstagedChange = &facet
+		}
+		status.Files[path] = file
+	}
+}
+
+// handleGitStatus handles GET /api/v1/git/status. Accepts an optional
+// ?repo=<subpath> query param that selects a sub-directory of the workspace
+// for multi-repo task roots; empty = workspace root (single-repo behavior).
+// Pass ?fresh=true to bypass the cached status and run a fresh git query.
+func (s *Server) handleGitStatus(c *gin.Context) {
+	wt, wtErr := s.procMgr.GetWorkspaceTrackerFor(c.Query("repo"))
+	if wtErr != nil {
+		c.JSON(http.StatusBadRequest, GitStatusResult{
+			Success: false,
+			Error:   wtErr.Error(),
+		})
+		return
+	}
+	if wt == nil {
+		c.JSON(http.StatusInternalServerError, GitStatusResult{
+			Success: false,
+			Error:   "workspace tracker not available",
+		})
+		return
+	}
+
+	mode := c.Query("mode")
+	fresh := c.Query("fresh") == queryParamTrue || mode == "fresh" || mode == "recover"
+	replay := mode == "replay"
+	detailsWait := c.Query("details") == "wait" && !replay
+	if fresh {
+		s.procMgr.RetryUnavailableComparisonTargets()
+	}
+	var status types.GitStatusUpdate
+	var err error
+	switch {
+	case replay:
+		status, err = wt.GetGitStatusReplay(c.Request.Context())
+	case detailsWait:
+		status, err = wt.GetGitStatusWithDetails(c.Request.Context(), fresh)
+	default:
+		status, err = wt.GetGitStatus(c.Request.Context(), fresh)
+	}
+	if err != nil {
+		s.logger.Error("git status failed", zap.Error(err))
+		result := unavailableGitStatusResult(err)
+		if status.StatusState == gitStatusReadyState && status.FilesComplete {
+			markGitStatusDetailsUnavailable(&status)
+			result = gitStatusResult(status, c.Query("repo"))
+			result.Success = false
+			result.ErrorCode = gitStatusDetailsUnavailableErrorCode
+			result.Error = "Git status details are unavailable."
+		}
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
+	// Convert Files map to interface{} map for JSON serialization
+	filesMap := make(map[string]interface{}, len(status.Files))
+	for k, v := range status.Files {
+		filesMap[k] = v
+	}
+
+	result := gitStatusResult(status, c.Query("repo"))
+	result.Files = filesMap
+	c.JSON(http.StatusOK, result)
+}
+
+// handleGitError handles errors from git operations.
+func (s *Server) handleGitError(c *gin.Context, operation string, err error) {
+	if errors.Is(err, process.ErrOperationInProgress) {
+		c.JSON(http.StatusConflict, process.GitOperationResult{
+			Success:   false,
+			Operation: operation,
+			Error:     "another git operation is already in progress",
+		})
+		return
+	}
+
+	s.logger.Error("git operation failed", zap.String("operation", operation), zap.Error(err))
+	c.JSON(http.StatusInternalServerError, process.GitOperationResult{
+		Success:   false,
+		Operation: operation,
+		Error:     err.Error(),
+	})
+}

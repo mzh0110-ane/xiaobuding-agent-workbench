@@ -1,0 +1,336 @@
+"use client";
+
+import { sessionRecoveryOwnerId } from "@/lib/session-recovery-presentation";
+import { RecoveryActions, type RecoveryChoice } from "./recovery-actions";
+import { SessionErrorDetails } from "./session-error-details";
+import Link from "@/components/routing/app-link";
+import { IconAlertTriangle, IconInfoCircle, IconRefresh } from "@tabler/icons-react";
+import { Alert, AlertDescription, AlertTitle } from "@kandev/ui/alert";
+import { Button } from "@kandev/ui/button";
+import { useTranslation } from "react-i18next";
+import { t } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import type { SessionRecoveryFailure } from "@/hooks/domains/session/use-session-resumption";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+
+// EnsureSessionErrorInfo wraps a parsed ensure error so UI can offer a targeted action for the missing-agent-profile case.
+export type EnsureSessionErrorInfo = {
+  title: string;
+  detail: string;
+  isAgentProfileMissing: boolean;
+  action: { label: string; href: string } | null;
+};
+
+// Matches the backend's exact validation message in task_http_handlers.go / task_ws_handlers.go.
+// i18n-exempt: matches the backend's exact validation message. See the comment above.
+const AGENT_PROFILE_MISSING_HINT = "agent_profile_id is required";
+
+export function describeEnsureError(
+  error: Error | null,
+  workspaceId?: string | null,
+): EnsureSessionErrorInfo | null {
+  if (!error) return null;
+  const message = error.message ?? "";
+  const isAgentProfileMissing = message.toLowerCase().includes(AGENT_PROFILE_MISSING_HINT);
+  if (isAgentProfileMissing) {
+    return {
+      title: t("task:noAgentProfileConfigured"),
+      detail: t("task:noAgentProfileConfiguredDetail"),
+      isAgentProfileMissing: true,
+      action: workspaceId
+        ? {
+            label: t("task:openWorkspaceSettings"),
+            href: `/settings/workspaces/${workspaceId}`,
+          }
+        : null,
+    };
+  }
+  return {
+    title: t("task:couldnTStartASession"),
+    detail: t("task:backendRejectedSessionRequest"),
+    isAgentProfileMissing: false,
+    action: null,
+  };
+}
+
+type RecoveryAction = {
+  kind?: RecoveryChoice["kind"];
+  label: string;
+  onClick: () => void;
+  testId: string;
+  disabled?: boolean;
+};
+
+export function getSessionRecoveryRetry(source: {
+  recoveryFailure: SessionRecoveryFailure | null;
+  resumeSession: () => Promise<boolean>;
+  retrySessionStatus: () => Promise<void>;
+}): () => void {
+  if (source.recoveryFailure?.outcome === "status_unavailable") {
+    return () => {
+      void source.retrySessionStatus();
+    };
+  }
+  return () => {
+    void source.resumeSession();
+  };
+}
+
+type BannerProps = {
+  error: Error | null;
+  onRetry: () => void;
+  workspaceId?: string | null;
+  action?: RecoveryAction;
+  secondaryAction?: RecoveryAction;
+  retryDisabled?: boolean;
+  recoveryFailure?: SessionRecoveryFailure | null;
+  testId?: string;
+  compact?: boolean;
+};
+
+function RecoveryFailureDetails({ failure }: { failure: SessionRecoveryFailure }) {
+  const { t } = useTranslation();
+  if (failure.outcome === "status_unavailable") return null;
+  const detail = [
+    `${t("task:sessionRecoveryResumeAttempt")}: ${failure.resumeError}`,
+    ...(failure.outcome === "recovery_failed"
+      ? [`${t("task:sessionRecoveryRestoreAttempt")}: ${failure.restoreError}`]
+      : []),
+  ].join("\n");
+  return (
+    <SessionErrorDetails testId="session-recovery-details" label={t("task:sessionRecoveryDetails")}>
+      {detail}
+    </SessionErrorDetails>
+  );
+}
+
+function SessionStatusUnavailableNotice({
+  failure,
+  onRetry,
+  retryDisabled,
+}: {
+  failure: Extract<SessionRecoveryFailure, { outcome: "status_unavailable" }>;
+  onRetry: () => void;
+  retryDisabled?: boolean;
+}) {
+  const { t } = useTranslation();
+  const { isFinePointer } = useResponsiveBreakpoint();
+  return (
+    <div className="px-3 pt-2" data-testid="session-status-unavailable">
+      <Alert>
+        <IconInfoCircle />
+        <AlertTitle>{t("task:sessionStatusUnavailable")}</AlertTitle>
+        <AlertDescription className="col-start-2 w-full min-w-0">
+          <span>{t("task:sessionStatusUnavailableDetail")}</span>
+          <SessionErrorDetails testId="session-status-details" label={t("task:details")}>
+            {failure.statusError}
+          </SessionErrorDetails>
+          <Button
+            variant="outline"
+            size="sm"
+            className={cn("mt-2 cursor-pointer px-2 text-xs", !isFinePointer && "min-h-11")}
+            onClick={onRetry}
+            disabled={retryDisabled}
+            data-testid="session-status-retry"
+          >
+            <IconRefresh className="size-3" aria-hidden="true" />
+            {t("task:retry")}
+          </Button>
+        </AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+function EnsureFailureDetails({
+  failure,
+  error,
+  profileMissing,
+}: {
+  failure: SessionRecoveryFailure | null;
+  error: Error | null;
+  profileMissing: boolean;
+}) {
+  if (failure) return <RecoveryFailureDetails failure={failure} />;
+  if (profileMissing || !error) return null;
+  return <SessionErrorDetails>{error.message}</SessionErrorDetails>;
+}
+
+/** Slim banner for the task page, rendered above the layout. */
+export function EnsureSessionErrorBanner({
+  error,
+  onRetry,
+  workspaceId,
+  action,
+  secondaryAction,
+  retryDisabled,
+  recoveryFailure,
+  testId = "ensure-session-error-banner",
+  compact = false,
+}: BannerProps) {
+  const { t } = useTranslation();
+  const info = describeEnsureError(error, workspaceId);
+  if (!info) return null;
+  const failedRecovery = recoveryFailure?.outcome === "recovery_failed" ? recoveryFailure : null;
+  const choices: RecoveryChoice[] = [
+    {
+      kind: "resume",
+      label: t("task:retry"),
+      onClick: onRetry,
+      testId: "ensure-session-error-retry",
+    },
+  ];
+  if (action) choices.push({ ...action, kind: action.kind ?? "restore" });
+  if (secondaryAction)
+    choices.push({ ...secondaryAction, kind: secondaryAction.kind ?? "fresh_start" });
+  return (
+    <div className={cn(!compact && "px-3 pt-2")} data-testid={testId}>
+      <Alert variant="destructive">
+        <IconAlertTriangle />
+        <AlertTitle>{failedRecovery ? t("task:sessionRecoveryFailed") : info.title}</AlertTitle>
+        <AlertDescription className="col-start-2 w-full min-w-0">
+          <span>{failedRecovery ? t("task:sessionRecoveryFailedDetail") : info.detail}</span>
+          <EnsureFailureDetails
+            failure={failedRecovery}
+            error={error}
+            profileMissing={info.isAgentProfileMissing}
+          />
+          <span className="mt-1 flex flex-wrap items-center gap-2">
+            {info.action ? (
+              <Link
+                href={info.action.href}
+                className="cursor-pointer underline underline-offset-2 hover:text-foreground"
+                data-testid="ensure-session-error-action"
+              >
+                {info.action.label}
+              </Link>
+            ) : null}
+          </span>
+          {!info.isAgentProfileMissing && (
+            <RecoveryActions actions={choices} busy={retryDisabled} />
+          )}
+        </AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+/** Non-blocking result notice used when the workspace remains available read-only. */
+export function SessionRecoveryNotice({
+  message,
+  recoveryFailure,
+}: {
+  message: string;
+  recoveryFailure?: Extract<SessionRecoveryFailure, { outcome: "workspace_read_only" }> | null;
+}) {
+  return (
+    <div className="px-3 pt-2" data-testid="session-recovery-notice">
+      <Alert>
+        <IconInfoCircle />
+        <AlertDescription className="col-start-2 w-full min-w-0">
+          <span>{message}</span>
+          {recoveryFailure ? <RecoveryFailureDetails failure={recoveryFailure} /> : null}
+        </AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+/** Shared inline rendering for automatic resume failures and read-only notices. */
+export function SessionRecoveryFeedback({
+  ownedByChat = false,
+  error,
+  notice,
+  onRetry,
+  workspaceId,
+  action,
+  secondaryAction,
+  retryDisabled,
+  recoveryFailure,
+  testId = "session-recovery-error",
+}: {
+  ownedByChat?: boolean;
+  error: string | null;
+  notice: string | null;
+  onRetry: () => void;
+  workspaceId?: string | null;
+  action?: RecoveryAction;
+  secondaryAction?: RecoveryAction;
+  retryDisabled?: boolean;
+  recoveryFailure?: SessionRecoveryFailure | null;
+  testId?: string;
+}) {
+  const readOnlyRecovery =
+    recoveryFailure?.outcome === "workspace_read_only" ? recoveryFailure : null;
+  const statusFailure = recoveryFailure?.outcome === "status_unavailable" ? recoveryFailure : null;
+  if (ownedByChat && !statusFailure) return null;
+  return (
+    <div id={sessionRecoveryOwnerId(recoveryFailure)} tabIndex={-1}>
+      {statusFailure ? (
+        <SessionStatusUnavailableNotice
+          failure={statusFailure}
+          onRetry={onRetry}
+          retryDisabled={retryDisabled}
+        />
+      ) : null}
+      <EnsureSessionErrorBanner
+        error={error ? new Error(error) : null}
+        onRetry={onRetry}
+        workspaceId={workspaceId}
+        action={action}
+        secondaryAction={secondaryAction}
+        retryDisabled={retryDisabled}
+        recoveryFailure={recoveryFailure}
+        testId={testId}
+      />
+      {notice ? (
+        <SessionRecoveryNotice message={notice} recoveryFailure={readOnlyRecovery} />
+      ) : null}
+    </div>
+  );
+}
+
+/** Full-panel centered state for the kanban preview's empty-sessions slot. */
+export function EnsureSessionErrorEmptyState({
+  error,
+  onRetry,
+  workspaceId,
+  retryDisabled,
+}: BannerProps) {
+  const { t } = useTranslation();
+  const info = describeEnsureError(error, workspaceId);
+  if (!info) return null;
+  return (
+    <div
+      className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm"
+      data-testid="preview-ensure-error"
+    >
+      <span className="font-medium text-foreground">{info.title}</span>
+      <span className="max-w-xs text-muted-foreground">{info.detail}</span>
+      {!info.isAgentProfileMissing && error && (
+        <SessionErrorDetails>{error.message}</SessionErrorDetails>
+      )}
+      <span className="flex flex-wrap items-center justify-center gap-2">
+        {info.action ? (
+          <Link
+            href={info.action.href}
+            className="cursor-pointer underline underline-offset-2 hover:text-foreground"
+            data-testid="ensure-session-error-action"
+          >
+            {info.action.label}
+          </Link>
+        ) : null}
+        <Button
+          variant="outline"
+          size="sm"
+          className="cursor-pointer"
+          onClick={onRetry}
+          disabled={retryDisabled}
+          data-testid="ensure-session-error-retry"
+        >
+          {t("task:retry")}
+        </Button>
+      </span>
+    </div>
+  );
+}

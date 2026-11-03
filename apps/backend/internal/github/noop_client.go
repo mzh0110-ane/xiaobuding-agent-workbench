@@ -1,0 +1,174 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// ErrNoClient is returned by NoopClient methods that cannot provide meaningful data.
+var ErrNoClient = errors.New("github client not configured")
+
+// NoopClient is a GitHub client that returns empty results for all operations.
+// Used when GitHub integration is not configured or not needed.
+type NoopClient struct{}
+
+func (c *NoopClient) IsAuthenticated(context.Context) (bool, error) {
+	return false, nil
+}
+
+func (c *NoopClient) GetAuthenticatedUser(context.Context) (string, error) {
+	return "", nil
+}
+
+func (c *NoopClient) GetPR(context.Context, string, string, int) (*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetIssue(context.Context, string, string, int) (*Issue, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) FindPRByBranch(context.Context, string, string, string) (*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) FindPRByHead(context.Context, string, string, string, string, string) (*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListAuthoredPRs(context.Context, string, string) ([]*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListReviewRequestedPRs(context.Context, string, string, string) ([]*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListUserOrgs(context.Context) ([]GitHubOrg, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) SearchOrgRepos(context.Context, string, string, int) ([]GitHubRepo, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListUserRepos(context.Context, string, int) ([]GitHubRepo, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListAccessibleRepos(context.Context, string, int) ([]GitHubRepo, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) HasRepositoryAccess(context.Context, string, string) (bool, error) {
+	return false, ErrNoClient
+}
+
+func (c *NoopClient) GetRepository(context.Context, string, string) (*GitHubRepository, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListRepositoryForks(context.Context, string, string) ([]*GitHubRepository, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) CreateFork(context.Context, string, string) (*GitHubRepository, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListPRReviews(context.Context, string, string, int) ([]PRReview, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListPRComments(context.Context, string, string, int, *time.Time) ([]PRComment, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListCheckRuns(context.Context, string, string, string) ([]CheckRun, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListWorkflowRuns(context.Context, string, string, string) ([]WorkflowRun, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListWorkflowRunJobs(context.Context, string, string, int64, int) ([]WorkflowJob, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetPRFeedback(context.Context, string, string, int) (*PRFeedback, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetPRStatus(context.Context, string, string, int) (*PRStatus, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListPRFiles(context.Context, string, string, int) ([]PRFile, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListPRCommits(context.Context, string, string, int) ([]PRCommitInfo, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetPRCommitDetail(context.Context, string, string, string) (PRCommitDetail, error) {
+	return PRCommitDetail{}, ErrNoClient
+}
+
+func (c *NoopClient) ListRepoBranches(context.Context, string, string) ([]RepoBranch, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetRepoMergeMethods(context.Context, string, string) (RepoMergeMethods, error) {
+	return RepoMergeMethods{}, ErrNoClient
+}
+
+func (c *NoopClient) SubmitReview(context.Context, string, string, int, string, string) error {
+	return ErrNoClient
+}
+
+func (c *NoopClient) RequestReviewers(context.Context, string, string, int, []string) error {
+	return ErrNoClient
+}
+
+func (c *NoopClient) MergePR(context.Context, string, string, int, MergePRRequest) (MergeOutcome, error) {
+	return "", ErrNoClient
+}
+
+func (c *NoopClient) ListIssues(context.Context, string, string) ([]*Issue, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) ListIssuesPaged(context.Context, string, string, int, int) (*IssueSearchPage, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) SearchPRs(context.Context, string, string) ([]*PR, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) SearchPRsPaged(context.Context, string, string, int, int) (*PRSearchPage, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetIssueState(context.Context, string, string, int) (string, error) {
+	return "", ErrNoClient
+}
+
+func (c *NoopClient) CreateGist(context.Context, CreateGistInput) (*GistResponse, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) DeleteGist(context.Context, string) error {
+	return ErrNoClient
+}
+
+func (c *NoopClient) ListRepoDirectory(context.Context, string, string, string, string) ([]RepoContentEntry, error) {
+	return nil, ErrNoClient
+}
+
+func (c *NoopClient) GetRepoFileContent(context.Context, string, string, string, string) ([]byte, error) {
+	return nil, ErrNoClient
+}

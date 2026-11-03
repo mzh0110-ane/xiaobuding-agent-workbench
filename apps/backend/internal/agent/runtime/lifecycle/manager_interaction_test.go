@@ -1,0 +1,2292 @@
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/executor"
+	"github.com/kandev/kandev/internal/agent/mcpconfig"
+	"github.com/kandev/kandev/internal/agent/runtime/activity"
+	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/agentctl/server/process"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/task/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+type restartProfileResolver struct {
+	profile *AgentProfileInfo
+	err     error
+}
+
+func (r *restartProfileResolver) ResolveProfile(_ context.Context, _ string) (*AgentProfileInfo, error) {
+	return r.profile, r.err
+}
+
+type restartMockAgentctlServer struct {
+	server *httptest.Server
+
+	mu                 sync.Mutex
+	httpActions        []string
+	repairPackageSpecs []string
+	updateStreamCount  int
+	updateStreams      []*websocket.Conn
+	wsActions          []string
+	setModelIDs        []string
+	setModeIDs         []string
+	setOptions         []restartConfigOption
+
+	failStop                     bool
+	onStop                       func(context.Context)
+	failSessionNew               bool
+	initializeError              string
+	sessionNewError              string
+	configureError               string
+	startError                   string
+	failSessionReset             bool
+	failCacheRepair              bool
+	failMode                     bool
+	modeResult                   *agentctl.ModeResult
+	failModel                    bool
+	failConfigOptionID           string
+	stderrLines                  []string
+	stderrConfigured             bool
+	modelState                   *streams.SessionModelState
+	newModelState                *streams.SessionModelState
+	suppressSessionResetResponse bool
+	resetResponseDelay           time.Duration
+	updateStreamClosed           chan struct{}
+	resetLateEvent               *agentctl.AgentEvent
+	resetLateEventSent           chan struct{}
+	newLateEvent                 *agentctl.AgentEvent
+	newLateEventDelay            time.Duration
+	newLateEventSent             chan struct{}
+	newLateEventOnce             sync.Once
+	processGeneration            uint64
+	promptCalls                  int
+	onReset                      func()
+	onSessionNew                 func()
+	onCacheRepair                func()
+}
+
+type restartConfigOption struct {
+	ID    string `json:"config_id"`
+	Value string `json:"value"`
+}
+
+func restartDefaultModelState() *streams.SessionModelState {
+	return &streams.SessionModelState{
+		CurrentModelID: "claude-sonnet-4-20250514",
+		Models:         []streams.SessionModelInfo{{ModelID: "claude-sonnet-4-20250514"}},
+	}
+}
+
+func TestStopAgentWithReason_MissingExecutionIsClassified(t *testing.T) {
+	mgr := &Manager{executionStore: NewExecutionStore(), logger: newTestLogger().WithFields()}
+
+	err := mgr.StopAgentWithReason(context.Background(), "missing", "cleanup", true)
+
+	require.ErrorIs(t, err, ErrExecutionNotFound)
+}
+
+func TestStopAgentWithReasonReleasesAgentctlBeforeStoppedEventSnapshot(t *testing.T) {
+	mgr := newTestManager(t)
+	execution := &AgentExecution{
+		ID:        "exec-stop-lock-order",
+		SessionID: "session-stop-lock-order",
+		agentctl:  agentctl.NewClient("127.0.0.1", 12345, newTestLogger()),
+	}
+	require.NoError(t, mgr.executionStore.Add(execution))
+
+	// Hold the prompt lock so stop reaches the stopped-event snapshot and waits.
+	// It must release and detach agentctl first; prompt operations may need an
+	// agentctl read lease while this event snapshot is pending.
+	stopDone := make(chan error, 1)
+	execution.promptLifecycleMu.Lock()
+	promptLocked := true
+	stopJoined := false
+	defer func() {
+		if promptLocked {
+			execution.promptLifecycleMu.Unlock()
+		}
+		if !stopJoined {
+			select {
+			case <-stopDone:
+			case <-time.After(time.Second):
+			}
+		}
+	}()
+	go func() {
+		stopDone <- mgr.StopAgentWithReason(
+			context.Background(), execution.ID, StopReasonTaskDeleted, true,
+		)
+	}()
+
+	require.Eventually(t, func() bool {
+		_, exists := mgr.executionStore.Get(execution.ID)
+		return !exists
+	}, time.Second, time.Millisecond)
+
+	agentctlUnlocked := execution.agentctlLifecycleMu.TryRLock()
+	var currentClient *agentctl.Client
+	if agentctlUnlocked {
+		currentClient = execution.currentAgentCtlClient()
+		execution.agentctlLifecycleMu.RUnlock()
+	}
+	execution.promptLifecycleMu.Unlock()
+	promptLocked = false
+
+	stopErr := <-stopDone
+	stopJoined = true
+	require.NoError(t, stopErr)
+	require.True(t, agentctlUnlocked, "agentctl lifecycle lock remained held while publishing the stopped event")
+	require.Nil(t, currentClient, "terminal stop must detach the closed agentctl client")
+}
+
+func TestWaitForFreshSessionModelStateWaitsForAdvertisedCatalog(t *testing.T) {
+	execution := &AgentExecution{ID: "exec-model-catalog"}
+	execution.SetModelState(&CachedModelState{CurrentModelID: "mock-fast"})
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		execution.SetModelState(&CachedModelState{
+			CurrentModelID: "mock-fast",
+			Models:         []streams.SessionModelInfo{{ModelID: "mock-fast"}},
+		})
+	}()
+
+	require.True(t, waitForFreshSessionModelState(context.Background(), newTestLogger(), execution))
+}
+
+func TestFreshSessionModelCatalogReadyAcceptsConfigOptionsWithoutModels(t *testing.T) {
+	require.True(t, freshSessionModelCatalogReady(&CachedModelState{
+		ConfigOptions: []streams.ConfigOption{{ID: "effort", CurrentValue: "max"}},
+	}))
+	require.True(t, freshSessionModelCatalogReady(&CachedModelState{
+		ConfigOptionsSettled: true,
+	}))
+}
+
+func newRestartMockAgentctlServer(t *testing.T, failStop, failSessionNew bool) *restartMockAgentctlServer {
+	t.Helper()
+
+	m := &restartMockAgentctlServer{
+		failStop:           failStop,
+		failSessionNew:     failSessionNew,
+		updateStreamClosed: make(chan struct{}, 32),
+	}
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(_ *http.Request) bool { return true },
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/v1/stop", func(w http.ResponseWriter, r *http.Request) {
+		m.recordHTTP("stop")
+		if m.onStop != nil {
+			m.onStop(r.Context())
+		}
+		if m.failStop {
+			_, _ = w.Write([]byte(`{"success":false,"error":"stop failed"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	})
+	mux.HandleFunc("/api/v1/agent/managed-runtime/cache-repair", func(w http.ResponseWriter, r *http.Request) {
+		m.recordHTTP("cache-repair")
+		var request agentctl.RepairManagedRuntimeCacheRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err == nil {
+			m.mu.Lock()
+			m.repairPackageSpecs = append(m.repairPackageSpecs, request.PackageSpec)
+			m.mu.Unlock()
+		}
+		if m.onCacheRepair != nil {
+			m.onCacheRepair()
+		}
+		if m.failCacheRepair {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	})
+	mux.HandleFunc("/api/v1/agent/configure", func(w http.ResponseWriter, _ *http.Request) {
+		m.recordHTTP("configure")
+		m.mu.Lock()
+		configureError := m.configureError
+		m.mu.Unlock()
+		if configureError != "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": configureError})
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	})
+	mux.HandleFunc("/api/v1/start", func(w http.ResponseWriter, _ *http.Request) {
+		m.mu.Lock()
+		m.httpActions = append(m.httpActions, "start")
+		m.processGeneration++
+		generation := m.processGeneration
+		startError := m.startError
+		m.mu.Unlock()
+		if startError != "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": startError})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":            true,
+			"command":            "auggie --model test",
+			"process_generation": generation,
+		})
+	})
+	mux.HandleFunc("/api/v1/agent/stream", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		m.mu.Lock()
+		m.updateStreamCount++
+		m.updateStreams = append(m.updateStreams, conn)
+		m.mu.Unlock()
+		defer func() {
+			_ = conn.Close()
+			m.updateStreamClosed <- struct{}{}
+		}()
+
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+
+			var msg ws.Message
+			if err := json.Unmarshal(message, &msg); err != nil {
+				continue
+			}
+			if msg.Type != ws.MessageTypeRequest {
+				continue
+			}
+
+			m.recordWS(msg)
+
+			var resp *ws.Message
+			switch msg.Action {
+			case "agent.initialize":
+				m.mu.Lock()
+				initializeError := m.initializeError
+				m.mu.Unlock()
+				if initializeError != "" {
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+						"success": false,
+						"error":   initializeError,
+					})
+					break
+				}
+				resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+					"success": true,
+					"agent_info": map[string]string{
+						"name":    "test-agent",
+						"version": "1.0.0",
+					},
+				})
+			case "agent.session.new":
+				if m.onSessionNew != nil {
+					m.onSessionNew()
+				}
+				m.mu.Lock()
+				failSessionNew := m.failSessionNew
+				sessionNewError := m.sessionNewError
+				m.mu.Unlock()
+				if failSessionNew || sessionNewError != "" {
+					message := sessionNewError
+					if message == "" {
+						message = "session new failed"
+					}
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+						"success": false,
+						"error":   message,
+					})
+				} else {
+					payload := map[string]interface{}{
+						"success":    true,
+						"session_id": "new-session-123",
+					}
+					if m.newModelState != nil {
+						payload["model_state"] = m.newModelState
+					}
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, payload)
+				}
+			case "agent.session.reset":
+				if m.onReset != nil {
+					m.onReset()
+				}
+				if m.suppressSessionResetResponse {
+					continue
+				}
+				if m.resetResponseDelay > 0 {
+					time.Sleep(m.resetResponseDelay)
+				}
+				if m.resetLateEvent != nil {
+					eventData, _ := json.Marshal(m.resetLateEvent)
+					if err := conn.WriteMessage(websocket.TextMessage, eventData); err != nil {
+						return
+					}
+					if m.resetLateEventSent != nil {
+						close(m.resetLateEventSent)
+					}
+				}
+				if m.failSessionReset {
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+						"success": false,
+						"error":   "session reset failed",
+					})
+					break
+				}
+				payload := map[string]interface{}{
+					"success":    true,
+					"session_id": "reset-session-456",
+				}
+				if m.modelState != nil {
+					payload["model_state"] = m.modelState
+				}
+				resp, _ = ws.NewResponse(msg.ID, msg.Action, payload)
+			case "agent.session.set_mode":
+				if m.failMode {
+					resp, _ = ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "mode rejected", nil)
+				} else {
+					var request struct {
+						ModeID string `json:"mode_id"`
+					}
+					_ = json.Unmarshal(msg.Payload, &request)
+					result := agentctl.ModeResult{Requested: request.ModeID, Effective: request.ModeID, Confirmed: request.ModeID != ""}
+					if m.modeResult != nil {
+						result = *m.modeResult
+					}
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, result)
+				}
+			case "agent.session.set_model":
+				if m.failModel {
+					resp, _ = ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "model rejected", nil)
+				} else {
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+						"success": true,
+					})
+				}
+			case "agent.session.set_config_option":
+				var payload struct {
+					ConfigID string `json:"config_id"`
+					Value    string `json:"value"`
+				}
+				_ = json.Unmarshal(msg.Payload, &payload)
+				if payload.ConfigID == m.failConfigOptionID {
+					resp, _ = ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "config option rejected", nil)
+				} else {
+					resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+						"success": true,
+					})
+				}
+			case "agent.prompt":
+				m.mu.Lock()
+				m.promptCalls++
+				m.mu.Unlock()
+				resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+					"success": true,
+				})
+			case "agent.stderr":
+				m.mu.Lock()
+				stderrLines := append([]string(nil), m.stderrLines...)
+				stderrConfigured := m.stderrConfigured
+				m.mu.Unlock()
+				if !stderrConfigured && len(stderrLines) == 0 {
+					stderrLines = []string{
+						"npm error code ETARGET",
+						"npm error notarget No matching version found for opencode-ai@1.2.3",
+					}
+				}
+				resp, _ = ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
+					"lines": stderrLines,
+				})
+			default:
+				resp, _ = ws.NewError(msg.ID, msg.Action, ws.ErrorCodeUnknownAction, "unknown action", nil)
+			}
+
+			data, _ := json.Marshal(resp)
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+			if msg.Action == "agent.session.new" && m.newLateEvent != nil {
+				if m.newLateEventDelay > 0 {
+					time.Sleep(m.newLateEventDelay)
+				}
+				eventData, _ := json.Marshal(m.newLateEvent)
+				if err := conn.WriteMessage(websocket.TextMessage, eventData); err != nil {
+					return
+				}
+				if m.newLateEventSent != nil {
+					m.newLateEventOnce.Do(func() { close(m.newLateEventSent) })
+				}
+			}
+		}
+	})
+	mux.HandleFunc("/api/v1/workspace/stream", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		connected := map[string]string{"type": "connected"}
+		data, _ := json.Marshal(connected)
+		_ = conn.WriteMessage(websocket.TextMessage, data)
+
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+
+	m.server = httptest.NewServer(mux)
+	t.Cleanup(m.server.Close)
+	return m
+}
+
+func (m *restartMockAgentctlServer) recordHTTP(action string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.httpActions = append(m.httpActions, action)
+}
+
+func (m *restartMockAgentctlServer) recordWS(message ws.Message) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.wsActions = append(m.wsActions, message.Action)
+	switch message.Action {
+	case "agent.session.set_model":
+		var payload struct {
+			ModelID string `json:"model_id"`
+		}
+		if err := json.Unmarshal(message.Payload, &payload); err == nil {
+			m.setModelIDs = append(m.setModelIDs, payload.ModelID)
+		}
+	case "agent.session.set_mode":
+		var payload struct {
+			ModeID string `json:"mode_id"`
+		}
+		if err := json.Unmarshal(message.Payload, &payload); err == nil {
+			m.setModeIDs = append(m.setModeIDs, payload.ModeID)
+		}
+	case "agent.session.set_config_option":
+		var payload restartConfigOption
+		if err := json.Unmarshal(message.Payload, &payload); err == nil {
+			m.setOptions = append(m.setOptions, payload)
+		}
+	}
+}
+
+func (m *restartMockAgentctlServer) getHTTPActions() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.httpActions))
+	copy(out, m.httpActions)
+	return out
+}
+
+func (m *restartMockAgentctlServer) getUpdateStreamCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updateStreamCount
+}
+
+func (m *restartMockAgentctlServer) closeUpdateStreams() {
+	m.mu.Lock()
+	connections := append([]*websocket.Conn(nil), m.updateStreams...)
+	m.mu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+}
+
+func (m *restartMockAgentctlServer) getManagedRuntimeRepairSpecs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.repairPackageSpecs))
+	copy(out, m.repairPackageSpecs)
+	return out
+}
+
+func (m *restartMockAgentctlServer) getWSActions() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.wsActions))
+	copy(out, m.wsActions)
+	return out
+}
+
+func (m *restartMockAgentctlServer) getPromptCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.promptCalls
+}
+
+func (m *restartMockAgentctlServer) getSetModelIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.setModelIDs))
+	copy(out, m.setModelIDs)
+	return out
+}
+
+func (m *restartMockAgentctlServer) getSetModeIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.setModeIDs))
+	copy(out, m.setModeIDs)
+	return out
+}
+
+func (m *restartMockAgentctlServer) getSetOptions() []restartConfigOption {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]restartConfigOption, len(m.setOptions))
+	copy(out, m.setOptions)
+	return out
+}
+
+func TestManager_RestartAgentProcess_Success(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.newModelState = restartDefaultModelState()
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	exec := &AgentExecution{
+		ID:              "exec-1",
+		TaskID:          "task-1",
+		SessionID:       "session-1",
+		AgentProfileID:  "profile-1",
+		ResumeAttemptID: "resume-restart",
+		ACPSessionID:    "old-session",
+		AgentCommand:    "auggie --model test",
+		Status:          v1.AgentStatusRunning,
+		WorkspacePath:   "/workspace",
+		metadata: map[string]interface{}{
+			"task_description": "review the changes",
+		},
+		agentctl:     client,
+		promptDoneCh: make(chan PromptCompletionSignal, 1),
+	}
+	initialStartupGeneration := exec.beginStartupAttemptWithID("resume-restart")
+	exec.messageBuffer.WriteString("old-response")
+	exec.thinkingBuffer.WriteString("old-thinking")
+	exec.currentMessageID = "msg-1"
+	exec.currentThinkingID = "th-1"
+	exec.protocolMessageIDs = map[string]string{"source-message": "msg-1"}
+	exec.protocolThinkingIDs = map[string]string{"source-thought": "th-1"}
+	exec.assistantHistoryBuffer.WriteString("old response")
+	exec.needsResumeContext = true
+	exec.resumeContextInjected = true
+	exec.dispatchedPromptPending.Store(true)
+	exec.promptDoneCh <- PromptCompletionSignal{StopReason: "stale"}
+
+	mgr.executionStore.Add(exec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := mgr.RestartAgentProcess(ctx, exec.ID); err != nil {
+		t.Fatalf("RestartAgentProcess failed: %v", err)
+	}
+
+	if exec.ACPSessionID != "new-session-123" {
+		t.Fatalf("expected new ACP session ID, got %q", exec.ACPSessionID)
+	}
+	if exec.currentStartupAttemptID() != "resume-restart" {
+		t.Fatalf("restart changed recovery attempt ID to %q", exec.currentStartupAttemptID())
+	}
+	if got := exec.startupAttemptSnapshot(); got <= initialStartupGeneration {
+		t.Fatalf("restart startup source generation = %d, want > %d", got, initialStartupGeneration)
+	}
+	if exec.Status != v1.AgentStatusReady {
+		t.Fatalf("expected status %q, got %q", v1.AgentStatusReady, exec.Status)
+	}
+	if exec.messageBuffer.Len() != 0 || exec.thinkingBuffer.Len() != 0 {
+		t.Fatalf("expected message buffers to be reset")
+	}
+	if exec.currentMessageID != "" || exec.currentThinkingID != "" {
+		t.Fatalf("expected streaming message IDs to be reset")
+	}
+	if exec.protocolMessageIDs != nil || exec.protocolThinkingIDs != nil {
+		t.Fatalf("expected protocol message correlation to be reset")
+	}
+	if exec.assistantHistoryBuffer.Len() != 0 {
+		t.Fatalf("expected assistant history accumulator to be reset")
+	}
+	if exec.needsResumeContext || exec.resumeContextInjected {
+		t.Fatalf("expected resume context flags to be reset")
+	}
+	select {
+	case <-exec.promptDoneCh:
+		t.Fatalf("expected stale prompt signal to be drained")
+	default:
+	}
+	if exec.dispatchedPromptPending.Load() {
+		t.Fatal("expected stale dispatch gate to be cleared")
+	}
+
+	httpActions := mock.getHTTPActions()
+	if !slices.Equal(httpActions, []string{"stop", "configure", "start"}) {
+		t.Fatalf("unexpected HTTP action order: %v", httpActions)
+	}
+
+	wsActions := mock.getWSActions()
+	if !slices.Equal(wsActions, []string{"agent.initialize", "agent.session.new", "agent.session.set_model"}) {
+		t.Fatalf("unexpected WS action order: %v", wsActions)
+	}
+
+	mockBus, ok := mgr.eventBus.(*MockEventBus)
+	if !ok {
+		t.Fatal("expected mock event bus")
+	}
+	eventTypes := make([]string, 0, len(mockBus.PublishedEvents))
+	for _, ev := range mockBus.PublishedEvents {
+		eventTypes = append(eventTypes, ev.Type)
+	}
+	// Restart is a boot scenario — initializeACPSessionForRestart publishes
+	// AgentBootReady (not AgentReady) so the orchestrator routes it to
+	// handleAgentBootReady rather than evaluating on_turn_complete.
+	if !slices.Contains(eventTypes, events.AgentBootReady) {
+		t.Fatalf("expected %q event, got %v", events.AgentBootReady, eventTypes)
+	}
+	if !slices.Contains(eventTypes, events.AgentACPSessionCreated) {
+		t.Fatalf("expected %q event, got %v", events.AgentACPSessionCreated, eventTypes)
+	}
+	if !slices.Contains(eventTypes, events.AgentContextReset) {
+		t.Fatalf("expected %q event, got %v", events.AgentContextReset, eventTypes)
+	}
+}
+
+func TestManager_RestartAgentProcessAppliesCursorAuthPreference(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := t.TempDir()
+	cursorHome := filepath.Join(home, ".cursor")
+	projects := filepath.Join(cursorHome, "projects")
+	if err := os.MkdirAll(filepath.Join(projects, "source-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projects, "source-project", "mcp-auth.json"), []byte(`{"figma":{"token":"opaque"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mcpconfig.LinkCursorMCPAuth(workspace, cursorHome); err != nil {
+		t.Fatalf("create existing bridge link: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	mgr.profileResolver = &restartProfileResolver{profile: &AgentProfileInfo{
+		ProfileID:            "cursor-profile",
+		AgentName:            "cursor-acp",
+		CursorMCPAuthEnabled: false,
+	}}
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.newModelState = restartDefaultModelState()
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	execution := &AgentExecution{
+		ID:             "exec-cursor-restart",
+		TaskID:         "task-1",
+		SessionID:      "session-cursor-restart",
+		AgentProfileID: "cursor-profile",
+		ExecutorType:   "local",
+		ACPSessionID:   "old-session",
+		AgentCommand:   "cursor-acp",
+		Status:         v1.AgentStatusRunning,
+		WorkspacePath:  workspace,
+		agentctl:       client,
+		promptDoneCh:   make(chan PromptCompletionSignal, 1),
+	}
+	require.NoError(t, mgr.executionStore.Add(execution))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, mgr.RestartAgentProcess(ctx, execution.ID))
+
+	destination := cursorMCPAuthDestinationForTest(t, projects, workspace)
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("disabled preference was not applied before process restart, lstat err=%v", err)
+	}
+}
+
+func TestManager_PromptOnRunningCursorSessionKeepsLoadedAuthLink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workspace := t.TempDir()
+	cursorHome := filepath.Join(home, ".cursor")
+	projects := filepath.Join(cursorHome, "projects")
+	if err := os.MkdirAll(filepath.Join(projects, "source-project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projects, "source-project", "mcp-auth.json"), []byte(`{"figma":{"token":"opaque"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mcpconfig.LinkCursorMCPAuth(workspace, cursorHome); err != nil {
+		t.Fatalf("create existing bridge link: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	mgr.profileResolver = &restartProfileResolver{profile: &AgentProfileInfo{
+		ProfileID:            "cursor-profile",
+		AgentName:            "cursor-acp",
+		CursorMCPAuthEnabled: false,
+	}}
+	mock := newRestartMockAgentctlServer(t, false, false)
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	execution := &AgentExecution{
+		ID:                 "exec-cursor-existing",
+		TaskID:             "task-1",
+		SessionID:          "session-cursor-existing",
+		AgentProfileID:     "cursor-profile",
+		ExecutorType:       "local",
+		ACPSessionID:       "existing-session",
+		AgentCommand:       "cursor-acp",
+		AgentID:            "cursor-acp",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      workspace,
+		sessionInitialized: true,
+		agentctl:           client,
+		promptDoneCh:       make(chan PromptCompletionSignal, 1),
+	}
+	require.NoError(t, mgr.executionStore.Add(execution))
+
+	if _, err := mgr.PromptAgent(ctx, execution.ID, "continue current session", nil, true); err != nil {
+		t.Fatalf("PromptAgent: %v", err)
+	}
+	destination := cursorMCPAuthDestinationForTest(t, projects, workspace)
+	if _, err := os.Readlink(destination); err != nil {
+		t.Fatalf("running session auth link was changed by a prompt: %v", err)
+	}
+	if !slices.Contains(mock.getWSActions(), "agent.prompt") {
+		t.Fatalf("follow-up prompt did not reach running Cursor session: %v", mock.getWSActions())
+	}
+}
+
+func TestManager_RestartAgentProcess_InvalidReplacementLeavesCurrentProcessUntouched(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolver ProfileResolver
+	}{
+		{
+			name:     "unresolvable profile",
+			resolver: &restartProfileResolver{err: errors.New("profile unavailable")},
+		},
+		{
+			name: "malformed persisted command prefix",
+			resolver: &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID:     "profile-1",
+				AgentName:     "auggie",
+				CommandPrefix: `greywall "unterminated`,
+			}},
+		},
+		{
+			name: "persisted prefix has an empty quoted executable",
+			resolver: &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID:     "profile-1",
+				AgentName:     "auggie",
+				CommandPrefix: `'' --arg`,
+			}},
+		},
+		{
+			name: "persisted prefix has a whitespace executable",
+			resolver: &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID:     "profile-1",
+				AgentName:     "auggie",
+				CommandPrefix: `"   " --arg`,
+			}},
+		},
+		{
+			name: "persisted prefix starts with a flag",
+			resolver: &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID:     "profile-1",
+				AgentName:     "auggie",
+				CommandPrefix: `--not-a-launcher`,
+			}},
+		},
+		{
+			name: "persisted prefix starts with a space-prefixed flag",
+			resolver: &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID:     "profile-1",
+				AgentName:     "auggie",
+				CommandPrefix: `"  --not-a-launcher"`,
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := newTestManager(t)
+			mgr.profileResolver = tt.resolver
+			mock := newRestartMockAgentctlServer(t, false, false)
+			client := createTestClient(t, mock.server.URL)
+			t.Cleanup(client.Close)
+
+			execution := &AgentExecution{
+				ID:              "exec-invalid-restart",
+				TaskID:          "task-1",
+				SessionID:       "session-1",
+				AgentProfileID:  "profile-1",
+				ACPSessionID:    "old-acp-session",
+				AgentCommand:    "auggie --resume old-acp-session",
+				ContinueCommand: "auggie continue old-acp-session",
+				AgentArgs:       []string{"auggie", "--resume", "old-acp-session"},
+				ContinueArgs:    []string{"auggie", "continue", "old-acp-session"},
+				Status:          v1.AgentStatusRunning,
+				ErrorMessage:    "existing error",
+				agentctl:        client,
+				promptDoneCh:    make(chan PromptCompletionSignal, 1),
+			}
+			require.NoError(t, mgr.executionStore.Add(execution))
+
+			err := mgr.RestartAgentProcess(context.Background(), execution.ID)
+			require.Error(t, err)
+			require.Empty(t, mock.getHTTPActions(), "invalid replacement must not stop, configure, or start the current process")
+
+			current, found := mgr.executionStore.Get(execution.ID)
+			require.True(t, found)
+			require.Equal(t, v1.AgentStatusRunning, current.Status)
+			require.Equal(t, "old-acp-session", current.ACPSessionID)
+			require.Equal(t, "auggie --resume old-acp-session", current.AgentCommand)
+			require.Equal(t, []string{"auggie", "--resume", "old-acp-session"}, current.AgentArgs)
+			require.Equal(t, "existing error", current.ErrorMessage)
+		})
+	}
+}
+
+func TestManager_RestartAgentProcess_InvalidBuiltReplacementLeavesCurrentProcessUntouched(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent *invalidCommandTestAgent
+	}{
+		{
+			name:  "initial executable is a flag",
+			agent: &invalidCommandTestAgent{command: agents.NewCommand("--not-an-executable")},
+		},
+		{
+			name: "continue executable is whitespace",
+			agent: &invalidCommandTestAgent{
+				command: agents.NewCommand("agent"),
+				testAgent: testAgent{runtimeConfig: &agents.RuntimeConfig{SessionConfig: agents.SessionConfig{
+					ContinueSessionCmd: agents.NewCommand("   "),
+				}}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := newTestManager(t)
+			tt.agent.id = "invalid-restart"
+			require.NoError(t, mgr.registry.Register(tt.agent))
+			mgr.profileResolver = &restartProfileResolver{profile: &AgentProfileInfo{
+				ProfileID: "profile-1",
+				AgentName: tt.agent.ID(),
+			}}
+			mock := newRestartMockAgentctlServer(t, false, false)
+			client := createTestClient(t, mock.server.URL)
+			t.Cleanup(client.Close)
+
+			execution := &AgentExecution{
+				ID:             "exec-invalid-built-restart",
+				TaskID:         "task-1",
+				SessionID:      "session-1",
+				AgentProfileID: "profile-1",
+				ACPSessionID:   "old-acp-session",
+				AgentCommand:   "agent --resume old-acp-session",
+				AgentArgs:      []string{"agent", "--resume", "old-acp-session"},
+				Status:         v1.AgentStatusRunning,
+				ErrorMessage:   "existing error",
+				agentctl:       client,
+				promptDoneCh:   make(chan PromptCompletionSignal, 1),
+			}
+			require.NoError(t, mgr.executionStore.Add(execution))
+
+			err := mgr.RestartAgentProcess(context.Background(), execution.ID)
+			require.Error(t, err)
+			require.Empty(t, mock.getHTTPActions())
+
+			current, found := mgr.executionStore.Get(execution.ID)
+			require.True(t, found)
+			require.Equal(t, v1.AgentStatusRunning, current.Status)
+			require.Equal(t, "old-acp-session", current.ACPSessionID)
+			require.Equal(t, []string{"agent", "--resume", "old-acp-session"}, current.AgentArgs)
+			require.Equal(t, "existing error", current.ErrorMessage)
+		})
+	}
+
+}
+
+func TestPromptAgentWithDispatchCallbackTracksExecutionActivityUntilCompletion(t *testing.T) {
+	mgr := newTestManager(t)
+	coordinator := activity.NewCoordinator(activity.Options{})
+	mgr.SetActivityCoordinator(coordinator)
+	mock := newMockAgentServer(t)
+	t.Cleanup(mock.Close)
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+	if err := client.StreamUpdates(context.Background(), func(agentctl.AgentEvent) {}, nil, nil); err != nil {
+		t.Fatalf("connect update stream: %v", err)
+	}
+	waitForWSConnected(t, mock)
+
+	execution := &AgentExecution{
+		ID: "exec-callback-activity", TaskID: "task-1", SessionID: "session-1",
+		Status: v1.AgentStatusRunning, WorkspacePath: "/workspace", agentctl: client,
+		promptDoneCh: make(chan PromptCompletionSignal, 1),
+	}
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("add execution: %v", err)
+	}
+
+	dispatched := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := mgr.PromptAgentWithDispatchCallback(
+			context.Background(), execution.ID, "hello", nil, false, func() { close(dispatched) },
+		)
+		done <- err
+	}()
+	<-dispatched
+
+	maintenance, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if maintenance != nil {
+		maintenance.Release()
+	}
+	if !errors.Is(err, activity.ErrBusy) {
+		t.Fatalf("maintenance while callback prompt is running: %v, want activity.ErrBusy", err)
+	}
+
+	execution.promptDoneCh <- PromptCompletionSignal{StopReason: "end_turn"}
+	if err := <-done; err != nil {
+		t.Fatalf("PromptAgentWithDispatchCallback: %v", err)
+	}
+	maintenance, _, err = coordinator.TryAcquireMaintenance(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("maintenance after callback prompt completed: %v", err)
+	}
+	maintenance.Release()
+}
+
+func TestManager_RestartAgentProcess_StopErrorIsNonFatal(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, true, false)
+	mock.newModelState = restartDefaultModelState()
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	exec := &AgentExecution{
+		ID:             "exec-stop-error",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "auggie --model test",
+		Status:         v1.AgentStatusRunning,
+		WorkspacePath:  "/workspace",
+		agentctl:       client,
+		promptDoneCh:   make(chan PromptCompletionSignal, 1),
+	}
+	mgr.executionStore.Add(exec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := mgr.RestartAgentProcess(ctx, exec.ID); err != nil {
+		t.Fatalf("expected restart to continue after stop failure, got: %v", err)
+	}
+}
+
+func TestManager_RestartAgentProcess_SessionInitFailure(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, true)
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	exec := &AgentExecution{
+		ID:             "exec-session-fail",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		AgentCommand:   "auggie --model test",
+		Status:         v1.AgentStatusRunning,
+		WorkspacePath:  "/workspace",
+		agentctl:       client,
+		promptDoneCh:   make(chan PromptCompletionSignal, 1),
+	}
+	mgr.executionStore.Add(exec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err := mgr.RestartAgentProcess(ctx, exec.ID)
+	if err == nil {
+		t.Fatal("expected restart to fail when ACP session initialization fails")
+	}
+
+	updated, found := mgr.executionStore.Get(exec.ID)
+	if !found {
+		t.Fatal("expected execution to still exist")
+	}
+	if updated.Status != v1.AgentStatusFailed {
+		t.Fatalf("expected status %q, got %q", v1.AgentStatusFailed, updated.Status)
+	}
+	if updated.ErrorMessage == "" {
+		t.Fatal("expected execution error message to be set")
+	}
+
+	mockBus, ok := mgr.eventBus.(*MockEventBus)
+	if !ok {
+		t.Fatal("expected mock event bus")
+	}
+	for _, ev := range mockBus.PublishedEvents {
+		if ev.Type == events.AgentContextReset {
+			t.Fatalf("did not expect %q event on failed restart", events.AgentContextReset)
+		}
+	}
+}
+
+// --- Session mode preservation across reset (issue #1183) ---
+
+// TestManager_RestartAgentProcess_ReappliesSessionMode is the regression test for
+// the full-process-restart path: a non-default session permission mode (auto /
+// accept-edits) chosen by the user must be re-applied to the fresh ACP session
+// after restart instead of silently reverting to the agent's default.
+func TestManager_RestartAgentProcess_ReappliesSessionMode(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.newModelState = restartDefaultModelState()
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	exec := &AgentExecution{
+		ID:             "exec-mode-restart",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		ACPSessionID:   "old-session",
+		AgentCommand:   "auggie --model test",
+		Status:         v1.AgentStatusRunning,
+		WorkspacePath:  "/workspace",
+		agentctl:       client,
+		promptDoneCh:   make(chan PromptCompletionSignal, 1),
+	}
+	exec.SetModeState(&CachedModeState{
+		CurrentModeID:  "acceptEdits",
+		AvailableModes: []streams.SessionModeInfo{{ID: "default"}, {ID: "acceptEdits"}},
+	})
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	require.NoError(t, mgr.RestartAgentProcess(ctx, exec.ID))
+
+	require.Contains(t, mock.getWSActions(), "agent.session.set_mode",
+		"restart must re-apply the previously-active session mode to the new session")
+	require.NotNil(t, exec.GetModeState())
+	require.Equal(t, "acceptEdits", exec.GetModeState().CurrentModeID,
+		"cached mode state must reflect the re-applied mode after restart")
+}
+
+// TestManager_ResetAgentContext_ReappliesSessionMode is the regression test for
+// the ACP fast-path (session reset without a process restart): the user's chosen
+// session permission mode must deterministically survive the reset.
+func TestManager_ResetAgentContext_ReappliesSessionMode(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.modelState = restartDefaultModelState()
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// The ACP fast-path reuses the existing agent stream, so connect it first.
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	exec := &AgentExecution{
+		ID:                 "exec-mode-reset",
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		AgentProfileID:     "profile-1",
+		ACPSessionID:       "old-session",
+		AgentCommand:       "auggie --model test",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      "/workspace",
+		sessionInitialized: true,
+		agentctl:           client,
+		promptDoneCh:       make(chan PromptCompletionSignal, 1),
+	}
+	exec.SetModeState(&CachedModeState{
+		CurrentModeID:  "acceptEdits",
+		AvailableModes: []streams.SessionModeInfo{{ID: "default"}, {ID: "acceptEdits"}},
+	})
+	exec.protocolMessageIDs = map[string]string{"source-message": "msg-1"}
+	exec.protocolThinkingIDs = map[string]string{"source-thought": "th-1"}
+	exec.assistantHistoryBuffer.WriteString("old response")
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	require.NoError(t, mgr.ResetAgentContext(ctx, exec.ID))
+
+	require.Equal(t, "reset-session-456", exec.ACPSessionID,
+		"fast-path reset should create a new ACP session, not restart the process")
+	require.Contains(t, mock.getWSActions(), "agent.session.set_mode",
+		"fast-path reset must re-apply the previously-active session mode")
+	require.NotNil(t, exec.GetModeState())
+	require.Equal(t, "acceptEdits", exec.GetModeState().CurrentModeID)
+	require.Nil(t, exec.protocolMessageIDs)
+	require.Nil(t, exec.protocolThinkingIDs)
+	require.Zero(t, exec.assistantHistoryBuffer.Len())
+}
+
+// @covers AC-TASKS-WORKFLOW-STEP-AGENT-START-OWNERSHIP-002.3
+func TestManager_ResetAgentContext_ClearsIdleDispatchGate(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.modelState = restartDefaultModelState()
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	exec := &AgentExecution{
+		ID:                 "exec-idle-reset",
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		AgentProfileID:     "profile-1",
+		ACPSessionID:       "old-session",
+		AgentCommand:       "auggie --model test",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      "/workspace",
+		sessionInitialized: true,
+		agentctl:           client,
+		promptDoneCh:       make(chan PromptCompletionSignal, 1),
+	}
+	exec.dispatchedPromptPending.Store(true)
+	exec.promptDoneCh <- PromptCompletionSignal{StopReason: "end_turn"}
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	require.NoError(t, mgr.ResetAgentContext(ctx, exec.ID))
+	require.False(t, exec.dispatchedPromptPending.Load(),
+		"reset must clear the gate when it drains the completion signal")
+
+	followUpCtx, followUpCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer followUpCancel()
+	_, err := mgr.PromptAgent(followUpCtx, exec.ID, "follow-up", nil, true)
+	require.NoError(t, err, "follow-up prompt must reach the new agent context")
+	require.Contains(t, mock.getWSActions(), "agent.prompt")
+}
+
+// TestManager_ResetAgentContext_FailsWhenSessionModelCannotBeRestored ensures
+// a fresh ACP session never continues on its provider default after losing a
+// persisted model selection.
+func TestManager_ResetAgentContext_FailsWhenSessionModelCannotBeRestored(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.profileResolver = &restartProfileResolver{profile: &AgentProfileInfo{
+		AgentName:         "auggie",
+		RequireExactModel: true,
+	}}
+	mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{
+		infos: map[string]*WorkspaceInfo{
+			"session-1": {SessionID: "session-1", RuntimeModel: "mock-smart"},
+		},
+	}
+	mock := newRestartMockAgentctlServer(t, false, false)
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	exec := &AgentExecution{
+		ID:                 "exec-model-reset",
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		AgentProfileID:     "profile-1",
+		ACPSessionID:       "old-session",
+		AgentCommand:       "auggie --model test",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      "/workspace",
+		sessionInitialized: true,
+		agentctl:           client,
+		promptDoneCh:       make(chan PromptCompletionSignal, 1),
+	}
+	// The cache may lag a just-persisted workflow/user model change. The
+	// persisted runtime model is the authoritative pre-reset selection.
+	exec.SetModelState(&CachedModelState{CurrentModelID: "mock-fast"})
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	err := mgr.ResetAgentContext(ctx, exec.ID)
+	require.ErrorContains(t, err, `requested model "mock-smart" is unavailable (reason: catalog_empty)`)
+	require.Equal(t, v1.AgentStatusFailed, exec.Status)
+
+	actions := mock.getWSActions()
+	resetIndex := slices.Index(actions, "agent.session.reset")
+	modelIndex := slices.Index(actions, "agent.session.set_model")
+	require.GreaterOrEqual(t, resetIndex, 0)
+	require.Equal(t, -1, modelIndex,
+		"an empty fresh-session model catalog must not receive a model-selection request")
+	require.Empty(t, mock.getSetModelIDs(),
+		"reset must not send a speculative model-selection request")
+}
+
+func TestManager_ResetAgentContext_UsesSynchronousSessionModelCatalog(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{
+		infos: map[string]*WorkspaceInfo{
+			"session-1": {SessionID: "session-1", RuntimeModel: "mock-smart"},
+		},
+	}
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.modelState = &streams.SessionModelState{
+		CurrentModelID: "mock-fast",
+		Models:         []streams.SessionModelInfo{{ModelID: "mock-fast"}, {ModelID: "mock-smart"}},
+	}
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	exec := &AgentExecution{
+		ID:                 "exec-model-reset-response",
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		AgentProfileID:     "profile-1",
+		ACPSessionID:       "old-session",
+		AgentCommand:       "auggie --model test",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      "/workspace",
+		sessionInitialized: true,
+		agentctl:           client,
+		promptDoneCh:       make(chan PromptCompletionSignal, 1),
+	}
+	exec.SetModelState(&CachedModelState{CurrentModelID: "mock-fast"})
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	require.NoError(t, mgr.ResetAgentContext(ctx, exec.ID))
+
+	require.Equal(t, []string{"mock-smart"}, mock.getSetModelIDs(),
+		"reset must use the synchronous session catalog before the stream event is dispatched")
+}
+
+// TestManager_RestartAgentProcess_PrefersPersistedModeOverStaleCache is the
+// regression for the ordering hazard flagged on #1188: when a set_session_mode
+// action persists a newer mode to the DB in the same on_enter batch just before
+// reset_agent_context, the in-memory modeState is still the old value (its agent
+// mode event is async). The restart must restore the persisted (DB) mode, not the
+// stale cached one.
+func TestManager_RestartAgentProcess_PrefersPersistedModeOverStaleCache(t *testing.T) {
+	mgr := newTestManager(t)
+	mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{
+		infos: map[string]*WorkspaceInfo{
+			"session-1": {SessionID: "session-1", SessionMode: "acceptEdits"},
+		},
+	}
+	mock := newRestartMockAgentctlServer(t, false, false)
+	mock.newModelState = restartDefaultModelState()
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	exec := &AgentExecution{
+		ID:             "exec-mode-stale",
+		TaskID:         "task-1",
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+		ACPSessionID:   "old-session",
+		AgentCommand:   "auggie --model test",
+		Status:         v1.AgentStatusRunning,
+		WorkspacePath:  "/workspace",
+		agentctl:       client,
+		promptDoneCh:   make(chan PromptCompletionSignal, 1),
+	}
+	// Stale in-memory cache: the previous (pre-action) mode.
+	exec.SetModeState(&CachedModeState{CurrentModeID: "default"})
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, mgr.RestartAgentProcess(ctx, exec.ID))
+
+	require.Contains(t, mock.getWSActions(), "agent.session.set_mode")
+	require.NotNil(t, exec.GetModeState())
+	require.Equal(t, "acceptEdits", exec.GetModeState().CurrentModeID,
+		"restart must restore the persisted DB mode, not the stale in-memory cache")
+}
+
+func TestManager_SetSessionConfigOptionBySessionID(t *testing.T) {
+	mgr := newTestManager(t)
+	mock := newRestartMockAgentctlServer(t, false, false)
+
+	client := createTestClient(t, mock.server.URL)
+	t.Cleanup(client.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil))
+
+	exec := &AgentExecution{
+		ID:                 "exec-config-option",
+		TaskID:             "task-1",
+		SessionID:          "session-1",
+		AgentProfileID:     "profile-1",
+		ACPSessionID:       "acp-session-1",
+		Status:             v1.AgentStatusRunning,
+		WorkspacePath:      "/workspace",
+		agentctl:           client,
+		sessionInitialized: true,
+	}
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	require.NoError(t, mgr.SetSessionConfigOptionBySessionID(ctx, "session-1", "reasoning_effort", "high"))
+	require.Contains(t, mock.getWSActions(), "agent.session.set_config_option")
+}
+
+// --- SetSessionModel passthrough tests ---
+
+// TestManager_SetSessionModel_Passthrough_PersistsOverride is the regression test for
+// the bug where set-model returned "no agentctl client" on passthrough sessions.
+// The fix: passthrough sessions persist a model_override on the execution and
+// restart the PTY so the next launch uses the new --model.
+func TestManager_SetSessionModel_Passthrough_PersistsOverride(t *testing.T) {
+	mgr := newTestManager(t)
+	exec := &AgentExecution{
+		ID:                   "exec-pt",
+		SessionID:            "session-pt",
+		PassthroughProcessID: "pt-process-1",
+		Status:               v1.AgentStatusRunning,
+		metadata:             map[string]interface{}{},
+		agentctl:             nil, // passthrough sessions have no agentctl client
+	}
+	require.NoError(t, mgr.executionStore.Add(exec))
+
+	// SetSessionModel triggers a PTY restart. The test manager has no interactive
+	// runner registered, so the restart itself returns an error — but the override
+	// must already be persisted by the time the restart fires.
+	_ = mgr.SetSessionModel(context.Background(), exec.ID, "claude-opus-4-7")
+
+	require.Equal(t, "claude-opus-4-7", exec.metadataString(MetadataKeyModelOverride),
+		"SetSessionModel must persist model override on passthrough executions")
+}
+
+func TestEffectivePassthroughModel(t *testing.T) {
+	t.Run("returns override when set", func(t *testing.T) {
+		execution := &AgentExecution{
+			metadata: map[string]interface{}{MetadataKeyModelOverride: "claude-opus-4-7"},
+		}
+		profile := &AgentProfileInfo{Model: "claude-sonnet-4-6"}
+		require.Equal(t, "claude-opus-4-7", effectivePassthroughModel(execution, profile))
+	})
+
+	t.Run("falls back to profile model when override empty", func(t *testing.T) {
+		execution := &AgentExecution{metadata: map[string]interface{}{}}
+		profile := &AgentProfileInfo{Model: "claude-sonnet-4-6"}
+		require.Equal(t, "claude-sonnet-4-6", effectivePassthroughModel(execution, profile))
+	})
+
+	t.Run("handles nil execution and profile", func(t *testing.T) {
+		require.Equal(t, "", effectivePassthroughModel(nil, nil))
+	})
+}
+
+// --- IsAgentRunningForSession tests ---
+
+// mockExecutorWithRunner implements ExecutorBackend and returns a real InteractiveRunner.
+type mockExecutorWithRunner struct {
+	MockExecutor
+	runner *process.InteractiveRunner
+}
+
+func (m *mockExecutorWithRunner) GetInteractiveRunner() *process.InteractiveRunner {
+	return m.runner
+}
+
+func TestIsAgentRunningForSession(t *testing.T) {
+	t.Run("no execution returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		mgr := &Manager{executionStore: store, logger: newTestLogger().WithFields()}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "nonexistent"))
+	})
+
+	t.Run("fresh starting execution is live before agentctl responds", func(t *testing.T) {
+		store := NewExecutionStore()
+		require.NoError(t, store.Add(&AgentExecution{
+			ID:        "exec-acp-starting",
+			SessionID: "session-acp-starting",
+			Status:    v1.AgentStatusStarting,
+			StartedAt: time.Now(),
+		}))
+
+		mgr := &Manager{executionStore: store, logger: newTestLogger().WithFields()}
+		require.True(t, mgr.IsAgentRunningForSession(context.Background(), "session-acp-starting"))
+	})
+
+	t.Run("expired starting execution without agentctl is stale", func(t *testing.T) {
+		store := NewExecutionStore()
+		require.NoError(t, store.Add(&AgentExecution{
+			ID:        "exec-acp-starting-stale",
+			SessionID: "session-acp-starting-stale",
+			Status:    v1.AgentStatusStarting,
+			StartedAt: time.Now().Add(-5 * time.Minute),
+		}))
+
+		mgr := &Manager{executionStore: store, logger: newTestLogger().WithFields()}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "session-acp-starting-stale"))
+	})
+
+	t.Run("passthrough with alive process returns true", func(t *testing.T) {
+		log := newTestLogger()
+		runner := process.NewInteractiveRunner(nil, log, 2*1024*1024)
+
+		// Start a deferred process (pending but alive)
+		info, err := runner.Start(context.Background(), process.InteractiveStartRequest{
+			SessionID: "session-pt",
+			Command:   []string{"cat"},
+		})
+		require.NoError(t, err)
+
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:                   "exec-pt",
+			SessionID:            "session-pt",
+			PassthroughProcessID: info.ID,
+			Status:               v1.AgentStatusRunning,
+		})
+
+		execRegistry := NewExecutorRegistry(log)
+		execRegistry.Register(&mockExecutorWithRunner{
+			MockExecutor: MockExecutor{name: executor.NameStandalone},
+			runner:       runner,
+		})
+
+		mgr := &Manager{
+			executionStore:   store,
+			executorRegistry: execRegistry,
+			logger:           log.WithFields(),
+		}
+		require.True(t, mgr.IsAgentRunningForSession(context.Background(), "session-pt"))
+	})
+
+	t.Run("passthrough with dead process returns false", func(t *testing.T) {
+		log := newTestLogger()
+		runner := process.NewInteractiveRunner(nil, log, 2*1024*1024)
+
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:                   "exec-dead",
+			SessionID:            "session-dead",
+			PassthroughProcessID: "nonexistent-process-id",
+			Status:               v1.AgentStatusRunning,
+		})
+
+		execRegistry := NewExecutorRegistry(log)
+		execRegistry.Register(&mockExecutorWithRunner{
+			MockExecutor: MockExecutor{name: executor.NameStandalone},
+			runner:       runner,
+		})
+
+		mgr := &Manager{
+			executionStore:   store,
+			executorRegistry: execRegistry,
+			logger:           log.WithFields(),
+		}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "session-dead"))
+	})
+
+	t.Run("passthrough with nil executor registry returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:                   "exec-noreg",
+			SessionID:            "session-noreg",
+			PassthroughProcessID: "some-process-id",
+			Status:               v1.AgentStatusRunning,
+		})
+
+		mgr := &Manager{
+			executionStore: store,
+			logger:         newTestLogger().WithFields(),
+		}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "session-noreg"))
+	})
+
+	t.Run("ACP execution with nil agentctl returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:        "exec-acp-nil",
+			SessionID: "session-acp-nil",
+			Status:    v1.AgentStatusRunning,
+			// No PassthroughProcessID → ACP path
+			// No agentctl → returns false
+		})
+
+		mgr := &Manager{
+			executionStore: store,
+			logger:         newTestLogger().WithFields(),
+		}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "session-acp-nil"))
+	})
+
+	t.Run("ACP execution with running agent returns true", func(t *testing.T) {
+		// Mock agentctl server that returns "running" status
+		statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/status" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"agent_status":"running"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(statusServer.Close)
+
+		client := createTestClient(t, statusServer.URL)
+		t.Cleanup(client.Close)
+
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:        "exec-acp-running",
+			SessionID: "session-acp-running",
+			Status:    v1.AgentStatusRunning,
+			agentctl:  client,
+		})
+
+		mgr := &Manager{
+			executionStore: store,
+			logger:         newTestLogger().WithFields(),
+		}
+		require.True(t, mgr.IsAgentRunningForSession(context.Background(), "session-acp-running"))
+	})
+
+	t.Run("ACP execution with stopped agent returns false", func(t *testing.T) {
+		statusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/status" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"agent_status":"stopped"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(statusServer.Close)
+
+		client := createTestClient(t, statusServer.URL)
+		t.Cleanup(client.Close)
+
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:        "exec-acp-stopped",
+			SessionID: "session-acp-stopped",
+			Status:    v1.AgentStatusRunning,
+			agentctl:  client,
+		})
+
+		mgr := &Manager{
+			executionStore: store,
+			logger:         newTestLogger().WithFields(),
+		}
+		require.False(t, mgr.IsAgentRunningForSession(context.Background(), "session-acp-stopped"))
+	})
+}
+
+func TestIsAgentReadyForPrompt(t *testing.T) {
+	t.Run("ACP execution requires ready status, initialized session, and update stream", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		mock := newMockAgentServer(t)
+		t.Cleanup(mock.Close)
+
+		client := createTestClient(t, mock.server.URL)
+		t.Cleanup(client.Close)
+
+		store := NewExecutionStore()
+		execution := &AgentExecution{
+			ID:           "exec-acp-ready",
+			SessionID:    "session-acp-ready",
+			ACPSessionID: "acp-session-1",
+			Status:       v1.AgentStatusReady,
+			agentctl:     client,
+		}
+		err := store.Add(execution)
+		require.NoError(t, err)
+
+		mgr := &Manager{
+			executionStore: store,
+			logger:         newTestLogger().WithFields(),
+		}
+		require.False(t, mgr.IsAgentReadyForPrompt(ctx, "session-acp-ready"))
+
+		err = client.StreamUpdates(ctx, func(agentctl.AgentEvent) {}, nil, nil)
+		require.NoError(t, err)
+
+		select {
+		case <-mock.wsConnected:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for updates stream")
+		}
+
+		require.False(t, mgr.IsAgentReadyForPrompt(ctx, "session-acp-ready"))
+
+		err = store.WithLock("exec-acp-ready", func(exec *AgentExecution) {
+			exec.sessionInitialized = true
+		})
+		require.NoError(t, err)
+		require.True(t, mgr.IsAgentReadyForPrompt(ctx, "session-acp-ready"))
+
+		err = store.WithLock("exec-acp-ready", func(exec *AgentExecution) {
+			exec.ACPSessionID = ""
+		})
+		require.NoError(t, err)
+		require.False(t, mgr.IsAgentReadyForPrompt(ctx, "session-acp-ready"))
+
+		err = store.WithLock("exec-acp-ready", func(exec *AgentExecution) {
+			exec.ACPSessionID = "acp-session-1"
+		})
+		require.NoError(t, err)
+
+		store.UpdateStatus("exec-acp-ready", v1.AgentStatusRunning)
+		require.False(t, mgr.IsAgentReadyForPrompt(ctx, "session-acp-ready"))
+	})
+
+	t.Run("missing execution returns false", func(t *testing.T) {
+		mgr := &Manager{executionStore: NewExecutionStore(), logger: newTestLogger().WithFields()}
+		require.False(t, mgr.IsAgentReadyForPrompt(context.Background(), "missing"))
+	})
+}
+
+func TestRecoverAgentPromptStream(t *testing.T) {
+	t.Run("missing execution returns not found", func(t *testing.T) {
+		mgr := newTestManager(t)
+		err := mgr.RecoverAgentPromptStream(context.Background(), "missing")
+		require.ErrorIs(t, err, ErrExecutionNotFound)
+	})
+
+	t.Run("passthrough execution is a no-op", func(t *testing.T) {
+		mgr := newTestManager(t)
+		require.NoError(t, mgr.executionStore.Add(&AgentExecution{
+			ID:                   "exec-passthrough",
+			SessionID:            "session-passthrough",
+			Status:               v1.AgentStatusFailed,
+			PassthroughProcessID: "pty-1",
+		}))
+
+		require.NoError(t, mgr.RecoverAgentPromptStream(context.Background(), "session-passthrough"))
+	})
+
+	t.Run("session initialization owns the initial stream connection", func(t *testing.T) {
+		mgr := &Manager{
+			executionStore: NewExecutionStore(),
+			logger:         newTestLogger().WithFields(),
+		}
+		client := createTestClient(t, "http://127.0.0.1:1")
+		t.Cleanup(client.Close)
+		require.NoError(t, mgr.executionStore.Add(&AgentExecution{
+			ID:        "exec-initializing",
+			SessionID: "session-initializing",
+			Status:    v1.AgentStatusStarting,
+			agentctl:  client,
+		}))
+
+		require.NoError(t, mgr.RecoverAgentPromptStream(context.Background(), "session-initializing"))
+	})
+
+	t.Run("missing stream manager errors when stream is absent", func(t *testing.T) {
+		mgr := &Manager{
+			executionStore: NewExecutionStore(),
+			logger:         newTestLogger().WithFields(),
+		}
+		client := createTestClient(t, "http://127.0.0.1:1")
+		t.Cleanup(client.Close)
+		require.NoError(t, mgr.executionStore.Add(&AgentExecution{
+			ID:                 "exec-no-stream-manager",
+			SessionID:          "session-no-stream-manager",
+			ACPSessionID:       "acp-session-1",
+			Status:             v1.AgentStatusFailed,
+			agentctl:           client,
+			sessionInitialized: true,
+		}))
+
+		err := mgr.RecoverAgentPromptStream(context.Background(), "session-no-stream-manager")
+		require.ErrorContains(t, err, "stream manager is not configured")
+	})
+
+	t.Run("restores stale failed status when the recovered stream is already connected", func(t *testing.T) {
+		mock := newMockAgentServer(t)
+		t.Cleanup(mock.Close)
+
+		client := createTestClient(t, mock.server.URL)
+		t.Cleanup(client.Close)
+
+		streamCtx, cancelStream := context.WithCancel(context.Background())
+		t.Cleanup(cancelStream)
+		require.NoError(t, client.StreamUpdates(streamCtx, func(agentctl.AgentEvent) {}, nil, nil))
+		select {
+		case <-mock.wsConnected:
+		case <-time.After(2 * time.Second):
+			t.Fatal("mock server did not see preconnected updates stream")
+		}
+
+		mgr := newTestManager(t)
+		exec := &AgentExecution{
+			ID:                 "exec-preconnected-recover",
+			SessionID:          "session-preconnected-recover",
+			ACPSessionID:       "acp-session-1",
+			Status:             v1.AgentStatusFailed,
+			agentctl:           client,
+			promptDoneCh:       make(chan PromptCompletionSignal, 1),
+			sessionInitialized: true,
+		}
+		require.NoError(t, mgr.executionStore.Add(exec))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+		require.NoError(t, mgr.RecoverAgentPromptStream(ctx, exec.SessionID))
+
+		updated, ok := mgr.executionStore.Get(exec.ID)
+		require.True(t, ok)
+		require.Equal(t, v1.AgentStatusReady, updated.Status,
+			"a remote refresh may reconnect the stream before prompt recovery repairs the disconnect status")
+	})
+
+	t.Run("reconnects stream and restores stale failed status", func(t *testing.T) {
+		mock := newMockAgentServer(t)
+		t.Cleanup(mock.Close)
+
+		client := createTestClient(t, mock.server.URL)
+		t.Cleanup(client.Close)
+
+		mgr := newTestManager(t)
+		exec := &AgentExecution{
+			ID:                 "exec-recover",
+			SessionID:          "session-recover",
+			ACPSessionID:       "acp-session-1",
+			Status:             v1.AgentStatusFailed,
+			agentctl:           client,
+			promptDoneCh:       make(chan PromptCompletionSignal, 1),
+			sessionInitialized: true,
+		}
+		require.NoError(t, mgr.executionStore.Add(exec))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+		require.NoError(t, mgr.RecoverAgentPromptStream(ctx, "session-recover"))
+
+		select {
+		case <-mock.wsConnected:
+		case <-time.After(2 * time.Second):
+			t.Fatal("mock server did not see WS connection")
+		}
+		require.True(t, client.HasAgentStream())
+		updated, ok := mgr.executionStore.Get(exec.ID)
+		require.True(t, ok)
+		require.Equal(t, v1.AgentStatusReady, updated.Status)
+
+		mockBus, ok := mgr.eventBus.(*MockEventBus)
+		require.True(t, ok)
+		var sawBootReady bool
+		for _, ev := range mockBus.PublishedEvents {
+			if ev.Type == events.AgentBootReady {
+				sawBootReady = true
+				break
+			}
+		}
+		require.True(t, sawBootReady, "expected AgentBootReady event after stream recovery")
+	})
+
+	t.Run("does not restore failed status when agent process is stopped", func(t *testing.T) {
+		mock := newMockAgentServer(t)
+		t.Cleanup(mock.Close)
+		mock.agentStatus = "stopped"
+
+		client := createTestClient(t, mock.server.URL)
+		t.Cleanup(client.Close)
+
+		mgr := newTestManager(t)
+		exec := &AgentExecution{
+			ID:                 "exec-recover-stopped",
+			SessionID:          "session-recover-stopped",
+			ACPSessionID:       "acp-session-1",
+			Status:             v1.AgentStatusFailed,
+			agentctl:           client,
+			promptDoneCh:       make(chan PromptCompletionSignal, 1),
+			sessionInitialized: true,
+		}
+		require.NoError(t, mgr.executionStore.Add(exec))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+		err := mgr.RecoverAgentPromptStream(ctx, "session-recover-stopped")
+		require.ErrorContains(t, err, "agent process is not running")
+
+		updated, ok := mgr.executionStore.Get(exec.ID)
+		require.True(t, ok)
+		require.Equal(t, v1.AgentStatusFailed, updated.Status)
+
+		mockBus, ok := mgr.eventBus.(*MockEventBus)
+		require.True(t, ok)
+		for _, ev := range mockBus.PublishedEvents {
+			require.NotEqual(t, events.AgentBootReady, ev.Type)
+		}
+	})
+}
+
+// TestEffectiveSessionMode covers the fresh-launch mode propagation for issue
+// #1183: a persisted session_mode (e.g. from a set_session_mode workflow step)
+// must override the profile default at ACP session init, while a missing
+// provider / lookup error / empty session mode falls back to the profile mode.
+func TestEffectiveSessionMode(t *testing.T) {
+	exec := &AgentExecution{ID: "exec-1", TaskID: "task-1", SessionID: "session-1"}
+
+	t.Run("session mode overrides profile mode", func(t *testing.T) {
+		mgr := newTestManager(t)
+		mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{"session-1": {SessionID: "session-1", SessionMode: "acceptEdits"}},
+		}
+		require.Equal(t, "acceptEdits", mgr.effectiveSessionMode(context.Background(), exec, "default"))
+	})
+
+	t.Run("falls back to profile mode when no session mode set", func(t *testing.T) {
+		mgr := newTestManager(t)
+		mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{"session-1": {SessionID: "session-1"}},
+		}
+		require.Equal(t, "default", mgr.effectiveSessionMode(context.Background(), exec, "default"))
+	})
+
+	t.Run("falls back to profile mode on provider error", func(t *testing.T) {
+		mgr := newTestManager(t)
+		mgr.workspaceInfoProvider = &mockWorkspaceInfoProvider{err: fmt.Errorf("boom")}
+		require.Equal(t, "default", mgr.effectiveSessionMode(context.Background(), exec, "default"))
+	})
+
+	t.Run("falls back to profile mode when no provider wired", func(t *testing.T) {
+		mgr := newTestManager(t)
+		require.Equal(t, "default", mgr.effectiveSessionMode(context.Background(), exec, "default"))
+	})
+}
+
+func TestEffectiveSessionRuntimeConfig(t *testing.T) {
+	exec := &AgentExecution{ID: "exec-1", TaskID: "task-1", SessionID: "session-1"}
+	profileOptions := map[string]string{"reasoning_effort": "medium"}
+
+	t.Run("session runtime config overrides profile defaults", func(t *testing.T) {
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-1": {
+					SessionID:               "session-1",
+					SessionMode:             "full-access",
+					RuntimeModel:            "gpt-5.3-codex-spark",
+					RuntimeConfigOptions:    map[string]string{"reasoning_effort": "low"},
+					RuntimeConfigOptionsSet: true,
+				},
+			},
+		}
+		mgr := newTestManager(t)
+		mgr.workspaceInfoProvider = provider
+
+		model, mode, options := mgr.effectiveSessionRuntimeConfig(
+			context.Background(),
+			exec,
+			"gpt-5.5",
+			"auto",
+			profileOptions,
+		)
+
+		require.Equal(t, "gpt-5.3-codex-spark", model)
+		provider.infos["session-1"].RuntimeConfigOptions["reasoning_effort"] = "medium"
+		require.Equal(t, "low", options["reasoning_effort"], "effective config must own its map")
+		require.Equal(t, "full-access", mode)
+		require.Equal(t, map[string]string{"reasoning_effort": "low"}, options)
+		require.Equal(t, 1, provider.sessionCalls)
+	})
+
+	t.Run("model-only session runtime config keeps profile options", func(t *testing.T) {
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-1": {
+					SessionID:    "session-1",
+					RuntimeModel: "gpt-5.3-codex-spark",
+				},
+			},
+		}
+		mgr := newTestManager(t)
+		mgr.workspaceInfoProvider = provider
+
+		model, mode, options := mgr.effectiveSessionRuntimeConfig(
+			context.Background(),
+			exec,
+			"gpt-5.5",
+			"auto",
+			profileOptions,
+		)
+
+		require.Equal(t, "gpt-5.3-codex-spark", model)
+		require.Equal(t, "auto", mode)
+		require.Equal(t, profileOptions, options)
+	})
+
+	t.Run("falls back to profile defaults", func(t *testing.T) {
+		mgr := newTestManager(t)
+		model, mode, options := mgr.effectiveSessionRuntimeConfig(
+			context.Background(),
+			exec,
+			"gpt-5.5",
+			"auto",
+			profileOptions,
+		)
+
+		require.Equal(t, "gpt-5.5", model)
+		require.Equal(t, "auto", mode)
+		require.Equal(t, profileOptions, options)
+	})
+}
+
+// --- IsRemoteSession tests ---
+
+type mockWorkspaceInfoProvider struct {
+	infos        map[string]*WorkspaceInfo
+	envInfos     map[string]*WorkspaceInfo
+	err          error
+	sessionCalls int
+}
+
+func (m *mockWorkspaceInfoProvider) GetWorkspaceInfoForSession(_ context.Context, _, sessionID string) (*WorkspaceInfo, error) {
+	m.sessionCalls++
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.infos[sessionID], nil
+}
+
+func (m *mockWorkspaceInfoProvider) GetWorkspaceInfoForEnvironment(_ context.Context, taskEnvironmentID string) (*WorkspaceInfo, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.envInfos != nil {
+		return m.envInfos[taskEnvironmentID], nil
+	}
+	for _, info := range m.infos {
+		if info.TaskEnvironmentID == taskEnvironmentID {
+			return info, nil
+		}
+	}
+	return nil, nil
+}
+
+func TestIsRemoteSession(t *testing.T) {
+	t.Run("in-memory execution with sprites runtime", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-1",
+			SessionID:   "session-1",
+			RuntimeName: executor.NameSprites,
+			Status:      v1.AgentStatusRunning,
+		})
+		mgr := &Manager{executionStore: store}
+		require.True(t, mgr.IsRemoteSession(context.Background(), "session-1"))
+	})
+
+	t.Run("in-memory execution with is_remote metadata", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-2",
+			SessionID:   "session-2",
+			RuntimeName: executor.NameStandalone,
+			Status:      v1.AgentStatusRunning,
+			metadata:    map[string]interface{}{MetadataKeyIsRemote: true},
+		})
+		mgr := &Manager{executionStore: store}
+		require.True(t, mgr.IsRemoteSession(context.Background(), "session-2"))
+	})
+
+	t.Run("in-memory execution with local runtime", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-3",
+			SessionID:   "session-3",
+			RuntimeName: executor.NameStandalone,
+			Status:      v1.AgentStatusRunning,
+		})
+		mgr := &Manager{executionStore: store}
+		require.False(t, mgr.IsRemoteSession(context.Background(), "session-3"))
+	})
+
+	t.Run("not in memory, DB returns sprites executor type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-4": {ExecutorType: string(models.ExecutorTypeSprites)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.IsRemoteSession(context.Background(), "session-4"))
+	})
+
+	t.Run("not in memory, DB returns remote_docker executor type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-5": {ExecutorType: string(models.ExecutorTypeRemoteDocker)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.IsRemoteSession(context.Background(), "session-5"))
+	})
+
+	t.Run("not in memory, DB returns sprites runtime name", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-6": {RuntimeName: executor.NameSprites},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.IsRemoteSession(context.Background(), "session-6"))
+	})
+
+	t.Run("not in memory, DB returns local type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-7": {ExecutorType: string(models.ExecutorTypeLocal)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.False(t, mgr.IsRemoteSession(context.Background(), "session-7"))
+	})
+
+	t.Run("not in memory, DB error returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{err: fmt.Errorf("db error")}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.False(t, mgr.IsRemoteSession(context.Background(), "session-8"))
+	})
+
+	t.Run("nil workspaceInfoProvider returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		mgr := &Manager{executionStore: store}
+		require.False(t, mgr.IsRemoteSession(context.Background(), "nonexistent"))
+	})
+}
+
+func TestShouldUseContainerShell(t *testing.T) {
+	t.Run("in-memory execution with docker runtime", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-1",
+			SessionID:   "session-1",
+			RuntimeName: executor.NameDocker,
+			Status:      v1.AgentStatusRunning,
+		})
+		mgr := &Manager{executionStore: store}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-1"))
+	})
+
+	t.Run("in-memory execution with sprites runtime", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-2",
+			SessionID:   "session-2",
+			RuntimeName: executor.NameSprites,
+			Status:      v1.AgentStatusRunning,
+		})
+		mgr := &Manager{executionStore: store}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-2"))
+	})
+
+	t.Run("in-memory execution with is_remote metadata", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-3",
+			SessionID:   "session-3",
+			RuntimeName: executor.NameStandalone,
+			Status:      v1.AgentStatusRunning,
+			metadata:    map[string]interface{}{MetadataKeyIsRemote: true},
+		})
+		mgr := &Manager{executionStore: store}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-3"))
+	})
+
+	t.Run("in-memory execution with standalone runtime", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:          "exec-4",
+			SessionID:   "session-4",
+			RuntimeName: executor.NameStandalone,
+			Status:      v1.AgentStatusRunning,
+		})
+		mgr := &Manager{executionStore: store}
+		require.False(t, mgr.ShouldUseContainerShell(context.Background(), "session-4"))
+	})
+
+	t.Run("not in memory, DB returns local_docker executor type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-5": {ExecutorType: string(models.ExecutorTypeLocalDocker)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-5"))
+	})
+
+	t.Run("not in memory, DB returns sprites executor type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-6": {ExecutorType: string(models.ExecutorTypeSprites)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-6"))
+	})
+
+	t.Run("not in memory, DB returns docker runtime name", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-7": {RuntimeName: executor.NameDocker},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.True(t, mgr.ShouldUseContainerShell(context.Background(), "session-7"))
+	})
+
+	t.Run("not in memory, DB returns local type", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{
+			infos: map[string]*WorkspaceInfo{
+				"session-8": {ExecutorType: string(models.ExecutorTypeLocal)},
+			},
+		}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.False(t, mgr.ShouldUseContainerShell(context.Background(), "session-8"))
+	})
+
+	t.Run("not in memory, DB error returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		provider := &mockWorkspaceInfoProvider{err: fmt.Errorf("db error")}
+		mgr := &Manager{executionStore: store, workspaceInfoProvider: provider}
+		require.False(t, mgr.ShouldUseContainerShell(context.Background(), "session-9"))
+	})
+
+	t.Run("nil workspaceInfoProvider returns false", func(t *testing.T) {
+		store := NewExecutionStore()
+		mgr := &Manager{executionStore: store}
+		require.False(t, mgr.ShouldUseContainerShell(context.Background(), "nonexistent"))
+	})
+}
+
+func TestFallbackAuthMethods(t *testing.T) {
+	t.Run("claude-acp returns auth login method", func(t *testing.T) {
+		methods := fallbackAuthMethods("claude-acp")
+		require.Len(t, methods, 1)
+		require.Equal(t, "claude-auth-login", methods[0].ID)
+		require.Equal(t, "Anthropic Authentication", methods[0].Name)
+		require.NotNil(t, methods[0].TerminalAuth)
+		require.Equal(t, "claude", methods[0].TerminalAuth.Command)
+		require.Equal(t, []string{"auth", "login"}, methods[0].TerminalAuth.Args)
+	})
+
+	t.Run("auggie returns login method", func(t *testing.T) {
+		methods := fallbackAuthMethods("auggie")
+		require.Len(t, methods, 1)
+		require.Equal(t, "auggie-login", methods[0].ID)
+		require.Equal(t, "Auggie Authentication", methods[0].Name)
+		require.NotNil(t, methods[0].TerminalAuth)
+		require.Equal(t, "auggie", methods[0].TerminalAuth.Command)
+		require.Equal(t, []string{"login"}, methods[0].TerminalAuth.Args)
+	})
+
+	t.Run("unknown agent returns nil", func(t *testing.T) {
+		require.Nil(t, fallbackAuthMethods("unknown-agent"))
+	})
+
+	t.Run("empty agent ID returns nil", func(t *testing.T) {
+		require.Nil(t, fallbackAuthMethods(""))
+	})
+}
+
+func TestGetSessionAuthMethodsFallback(t *testing.T) {
+	t.Run("returns cached methods when available", func(t *testing.T) {
+		store := NewExecutionStore()
+		exec := &AgentExecution{
+			ID:        "exec-1",
+			SessionID: "session-1",
+			AgentID:   "claude-acp",
+		}
+		exec.SetAuthMethods([]streams.AuthMethodInfo{
+			{ID: "custom-method", Name: "Custom"},
+		})
+		store.Add(exec)
+		mgr := &Manager{executionStore: store}
+
+		methods := mgr.GetSessionAuthMethods("session-1")
+		require.Len(t, methods, 1)
+		require.Equal(t, "custom-method", methods[0].ID)
+	})
+
+	t.Run("falls back to static methods when cache is empty", func(t *testing.T) {
+		store := NewExecutionStore()
+		store.Add(&AgentExecution{
+			ID:        "exec-2",
+			SessionID: "session-2",
+			AgentID:   "claude-acp",
+		})
+		mgr := &Manager{executionStore: store}
+
+		methods := mgr.GetSessionAuthMethods("session-2")
+		require.Len(t, methods, 1)
+		require.Equal(t, "claude-auth-login", methods[0].ID)
+	})
+
+	t.Run("returns nil for unknown session", func(t *testing.T) {
+		store := NewExecutionStore()
+		mgr := &Manager{executionStore: store}
+		require.Nil(t, mgr.GetSessionAuthMethods("nonexistent"))
+	})
+}

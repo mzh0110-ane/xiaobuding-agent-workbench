@@ -1,0 +1,400 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+
+	acp "github.com/coder/acp-go-sdk"
+)
+
+// isScriptMode returns true if the command starts with "e2e:" prefix
+// (excluding the predefined "/e2e:" slash-command format).
+func isScriptMode(cmd string) bool {
+	return strings.HasPrefix(cmd, "e2e:")
+}
+
+// executeScript processes a multi-line script command.
+func executeScript(e *emitter, fullPrompt, cmd string) {
+	planVersion := ""
+	lines := strings.Split(cmd, "\n")
+	for _, line := range lines {
+		if e.ctx != nil && e.ctx.Err() != nil {
+			return
+		}
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		executeCommand(e, fullPrompt, line, &planVersion)
+	}
+}
+
+// executeCommand dispatches a single script command line.
+func executeCommand(e *emitter, fullPrompt, line string, planVersion *string) {
+	switch {
+	case strings.HasPrefix(line, "e2e:message("):
+		text := extractStringArg(line, "e2e:message(")
+		e.text(text)
+
+	case strings.HasPrefix(line, "e2e:thinking("):
+		text := extractStringArg(line, "e2e:thinking(")
+		e.thought(text)
+
+	case strings.HasPrefix(line, "e2e:reasoning_burst(") || strings.HasPrefix(line, "e2e:reasoning-burst("):
+		if count, ok := parseReasoningBurstCommand(line); ok {
+			emitReasoningBurst(e, count)
+		}
+
+	case strings.HasPrefix(line, "e2e:delay("):
+		ms := extractIntArg(line, "e2e:delay(")
+		waitForDelay(e.ctx, ms)
+
+	case strings.HasPrefix(line, "e2e:mcp:"):
+		executeMCPCommand(e, fullPrompt, line, planVersion)
+
+	case strings.HasPrefix(line, "e2e:plan("):
+		executePlanCommand(e, line)
+
+	case strings.HasPrefix(line, "e2e:tool_use("):
+		executeSimulatedToolUse(e, line)
+
+	case strings.HasPrefix(line, "e2e:tool_result("):
+		executeSimulatedToolResult(e, line)
+
+	case strings.HasPrefix(line, "e2e:monitor_start("):
+		executeMonitorStart(e, line)
+
+	case strings.HasPrefix(line, "e2e:monitor_event("):
+		executeMonitorEvent(e, line)
+
+	case strings.HasPrefix(line, "e2e:monitor_end("):
+		executeMonitorEnd(e, line)
+
+	case strings.HasPrefix(line, "e2e:shell_result("):
+		executeSimulatedShellResult(e, line)
+	}
+}
+
+// executeMonitorStart emits a Monitor registration sequence reproducing the
+// claude-agent-acp wire format. Format: e2e:monitor_start("taskId", "command")
+//
+// The taskId is what subsequent monitor_event / monitor_end directives use
+// to look the Monitor back up. Command is recorded in the rawInput so the
+// frontend can label the card (e.g. "gh pr checks --watch").
+func executeMonitorStart(e *emitter, line string) {
+	inner := extractParenContent(line, "e2e:monitor_start(")
+	taskID, rest := extractFirstStringArg(inner)
+	if taskID == "" {
+		e.text("Script error: monitor_start requires taskId")
+		return
+	}
+	rest = strings.TrimSpace(rest)
+	rest = strings.TrimPrefix(rest, ",")
+	command, _ := extractFirstStringArg(rest)
+	toolID := nextToolID()
+	state.monitorTools[taskID] = toolID
+	e.startMonitorTool(toolID, taskID, command)
+}
+
+// executeMonitorEvent emits a `<task-notification>` envelope as if the
+// model echoed an injected user turn. Format: e2e:monitor_event("taskId", "event body")
+func executeMonitorEvent(e *emitter, line string) {
+	inner := extractParenContent(line, "e2e:monitor_event(")
+	taskID, rest := extractFirstStringArg(inner)
+	if taskID == "" {
+		e.text("Script error: monitor_event requires taskId")
+		return
+	}
+	rest = strings.TrimSpace(rest)
+	rest = strings.TrimPrefix(rest, ",")
+	body, _ := extractFirstStringArg(rest)
+	e.emitMonitorEvent(taskID, body)
+}
+
+// executeMonitorEnd emits the terminal tool_call_update for a previously
+// started Monitor. Format: e2e:monitor_end("taskId")
+func executeMonitorEnd(e *emitter, line string) {
+	taskID := extractStringArg(line, "e2e:monitor_end(")
+	tcID, ok := state.monitorTools[taskID]
+	if !ok {
+		e.text("Script error: monitor_end for unknown taskId " + taskID)
+		return
+	}
+	delete(state.monitorTools, taskID)
+	e.endMonitorTool(tcID)
+}
+
+// executeMCPCommand parses and executes: e2e:mcp:<server>:<tool>(<json_args>)
+func executeMCPCommand(e *emitter, fullPrompt, line string, planVersion *string) {
+	rest := strings.TrimPrefix(line, "e2e:mcp:")
+
+	colonIdx := strings.Index(rest, ":")
+	if colonIdx < 0 {
+		e.text("Script error: invalid MCP command: " + line)
+		return
+	}
+	server := rest[:colonIdx]
+	remainder := rest[colonIdx+1:]
+
+	parenIdx := strings.Index(remainder, "(")
+	if parenIdx < 0 {
+		e.text("Script error: missing args in MCP command: " + line)
+		return
+	}
+	toolName := remainder[:parenIdx]
+	closeIdx := strings.LastIndex(remainder, ")")
+	if closeIdx <= parenIdx {
+		e.text("Script error: missing closing paren in MCP command: " + line)
+		return
+	}
+	argsStr := remainder[parenIdx+1 : closeIdx]
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		e.text(fmt.Sprintf("Script error: bad MCP args JSON: %v", err))
+		return
+	}
+
+	currentPlanVersion := ""
+	if planVersion != nil {
+		currentPlanVersion = *planVersion
+	}
+	substituteScriptPlaceholders(args, fullPrompt, currentPlanVersion)
+
+	toolID := nextToolID()
+	e.startTool(toolID, toolName, acp.ToolKindOther, args)
+
+	// Tie scripted MCP calls to the ACP prompt context. A cancelled turn must
+	// be able to interrupt an in-flight HTTP/SSE call; otherwise the mock
+	// agent can keep the prompt RPC open while the backend waits for cancel.
+	result, err := e.callMCPToolCtx(e.ctx, server, toolName, args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mock-agent: MCP call %s/%s failed: %v\n", server, toolName, err)
+		e.completeTool(toolID, map[string]any{toolKeyError: "MCP error: " + err.Error()})
+	} else {
+		e.completeTool(toolID, map[string]any{toolKeyResult: result})
+		if planVersion != nil {
+			if version := extractPlanVersion(result); version != "" {
+				*planVersion = version
+			}
+		}
+	}
+}
+
+// executePlanCommand emits an ACP Plan update.
+// Format: e2e:plan([{"content":"task","status":"in_progress"},{"content":"task2","status":"pending"}])
+func executePlanCommand(e *emitter, line string) {
+	argsStr := extractParenContent(line, "e2e:plan(")
+	var rawEntries []struct {
+		Content  string `json:"content"`
+		Status   string `json:"status"`
+		Priority string `json:"priority,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(argsStr), &rawEntries); err != nil {
+		e.text(fmt.Sprintf("Script error: bad plan JSON: %v", err))
+		return
+	}
+	entries := make([]acp.PlanEntry, len(rawEntries))
+	for i, r := range rawEntries {
+		entries[i] = acp.PlanEntry{
+			Content:  r.Content,
+			Status:   acp.PlanEntryStatus(r.Status),
+			Priority: acp.PlanEntryPriority(r.Priority),
+		}
+	}
+	e.plan(entries)
+}
+
+// executeSimulatedToolUse emits a simulated tool call start (no real execution).
+// Format: e2e:tool_use("name", {"key":"value"})
+func executeSimulatedToolUse(e *emitter, line string) {
+	inner := extractParenContent(line, "e2e:tool_use(")
+	name, rest := extractFirstStringArg(inner)
+
+	var input map[string]any
+	rest = strings.TrimSpace(rest)
+	if rest != "" {
+		rest = strings.TrimPrefix(rest, ",")
+		rest = strings.TrimSpace(rest)
+		if err := json.Unmarshal([]byte(rest), &input); err != nil {
+			e.text(fmt.Sprintf("Script error: bad tool_use input JSON: %v", err))
+			return
+		}
+	}
+
+	toolID := nextToolID()
+	e.startTool(toolID, name, acp.ToolKindOther, input)
+}
+
+// executeSimulatedToolResult emits a tool completion for the last tool_use.
+// Format: e2e:tool_result("content")
+func executeSimulatedToolResult(e *emitter, line string) {
+	content := extractStringArg(line, "e2e:tool_result(")
+	e.completeTool(acp.ToolCallId(state.lastToolID), map[string]any{toolKeyResult: content})
+}
+
+// executeSimulatedShellResult emits an execute-kind (shell) tool call for
+// the given command and completes it with the given raw stdout text. Used to
+// reproduce a real provider whose captured stdout echoes the command before
+// the actual output - the ACP shell-output normalizer must strip that
+// leading echo so the transcript's command header and Output disclosure
+// don't show the command twice.
+// Format: e2e:shell_result("<command>", "<stdout>"[, "<cwd>"])
+//
+// The optional third argument reproduces a provider that resolves a
+// relative file-path argument in the command to an absolute (cwd-joined)
+// one before actually invoking the real terminal, while the reported
+// "command" keeps the original relative form - the normalizer's workDir-
+// aware echo stripping must still recognize that echo.
+//
+// rawInputCommandKey/rawInputCwdKey/rawOutputKey mirror the
+// "command"/"cwd"/"output" keys a real shell provider's
+// tool_call/tool_call_update JSON uses.
+const (
+	rawInputCommandKey = "command"
+	rawInputCwdKey     = "cwd"
+	rawOutputKey       = "output"
+)
+
+func executeSimulatedShellResult(e *emitter, line string) {
+	inner := extractParenContent(line, "e2e:shell_result(")
+	command, rest := extractFirstStringArg(inner)
+	rest = strings.TrimPrefix(strings.TrimSpace(rest), ",")
+	stdout, rest := extractFirstStringArg(strings.TrimSpace(rest))
+	rest = strings.TrimPrefix(strings.TrimSpace(rest), ",")
+	cwd, _ := extractFirstStringArg(strings.TrimSpace(rest))
+
+	rawInput := map[string]any{rawInputCommandKey: command}
+	if cwd != "" {
+		rawInput[rawInputCwdKey] = cwd
+	}
+
+	toolID := nextToolID()
+	e.startTool(toolID, command, acp.ToolKindExecute, rawInput)
+	e.completeTool(toolID, map[string]any{rawOutputKey: stdout})
+}
+
+// --- Argument parsing helpers ---
+
+// extractStringArg extracts a quoted string argument from a command like prefix"text")
+func extractStringArg(line, prefix string) string {
+	rest := strings.TrimPrefix(line, prefix)
+	rest = strings.TrimSuffix(rest, ")")
+	rest = strings.TrimSpace(rest)
+	if len(rest) >= 2 && rest[0] == '"' && rest[len(rest)-1] == '"' {
+		rest = rest[1 : len(rest)-1]
+	}
+	return unescapeString(rest)
+}
+
+// extractIntArg extracts an integer argument from a command like prefix123)
+func extractIntArg(line, prefix string) int {
+	rest := strings.TrimPrefix(line, prefix)
+	rest = strings.TrimSuffix(rest, ")")
+	rest = strings.TrimSpace(rest)
+	n, _ := strconv.Atoi(rest)
+	return n
+}
+
+// extractParenContent extracts everything inside the outermost parentheses.
+func extractParenContent(line, prefix string) string {
+	rest := strings.TrimPrefix(line, prefix)
+	if len(rest) > 0 && rest[len(rest)-1] == ')' {
+		rest = rest[:len(rest)-1]
+	}
+	return rest
+}
+
+// extractFirstStringArg extracts the first quoted string and returns
+// (value, remaining).
+func extractFirstStringArg(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 || s[0] != '"' {
+		return s, ""
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++ // skip escaped char
+			continue
+		}
+		if s[i] == '"' {
+			return unescapeString(s[1:i]), s[i+1:]
+		}
+	}
+	return s[1:], ""
+}
+
+// unescapeString handles basic escape sequences in script string args.
+func unescapeString(s string) string {
+	s = strings.ReplaceAll(s, `\\`, "\x00") // temp placeholder
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\t`, "\t")
+	s = strings.ReplaceAll(s, "\x00", `\`)
+	return s
+}
+
+// --- Context placeholder substitution ---
+
+var (
+	taskIDRegex    = regexp.MustCompile(`Kandev Task ID:\s*(\S+)`)
+	sessionIDRegex = regexp.MustCompile(`Kandev Session ID:\s*(\S+)`)
+)
+
+// substituteContextPlaceholders replaces {task_id} and {session_id} placeholders
+// in MCP tool args with values from the kandev-system context block.
+func substituteContextPlaceholders(args map[string]any, fullPrompt string) {
+	taskID := extractRegexMatch(taskIDRegex, fullPrompt)
+	sessID := extractRegexMatch(sessionIDRegex, fullPrompt)
+
+	for k, v := range args {
+		if s, ok := v.(string); ok {
+			s = strings.ReplaceAll(s, "{task_id}", taskID)
+			s = strings.ReplaceAll(s, "{session_id}", sessID)
+			args[k] = s
+		}
+	}
+}
+
+// substituteScriptPlaceholders replaces the context placeholders and the
+// version returned by the most recent scripted plan MCP call. The latter lets
+// deterministic E2E scripts perform a sequence of conditional agent writes
+// without weakening the production requirement to pass expected_version.
+func substituteScriptPlaceholders(args map[string]any, fullPrompt, planVersion string) {
+	substituteContextPlaceholders(args, fullPrompt)
+	for k, v := range args {
+		if s, ok := v.(string); ok {
+			args[k] = strings.ReplaceAll(s, "{plan_version}", planVersion)
+		}
+	}
+}
+
+var (
+	planWriteVersionRegex = regexp.MustCompile(`(?:^|[\s,])version=([^\s.,]+)`)
+	planReadVersionRegex  = regexp.MustCompile(`"version"\s*:\s*"([^"]+)"`)
+)
+
+// extractPlanVersion reads the committed version from either a plan-write
+// acknowledgement or the metadata block returned by get_task_plan_kandev.
+func extractPlanVersion(result string) string {
+	if match := planWriteVersionRegex.FindStringSubmatch(result); len(match) == 2 {
+		return match[1]
+	}
+	if match := planReadVersionRegex.FindStringSubmatch(result); len(match) == 2 {
+		return match[1]
+	}
+	return ""
+}
+
+// extractRegexMatch returns the first capture group match, or empty string.
+func extractRegexMatch(re *regexp.Regexp, s string) string {
+	m := re.FindStringSubmatch(s)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}

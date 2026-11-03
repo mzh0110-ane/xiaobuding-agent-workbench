@@ -1,0 +1,408 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/utility/models"
+)
+
+type sqliteRepository struct {
+	db     *sqlx.DB // writer
+	ro     *sqlx.DB // reader
+	ownsDB bool
+}
+
+var _ Repository = (*sqliteRepository)(nil)
+
+func newSQLiteRepositoryWithDB(writer, reader *sqlx.DB) (*sqliteRepository, error) {
+	return newSQLiteRepository(writer, reader, false)
+}
+
+func newSQLiteRepository(writer, reader *sqlx.DB, ownsDB bool) (*sqliteRepository, error) {
+	repo := &sqliteRepository{db: writer, ro: reader, ownsDB: ownsDB}
+	if err := repo.initSchema(); err != nil {
+		if ownsDB {
+			if closeErr := writer.Close(); closeErr != nil {
+				return nil, fmt.Errorf("failed to close database after schema error: %w", closeErr)
+			}
+		}
+		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	}
+	return repo, nil
+}
+
+func (r *sqliteRepository) initSchema() error {
+	// New simplified schema for utility agents
+	schema := `
+		CREATE TABLE IF NOT EXISTS utility_agents (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			description TEXT NOT NULL DEFAULT '',
+			prompt TEXT NOT NULL,
+			agent_id TEXT NOT NULL DEFAULT 'claude-acp',
+			model TEXT NOT NULL DEFAULT '',
+			agent_profile_id TEXT NOT NULL DEFAULT '',
+			profile_binding_state TEXT NOT NULL DEFAULT 'explicit',
+			builtin INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS utility_agent_calls (
+			id TEXT PRIMARY KEY,
+			utility_id TEXT NOT NULL,
+			session_id TEXT NOT NULL DEFAULT '',
+			resolved_prompt TEXT NOT NULL DEFAULT '',
+			response TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			agent_profile_id TEXT NOT NULL DEFAULT '',
+			execution_profile_id TEXT NOT NULL DEFAULT '',
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			response_tokens INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'pending',
+			error_message TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			completed_at TIMESTAMP,
+			FOREIGN KEY (utility_id) REFERENCES utility_agents(id) ON DELETE CASCADE
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_utility_calls_utility_id ON utility_agent_calls(utility_id);
+		CREATE INDEX IF NOT EXISTS idx_utility_calls_session_id ON utility_agent_calls(session_id);
+		CREATE INDEX IF NOT EXISTS idx_utility_calls_created_at ON utility_agent_calls(created_at);
+	`
+	if _, err := r.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Add columns for existing databases. Duplicate-column errors are the only
+	// tolerated replay result; every other migration failure must stop the
+	// required utility store from being published.
+	migrate := db.NewRequiredMigrateLogger(r.db, nil)
+	migrations := []struct {
+		name string
+		stmt string
+	}{
+		{"utility_agents.enabled", `ALTER TABLE utility_agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`},
+		{"utility_agents.agent_profile_id", `ALTER TABLE utility_agents ADD COLUMN agent_profile_id TEXT NOT NULL DEFAULT ''`},
+		{"utility_agents.profile_binding_state", `ALTER TABLE utility_agents ADD COLUMN profile_binding_state TEXT NOT NULL DEFAULT 'explicit'`},
+		{"utility_agent_calls.agent_profile_id", `ALTER TABLE utility_agent_calls ADD COLUMN agent_profile_id TEXT NOT NULL DEFAULT ''`},
+		{"utility_agent_calls.execution_profile_id", `ALTER TABLE utility_agent_calls ADD COLUMN execution_profile_id TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, migration := range migrations {
+		if err := migrate.Apply(migration.name, migration.stmt); err != nil {
+			return fmt.Errorf("required utility migration: %w", err)
+		}
+	}
+	if err := migrate.Err(); err != nil {
+		return fmt.Errorf("required utility migration: %w", err)
+	}
+
+	// Heal pre-existing custom agents that were created with enabled=0 due
+	// to a bug in CreateAgent (the Enabled field on the model defaulted to
+	// the zero value, so the INSERT wrote 0 even though the DB schema's
+	// own DEFAULT was 1). Built-ins are skipped — they have their own
+	// "enabled=false means fall back to user defaults" semantics.
+	//
+	// Restricted to rows whose updated_at == created_at — i.e. agents that
+	// have never been modified since INSERT. UpdateAgent always bumps
+	// updated_at, so a user who deliberately disables an agent post-fix
+	// has updated_at > created_at and is left alone. Without this guard
+	// every restart would silently re-enable any user-disabled custom agent.
+	if _, err := r.db.Exec(`UPDATE utility_agents SET enabled = 1
+		WHERE builtin = 0 AND enabled = 0
+		  AND agent_id <> '' AND model <> ''
+		  AND updated_at = created_at`); err != nil {
+		return fmt.Errorf("repair utility agent enabled values: %w", err)
+	}
+
+	// Legacy-data backfill: rewrite the old "claude-code" identifier and any
+	// pre-fix builtin rows that were persisted with an empty agent_id to the
+	// registered inference agent ID "claude-acp". The Claude agent was
+	// renamed during the ACP migration (#566), and seedBuiltinAgents()
+	// historically inserted rows with agent_id = "" — combined with its
+	// ON CONFLICT(id) DO NOTHING contract, those stale rows survived
+	// untouched on every restart. Current seeds now use builtinSeedAgentID
+	// (see builtins.go), so this migration only repairs existing deployments.
+	if _, err := r.db.Exec(`UPDATE utility_agents SET agent_id = 'claude-acp'
+		WHERE agent_id IN ('claude-code', '')`); err != nil {
+		return fmt.Errorf("repair utility agent identifiers: %w", err)
+	}
+
+	// Seed built-in agents
+	if err := r.seedBuiltinAgents(); err != nil {
+		return fmt.Errorf("failed to seed built-in agents: %w", err)
+	}
+
+	// Migration: fix template placeholders from {{.Key}} to {{Key}} format
+	if err := r.migrateTemplatePlaceholders(); err != nil {
+		return fmt.Errorf("failed to migrate template placeholders: %w", err)
+	}
+
+	return nil
+}
+
+// migrateTemplatePlaceholders fixes old {{.Key}} format to {{Key}} format in builtin prompts.
+func (r *sqliteRepository) migrateTemplatePlaceholders() error {
+	placeholders := []string{
+		"GitDiff", "CommitLog", "ChangedFiles", "DiffSummary", "BranchName", "BaseBranch",
+		"TaskTitle", "TaskDescription", "SessionID", "WorkspacePath", "UserPrompt",
+	}
+	for _, p := range placeholders {
+		old := "{{." + p + "}}"
+		new := "{{" + p + "}}"
+		if _, err := r.db.Exec(r.db.Rebind(`UPDATE utility_agents SET prompt = REPLACE(prompt, ?, ?) WHERE builtin = 1`), old, new); err != nil {
+			return fmt.Errorf("replace utility prompt placeholder %q: %w", old, err)
+		}
+	}
+	return nil
+}
+
+func (r *sqliteRepository) Close() error {
+	if !r.ownsDB {
+		return nil
+	}
+	var errs []error
+	if err := r.db.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if r.ro != r.db {
+		if err := r.ro.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
+}
+
+func (r *sqliteRepository) ListAgents(ctx context.Context) ([]*models.UtilityAgent, error) {
+	rows, err := r.ro.QueryContext(ctx, `
+		SELECT id, name, description, prompt, agent_id, model, agent_profile_id, profile_binding_state, builtin, enabled, created_at, updated_at
+		FROM utility_agents
+		ORDER BY builtin DESC, name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return r.scanAgentRows(rows)
+}
+
+func (r *sqliteRepository) scanAgentRows(rows *sql.Rows) ([]*models.UtilityAgent, error) {
+	var agents []*models.UtilityAgent
+	for rows.Next() {
+		agent := &models.UtilityAgent{}
+		var builtinInt, enabledInt int
+		if err := rows.Scan(
+			&agent.ID, &agent.Name, &agent.Description, &agent.Prompt,
+			&agent.AgentID, &agent.Model, &agent.AgentProfileID, &agent.ProfileBindingState, &builtinInt, &enabledInt,
+			&agent.CreatedAt, &agent.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		agent.Builtin = builtinInt == 1
+		agent.Enabled = enabledInt == 1
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
+func (r *sqliteRepository) GetAgentByID(ctx context.Context, id string) (*models.UtilityAgent, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT id, name, description, prompt, agent_id, model, agent_profile_id, profile_binding_state, builtin, enabled, created_at, updated_at
+		FROM utility_agents WHERE id = ?
+	`), id)
+	return r.scanAgentRow(row)
+}
+
+func (r *sqliteRepository) GetAgentByName(ctx context.Context, name string) (*models.UtilityAgent, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT id, name, description, prompt, agent_id, model, agent_profile_id, profile_binding_state, builtin, enabled, created_at, updated_at
+		FROM utility_agents WHERE name = ?
+	`), name)
+	return r.scanAgentRow(row)
+}
+
+func (r *sqliteRepository) scanAgentRow(row *sql.Row) (*models.UtilityAgent, error) {
+	agent := &models.UtilityAgent{}
+	var builtinInt, enabledInt int
+	if err := row.Scan(
+		&agent.ID, &agent.Name, &agent.Description, &agent.Prompt,
+		&agent.AgentID, &agent.Model, &agent.AgentProfileID, &agent.ProfileBindingState, &builtinInt, &enabledInt,
+		&agent.CreatedAt, &agent.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	agent.Builtin = builtinInt == 1
+	agent.Enabled = enabledInt == 1
+	return agent, nil
+}
+
+func (r *sqliteRepository) CreateAgent(ctx context.Context, agent *models.UtilityAgent) error {
+	if agent.ID == "" {
+		agent.ID = uuid.New().String()
+	}
+	agent.Name = strings.TrimSpace(agent.Name)
+	agent.Description = strings.TrimSpace(agent.Description)
+	agent.Prompt = strings.TrimSpace(agent.Prompt)
+	if agent.CreatedAt.IsZero() {
+		agent.CreatedAt = time.Now().UTC()
+	}
+	agent.UpdatedAt = time.Now().UTC()
+
+	builtinInt := 0
+	if agent.Builtin {
+		builtinInt = 1
+	}
+	enabledInt := 0
+	if agent.Enabled {
+		enabledInt = 1
+	}
+
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		INSERT INTO utility_agents (id, name, description, prompt, agent_id, model, agent_profile_id, profile_binding_state, builtin, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`), agent.ID, agent.Name, agent.Description, agent.Prompt, agent.AgentID, agent.Model,
+		agent.AgentProfileID, agent.ProfileBindingState, builtinInt, enabledInt, agent.CreatedAt, agent.UpdatedAt)
+	return err
+}
+
+func (r *sqliteRepository) UpdateAgent(ctx context.Context, agent *models.UtilityAgent) error {
+	if agent == nil {
+		return errors.New("agent is nil")
+	}
+	agent.Name = strings.TrimSpace(agent.Name)
+	agent.Description = strings.TrimSpace(agent.Description)
+	agent.Prompt = strings.TrimSpace(agent.Prompt)
+	agent.UpdatedAt = time.Now().UTC()
+
+	enabledInt := 0
+	if agent.Enabled {
+		enabledInt = 1
+	}
+
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE utility_agents
+		SET name = ?, description = ?, prompt = ?, agent_id = ?, model = ?, agent_profile_id = ?, profile_binding_state = ?, enabled = ?, updated_at = ?
+		WHERE id = ?
+	`), agent.Name, agent.Description, agent.Prompt, agent.AgentID, agent.Model, agent.AgentProfileID, agent.ProfileBindingState, enabledInt, agent.UpdatedAt, agent.ID)
+	return err
+}
+
+func (r *sqliteRepository) NormalizeEmptyBuiltinBinding(ctx context.Context, id string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE utility_agents
+		SET profile_binding_state = ?, updated_at = ?
+		WHERE id = ? AND builtin = 1 AND agent_profile_id = '' AND profile_binding_state = ?
+	`), models.ProfileBindingInherit, time.Now().UTC(), id, models.ProfileBindingUnconfigured)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+
+func (r *sqliteRepository) DeleteAgent(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`DELETE FROM utility_agents WHERE id = ? AND builtin = 0`), id)
+	return err
+}
+
+func (r *sqliteRepository) ListCalls(ctx context.Context, utilityID string, limit int) ([]*models.UtilityAgentCall, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.ro.QueryContext(ctx, r.ro.Rebind(`
+		SELECT id, utility_id, session_id, resolved_prompt, response, model, agent_profile_id, execution_profile_id, prompt_tokens, response_tokens, duration_ms, status, error_message, created_at, completed_at
+		FROM utility_agent_calls
+		WHERE utility_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`), utilityID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return r.scanCallRows(rows)
+}
+
+func (r *sqliteRepository) scanCallRows(rows *sql.Rows) ([]*models.UtilityAgentCall, error) {
+	var calls []*models.UtilityAgentCall
+	for rows.Next() {
+		call := &models.UtilityAgentCall{}
+		if err := rows.Scan(
+			&call.ID, &call.UtilityID, &call.SessionID, &call.ResolvedPrompt, &call.Response,
+			&call.Model, &call.AgentProfileID, &call.ExecutionProfileID, &call.PromptTokens, &call.ResponseTokens, &call.DurationMs,
+			&call.Status, &call.ErrorMessage, &call.CreatedAt, &call.CompletedAt,
+		); err != nil {
+			return nil, err
+		}
+		calls = append(calls, call)
+	}
+	return calls, rows.Err()
+}
+
+func (r *sqliteRepository) GetCallByID(ctx context.Context, id string) (*models.UtilityAgentCall, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT id, utility_id, session_id, resolved_prompt, response, model, agent_profile_id, execution_profile_id, prompt_tokens, response_tokens, duration_ms, status, error_message, created_at, completed_at
+		FROM utility_agent_calls WHERE id = ?
+	`), id)
+	call := &models.UtilityAgentCall{}
+	if err := row.Scan(
+		&call.ID, &call.UtilityID, &call.SessionID, &call.ResolvedPrompt, &call.Response,
+		&call.Model, &call.AgentProfileID, &call.ExecutionProfileID, &call.PromptTokens, &call.ResponseTokens, &call.DurationMs,
+		&call.Status, &call.ErrorMessage, &call.CreatedAt, &call.CompletedAt,
+	); err != nil {
+		return nil, err
+	}
+	return call, nil
+}
+
+func (r *sqliteRepository) CreateCall(ctx context.Context, call *models.UtilityAgentCall) error {
+	if call.ID == "" {
+		call.ID = uuid.New().String()
+	}
+	if call.CreatedAt.IsZero() {
+		call.CreatedAt = time.Now().UTC()
+	}
+	if call.Status == "" {
+		call.Status = "pending"
+	}
+
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		INSERT INTO utility_agent_calls (id, utility_id, session_id, resolved_prompt, response, model, agent_profile_id, execution_profile_id, prompt_tokens, response_tokens, duration_ms, status, error_message, created_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`), call.ID, call.UtilityID, call.SessionID, call.ResolvedPrompt, call.Response,
+		call.Model, call.AgentProfileID, call.ExecutionProfileID, call.PromptTokens, call.ResponseTokens, call.DurationMs,
+		call.Status, call.ErrorMessage, call.CreatedAt, call.CompletedAt)
+	return err
+}
+
+func (r *sqliteRepository) UpdateCall(ctx context.Context, call *models.UtilityAgentCall) error {
+	if call == nil {
+		return errors.New("call is nil")
+	}
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE utility_agent_calls
+		SET response = ?, model = ?, agent_profile_id = ?, execution_profile_id = ?, prompt_tokens = ?, response_tokens = ?, duration_ms = ?, status = ?, error_message = ?, completed_at = ?
+		WHERE id = ?
+	`), call.Response, call.Model, call.AgentProfileID, call.ExecutionProfileID, call.PromptTokens, call.ResponseTokens, call.DurationMs,
+		call.Status, call.ErrorMessage, call.CompletedAt, call.ID)
+	return err
+}

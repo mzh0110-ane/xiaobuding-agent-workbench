@@ -1,0 +1,407 @@
+package costs
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/kandev/kandev/internal/office/models"
+
+	"go.uber.org/zap"
+)
+
+// Budget scope type constants.
+const (
+	scopeAgent     = "agent"
+	scopeProject   = "project"
+	scopeWorkspace = "workspace"
+)
+
+// Budget period and action-on-exceed constants. See spec
+// docs/specs/office/requirements/costs.md for semantics.
+const (
+	budgetPeriodMonthly = "monthly"
+
+	budgetActionPauseAgent    = "pause_agent"
+	budgetActionBlockNewTasks = "block_new_tasks"
+)
+
+// Claim levels. See docs/specs/office/requirements/costs.md#terminology.
+const (
+	claimLevelAlert    = "alert"
+	claimLevelExceeded = "exceeded"
+)
+
+// claimPeriodLifetime is the period_key for a policy whose spend window
+// never resets (periodCutoff's zero-time "no filter" answer). It is a
+// literal rather than the RFC3339 rendering of the zero time so a future
+// change to periodCutoff's zero value can never collide with it.
+const claimPeriodLifetime = "lifetime"
+
+// BudgetCheckResult describes the outcome of a budget check.
+// SpentSubcents / LimitSubcents are hundredths of a cent. AlertFired /
+// LimitExceed report whether spend reaches that level *now* (used for
+// gating); AlertSubmitted / ExceededSubmitted report whether *this*
+// evaluation handed that level's row to the activity logger (used for
+// assertions and for callers that want to react only to new crossings).
+// The two pairs are independent: holding a claim does not imply a
+// submission, and a submission does not imply a claim was held.
+type BudgetCheckResult struct {
+	PolicyID          string
+	ActionOnExceed    string
+	SpentSubcents     int64
+	LimitSubcents     int64
+	AlertFired        bool
+	LimitExceed       bool
+	AlertSubmitted    bool
+	ExceededSubmitted bool
+	AgentPaused       bool
+}
+
+// CheckBudget evaluates all budget policies for the given agent and project.
+// Returns results for each applicable policy, performing side-effects (alert, pause).
+func (s *CostService) CheckBudget(
+	ctx context.Context,
+	workspaceID, agentInstanceID, projectID string,
+) ([]BudgetCheckResult, error) {
+	policies, err := s.repo.ListBudgetPolicies(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+
+	applicable := filterApplicablePolicies(policies, agentInstanceID, projectID)
+	if len(applicable) == 0 {
+		return nil, nil
+	}
+
+	var results []BudgetCheckResult
+	for _, policy := range applicable {
+		result, err := s.evaluatePolicy(ctx, workspaceID, policy)
+		if err != nil {
+			s.logger.Error("budget check failed",
+				zap.String("policy_id", policy.ID),
+				zap.Error(err))
+			continue
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func filterApplicablePolicies(
+	policies []*BudgetPolicy,
+	agentInstanceID, projectID string,
+) []*BudgetPolicy {
+	var applicable []*BudgetPolicy
+	for _, p := range policies {
+		switch p.ScopeType {
+		case scopeAgent:
+			if p.ScopeID == agentInstanceID {
+				applicable = append(applicable, p)
+			}
+		case scopeProject:
+			if p.ScopeID == projectID {
+				applicable = append(applicable, p)
+			}
+		case scopeWorkspace:
+			applicable = append(applicable, p)
+		}
+	}
+	return applicable
+}
+
+func (s *CostService) evaluatePolicy(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+) (BudgetCheckResult, error) {
+	boundary := periodCutoff(string(policy.Period), time.Now())
+	spent, err := s.getSpendForPolicy(ctx, workspaceID, policy, boundary)
+	if err != nil {
+		return BudgetCheckResult{}, err
+	}
+
+	limit := policy.LimitSubcents
+	result := BudgetCheckResult{
+		PolicyID:       policy.ID,
+		ActionOnExceed: string(policy.ActionOnExceed),
+		SpentSubcents:  spent,
+		LimitSubcents:  limit,
+	}
+
+	periodKey := periodKeyFor(boundary)
+	threshold := limit * int64(policy.AlertThresholdPct) / 100
+
+	switch {
+	case spent >= limit:
+		result.LimitExceed = true
+		if policy.ActionOnExceed == budgetActionPauseAgent && policy.ScopeType == scopeAgent {
+			result.AgentPaused = s.pauseAgentForBudget(ctx, policy.ScopeID)
+		}
+		result.ExceededSubmitted = s.claimExceededAndEmit(ctx, workspaceID, policy, spent, periodKey)
+	case spent >= threshold:
+		result.AlertFired = true
+		result.AlertSubmitted = s.claimAndEmit(ctx, workspaceID, policy, spent, periodKey, claimLevelAlert)
+	}
+
+	return result, nil
+}
+
+// claimAndEmit resolves the three outcomes of claiming (policy, periodKey,
+// level) at the policy's current revision, and emits that level's activity
+// row when the claim allows it. Reports whether this evaluation submitted
+// the row.
+func (s *CostService) claimAndEmit(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+	spent int64,
+	periodKey, level string,
+) bool {
+	claimed, err := s.repo.Claim(ctx, policy.ID, periodKey, level, policy.Revision)
+	if err != nil {
+		s.recordClaimFailure(policy.ID, level, err)
+		s.emitLevel(ctx, workspaceID, policy, spent, level)
+		return true
+	}
+	if !claimed {
+		return false
+	}
+	s.emitLevel(ctx, workspaceID, policy, spent, level)
+	return true
+}
+
+// claimExceededAndEmit resolves the atomic exceeded-plus-companion claim
+// pair at the policy's current revision and emits budget.exceeded when the
+// exceeded-level row was won. A claim-store error anywhere in the pair —
+// including on the companion insert — fails the whole pair open: the error
+// is logged and counted once, and budget.exceeded still emits.
+func (s *CostService) claimExceededAndEmit(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+	spent int64,
+	periodKey string,
+) bool {
+	claimed, err := s.repo.ClaimExceeded(ctx, policy.ID, periodKey, policy.Revision)
+	if err != nil {
+		s.recordClaimFailure(policy.ID, claimLevelExceeded, err)
+		s.emitLevel(ctx, workspaceID, policy, spent, claimLevelExceeded)
+		return true
+	}
+	if !claimed {
+		return false
+	}
+	s.emitLevel(ctx, workspaceID, policy, spent, claimLevelExceeded)
+	return true
+}
+
+func (s *CostService) emitLevel(
+	ctx context.Context, workspaceID string, policy *BudgetPolicy, spent int64, level string,
+) {
+	if level == claimLevelExceeded {
+		s.logBudgetExceeded(ctx, workspaceID, policy, spent)
+		return
+	}
+	s.logBudgetAlert(ctx, workspaceID, policy, spent)
+}
+
+// recordClaimFailure logs and counts a claim-store failure encountered
+// while evaluating a policy. Never called for a foreign-key violation (the
+// referenced policy no longer exists, not a store failure) or for a failed
+// claim discard during a policy update, both of which are reported through
+// different channels.
+func (s *CostService) recordClaimFailure(policyID, level string, err error) {
+	budgetClaimFailuresTotal.Add(budgetClaimFailureLabel, 1)
+	s.logger.Error("budget claim store failure",
+		zap.String("policy_id", policyID), zap.String("level", level), zap.Error(err))
+}
+
+// periodCutoff returns the time.Time at which the policy's spend window
+// starts. A zero time means "no filter" (lifetime / total) or an unknown
+// period retained for compatibility with stored policies.
+func periodCutoff(period string, now time.Time) time.Time {
+	start, ok := windowStart(models.BudgetPeriod(period), now)
+	if !ok {
+		return time.Time{}
+	}
+	return start
+}
+
+// periodKeyFor renders a period boundary as the claim's stored identity.
+// The layout is contract, not local style: a non-zero boundary is RFC3339 in
+// UTC, and periodCutoff's zero-time "lifetime" answer renders as the
+// literal "lifetime" rather than the RFC3339 zero time, so it can never be
+// mistaken for a real instant.
+func periodKeyFor(boundary time.Time) string {
+	if boundary.IsZero() {
+		return claimPeriodLifetime
+	}
+	return boundary.UTC().Format(time.RFC3339)
+}
+
+func (s *CostService) getSpendForPolicy(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+	since time.Time,
+) (int64, error) {
+	switch policy.ScopeType {
+	case scopeAgent:
+		return s.repo.GetCostForAgentSince(ctx, policy.ScopeID, since)
+	case scopeProject:
+		return s.repo.GetCostForProjectSince(ctx, policy.ScopeID, since)
+	case scopeWorkspace:
+		return s.repo.SumCostsSince(ctx, workspaceID, since)
+	default:
+		return 0, nil
+	}
+}
+
+func (s *CostService) logBudgetAlert(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+	spentSubcents int64,
+) {
+	s.activity.LogActivity(ctx, workspaceID, "system", "budget_checker",
+		"budget.alert", string(policy.ScopeType), policy.ScopeID,
+		fmt.Sprintf(`{"spent_subcents":%d,"limit_subcents":%d,"period":%q,"policy_id":%q}`,
+			spentSubcents, policy.LimitSubcents, policy.Period, policy.ID))
+}
+
+func (s *CostService) logBudgetExceeded(
+	ctx context.Context,
+	workspaceID string,
+	policy *BudgetPolicy,
+	spentSubcents int64,
+) {
+	s.activity.LogActivity(ctx, workspaceID, "system", "budget_checker",
+		"budget.exceeded", string(policy.ScopeType), policy.ScopeID,
+		fmt.Sprintf(`{"spent_subcents":%d,"limit_subcents":%d,"period":%q,"action":%q,"policy_id":%q}`,
+			spentSubcents, policy.LimitSubcents, policy.Period, policy.ActionOnExceed, policy.ID))
+}
+
+// EvaluateBudget runs the post-event budget check: any applicable
+// policy that is over its limit fires an alert; pause_agent policies
+// flip the agent to paused. Per-policy results are discarded — the
+// office service's subscriber only cares about side effects.
+func (s *CostService) EvaluateBudget(
+	ctx context.Context, workspaceID, agentInstanceID, projectID string,
+) error {
+	_, err := s.CheckBudget(ctx, workspaceID, agentInstanceID, projectID)
+	return err
+}
+
+// CheckPreExecutionBudget checks all applicable budget policies before
+// launching an agent session. Returns (allowed, reason, error). Only
+// pause_agent and block_new_tasks return allowed=false (notify_only
+// alerts but does not block). See docs/specs/office/requirements/costs.md.
+// Implements shared.BudgetChecker.
+func (s *CostService) CheckPreExecutionBudget(
+	ctx context.Context, agentInstanceID, projectID, workspaceID string,
+) (bool, string, error) {
+	results, err := s.CheckBudget(ctx, workspaceID, agentInstanceID, projectID)
+	if err != nil {
+		return false, "", fmt.Errorf("budget check: %w", err)
+	}
+	for _, r := range results {
+		if !r.LimitExceed {
+			continue
+		}
+		if r.ActionOnExceed == budgetActionPauseAgent || r.ActionOnExceed == budgetActionBlockNewTasks {
+			reason := fmt.Sprintf(
+				"budget exceeded: spent %d of %d subcents (policy %s, action %s)",
+				r.SpentSubcents, r.LimitSubcents, r.PolicyID, r.ActionOnExceed)
+			return false, reason, nil
+		}
+	}
+	return true, "", nil
+}
+
+// EvaluateProjectBudget evaluates project-scoped budget policies for
+// projectID after a task is reassigned into it — the only budget hook on
+// the reassignment path. Reassignment can move a task's historical spend
+// across the project boundary that GetCostForProjectSince rolls up, so
+// without this the destination project's policies never see the crossing.
+//
+// Only policies with ScopeType==project and ScopeID==projectID are
+// evaluated: reassignment does not change the workspace total, so
+// re-checking scopeWorkspace policies (as CheckBudget does) would emit a
+// duplicate alert on every reassignment in an already over-budget
+// workspace. The source project is not evaluated either — reassignment
+// only lowers its spend, so it can't newly cross a threshold. A no-op
+// projectID (clearing a project) has no destination to evaluate.
+func (s *CostService) EvaluateProjectBudget(ctx context.Context, workspaceID, projectID string) error {
+	if projectID == "" {
+		return nil
+	}
+	policies, err := s.repo.ListBudgetPolicies(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	for _, policy := range policies {
+		if policy.ScopeType != scopeProject || policy.ScopeID != projectID {
+			continue
+		}
+		if _, err := s.evaluatePolicy(ctx, workspaceID, policy); err != nil {
+			s.logger.Error("project budget check failed",
+				zap.String("policy_id", policy.ID),
+				zap.Error(err))
+		}
+	}
+	return nil
+}
+
+func (s *CostService) pauseAgentForBudget(ctx context.Context, agentID string) bool {
+	agent, err := s.agents.GetAgentInstance(ctx, agentID)
+	if err != nil {
+		s.logger.Error("failed to get agent for budget pause",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return false
+	}
+	if agent.Status == models.AgentStatusPaused {
+		return false
+	}
+	if updErr := s.agentW.UpdateAgentStatusFields(
+		ctx, agent.ID, string(models.AgentStatusPaused), "budget_exceeded",
+	); updErr != nil {
+		s.logger.Error("failed to persist agent pause for budget",
+			zap.String("agent_id", agentID), zap.Error(updErr))
+		return false
+	}
+	s.logger.Info("agent paused due to budget exceeded",
+		zap.String("agent_id", agentID))
+	return true
+}
+
+// CreateBudgetPolicy creates a new budget policy.
+func (s *CostService) CreateBudgetPolicy(ctx context.Context, policy *BudgetPolicy) error {
+	if err := validateBudgetPolicyWrite(policy); err != nil {
+		return err
+	}
+	return s.repo.CreateBudgetPolicy(ctx, policy)
+}
+
+// ListBudgetPolicies returns all budget policies for a workspace.
+func (s *CostService) ListBudgetPolicies(ctx context.Context, wsID string) ([]*BudgetPolicy, error) {
+	return s.repo.ListBudgetPolicies(ctx, wsID)
+}
+
+// GetBudgetPolicy returns a budget policy by ID.
+func (s *CostService) GetBudgetPolicy(ctx context.Context, id string) (*BudgetPolicy, error) {
+	return s.repo.GetBudgetPolicy(ctx, id)
+}
+
+// UpdateBudgetPolicy updates a budget policy.
+func (s *CostService) UpdateBudgetPolicy(ctx context.Context, policy *BudgetPolicy) error {
+	if err := validateBudgetPolicyWrite(policy); err != nil {
+		return err
+	}
+	return s.repo.UpdateBudgetPolicy(ctx, policy)
+}
+
+// DeleteBudgetPolicy deletes a budget policy.
+func (s *CostService) DeleteBudgetPolicy(ctx context.Context, id string) error {
+	return s.repo.DeleteBudgetPolicy(ctx, id)
+}

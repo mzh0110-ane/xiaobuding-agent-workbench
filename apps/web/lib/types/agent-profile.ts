@@ -1,0 +1,311 @@
+import type { ProfileEnvVar } from "./http";
+import type { AgentProfileId, WorkspaceId } from "./ids";
+
+// Canonical AgentProfile (ADR 0005, Wave E):
+// ONE camelCase shape used by both kanban and office consumers. The HTTP
+// transport layer normalizes snake_case server payloads at the API client
+// boundary (see `lib/api/domains/office-api.ts#normalizeAgent` and
+// `lib/api/domains/agent-profile-normalize.ts#normalizeAgentProfile`).
+//
+// Field categories:
+//   - **Identity / CLI**: id, agentId, name, agentDisplayName, model, mode,
+//     cliFlags, cliPassthrough, allowIndexing, userModified, createdAt,
+//     updatedAt. Always populated by the kanban API (`/api/v1/agents` →
+//     `Agent.profiles[]`) and by `/api/v1/agent-profiles/:id`. Optional in
+//     the type because office-served rows that have not yet been wired to a
+//     CLI client may omit them.
+//   - **Office orchestration**: workspaceId, role, status, icon, reportsTo,
+//     permissions, budgetMonthlyCents, maxConcurrentSessions, desiredSkills,
+//     executorPreference, pauseReason, billingType, utilization,
+//     skillIds, agentProfileId. Always populated by the office API;
+//     absent on kanban-served rows.
+
+export type CLIFlag = {
+  description: string;
+  flag: string;
+  enabled: boolean;
+};
+
+export type BillingType = "api_key" | "subscription";
+
+export type AgentProfileKind = "concrete" | "dynamic";
+export type MCPSelectionMode = "inherit" | "selected";
+
+export type DynamicErrorClass = "transient" | "hard";
+export type DynamicPolicyOutcome = "skip" | "stop";
+
+export type DynamicRetryPolicy = {
+  enabled: boolean;
+  maxRetries: number;
+  initialIntervalSeconds: number;
+};
+
+export type DynamicResetWaitPolicy = {
+  enabled: boolean;
+  maxWaitSeconds: number;
+};
+
+export type DynamicErrorPolicy = {
+  retry: DynamicRetryPolicy;
+  waitForReset: DynamicResetWaitPolicy;
+  onExhausted: DynamicPolicyOutcome;
+};
+
+export type DynamicUnclassifiedPolicy = {
+  enabled: boolean;
+  consecutiveFailureThreshold: number;
+};
+
+export type DynamicAgentPolicy = {
+  version: number;
+  transient: DynamicErrorPolicy;
+  hard: DynamicErrorPolicy;
+  unclassified: DynamicUnclassifiedPolicy;
+};
+
+export type DynamicAgentCandidate = {
+  position: number;
+  executionProfileId: AgentProfileId;
+  enabled: boolean;
+  policies: DynamicAgentPolicy;
+  /** Read compatibility for clients that still construct legacy drafts. */
+  rules?: Record<string, string>;
+};
+
+export type DynamicAgentProfile = {
+  version: number;
+  candidates: DynamicAgentCandidate[];
+};
+
+export type UtilizationWindow = {
+  label: string;
+  utilization_pct: number;
+  reset_at: string;
+};
+
+export type ProviderUsage = {
+  provider: string;
+  windows: UtilizationWindow[];
+  fetched_at: string;
+};
+
+export type AgentRole =
+  | "ceo"
+  | "worker"
+  | "specialist"
+  | "assistant"
+  | "security"
+  | "qa"
+  | "devops";
+
+export type AgentStatus = "idle" | "working" | "paused" | "stopped" | "pending_approval";
+
+export type AgentProfile = {
+  // --- Identity ---
+  id: AgentProfileId;
+  /** The execution family. Dynamic profiles own routing, not a subprocess. */
+  kind?: AgentProfileKind;
+  /** Versioned routing document for the dynamic execution family. */
+  dynamic?: DynamicAgentProfile;
+  name: string;
+  /** ID of the agent (CLI) this profile belongs to. */
+  agentId: string;
+  /** Human display name for the agent CLI (e.g. "Claude Code"). */
+  agentDisplayName: string;
+
+  // --- CLI subprocess config ---
+  /** Model ID applied through ACP session model selection at session start. */
+  model: string;
+  /**
+   * Optional single ACP model ID the runtime switches to when the start
+   * model becomes unavailable. Ignored at runtime when autoFallback is on.
+   */
+  fallbackModel?: string;
+  /**
+   * Explicit opt-in to the legacy automatic-fallback behavior (session-start
+   * best-effort, office re-dispatch to the next provider candidate). When
+   * on, the fallbackModel field is hidden/ignored.
+   */
+  autoFallback?: boolean;
+  /** Require the configured model to be advertised and applied before prompting. */
+  requireExactModel?: boolean;
+  /** Optional ACP session mode applied via `session/set_mode`. */
+  mode?: string;
+  /** Dynamic ACP session config options applied via `session/set_config_option`. */
+  configOptions?: Record<string, string>;
+  /** @deprecated Use cliFlags. Retained for legacy clients. */
+  allowIndexing: boolean;
+  /** Kandev agentctl auto-approves ACP permission_request prompts when true. */
+  autoApprove: boolean;
+  /** User-configurable CLI flags passed to the agent subprocess. */
+  cliFlags: CLIFlag[];
+  /**
+   * Free-form tokens prepended to the agent subprocess launch command, e.g.
+   * `greywall --`. Used to wrap the ACP subprocess in a sandbox launcher.
+   * Shell-tokenised; empty means the agent runs directly.
+   */
+  commandPrefix?: string;
+  /**
+   * Provider routing. "" / "native" keeps the agent CLI's own provider
+   * configuration; "openai_compatible" makes Kandev inject providerBaseUrl and
+   * the key behind providerApiKeySecretId into the agent (9router, LiteLLM,
+   * vLLM, self-hosted OpenRouter, ...).
+   */
+  providerKind?: string;
+  /** Absolute http(s) endpoint root of the OpenAI-compatible provider. */
+  providerBaseUrl?: string;
+  /** Kandev global secret ID holding the provider bearer key. Never returned. */
+  providerApiKeySecretId?: string;
+  /**
+   * Computed at read time: true when this profile's agent advertises
+   * OpenAI-compatible provider support. Not persisted; never sent back.
+   */
+  providerSupported?: boolean;
+  /** Environment variables injected when this profile starts an agent session. */
+  envVars?: ProfileEnvVar[];
+  cliPassthrough: boolean;
+  /** Reuse locally stored Cursor MCP OAuth credentials when this profile launches. */
+  cursorMcpAuthEnabled?: boolean;
+  /** Import local Cursor plugin MCP servers when this profile launches. */
+  cursorPluginsMcpEnabled?: boolean;
+  /** Use all imported MCP servers or only the profile's selected native IDs. */
+  mcpSelectionMode?: MCPSelectionMode;
+  /** Exact native MCP server IDs selected when mcpSelectionMode is selected. */
+  mcpSelectedServers?: string[];
+  /**
+   * False hides the profile from task/session creation pickers. Existing
+   * sessions keep running and the profile stays editable in settings.
+   * Absent on old payloads — treat as enabled.
+   */
+  enabled?: boolean;
+  userModified?: boolean;
+
+  // --- Office orchestration (always populated by office API,
+  //     absent on kanban-served rows; consumers should null-check) ---
+  workspaceId?: WorkspaceId;
+  /**
+   * FK to a kanban-flavour profile when the office row delegates CLI
+   * subprocess configuration to a separate profile rather than carrying
+   * the CLI fields directly.
+   */
+  agentProfileId?: AgentProfileId;
+  role?: AgentRole;
+  icon?: string;
+  status?: AgentStatus;
+  reportsTo?: string;
+  permissions?: Record<string, unknown>;
+  budgetMonthlyCents?: number;
+  maxConcurrentSessions?: number;
+  desiredSkills?: string[];
+  executorPreference?: {
+    type?: string;
+    image?: string;
+    resource_limits?: Record<string, unknown>;
+    environment_id?: string;
+  };
+  pauseReason?: string;
+  billingType?: BillingType;
+  utilization?: ProviderUsage | null;
+  skillIds?: string[];
+
+  // --- Timestamps ---
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * Office-served `AgentProfile` view: the canonical shape with
+ * orchestration fields narrowed to non-optional. Returned by
+ * `/api/v1/office/workspaces/:id/agents` (and friends), which always
+ * populates these fields.
+ */
+export type OfficeAgentProfile = AgentProfile &
+  Required<
+    Pick<
+      AgentProfile,
+      "workspaceId" | "role" | "status" | "budgetMonthlyCents" | "maxConcurrentSessions"
+    >
+  > & {
+    /** Dynamic profile selected as this Office agent's authoritative execution route. */
+    executionAgentProfileId?: string;
+  };
+
+/**
+ * Snake_case wire shape for HTTP request bodies sent to `POST/PATCH
+ * /api/v1/agents/:id/profiles` and `/api/v1/agent-profiles/:id`. The
+ * backend speaks snake_case; this is the legacy shape used by form
+ * helpers, server actions, and WS payloads. Read paths normalize this
+ * into the canonical `AgentProfile` (camelCase) at the API client
+ * boundary.
+ */
+export type AgentProfilePayload = {
+  id: string;
+  agent_id: string;
+  kind?: AgentProfileKind;
+  name: string;
+  agent_display_name: string;
+  model: string;
+  fallback_model?: string;
+  auto_fallback?: boolean;
+  require_exact_model?: boolean;
+  mode?: string;
+  config_options?: Record<string, string>;
+  allow_indexing: boolean;
+  auto_approve: boolean;
+  cli_flags: CLIFlag[];
+  command_prefix?: string;
+  provider_kind?: string;
+  provider_base_url?: string;
+  provider_api_key_secret_id?: string;
+  provider_supported?: boolean;
+  env_vars?: ProfileEnvVar[];
+  cli_passthrough: boolean;
+  cursor_mcp_auth_enabled?: boolean;
+  cursor_plugins_mcp_enabled?: boolean;
+  mcp_selection_mode?: MCPSelectionMode;
+  mcp_selected_servers?: string[];
+  enabled?: boolean;
+  user_modified?: boolean;
+  created_at: string;
+  updated_at: string;
+  dynamic?: {
+    version: number;
+    candidates: Array<{
+      position: number;
+      execution_profile_id: string;
+      enabled: boolean;
+      policies?: {
+        version: number;
+        transient: {
+          retry: {
+            enabled: boolean;
+            max_retries: number;
+            initial_interval_seconds: number;
+          };
+          wait_for_reset: {
+            enabled: boolean;
+            max_wait_seconds: number;
+          };
+          on_exhausted: DynamicPolicyOutcome;
+        };
+        hard: {
+          retry: {
+            enabled: boolean;
+            max_retries: number;
+            initial_interval_seconds: number;
+          };
+          wait_for_reset: {
+            enabled: boolean;
+            max_wait_seconds: number;
+          };
+          on_exhausted: DynamicPolicyOutcome;
+        };
+        unclassified: {
+          enabled: boolean;
+          consecutive_failure_threshold: number;
+        };
+      };
+      rules?: Record<string, string>;
+    }>;
+  };
+};

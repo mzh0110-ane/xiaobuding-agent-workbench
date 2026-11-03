@@ -1,0 +1,107 @@
+// Executor and environment payload types for WS events
+
+import type { ExecutorProvider, ExecutorType } from "./executor";
+
+export type ExecutorPayload = {
+  id: string;
+  name: string;
+  type: ExecutorType;
+  status: string;
+  is_system: boolean;
+  config?: Record<string, string>;
+  provider?: ExecutorProvider;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ExecutorProfilePayload = {
+  id: string;
+  executor_id: string;
+  name: string;
+  mcp_policy?: string;
+  config?: Record<string, string>;
+  secret_fields?: Record<string, boolean>;
+  provider?: ExecutorProvider;
+  prepare_script: string;
+  cleanup_script: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type PrepareProgressPayload = {
+  task_id: string;
+  session_id: string;
+  execution_id: string;
+  step_name: string;
+  step_kind?: string;
+  remote_platform?: string;
+  mcp_server_id?: string;
+  mcp_provider?: string;
+  failure_code?: string;
+  step_command?: string;
+  step_index: number;
+  total_steps: number;
+  status: string;
+  output?: string;
+  error?: string;
+  warning?: string;
+  warning_detail?: string;
+  started_at?: string;
+  ended_at?: string;
+  preparation_id?: string;
+  preparation_started_at?: string;
+  timestamp: string;
+};
+
+export type PrepareCompletedPayload = {
+  task_id: string;
+  session_id: string;
+  execution_id: string;
+  success: boolean;
+  error_message?: string;
+  duration_ms: number;
+  preparation_id?: string;
+  preparation_started_at?: string;
+  workspace_path?: string;
+  steps?: Array<{
+    name: string;
+    kind?: string;
+    remote_platform?: string;
+    mcp_server_id?: string;
+    mcp_provider?: string;
+    failure_code?: string;
+    command?: string;
+    status: string;
+    output?: string;
+    error?: string;
+    warning?: string;
+    warning_detail?: string;
+    started_at?: string;
+    ended_at?: string;
+  }>;
+  timestamp: string;
+};
+
+export type LaunchWarningPayload = {
+  task_id: string;
+  session_id: string;
+  executor_id: string;
+  host: string;
+  state: string;
+  reason: string;
+  last_success_at?: string;
+  timestamp: string;
+};
+
+export type EnvironmentPayload = {
+  id: string;
+  name: string;
+  kind: string;
+  is_system: boolean;
+  worktree_root?: string;
+  image_tag?: string;
+  dockerfile?: string;
+  build_config?: Record<string, string>;
+  created_at?: string;
+  updated_at?: string;
+};

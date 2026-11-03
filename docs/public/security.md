@@ -1,0 +1,276 @@
+---
+title: "Security and Trust"
+description: "Choose a safe Kandev deployment boundary, constrain agent access, protect credentials, and preserve human review."
+---
+
+# Security and Trust
+
+Kandev is a developer workbench that runs agents with access to repositories, tools, and credentials. Its local-first model lets an agent use the same Git host, issue tracker, editor, shell, and command-line access available to the Kandev process. That is useful, but it also means the operating-system account, executor, network, and agent profile are the security boundary.
+
+> Kandev authentication is opt-in. When it is disabled, requests receive the synthetic single-user administrator identity, so network reachability is administrator reachability. When authentication is enabled, accounts and workspace authorization apply, but shared executors and agent profiles, the host filesystem account, cluster credentials, and agent-accessible APIs remain separate trust boundaries. See [Authentication & Users](authentication.md).
+
+## Quick checklist
+
+- Keep the backend on loopback or behind an authenticated TLS proxy.
+- Use Worktree, Docker, Kubernetes, SSH, or Sprites only when their isolation boundary matches the risk.
+- Scope agent and provider credentials to the smallest repository and operation set.
+- Keep human approval before merge, release, deployment, or other irreversible actions.
+
+## Choose a deployment boundary
+
+| Use case | Recommended boundary | Avoid |
+|---|---|---|
+| One developer on one machine | Desktop or CLI bound to loopback, running as that developer | Publishing the backend port to the LAN |
+| One developer on a remote host | Dedicated OS account, private VPN or SSH tunnel, or an authenticated TLS access proxy | A public IP and port with only TLS |
+| A trusted team | Dedicated host or service account, identity-aware proxy, private network, scoped credentials, and separate deployments for different trust groups | Treating the Kandev UI as a tenant or role boundary |
+| Unattended automation | Dedicated agent and executor profiles, narrow repository credentials, workflow limits, and provider-side branch protection | Reusing a developer's broad personal token or enabling unrestricted approval bypasses |
+
+The default backend host is `0.0.0.0`. Plain `kandev`, `kandev run`, and `npx kandev@latest` commands inherit that all-interface bind unless you override it. For local-only access, set `KANDEV_SERVER_HOST=127.0.0.1` before launch; configure an equivalent protected bind for a managed service. Browser origin and CORS checks reduce accidental cross-site access, but they do not identify or authorize a user. `auth.jwtSecret` is compatibility configuration and does not enable product login.
+
+```bash
+KANDEV_SERVER_HOST=127.0.0.1 kandev
+```
+
+For remote access, protect the whole origin, including:
+
+- the web application and `/api/v1` routes;
+- the `/ws` WebSocket route and terminal or preview tunnels;
+- Streamable HTTP MCP at `/mcp`; and
+- SSE compatibility at `/mcp/sse` and `/mcp/message`.
+
+Use an authenticated reverse proxy that supports WebSockets and long-lived streaming, or keep the service on a private VPN. Block direct access to the backend so a client cannot bypass the proxy. See [Mobile Remote Access](mobile-remote-access.md), [Run Kandev as a service](run-as-a-service.md), [Docker](docker.md), and [Kubernetes](k8s.md) for deployment-specific constraints.
+
+## Understand executor access
+
+An executor decides where the agent process runs. It does not reduce permissions unless its environment is actually isolated and constrained.
+
+| Executor | Primary boundary | Important limit |
+|---|---|---|
+| Worktree | A separate Git checkout | Isolates file state, not the host account, credentials, processes, ports, or network |
+| Local | The selected folder and Kandev host account | The agent can affect the same host resources its process can reach |
+| Local Docker | A container plus explicitly mounted paths and credentials | A Docker socket or daemon API can grant host-level control; mounts remain readable in the container. User namespace support (per-profile opt-in) relaxes seccomp and AppArmor. See [executor ADR](../decisions/2026-08-18-executor-userns-security-options.md) for the exact boundary |
+| Kubernetes | A namespaced Pod plus cluster admission, workload identity, network, and storage policy | The Kandev API identity can create/exec/forward/delete Pods, while the administrator-authored Pod template can request privileged or host-integrated access |
+| SSH | The configured remote account and host | Remote directories and credentials require manual lifecycle review |
+| Sprites | A remote sandbox and its injected credentials | Destroying the sandbox can remove unpushed work; network and token scope still matter |
+
+Use separate profiles for different trust levels. Do not give a routine documentation or review task the same environment, secrets, and permission bypasses as a production automation. Review [Executors](executors.md) before changing from the seeded Worktree profile.
+
+### Separate Kubernetes control and workload identities
+
+The Kubernetes executor has two identities with different jobs:
+
+- Kandev's API identity comes from the configured kubeconfig or the control-plane Pod's service account. It needs narrow Pod, exec, port-forward, and conditional PVC access in one namespace.
+- The session Pod's workload service account is selected by the administrator-authored Pod template. Kandev defaults token automount off when the template does not explicitly choose otherwise.
+
+A kubeconfig is executable trust input, not only a credential file. `client-go` can run `users[].user.exec` credential helpers and initialize configured auth-provider plugins with the Kandev backend's OS privileges. Only accept administrator-reviewed kubeconfigs. Keep them root-owned and read-only, or owned by the dedicated Kandev service account and not writable by agents, and review each helper command, plugin configuration, and referenced binary.
+
+Do not give session Pods Kandev's executor service account. The workload runs agent-controlled code and receives the task workspace, selected environment secrets, copied agent configuration, and injected runtime files. Scope its service account and network policy to what the task needs.
+
+Kandev rejects template fields that collide with its namespace, generated names, command, arguments, working directory, reserved environment, ports, mounts, Linux platform, or ownership labels. It warns, but does not remove, compatible high-risk settings such as privileged containers, host networking, host PID/IPC, `hostPath`, host ports, or service-account token automount. Enforce prohibited settings with Pod Security admission and your normal policy engine; an administrator warning is not isolation.
+
+Every managed Kubernetes create receives a fresh 256-bit `kandev.ai/create-nonce` annotation. After an ambiguous API response, Kandev adopts, bootstraps, checkpoints, or deletes an object only when its exact nonce and complete recorded identity match; copied labels alone are insufficient.
+
+Kubeconfig bytes and cluster credentials are not copied into the session Pod. Kandev injects `agentctl`, task credentials, and configuration through Pod exec into reserved volumes, then reaches `agentctl` over a local-only port-forward rather than a Service or Ingress. Protect the Kandev host and its kubeconfig because compromise of that process inherits the configured Kubernetes API authority.
+
+Only Kandev administrators can create, edit, delete, or test Kubernetes executors and profiles. Members can read and use configured profiles and see sanitized status for sessions they are authorized to access. With authentication disabled, the synthetic administrator preserves single-user behavior, so these role checks do not protect a remotely exposed unauthenticated instance.
+
+Use the opt-in least-privilege example and review the live diagnostic behavior in [Kubernetes](k8s.md#configure-the-kubernetes-executor).
+
+## Scope agent profiles
+
+An agent profile combines a CLI, model, mode, flags, environment values, secret references, permissions, and optional MCP servers. Treat it as a reusable authority package.
+
+The configurable ACP command prefix is currently a launch-customization
+feature, not an isolation boundary. Kandev does not yet have a separate
+authenticated operator session for profile mutations, so an agent that can
+reach the main HTTP API may attempt the same profile edits as the UI. Do not
+rely on the prefix to confine a hostile agent until the operator-owned settings
+boundary in
+[ADR-2026-07-24-operator-owned-agent-launcher-settings](../decisions/2026-07-24-operator-owned-agent-launcher-settings.md)
+is enforced. The current per-boot token is a deliberately replayable interim
+CSRF and accidental-mutation interlock, not authentication: an intentional
+agent can fetch and replay it. It does not close this direct-client path, and
+an ambient browser login is insufficient while agent-controlled previews can
+share the operator origin.
+
+1. Create a profile for one purpose, such as local implementation, read-focused review, or unattended maintenance.
+2. Select the least-privileged Git, provider, and cloud credentials that purpose needs.
+3. Leave approval or sandbox bypasses disabled unless the executor is disposable and the task is trusted.
+4. Allow only required MCP transports and servers in the executor policy.
+5. Test the profile on a disposable repository before enabling workflow auto-start or scheduled automation.
+
+Agent CLIs can also discover authentication from their normal home-directory files, environment, keychain, or provider CLI. Removing a Kandev secret does not revoke a token stored elsewhere. Revoke credentials at the provider and remove retained executor copies when access should end.
+
+See [Agents and profiles](agents-and-profiles.md) for exact profile fields and [Automation and MCP](automation-and-mcp.md) for unattended and external-client boundaries.
+
+### Treat copied agent configuration as an authority grant
+
+Portable agent configuration lets a profile copy a small allowlisted file from
+the Kandev host into a Docker, Kubernetes, SSH, or Sprites executor. The copy is verbatim.
+It can therefore contain secrets, environment values, hooks, commands, model
+and permission settings, MCP servers, endpoints, or host paths. An agent and
+its child processes can use everything that the copied file grants.
+
+Kandev does not accept arbitrary paths or complete agent homes. It rejects
+symlinks, path traversal, non-regular files, and files above the per-file or
+per-launch size limit. It writes successful copies with owner-only mode
+`0600`, keeps raw contents out of the browser, API, and database, and reports
+optional copy failures as warnings. Fresh provisioning and **Reset
+Environment** read the current host file. Warm resume keeps the executor copy.
+
+An SSH copy is written below the configured remote user's home. A shared remote
+account can expose the file and its effects to other processes. Use a
+dedicated account when the configuration contains credentials or executable
+hooks. Review the selected bundle and the executor trust boundary before
+launching an agent.
+
+## Treat workspace sources as access grants
+
+Adding a repository or folder gives the task access to that source. A local folder is a live host-path grant, not an upload: Kandev does not copy, move, delete, or add marker files to it. Folder sources are therefore limited to Local/Local PC and Worktree tasks and are never sent to Docker, Kubernetes, SSH, Sprites, or Remote Docker.
+
+For task MCP source attachment, a task can grant a source to itself or to its direct child in the same workspace only. The backend verifies the session-bound caller identity; sibling, ancestor, non-direct descendant, unrelated, and cross-workspace tasks cannot use this path to grant access. Treat a parent-to-child attachment as a deliberate access grant, and keep the target idle while it is made.
+
+Remote repository locators and clone credentials can reveal authority. Kandev does not persist credential-bearing URLs or include credentials in source metadata or logs. Use provider credentials or a safe cloneable locator, and never paste tokens into a repository URL, task prompt, or source display name.
+
+## Protect stored secrets
+
+Secrets created through Kandev are encrypted in the database with the AES-256 master key at `<home>/data/master.key`. Protect both files:
+
+- a copied database can contain encrypted provider and profile credentials;
+- a database plus its matching master key can recover those values;
+- a database restored without its matching key cannot decrypt them; and
+- filesystem permissions and backup access remain part of the security boundary.
+
+Back up the master key separately with owner-only access when encrypted settings must survive recovery. Do not commit secrets to `config.yaml`, repository instructions, workflow prompts, task descriptions, capture artifacts, or shell history. Environment variables are visible to the process and may be visible to child agents.
+
+Kandev separates **Global** secrets from **Workspace** secrets. Global means user-global when authentication is enabled, and install-global when authentication is disabled. Workspace secrets are private to one authorized workspace. Shared agent and executor profiles can reference Global secrets only; a repository can explicitly bind a Global or same-workspace secret to a named environment key. Every task inherits bindings from all of its attached repositories.
+
+The runtime builds one environment snapshot before provisioning. Same-key bindings to the same secret are deduplicated; different secret IDs, literal-versus-secret bindings, or different literal values fail the launch before setup or agent startup. Source origins are retained for conflict diagnostics, but secret values and IDs are never exposed. Deleted, missing, unreadable, unauthorized, or wrong-workspace repository references fail closed and remain visible as broken bindings for repair. Values are held in process memory and are not written to repository, task, session, event, or environment metadata. Rotating a secret affects fresh provisioning or **Reset Environment**, not a running process or an already-open terminal.
+
+SSH forwards only the managed credential allowlist and repository environment keys explicitly approved by the task's bindings. It does not forward arbitrary host or request environment, and unrelated executor-profile variables do not cross the SSH boundary. Treat any secret that is approved for a repository as available to code and setup scripts in tasks that attach that repository.
+
+Webhook secrets are a separate case. A workspace automation stores its webhook secret with the automation, and a user with settings access can reveal it. Use TLS, keep it out of URLs and logs, and replace the automation when rotation is required.
+
+See [Configuration](configuration.md) for storage and environment fields and [Operations](operations.md) for backup, restore, logs, and reset behavior.
+
+## Keep a human in the loop
+
+Kandev can automate planning, implementation, review preparation, and pull-request operations without making the agent the final authority.
+
+For a human-gated workflow:
+
+1. Use a dedicated Review or Approval step.
+2. Set **On Turn Complete** to **Do nothing (wait for user)**.
+3. Do not auto-start the next privileged step.
+4. Inspect the conversation, diff, tests, walkthrough, checks, and provider review state.
+5. Let a person move the task or send the next instruction after approval.
+
+`step_complete_kandev` proves that an agent emitted the configured completion signal; it is not human approval. Kandev also does not bypass Git host permissions, required checks, review rules, or branch protection. Keep those controls authoritative for merges and deployments.
+
+For a coordinator pattern, split work into bounded sessions or subtasks, constrain each profile, and keep a human gate before merge or release. See [Tasks and workflows](tasks-and-workflows.md), [Coordinate work](coordination.md), and [Sessions and review](sessions-and-review.md).
+
+## Treat input and output as untrusted
+
+Repository content, task attachments, issue and pull-request text, Slack messages, webhook payloads, MCP client prompts, agent output, generated commands, and URLs can all influence an agent.
+
+- Do not let external text select credentials, shell commands, deployment targets, or unrestricted profiles without validation.
+- Review generated commands before running them in a privileged terminal.
+- Keep tool approval enabled for agents handling untrusted content.
+- Treat shared session snapshots, logs, traces, screenshots, and videos as potentially sensitive.
+- Test automation templates with missing and adversarial payload fields.
+
+Task MCP is scoped to an active Kandev agent session, but it can still create or mutate tasks and coordinate other sessions. External MCP exposes configuration and task-management tools without Kandev authentication. Review every client's live tool list and approval policy before connecting it.
+
+## Isolated web applications
+
+> [!EXPERIMENTAL]
+> Agent-authored canvases are in progress. Enable `features.canvases` only for a trusted test instance and review every permission request.
+
+An isolated web app is a packaged static app that runs inside a sandboxed
+iframe. It is different from a native plugin bundle. Native bundles run as
+same-origin frontend code and belong to the privileged plugin boundary.
+
+The isolated web-app boundary has these rules:
+
+- The iframe allows packaged scripts and forms, but it does not allow top-level
+  navigation or popups.
+- The iframe is same-origin with Kandev. Canvas source is trusted with the
+  viewing user's ordinary user-session authority, including same-origin
+  cookies, browser storage, and host DOM access.
+- The app uses relative `./_kandev/v1` protocol paths. For these protocol
+  requests, the app receives only the Kandev data, events, state, and actions
+  that the capability binding grants.
+  Cookies do not replace the capability URL or per-operation permission checks.
+- Kandev calculates effective access from the package declaration, instance
+  grant, trusted task or workspace scope, and current caller authorization.
+- A new owner-created task canvas can use a recorded, single-use creation
+  authority for its first valid release. The authority can add only supported
+  task-scoped data, event, state, and exact HTTPS-origin grants. Imported
+  packages, later permission increases, and consumed or revoked authority use
+  normal human review.
+- External network access uses exact HTTPS origins approved by a user. A
+  wildcard, origin path, query string, credential, or remote script is not
+  accepted.
+- Forms cannot submit to an external origin. The runtime policy sets
+  `form-action 'none'`.
+- A reverse proxy must preserve same-origin cookies for runtime requests and
+  must not redirect runtime HTML or inject remote scripts into it. Cloudflare
+  Web Analytics and similar HTML injection must be excluded on the runtime
+  path because the runtime CSP allows only packaged scripts.
+- Kandev applies a response Content Security Policy to the entry and asset
+  routes. The policy allows the response's exact same origin to frame the
+  runtime. This supports a custom Kandev DNS name, IP address, port, or HTTPS
+  deployment without a hostname allowlist. Unrelated and nested foreign
+  ancestors remain blocked. Local launcher and Tauri origins are exact
+  exceptions. Kandev does not trust `Host` or forwarded host headers when it
+  builds this policy. The response also applies `no-store`, `nosniff`,
+  `no-referrer`, and cross-origin resource protections.
+- The entry response includes a reserved host bootstrap before packaged scripts.
+  It captures early document errors, checks context access after document load,
+  and sends only a versioned ready or safe failure result to the exact parent
+  frame window. The host uses a fresh nonce and 15-second deadline for each
+  mount, ignores stale or sibling-frame messages, and exposes retry controls
+  outside the failed frame.
+- Runtime requests use a short-lived capability token. The host binds the
+  token to the user, instance, release, app key, placement, scope, and grant
+  generation, then checks those values on every request.
+
+External origin requests are direct browser requests and cannot be checked by
+Kandev after they leave the browser. When a release, grant, scope, archive,
+disable, or removal event changes authority, the host immediately unmounts the
+matching iframe. It loads a replacement only after a fresh metadata and
+runtime-binding check. Kandev runtime and protocol requests continue to
+revalidate on every request.
+
+Browser storage is available to trusted same-origin canvas code according to
+normal browser and site storage policy. Treat it as user-session storage, not
+as the durable app store. Use the canvas state protocol for small app-specific
+shared values and memory for temporary values. Do not copy task or workflow
+data into app state as a second source of truth.
+
+The host renders canvas controls outside the iframe. Keep the backend and its
+HTTP, WebSocket, and MCP routes behind the deployment boundary described at
+the top of this page. See [Agent-authored Canvases](canvases.md) for creation,
+promotion, Quick Chat editing, release review, and recovery.
+
+Release review uses authorized task and session lookups for readable source
+labels. If those records are deleted or inaccessible, the UI shows an
+unavailable label and never substitutes the internal identifier.
+
+## Operational checklist
+
+Before shared or remote use, confirm:
+
+- the backend is not directly reachable from an untrusted network;
+- an authenticated access layer protects HTTP, WebSocket, and MCP traffic;
+- the Kandev process runs as a dedicated, non-root account where practical;
+- repository, provider, agent, Docker, Kubernetes, SSH, and cloud credentials are narrowly scoped;
+- Docker daemon access is absent unless a task requires it;
+- workflow auto-start, turn-completion transitions, and schedules have been tested with human gates;
+- branch protection and required checks are enforced at the Git provider;
+- database, `master.key`, logs, traces, captures, and backups have controlled access and retention; and
+- restore and credential-revocation procedures have been tested.
+
+If the backend may have been exposed, restrict network access first. Then rotate provider, agent, Git, webhook, executor, and proxy credentials that the process or its tasks could access; inspect task/session history and logs; preserve evidence according to your policy; and rebuild disposable executor environments. Kandev does not currently provide a complete security audit log, so rely on host, proxy, provider, and infrastructure logs for incident investigation.
+
+Related: [Get started](use-kandev.md), [Feature status](feature-status.md), [Executors](executors.md), [Automation and MCP](automation-and-mcp.md), and [Operations](operations.md).

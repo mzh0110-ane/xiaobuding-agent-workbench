@@ -1,0 +1,203 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Combobox, type ComboboxOption } from "@/components/combobox";
+import { useAppStore } from "@/components/state-provider";
+import { TaskDetachConfirmationSurface } from "@/components/task/task-detach-confirm-dialog";
+import { searchTasks, updateTask } from "@/lib/api/domains/office-extended-api";
+import { detachTask, fetchTask } from "@/lib/api/domains/kanban-api";
+import { useOptimisticTaskMutation } from "@/hooks/use-optimistic-task-mutation";
+import type { OfficeTask } from "@/lib/state/slices/office/types";
+import type { Task } from "@/app/office/tasks/[id]/types";
+import { workspaceModeFromMetadata, type WorkspaceMode } from "@/lib/kanban/map-task";
+import { useTranslation } from "react-i18next";
+import { t } from "@/lib/i18n";
+
+type ParentPickerProps = {
+  task: Task;
+};
+
+const NO_PARENT = "__none__";
+const DETACH_CONFIRMATION_DELAY_MS = 300;
+
+function useDeferredDetachConfirmation() {
+  const [open, setOpen] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  const cancelPending = useCallback(() => {
+    if (timerRef.current === null) return;
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }, []);
+  const request = useCallback(() => {
+    cancelPending();
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setOpen(true);
+    }, DETACH_CONFIRMATION_DELAY_MS);
+  }, [cancelPending]);
+
+  useEffect(() => cancelPending, [cancelPending]);
+  return { open, setOpen, cancelPending, request };
+}
+
+function useTaskWorkspaceMode(task: Task) {
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode | undefined>(task.workspaceMode);
+
+  useEffect(() => {
+    if (task.workspaceMode) {
+      setWorkspaceMode(task.workspaceMode);
+      return;
+    }
+    if (!task.parentId) return;
+    let cancelled = false;
+    fetchTask(task.id)
+      .then((canonicalTask) => {
+        if (!cancelled) setWorkspaceMode(workspaceModeFromMetadata(canonicalTask.metadata));
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaceMode(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task.id, task.parentId, task.workspaceMode]);
+
+  return workspaceMode;
+}
+
+function buildOptions(candidates: OfficeTask[], currentTaskId: string): ComboboxOption[] {
+  const noOpt: ComboboxOption = {
+    value: NO_PARENT,
+    label: t("task:noParent"),
+    keywords: ["none"],
+    renderLabel: () => <span className="text-muted-foreground">{t("task:noParent")}</span>,
+  };
+  const taskOpts = candidates
+    .filter((t) => t.id !== currentTaskId)
+    .map<ComboboxOption>((t) => ({
+      value: t.id,
+      label: `${t.identifier} ${t.title}`,
+      keywords: [t.identifier, t.title],
+      renderLabel: () => (
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="font-mono text-xs text-muted-foreground shrink-0">{t.identifier}</span>
+          <span className="truncate">{t.title}</span>
+        </span>
+      ),
+    }));
+  return [noOpt, ...taskOpts];
+}
+
+export function ParentPicker({ task }: ParentPickerProps) {
+  const { t, i18n } = useTranslation();
+  const storeTasks = useAppStore((s) => s.office.tasks.items);
+  const workspaceId = useAppStore((s) => s.workspaces.activeId);
+  const [fetched, setFetched] = useState<OfficeTask[]>([]);
+  const [isDetaching, setIsDetaching] = useState(false);
+  const detachAnchorRef = useRef<HTMLButtonElement>(null);
+  const detachConfirmation = useDeferredDetachConfirmation();
+  const workspaceMode = useTaskWorkspaceMode(task);
+  const mutate = useOptimisticTaskMutation();
+
+  // If the store doesn't already have tasks for the workspace, lazily fetch.
+  useEffect(() => {
+    if (!workspaceId || storeTasks.length > 0) return;
+    let cancelled = false;
+    searchTasks(workspaceId, "", 50)
+      .then((res) => {
+        if (!cancelled) setFetched(res.tasks ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setFetched([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, storeTasks.length]);
+
+  const candidates = storeTasks.length > 0 ? storeTasks : fetched;
+
+  // `buildOptions` resolves its "No parent" label through the module-level `t`.
+  // Keeping the language in the deps is what makes that label follow a runtime
+  // locale switch; without it the memo only recomputes when the data changes.
+  const options = useMemo(
+    () => buildOptions(candidates, task.id),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- i18n.language is the locale trigger
+    [candidates, task.id, i18n.language],
+  );
+
+  const currentValue = task.parentId || NO_PARENT;
+
+  const handleSelect = async (next: string) => {
+    detachConfirmation.cancelPending();
+    const sendValue = next === NO_PARENT || next === "" ? "" : next;
+    if (sendValue === (task.parentId ?? "")) return;
+    if (!sendValue) {
+      // Let the combobox finish closing before the local confirmation opens.
+      detachConfirmation.request();
+      return;
+    }
+    const matched = candidates.find((t) => t.id === sendValue);
+    try {
+      await mutate(
+        task.id,
+        {
+          parentId: sendValue || undefined,
+          parentTitle: matched?.title,
+          parentIdentifier: matched?.identifier,
+        },
+        () => updateTask(task.id, { parent_id: sendValue }),
+      );
+    } catch {
+      /* toast already raised */
+    }
+  };
+
+  const handleDetachConfirm = async () => {
+    if (isDetaching) return;
+    setIsDetaching(true);
+    try {
+      await mutate(
+        task.id,
+        {
+          parentId: undefined,
+          parentTitle: undefined,
+          parentIdentifier: undefined,
+        },
+        () => detachTask(task.id),
+      );
+      detachConfirmation.setOpen(false);
+    } catch {
+      // useOptimisticTaskMutation restores state and reports the request error.
+    } finally {
+      setIsDetaching(false);
+    }
+  };
+
+  return (
+    <>
+      <Combobox
+        options={options}
+        value={currentValue}
+        onValueChange={handleSelect}
+        placeholder={t("task:noParent")}
+        searchPlaceholder={t("task:searchTasks")}
+        emptyMessage={t("task:noTasksFound")}
+        disabled={isDetaching}
+        triggerClassName="h-7 w-full justify-end px-2"
+        popoverAlign="end"
+        triggerRef={detachAnchorRef}
+        testId="parent-picker-trigger"
+      />
+      <TaskDetachConfirmationSurface
+        taskId={task.id}
+        open={detachConfirmation.open}
+        anchorRef={detachAnchorRef}
+        taskTitle={task.title}
+        sharesParentWorkspace={workspaceMode === "inherit_parent"}
+        onOpenChange={detachConfirmation.setOpen}
+        onConfirm={handleDetachConfirm}
+      />
+    </>
+  );
+}

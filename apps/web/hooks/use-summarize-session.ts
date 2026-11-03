@@ -1,0 +1,58 @@
+import { useCallback, useState } from "react";
+import { executeUtilityPrompt } from "@/lib/api/domains/utility-api";
+import { listTaskSessionMessages } from "@/lib/api/domains/session-api";
+import type { Message } from "@/lib/types/http";
+import { t } from "@/lib/i18n";
+
+export type SummarizeSessionResult = {
+  summary: string | null;
+  error?: string;
+};
+
+function formatTranscript(messages: Message[]): string {
+  return messages
+    .filter((m) => m.type === "message" || m.type === "content")
+    .map((m) => {
+      // i18n-exempt: transcript role markers sent verbatim to the summarizing model, not shown to a user.
+      const role = m.author_type === "user" ? "User" : "Agent";
+      return `${role}: ${m.content}`;
+    })
+    .join("\n\n");
+}
+
+export function useSummarizeSession() {
+  const [isSummarizing, setIsSummarizing] = useState(false);
+
+  const summarize = useCallback(async (sessionId: string): Promise<SummarizeSessionResult> => {
+    setIsSummarizing(true);
+    try {
+      // Fetch messages from API — they may not be in the store for non-active sessions
+      const resp = await listTaskSessionMessages(sessionId, { sort: "asc" });
+      const messages = resp.messages ?? [];
+      if (!messages.length) return { summary: null };
+
+      const transcript = formatTranscript(messages);
+      if (!transcript) return { summary: null };
+
+      // Sessionless: handoff often runs against a completed session whose
+      // agentctl is gone. Host utility executes the builtin summarize agent.
+      const result = await executeUtilityPrompt({
+        utility_agent_id: "builtin-summarize-session",
+        conversation_history: transcript,
+      });
+      if (!result.success) {
+        return { summary: null, error: result.error || t("task:summarizeReturnedNoResult") };
+      }
+      return { summary: result.response ?? null };
+    } catch (error) {
+      return {
+        summary: null,
+        error: error instanceof Error ? error.message : t("task:couldNotGenerateSummary"),
+      };
+    } finally {
+      setIsSummarizing(false);
+    }
+  }, []);
+
+  return { summarize, isSummarizing };
+}

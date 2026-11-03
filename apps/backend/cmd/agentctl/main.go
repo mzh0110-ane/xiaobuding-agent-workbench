@@ -1,0 +1,361 @@
+// Package main is the entry point for the agentctl binary.
+// agentctl is a sidecar process that manages agent subprocess communication
+// via HTTP API, bridging the agent's ACP protocol with the kandev backend.
+//
+// agentctl is runtime-agnostic - it behaves identically whether running
+// inside a Docker container or directly on the host machine. The caller
+// (kandev backend) handles any Docker vs standalone differences.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
+	"github.com/kandev/kandev/internal/agentctl/server/api"
+	"github.com/kandev/kandev/internal/agentctl/server/config"
+	"github.com/kandev/kandev/internal/agentctl/server/instance"
+	"github.com/kandev/kandev/internal/agentctl/server/process"
+	"github.com/kandev/kandev/internal/agentctl/tracing"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/githubauth"
+	mcpprofile "github.com/kandev/kandev/internal/mcp/profile"
+	mcpserver "github.com/kandev/kandev/internal/mcp/server"
+	"github.com/kandev/kandev/internal/profiles"
+	"github.com/kandev/kandev/pkg/agent"
+	"go.uber.org/zap"
+)
+
+// Command-line flags
+var (
+	protocolFlag     = flag.String("protocol", "", "Protocol for agent communication (acp, codex, mcp)")
+	agentCommandFlag = flag.String("agent-command", "", "Command to run the agent")
+	workDirFlag      = flag.String("workdir", "", "Working directory for the agent")
+	portFlag         = flag.Int("port", 0, "HTTP server port")
+)
+
+func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
+	if code, handled := runGitHubUtilityCommand(); handled {
+		return code
+	}
+
+	// Dispatch kandev CLI subcommands before flag parsing or server startup.
+	// When invoked as "agentctl kandev <cmd>", this runs the CLI and exits
+	// without starting the HTTP server.
+	if len(os.Args) > 1 && os.Args[1] == "kandev" {
+		return runKandevCLI(os.Args[2:])
+	}
+
+	cleanupGitHubCLIShim, err := prepareGitHubCLIShim()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer cleanupGitHubCLIShim()
+
+	flag.Parse()
+
+	// Load configuration. Managed launches receive a validated, resolved child
+	// contract from the backend. Direct invocations retain legacy environment
+	// compatibility when that private contract is absent.
+	startup, managed, err := config.StartupConfigFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load managed agentctl configuration: %v\n", err)
+		return 1
+	}
+	var cfg *config.Config
+	if managed {
+		cfg, err = config.LoadWithStartup(startup)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load managed agentctl configuration: %v\n", err)
+			return 1
+		}
+		tracing.ConfigureEndpoint(startup.OTLPEndpoint)
+	} else {
+		cfg = config.Load()
+		tracing.ConfigureEndpoint(cfg.OTLPEndpoint)
+	}
+	if _, _, err := profiles.ApplyProfile(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to apply profile defaults: %v\n", err)
+		return 1
+	}
+
+	// Override with CLI flags if provided
+	if *protocolFlag != "" {
+		cfg.Defaults.Protocol = agent.Protocol(*protocolFlag)
+	}
+	if *agentCommandFlag != "" {
+		cfg.Defaults.AgentCommand = *agentCommandFlag
+	}
+	if *workDirFlag != "" {
+		cfg.Defaults.WorkDir = *workDirFlag
+	}
+	if *portFlag != 0 {
+		cfg.Port = *portFlag
+	}
+
+	applySIGPIPEDisposition(cfg, signal.Ignore)
+
+	// Initialize logger
+	log, err := logger.NewLogger(resolveRunLoggingConfig(cfg))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+		return 1
+	}
+	defer func() {
+		_ = log.Sync()
+	}()
+
+	log.Info("starting agentctl",
+		zap.Int("port", cfg.Port),
+		zap.String("log_level", cfg.LogLevel))
+	log.Info("agentctl bootstrap nonce mode",
+		zap.Bool("configured", cfg.BootstrapNonceConfigured()),
+		zap.String("nonce_fingerprint", cfg.BootstrapNonceFingerprint()))
+
+	run(cfg, log)
+	return 0
+}
+
+func runGitHubUtilityCommand() (int, bool) {
+	if isGitHubCLIShimInvocation(os.Args[0]) {
+		self, _ := os.Executable()
+		lookPath := lookPathSkippingShims(self)
+		err := runGitHubCLIShim(
+			context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr,
+			os.Getenv, os.Environ, nil, os.Getenv(envGitHubCLIShimDir), lookPath, executeGitHubCLI,
+		)
+		return githubUtilityExitCode(err), true
+	}
+	if len(os.Args) > 1 && os.Args[1] == "git-credential" {
+		err := runGitHubCredentialHelper(
+			context.Background(), os.Args[2:], os.Stdin, os.Stdout, os.Getenv, nil,
+		)
+		return githubUtilityExitCode(err), true
+	}
+	return 0, false
+}
+
+func prepareGitHubCLIShim() (func(), error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve agentctl executable for gh shim: %w", err)
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return nil, fmt.Errorf("resolve absolute agentctl executable for GitHub tools: %w", err)
+	}
+	shimDir, cleanup, err := installGitHubCLIShim(executable, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Setenv(envGitHubCLIShimDir, shimDir); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("configure gh shim directory: %w", err)
+	}
+	if err := os.Setenv(
+		githubauth.CredentialCLIBashEnvEnv,
+		filepath.Join(shimDir, githubauth.CLIBashEnvFilename),
+	); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("configure Bash environment: %w", err)
+	}
+	if err := os.Setenv(githubauth.CredentialHelperPathEnv, executable); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("configure Git credential helper executable: %w", err)
+	}
+	return cleanup, nil
+}
+
+func githubUtilityExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, err)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return 1
+}
+
+// run starts the agentctl server.
+// All instances are managed through the instance management API.
+func run(cfg *config.Config, log *logger.Logger) {
+	// Start the ACP debug-log janitor (no-op unless KANDEV_DEBUG_AGENT_MESSAGES
+	// is set). It periodically flushes the per-session debug writers and prunes
+	// old/oversized files so an always-on debug session can't fill the disk.
+	acpJanitor := shared.NewACPJanitor()
+	acpJanitor.Start(context.Background())
+
+	// Create instance manager
+	instMgr := instance.NewManager(cfg, log)
+
+	// Declared here and assigned below, before any instance can actually be
+	// created: the server factory closure reads controlServer.CredentialSource()
+	// lazily (at CreateInstance time, not at SetServerFactory time), so the
+	// forward reference is safe as long as controlServer is assigned before
+	// the first instance is created.
+	var controlServer *api.ControlServer
+
+	// Set the server factory to create API servers for each instance
+	instMgr.SetServerFactory(func(instCfg *config.InstanceConfig, procMgr *process.Manager, instLog *logger.Logger) http.Handler {
+		// Create MCP backend client for bidirectional communication through agent stream
+		// MCP requests from agents are sent through the agent stream WebSocket to the backend
+		mcpBackendClient := mcpserver.NewChannelBackendClient(instLog)
+
+		// Create MCP server using the channel-based backend client
+		var mcpSrv *mcpserver.Server
+		mcpNamePresentationOption := mcpserver.WithMCPToolNamespacingByServer(instCfg.NamespacesMCPToolsByServer)
+		mcpSSEBaseURLOption := mcpserver.WithSSEBaseURL(config.MCPServerURL(instCfg.MCPHost, instCfg.Port, ""))
+		if instCfg.McpProfile != nil {
+			mcpSrv = mcpserver.NewWithProfile(mcpBackendClient, instCfg.SessionID, instCfg.TaskID, instCfg.Port, instLog, cfg.McpLogFile, instCfg.DisableAskQuestion, *instCfg.McpProfile, mcpNamePresentationOption, mcpSSEBaseURLOption)
+		} else {
+			legacyProfile := mcpprofile.Legacy(instCfg.McpMode, instCfg.DisableAskQuestion, instCfg.McpProviders)
+			mcpSrv = mcpserver.NewWithProfile(mcpBackendClient, instCfg.SessionID, instCfg.TaskID, instCfg.Port, instLog, cfg.McpLogFile, instCfg.DisableAskQuestion, legacyProfile, mcpNamePresentationOption, mcpSSEBaseURLOption)
+		}
+		mcpSrv.SetAttachmentReporter(procMgr.PublishMCPAttachment)
+		instLog.Info("MCP server enabled (channel-based)",
+			zap.String("session_id", instCfg.SessionID))
+
+		srv := api.NewServer(instCfg, procMgr, mcpSrv, mcpBackendClient, instLog)
+		srv.SetCredentialSource(controlServer.CredentialSource())
+		return srv.Router()
+	})
+
+	// Create control server
+	controlServer = api.NewControlServer(cfg, instMgr, log)
+	stopUnownedReaper := startUnownedReaperIfEnabled(cfg, controlServer)
+	defer stopUnownedReaper()
+
+	// Start HTTP server. When no auth token is configured (auth disabled),
+	// ListenHost binds to loopback only so the unauthenticated command/shell/
+	// process routes are never reachable beyond the local host.
+	addr := fmt.Sprintf("%s:%d", cfg.ListenHost(), cfg.Port)
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: controlServer.Router(),
+	}
+
+	go func() {
+		log.Info("HTTP server starting", zap.String("address", addr))
+		// Try to listen first so we get a clear error before serving
+		ln, listenErr := net.Listen("tcp", addr)
+		if listenErr != nil {
+			log.Error("HTTP server failed to bind",
+				zap.String("address", addr),
+				zap.Error(listenErr))
+			os.Exit(1)
+		}
+		log.Info("HTTP server bound successfully", zap.String("address", ln.Addr().String()))
+		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Error("HTTP server error", zap.Error(err))
+			os.Exit(1)
+		}
+	}()
+
+	// Monitor parent liveness via inherited pipe (standalone mode only).
+	// Returns a channel that closes when the parent dies.
+	parentDied := monitorParentLiveness(log)
+
+	// Wait for shutdown signal (OS signal, parent death, or an authenticated
+	// ownership-shutdown operation from an adopting/owning backend).
+	waitForShutdown(log, parentDied, controlServer.ShutdownRequested(), func(ctx context.Context) {
+		// Flush pending traces before stopping instances
+		if err := shared.ShutdownTracing(ctx); err != nil {
+			log.Error("error shutting down tracing", zap.Error(err))
+		}
+		// Shutdown all instances first so any final ACP frames they emit during
+		// teardown are still captured by the (still-live) debug writers.
+		if err := instMgr.Shutdown(ctx); err != nil {
+			log.Error("error shutting down instance manager", zap.Error(err))
+		}
+		// Then flush + close all debug-log writers as the final logging step.
+		acpJanitor.Stop()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Error("error shutting down HTTP server", zap.Error(err))
+		}
+	})
+}
+
+// waitForShutdown waits for a shutdown trigger (OS signal, parent death, or
+// an ownership-shutdown operation) and runs the cleanup function. parentDied
+// may be nil when no parent monitor is active. ownershipShutdown may be nil
+// in tests that don't exercise a control server.
+func waitForShutdown(log *logger.Logger, parentDied <-chan struct{}, ownershipShutdown <-chan struct{}, cleanup func(ctx context.Context)) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// A nil channel (no parent monitor, no control server) blocks forever in
+	// a select, so that case is simply never chosen -- no separate branching
+	// needed for the "not active" cases.
+	select {
+	case sig := <-sigCh:
+		log.Info("received signal", zap.String("signal", sig.String()))
+	case <-parentDied:
+		log.Warn("parent process died, initiating shutdown")
+	case <-ownershipShutdown:
+		log.Warn("ownership-shutdown operation invoked, initiating shutdown")
+	}
+
+	log.Info("shutting down agentctl...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cleanup(ctx)
+
+	log.Info("agentctl stopped")
+}
+
+// monitorParentLiveness watches a pipe inherited from the parent process.
+// The parent (kandev backend) passes the read-end of a pipe via ExtraFiles
+// and sets KANDEV_PARENT_PIPE_FD to the FD number. A goroutine blocks on
+// reading the pipe. When the parent dies — even via SIGKILL — the kernel
+// closes the write-end, the read returns, and the returned channel is closed.
+// Returns nil when the env var is absent (Docker, manual start, remote executors).
+func monitorParentLiveness(log *logger.Logger) <-chan struct{} {
+	fdStr := os.Getenv("KANDEV_PARENT_PIPE_FD")
+	if fdStr == "" {
+		return nil
+	}
+
+	fd, err := strconv.Atoi(fdStr)
+	if err != nil {
+		log.Warn("invalid KANDEV_PARENT_PIPE_FD", zap.String("value", fdStr), zap.Error(err))
+		return nil
+	}
+
+	pipe := os.NewFile(uintptr(fd), "parent-liveness-pipe")
+	if pipe == nil {
+		log.Warn("failed to open parent liveness pipe", zap.Int("fd", fd))
+		return nil
+	}
+
+	log.Info("parent liveness monitor started", zap.Int("fd", fd))
+
+	ch := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		_, _ = pipe.Read(buf) // blocks until pipe breaks
+		_ = pipe.Close()
+		close(ch)
+	}()
+
+	return ch
+}

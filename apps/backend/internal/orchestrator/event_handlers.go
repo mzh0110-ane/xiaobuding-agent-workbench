@@ -1,0 +1,183 @@
+// Package orchestrator provides event handler methods for the orchestrator service.
+package orchestrator
+
+import (
+	"context"
+	"errors"
+
+	"go.uber.org/zap"
+
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/orchestrator/watcher"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+// Agent event type string constants.
+const (
+	agentEventComplete   = "complete"
+	agentEventCompleted  = "completed"
+	agentEventError      = "error"
+	agentEventToolCall   = "tool_call"
+	agentEventToolUpdate = "tool_update"
+	agentEventFailed     = "failed"
+)
+
+// toolKindToMessageType maps the normalized tool kind to a frontend message type.
+func toolKindToMessageType(normalized *streams.NormalizedPayload) string {
+	if normalized == nil {
+		return "tool_call"
+	}
+	return normalized.Kind().ToMessageType()
+}
+
+// Event handlers
+
+func (s *Service) handleTaskDeleted(ctx context.Context, data watcher.TaskEventData) {
+	s.scheduler.RemoveTask(data.TaskID)
+	s.clearParkedProjectionOnTaskDeleted(data.TaskID)
+	if closer, ok := s.automationService.(deferredAutomationRunCloser); ok {
+		if err := closer.MarkDeferredRunFailedByTaskID(
+			ctx, data.TaskID, "task deleted before deferred automation start",
+		); err != nil {
+			s.logger.Warn("failed to close deferred automation run after task deletion",
+				zap.String("task_id", data.TaskID), zap.Error(err))
+		}
+	}
+}
+
+func (s *Service) handleACPSessionCreated(ctx context.Context, data watcher.ACPSessionEventData) {
+	if data.SessionID == "" || data.ACPSessionID == "" {
+		return
+	}
+	guard := s.lockCancelInFlightGuard(data.SessionID)
+	defer guard.release()
+	// A cancellation operation has already claimed the session. Let its owner
+	// invalidate the startup identity before accepting any late provider event.
+	if s.currentCancellation(data.SessionID) != nil || !s.resumeAttemptAllowsExecution(data.SessionID, data.AgentExecutionID, data.AttemptID) {
+		return
+	}
+	s.storeResumeToken(ctx, data.TaskID, data.SessionID, data.AgentExecutionID, data.ACPSessionID, "", data.AttemptID)
+}
+
+// storeResumeToken stores an agent's session ID as the resume token for session recovery.
+// Called from handleACPSessionCreated, handleSessionStatusEvent, and handleCompleteStreamEvent.
+//
+// expectedExecID identifies the lifecycle execution that emitted the event. The repo
+// performs a CAS update keyed on agent_execution_id: if the row has rotated to a
+// different execution since this event was queued, the update is rejected with
+// models.ErrExecutionRotated and the stale token is silently dropped. This prevents
+// a previous execution's tail-end events (post model-switch / context-reset) from
+// overwriting the live execution's resume_token with a defunct ACP session ID.
+//
+// Pass expectedExecID="" only when the caller genuinely doesn't care which execution
+// the event came from (no callers should today; the parameter exists for forward
+// compatibility with paths that don't have an execution context).
+//
+// The token is always stored when CAS succeeds. NativeSessionResume only gates ACP
+// session/load vs session/new in session.go — agents without native resume (e.g.,
+// Claude Code) use the token for their own --resume CLI flag instead.
+func (s *Service) storeResumeToken(ctx context.Context, taskID, sessionID, expectedExecID, acpSessionID, lastMessageUUID string, origin ...string) {
+	if !s.resumeAttemptAllowsExecution(sessionID, expectedExecID, origin...) {
+		s.logger.Info("dropping resume token from cancelled or superseded resume attempt",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.String("expected_exec_id", expectedExecID),
+			zap.String("resume_token", acpSessionID))
+		return
+	}
+	// The lifecycle manager updates its in-memory ACP session ID before it
+	// publishes reset/start events. Events from the previous ACP session can
+	// still be queued after that point, so reject those events before the
+	// execution-level CAS. The execution ID alone does not identify an ACP
+	// session generation because context resets keep the same execution.
+	if currentACPSessionID := s.currentACPSessionID(sessionID); currentACPSessionID != "" &&
+		acpSessionID != "" && acpSessionID != currentACPSessionID {
+		s.logger.Info("dropping resume token from stale ACP session generation",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.String("expected_exec_id", expectedExecID),
+			zap.String("resume_token", acpSessionID),
+			zap.String("current_resume_token", currentACPSessionID))
+		return
+	}
+
+	err := s.repo.UpdateResumeToken(ctx, sessionID, expectedExecID, acpSessionID, lastMessageUUID)
+	switch {
+	case err == nil:
+		s.logger.Debug("stored resume token for session",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.String("expected_exec_id", expectedExecID),
+			zap.String("resume_token", acpSessionID),
+			zap.String("last_message_uuid", lastMessageUUID))
+		// The CAS above proved the token belongs to the session's current
+		// execution — mirror it into the session's durable "acp" metadata
+		// too. executors_running rows are operational state and get pruned;
+		// without this, the ACP session id only survives for agents that
+		// happen to emit a session_info frame (handleSessionInfoEvent).
+		s.persistACPSessionID(ctx, sessionID, acpSessionID)
+	case errors.Is(err, models.ErrExecutionRotated):
+		// The row's agent_execution_id has rotated since the event was emitted —
+		// the token belongs to a defunct execution and must be dropped. The new
+		// execution will emit its own ACP session created event and a fresh
+		// storeResumeToken will succeed.
+		s.logger.Info("dropping resume token from rotated execution",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.String("expected_exec_id", expectedExecID))
+	case errors.Is(err, models.ErrExecutorRunningNotFound):
+		// No executors_running row for this session. With the lifecycle-manager-
+		// owned persistence model this should never happen for a live execution
+		// (the row is created in lockstep with the in-memory Add). Most likely
+		// causes: a session was torn down between event emission and handling,
+		// or a code path that emits ACP events without a registered execution.
+		// Logged loud; nothing to retry.
+		s.logger.Warn("no executors_running row when storing resume token",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.String("expected_exec_id", expectedExecID))
+	default:
+		s.logger.Warn("failed to persist resume token for session",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+	}
+}
+
+// currentACPSessionID returns the lifecycle manager's current ACP session ID
+// when the concrete manager exposes it. The optional seam keeps the generic
+// AgentManagerClient contract unchanged for remote clients and test doubles.
+func (s *Service) currentACPSessionID(sessionID string) string {
+	provider, ok := s.agentManager.(interface {
+		GetACPSessionIDForSession(string) (string, bool)
+	})
+	if !ok {
+		return ""
+	}
+	acpSessionID, ok := provider.GetACPSessionIDForSession(sessionID)
+	if !ok {
+		return ""
+	}
+	return acpSessionID
+}
+
+// persistACPSessionID mirrors the agent's ACP session id into the session's
+// "acp" metadata map. Best-effort: resume correctness never depends on this
+// copy — it exists so the id survives executors_running cleanup for consumers
+// that join sessions to agent-CLI artifacts (e.g. transcript-based usage
+// stats). The repo performs the mirror as a single guarded UPDATE: it merges
+// into the existing acp map (preserving session_info keys), skips when the
+// stored id is already current, and only writes while executors_running still
+// holds acpSessionID as the resume token — so a stale event from a rotated
+// execution can never overwrite the live execution's id.
+func (s *Service) persistACPSessionID(ctx context.Context, sessionID, acpSessionID string) {
+	if sessionID == "" || acpSessionID == "" || s.repo == nil {
+		return
+	}
+	if _, err := s.repo.SetSessionACPSessionID(ctx, sessionID, acpSessionID); err != nil {
+		s.logger.Warn("failed to persist ACP session id to session metadata",
+			zap.String("session_id", sessionID),
+			zap.String("acp_session_id", acpSessionID),
+			zap.Error(err))
+	}
+}

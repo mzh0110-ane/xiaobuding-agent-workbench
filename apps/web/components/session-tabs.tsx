@@ -1,0 +1,281 @@
+"use client";
+
+import { useRef, type ReactNode, type MouseEvent, type RefObject } from "react";
+import { Fragment } from "react";
+import { Tabs, TabsList, TabsTrigger } from "@kandev/ui/tabs";
+import { ContextMenu, ContextMenuTrigger } from "@kandev/ui/context-menu";
+
+export type SessionTab = {
+  id: string;
+  label: string;
+  icon?: ReactNode;
+  /** Optional badge rendered before the label — e.g. "#3" for an ordinary terminal. */
+  badge?: ReactNode;
+  closable?: boolean;
+  alwaysShowClose?: boolean;
+  onClose?: (event: MouseEvent) => void;
+  onContextMenu?: (event: MouseEvent) => void;
+  onDoubleClick?: (event: MouseEvent) => void;
+  renderContextMenu?: (closeAnchorRef: RefObject<HTMLElement | null>) => ReactNode;
+  content?: ReactNode;
+  className?: string;
+  testId?: string;
+  closeTestId?: string;
+  /** When true (default) keeps the existing 120px max-width; ordinary terminals with custom names benefit from `false`. */
+  truncate?: boolean;
+};
+
+type SessionTabsProps = {
+  children?: ReactNode; // TabsContent elements (optional for cases where tabs are just visible)
+  tabs: SessionTab[];
+  activeTab: string;
+  onTabChange: (tabId: string) => void;
+  showAddButton?: boolean;
+  onAddTab?: () => void;
+  addButtonLabel?: string;
+  separatorAfterIndex?: number;
+  className?: string;
+  /** Overrides the default `TabsList` className — use to drop the pill background, etc. */
+  listClassName?: string;
+  // Collapse support
+  collapsible?: boolean;
+  isCollapsed?: boolean;
+  onToggleCollapse?: () => void;
+  // Right content (e.g., approve button)
+  rightContent?: ReactNode;
+};
+
+const SVG_PROPS = {
+  xmlns: "http://www.w3.org/2000/svg",
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: "2",
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+};
+
+function CloseIcon() {
+  return (
+    <svg className="h-3 w-3" {...SVG_PROPS}>
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function CollapseIcon({ isCollapsed }: { isCollapsed: boolean }) {
+  return (
+    <svg className="h-4 w-4" {...SVG_PROPS}>
+      {isCollapsed ? <polyline points="18 15 12 9 6 15" /> : <polyline points="6 9 12 15 18 9" />}
+    </svg>
+  );
+}
+
+function getTabWidthClass(truncate: boolean | undefined) {
+  return truncate === false ? "max-w-[200px]" : "max-w-[120px]";
+}
+
+function DefaultTabContent({ tab }: { tab: SessionTab }) {
+  return (
+    <>
+      {tab.icon}
+      {tab.badge && (
+        <span
+          data-testid={`${tab.testId ?? tab.id}-seq-badge`}
+          className="mr-1 inline-flex items-center justify-center rounded-sm bg-muted text-muted-foreground text-[10px] font-mono leading-none px-1 py-0.5"
+        >
+          {tab.badge}
+        </span>
+      )}
+      <span className={`truncate ${tab.icon ? "ml-1.5" : ""}`} style={{ textOverflow: "clip" }}>
+        {tab.label}
+      </span>
+    </>
+  );
+}
+
+function TabCloseControl({
+  tab,
+  closeAnchorRef,
+}: {
+  tab: SessionTab;
+  closeAnchorRef: RefObject<HTMLElement | null>;
+}) {
+  if (!tab.closable || !tab.onClose) return null;
+  return (
+    <span
+      ref={closeAnchorRef}
+      role="button"
+      tabIndex={-1}
+      data-testid={tab.closeTestId}
+      className={`absolute right-1 rounded bg-background hover:bg-muted hover:text-foreground text-muted-foreground transition-opacity ${tab.alwaysShowClose ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
+      onClick={tab.onClose}
+    >
+      <CloseIcon />
+    </span>
+  );
+}
+
+function SessionTabItem({
+  tab,
+  index,
+  separatorAfterIndex,
+}: {
+  tab: SessionTab;
+  index: number;
+  separatorAfterIndex?: number;
+}) {
+  const closeAnchorRef = useRef<HTMLElement>(null);
+  const tabWidthClass = getTabWidthClass(tab.truncate);
+  const triggerClassName =
+    (tab.className ?? "") + " group relative py-1 cursor-pointer rounded-sm " + tabWidthClass;
+  const trigger = (
+    <TabsTrigger
+      value={tab.id}
+      data-testid={tab.testId}
+      aria-label={tab.content ? tab.label : undefined}
+      onContextMenu={tab.onContextMenu}
+      onDoubleClick={tab.onDoubleClick}
+      className={`${triggerClassName} ${tab.content ? "absolute inset-0 z-0 !max-w-none !flex-none" : ""}`}
+    >
+      {tab.content ? <span className="sr-only">{tab.label}</span> : <DefaultTabContent tab={tab} />}
+      <TabCloseControl tab={tab} closeAnchorRef={closeAnchorRef} />
+    </TabsTrigger>
+  );
+  const tabTarget = tab.content ? (
+    <div
+      className={`group relative inline-flex h-full min-w-0 flex-1 items-center ${tabWidthClass}`}
+    >
+      {trigger}
+      <div
+        data-testid={`${tab.testId ?? tab.id}-content`}
+        className="relative z-10 flex h-full min-w-0 items-center pr-5"
+      >
+        {tab.content}
+      </div>
+    </div>
+  ) : (
+    trigger
+  );
+
+  return (
+    <Fragment key={tab.id}>
+      {separatorAfterIndex !== undefined && index === separatorAfterIndex + 1 && (
+        <div className="h-4 w-px bg-border mx-1" />
+      )}
+      {tab.renderContextMenu ? (
+        <ContextMenu>
+          {/* `display: contents` keeps this wrapper out of layout while giving
+              ContextMenuTrigger's `asChild` Slot a DOM node of its own to clone
+              onto — otherwise, when tabTarget is the bare TabsTrigger (no
+              tab.content), the Slot's own data-state (open/closed) overwrites
+              TabsTrigger's data-state (active/inactive) on the same node. */}
+          <ContextMenuTrigger asChild>
+            <div className="contents">{tabTarget}</div>
+          </ContextMenuTrigger>
+          {tab.renderContextMenu(closeAnchorRef)}
+        </ContextMenu>
+      ) : (
+        tabTarget
+      )}
+    </Fragment>
+  );
+}
+
+function SessionTabsHeader({
+  tabsList,
+  collapsible,
+  isCollapsed,
+  onToggleCollapse,
+  rightContent,
+  hasChildren,
+}: {
+  tabsList: ReactNode;
+  collapsible: boolean;
+  isCollapsed: boolean;
+  onToggleCollapse?: () => void;
+  rightContent?: ReactNode;
+  hasChildren: boolean;
+}) {
+  if (collapsible && onToggleCollapse) {
+    return (
+      <div className={`flex items-center justify-between gap-2 ${hasChildren ? "" : "p-2"}`}>
+        {tabsList}
+        <div className="flex items-center gap-2 shrink-0">
+          {rightContent}
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground cursor-pointer"
+            onClick={onToggleCollapse}
+          >
+            <CollapseIcon isCollapsed={isCollapsed} />
+          </button>
+        </div>
+      </div>
+    );
+  }
+  if (rightContent) {
+    return (
+      <div className="flex items-center justify-between gap-2">
+        {tabsList}
+        <div className="shrink-0">{rightContent}</div>
+      </div>
+    );
+  }
+  return <>{tabsList}</>;
+}
+
+export function SessionTabs({
+  children,
+  tabs,
+  activeTab,
+  onTabChange,
+  showAddButton = false,
+  onAddTab,
+  addButtonLabel = "+",
+  separatorAfterIndex,
+  className,
+  listClassName,
+  collapsible = false,
+  isCollapsed = false,
+  onToggleCollapse,
+  rightContent,
+}: SessionTabsProps) {
+  const defaultListClassName =
+    "p-0 !h-7 rounded-sm overflow-x-auto overflow-y-hidden min-w-0 shrink [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]";
+  const tabsList = (
+    <TabsList className={listClassName ?? defaultListClassName}>
+      {tabs.map((tab, index) => (
+        <SessionTabItem
+          key={tab.id}
+          tab={tab}
+          index={index}
+          separatorAfterIndex={separatorAfterIndex}
+        />
+      ))}
+      {showAddButton && onAddTab && (
+        <button
+          type="button"
+          onClick={onAddTab}
+          className="inline-flex items-center justify-center whitespace-nowrap rounded-sm px-2 py-1 h-6 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 cursor-pointer hover:bg-muted"
+        >
+          {addButtonLabel}
+        </button>
+      )}
+    </TabsList>
+  );
+  return (
+    <Tabs value={activeTab} onValueChange={onTabChange} className={className}>
+      <SessionTabsHeader
+        tabsList={tabsList}
+        collapsible={collapsible}
+        isCollapsed={isCollapsed}
+        onToggleCollapse={onToggleCollapse}
+        rightContent={rightContent}
+        hasChildren={Boolean(children)}
+      />
+      {children}
+    </Tabs>
+  );
+}

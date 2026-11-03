@@ -1,0 +1,258 @@
+package streams
+
+import "time"
+
+// GitStatusUpdate is the message type streamed via the git status stream.
+// Represents the current git state of the workspace.
+//
+// Stream endpoint: ws://.../api/v1/workspace/git-status/stream
+type GitStatusUpdate struct {
+	// Timestamp is when this status was captured.
+	Timestamp time.Time `json:"timestamp"`
+	// StatusState reports whether this repository has a usable live observation.
+	StatusState string `json:"status_state,omitempty"`
+	// FilesComplete distinguishes a complete empty membership snapshot from summary-only data.
+	FilesComplete bool `json:"files_complete"`
+	// DetailState reports whether secondary Git details are ready or still pending.
+	DetailState string `json:"detail_state,omitempty"`
+	// ErrorCode is a closed, sanitized status failure code.
+	ErrorCode string `json:"error_code,omitempty"`
+	// TrackerEpoch and SnapshotRevision order snapshots within one tracker lifetime.
+	TrackerID        string `json:"tracker_id,omitempty"`
+	TrackerEpoch     uint64 `json:"tracker_epoch,omitempty"`
+	SnapshotRevision uint64 `json:"snapshot_revision,omitempty"`
+
+	// RepositoryName identifies which repository this status belongs to when
+	// the agent's workspace contains multiple git repos as siblings (multi-repo
+	// task roots). Empty for single-repo workspaces. Frontends key per-repo
+	// state on this name.
+	RepositoryName string `json:"repository_name,omitempty"`
+
+	// IsSubmodule identifies initialized Git submodule repositories. The
+	// frontend uses this explicit boundary metadata when rendering review
+	// scope headers; repository names alone cannot distinguish submodules
+	// from sibling repositories.
+	IsSubmodule bool `json:"is_submodule,omitempty"`
+
+	// Modified contains paths of modified files.
+	Modified []string `json:"modified"`
+
+	// Added contains paths of added/staged files.
+	Added []string `json:"added"`
+
+	// Deleted contains paths of deleted files.
+	Deleted []string `json:"deleted"`
+
+	// Untracked contains paths of untracked files.
+	Untracked []string `json:"untracked"`
+
+	// Renamed contains paths of renamed files.
+	Renamed []string `json:"renamed"`
+
+	// Ahead is the number of commits ahead of the base branch (origin/main).
+	// This is a "how much unreviewed work is on this branch" measure (the
+	// Changes panel's Push/Pull badge), not a push-state signal: it does not
+	// reach zero just because the branch was pushed, since pushing doesn't
+	// move the base branch. Push-state logic must use RemoteAhead instead.
+	Ahead int `json:"ahead"`
+
+	// Behind is the number of commits behind the base branch (origin/main).
+	Behind int `json:"behind"`
+
+	// Branch is the current local branch name.
+	Branch string `json:"branch"`
+
+	// RemoteBranch is the tracked remote branch (e.g., "origin/main").
+	RemoteBranch string `json:"remote_branch,omitempty"`
+
+	// RemoteAhead is the number of local commits not yet present on this
+	// branch's own upstream (@{upstream}) — what `git push` would send.
+	// Unlike Ahead (relative to the base branch), this reaches zero once a
+	// push settles, which is what push-detection logic needs to observe a
+	// push. Always 0 when RemoteBranch is empty (no upstream configured yet).
+	RemoteAhead int `json:"remote_ahead"`
+
+	// RemoteBehind is the number of commits on the upstream not yet present
+	// locally — what `git pull` would fetch. Always 0 when RemoteBranch is
+	// empty.
+	RemoteBehind int `json:"remote_behind"`
+
+	// RemoteHeadCommit is the locally observed tip of RemoteBranch. It is
+	// captured with RemoteAhead and RemoteBehind so consumers can compare the
+	// checkout with an upstream snapshot without confusing it with the base.
+	RemoteHeadCommit string `json:"remote_head_commit,omitempty"`
+
+	// HeadCommit is the current HEAD commit SHA.
+	HeadCommit string `json:"head_commit,omitempty"`
+
+	// BaseCommit is the base branch HEAD commit SHA (for comparison/diff).
+	BaseCommit string `json:"base_commit,omitempty"`
+
+	// ComparisonTarget is the credential-free provider target display identity
+	// used when an explicit cross-repository comparison is active.
+	ComparisonTarget string `json:"comparison_target,omitempty"`
+	// ComparisonStatus is "ready" or "unavailable" for an explicit target.
+	ComparisonStatus string `json:"comparison_status,omitempty"`
+	// ComparisonErrorCode is a bounded machine-readable failure code. Raw Git
+	// and provider errors never enter the workspace stream.
+	ComparisonErrorCode string `json:"comparison_error_code,omitempty"`
+
+	// Files contains detailed information about each changed file.
+	Files map[string]FileInfo `json:"files,omitempty"`
+
+	// BranchAdditions is the total number of added lines across all changes on
+	// this branch compared to the merge-base (committed + staged + unstaged + untracked).
+	BranchAdditions int `json:"branch_additions,omitempty"`
+
+	// BranchDeletions is the total number of deleted lines across all changes on
+	// this branch compared to the merge-base (committed + staged + unstaged).
+	BranchDeletions int `json:"branch_deletions,omitempty"`
+}
+
+// FileChangeFacet is one layer of a mixed file change. A mixed path can have
+// one change between HEAD and the index plus another between the index and the
+// working tree.
+type FileChangeFacet struct {
+	// IsSymlink describes the destination entry, or the source for a deletion.
+	IsSymlink *bool `json:"is_symlink,omitempty"`
+
+	// Status indicates the layer status: "modified", "added", "deleted", or "renamed".
+	Status string `json:"status"`
+
+	// Additions is the number of added lines in this layer.
+	Additions int `json:"additions,omitempty"`
+
+	// Deletions is the number of deleted lines in this layer.
+	Deletions int `json:"deletions,omitempty"`
+
+	// OldPath is the original path for a rename in this layer.
+	OldPath string `json:"old_path,omitempty"`
+
+	// Diff contains the unified diff content for this layer.
+	Diff string `json:"diff,omitempty"`
+
+	// DiffSkipReason explains why this layer's diff was omitted or truncated.
+	DiffSkipReason string `json:"diff_skip_reason,omitempty"`
+	// DiffState distinguishes a pending diff from a ready empty diff.
+	DiffState string `json:"diff_state,omitempty"`
+}
+
+// FileInfo represents detailed information about a file's git status.
+type FileInfo struct {
+	// IsSymlink describes the destination entry, or the source for a deletion.
+	IsSymlink *bool `json:"is_symlink,omitempty"`
+
+	// Path is the file path relative to workspace root.
+	Path string `json:"path"`
+
+	// Status indicates the file status: "modified", "added", "deleted", "untracked", "renamed".
+	Status string `json:"status"`
+
+	// Staged indicates whether the file changes are staged (in the index).
+	// If false, the changes are unstaged (in the working tree only).
+	Staged bool `json:"staged"`
+
+	// Additions is the number of added lines.
+	Additions int `json:"additions,omitempty"`
+
+	// Deletions is the number of deleted lines.
+	Deletions int `json:"deletions,omitempty"`
+
+	// OldPath is the original path for renamed files.
+	OldPath string `json:"old_path,omitempty"`
+
+	// Diff contains the unified diff content for this file.
+	Diff string `json:"diff,omitempty"`
+
+	// DiffSkipReason explains why diff content was omitted or truncated.
+	// Values: "too_large", "binary", "truncated", "budget_exceeded".
+	DiffSkipReason string `json:"diff_skip_reason,omitempty"`
+	// DiffState distinguishes a pending diff from a ready empty diff.
+	DiffState string `json:"diff_state,omitempty"`
+
+	// StagedChange and UnstagedChange preserve the two layers when the same
+	// path has both index and working-tree changes. Single-layer paths keep the
+	// compact legacy fields above and omit both facets.
+	StagedChange   *FileChangeFacet `json:"staged_change,omitempty"`
+	UnstagedChange *FileChangeFacet `json:"unstaged_change,omitempty"`
+}
+
+// GitCommitNotification is sent when a new commit is detected in the workspace.
+type GitCommitNotification struct {
+	// Timestamp is when this notification was created.
+	Timestamp time.Time `json:"timestamp"`
+
+	// RepositoryName identifies which repository this commit belongs to in
+	// multi-repo task workspaces. Empty for single-repo. Carried through to
+	// the frontend so the Commits panel can render per-repo group headers.
+	RepositoryName string `json:"repository_name,omitempty"`
+
+	// CommitSHA is the SHA of the new commit.
+	CommitSHA string `json:"commit_sha"`
+
+	// ParentSHA is the SHA of the parent commit.
+	ParentSHA string `json:"parent_sha"`
+
+	// Message is the commit message.
+	Message string `json:"message"`
+
+	// AuthorName is the name of the commit author.
+	AuthorName string `json:"author_name"`
+
+	// AuthorEmail is the email of the commit author.
+	AuthorEmail string `json:"author_email"`
+
+	// FilesChanged is the number of files changed in the commit.
+	FilesChanged int `json:"files_changed"`
+
+	// Insertions is the number of lines added.
+	Insertions int `json:"insertions"`
+
+	// Deletions is the number of lines deleted.
+	Deletions int `json:"deletions"`
+
+	// CommittedAt is when the commit was made.
+	CommittedAt time.Time `json:"committed_at"`
+}
+
+// GitResetNotification is sent when HEAD moves backward (e.g., git reset, rebase).
+// This signals that commits may have been removed and the backend should sync.
+type GitResetNotification struct {
+	// Timestamp is when this notification was created.
+	Timestamp time.Time `json:"timestamp"`
+
+	// RepositoryName identifies which repository this reset belongs to in
+	// multi-repo task workspaces. Empty for single-repo. Carried through to
+	// the frontend so the Changes panel can scope per-repo group state.
+	RepositoryName string `json:"repository_name,omitempty"`
+
+	// PreviousHead is the SHA HEAD was pointing to before the reset.
+	PreviousHead string `json:"previous_head"`
+
+	// CurrentHead is the SHA HEAD is now pointing to.
+	CurrentHead string `json:"current_head"`
+}
+
+// GitBranchSwitchNotification is sent when the user switches branches (e.g., git checkout).
+// This signals that the base commit should be updated to reflect the new branch's merge-base.
+type GitBranchSwitchNotification struct {
+	// Timestamp is when this notification was created.
+	Timestamp time.Time `json:"timestamp"`
+
+	// RepositoryName identifies which repository this branch switch belongs to
+	// in multi-repo task workspaces. Empty for single-repo. Carried through to
+	// the frontend so the Changes panel can update the matching per-repo group.
+	RepositoryName string `json:"repository_name,omitempty"`
+
+	// PreviousBranch is the branch name before the switch.
+	PreviousBranch string `json:"previous_branch"`
+
+	// CurrentBranch is the new branch name after the switch.
+	CurrentBranch string `json:"current_branch"`
+
+	// CurrentHead is the SHA HEAD is now pointing to.
+	CurrentHead string `json:"current_head"`
+
+	// BaseCommit is the new base commit (merge-base with target branch).
+	BaseCommit string `json:"base_commit"`
+}

@@ -1,0 +1,918 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	ws "github.com/kandev/kandev/pkg/websocket"
+	mcplib "github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// testBackend implements BackendClient for testing handlers.
+type testBackend struct {
+	lastAction  string
+	lastPayload interface{}
+	response    map[string]interface{}
+	err         error
+}
+
+func (tb *testBackend) RequestPayload(_ context.Context, action string, payload, result interface{}) error {
+	tb.lastAction = action
+	tb.lastPayload = payload
+	if tb.err != nil {
+		return tb.err
+	}
+	if tb.response != nil && result != nil {
+		data, _ := json.Marshal(tb.response)
+		return json.Unmarshal(data, result)
+	}
+	return nil
+}
+
+func newTestServer(t *testing.T, backend BackendClient) *Server {
+	t.Helper()
+	log := newTestLogger(t)
+	return New(backend, "test-session", "", 10005, log, "", false, ModeConfig)
+}
+
+func callTool(t *testing.T, s *Server, toolName string, args map[string]interface{}) *mcplib.CallToolResult {
+	t.Helper()
+	toolsMap := s.mcpServer.ListTools()
+	st, ok := toolsMap[toolName]
+	require.True(t, ok, "tool %q not registered", toolName)
+
+	reqArgs, err := json.Marshal(args)
+	require.NoError(t, err)
+
+	req := mcplib.CallToolRequest{}
+	req.Method = "tools/call"
+	req.Params.Name = toolName
+	req.Params.Arguments = make(map[string]interface{})
+	if err := json.Unmarshal(reqArgs, &req.Params.Arguments); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := st.Handler(context.Background(), req)
+	require.NoError(t, err)
+	return result
+}
+
+func toolInputProperties(t *testing.T, s *Server, toolName string) map[string]interface{} {
+	t.Helper()
+	toolsMap := s.mcpServer.ListTools()
+	st, ok := toolsMap[toolName]
+	require.True(t, ok, "tool %q not registered", toolName)
+
+	schema, err := json.Marshal(st.Tool.InputSchema)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(schema, &parsed))
+	props, ok := parsed["properties"].(map[string]interface{})
+	require.True(t, ok, "schema should have properties")
+	return props
+}
+
+func TestMoveTaskToolSchemasExposeEntryOptions(t *testing.T) {
+	for name, server := range map[string]*Server{
+		"task":   newTaskModeServer(t, &testBackend{}, "task-current"),
+		"config": newTestServer(t, &testBackend{}),
+	} {
+		props := toolInputProperties(t, server, "move_task_kandev")
+		entryOptions, ok := props["entry_options"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s move_task schema must expose entry_options as an object", name)
+		}
+		nested, ok := entryOptions["properties"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s entry_options schema must expose nested properties", name)
+		}
+		for _, field := range []string{"reset_context", "instructions", "skip_step_prompt"} {
+			assert.Contains(t, nested, field, "%s entry_options schema must expose %s", name, field)
+		}
+	}
+}
+
+func TestMoveTaskSameStepDescriptionsAndResponseForwarding(t *testing.T) {
+	for name, backend := range map[string]*testBackend{
+		"task":   {response: map[string]interface{}{"disposition": "applied", "task": map[string]interface{}{"id": "task-1", "workflow_step_id": "step-work", "position": 7}}},
+		"config": {response: map[string]interface{}{"disposition": "applied", "task": map[string]interface{}{"id": "task-1", "workflow_step_id": "step-work", "position": 7}}},
+	} {
+		var server *Server
+		if name == "task" {
+			server = newTaskModeServer(t, backend, "task-current")
+		} else {
+			server = newTestServer(t, backend)
+		}
+
+		tool := server.mcpServer.ListTools()["move_task_kandev"]
+		assert.Contains(t, tool.Tool.Description, "current workflow and step")
+		assert.Contains(t, tool.Tool.Description, "no retry is needed")
+		assert.Contains(t, tool.Tool.Description, "Only an actual step change")
+		position, ok := toolInputProperties(t, server, "move_task_kandev")["position"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Contains(t, position["description"], "server determines arrival order")
+		assert.Contains(t, position["description"], "preserves the stored position")
+
+		result := callTool(t, server, "move_task_kandev", map[string]interface{}{
+			"task_id": "task-1", "workflow_id": "wf-1", "workflow_step_id": "step-work", "position": 99,
+		})
+		require.False(t, result.IsError)
+		require.Len(t, result.Content, 1)
+		content, ok := result.Content[0].(mcplib.TextContent)
+		require.True(t, ok)
+		var response map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(content.Text), &response))
+		assert.Equal(t, "applied", response["disposition"])
+		task, ok := response["task"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, float64(7), task["position"])
+		assert.Equal(t, ws.ActionMCPMoveTask, backend.lastAction)
+		payload, ok := backend.lastPayload.(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "task-1", payload["task_id"])
+		assert.Equal(t, "wf-1", payload["workflow_id"])
+		assert.Equal(t, "step-work", payload["workflow_step_id"])
+	}
+}
+
+// --- Action constant tests ---
+
+func TestActionConstants_MatchWebSocketActions(t *testing.T) {
+	// Verify canonical constants in pkg/websocket match the expected WS action strings.
+	assert.Equal(t, "mcp.create_workflow", ws.ActionMCPCreateWorkflow)
+	assert.Equal(t, "mcp.update_workflow", ws.ActionMCPUpdateWorkflow)
+	assert.Equal(t, "mcp.delete_workflow", ws.ActionMCPDeleteWorkflow)
+	assert.Equal(t, "mcp.import_workflow", ws.ActionMCPImportWorkflow)
+	assert.Equal(t, "mcp.export_workflow", ws.ActionMCPExportWorkflow)
+	assert.Equal(t, "mcp.create_workflow_step", ws.ActionMCPCreateWorkflowStep)
+	assert.Equal(t, "mcp.update_workflow_step", ws.ActionMCPUpdateWorkflowStep)
+	assert.Equal(t, "mcp.delete_workflow_step", ws.ActionMCPDeleteWorkflowStep)
+	assert.Equal(t, "mcp.reorder_workflow_steps", ws.ActionMCPReorderWorkflowStep)
+	assert.Equal(t, "mcp.list_agents", ws.ActionMCPListAgents)
+	assert.Equal(t, "mcp.update_agent", ws.ActionMCPUpdateAgent)
+	assert.Equal(t, "mcp.list_agent_profiles", ws.ActionMCPListAgentProfiles)
+	assert.Equal(t, "mcp.create_agent_profile", ws.ActionMCPCreateAgentProfile)
+	assert.Equal(t, "mcp.update_agent_profile", ws.ActionMCPUpdateAgentProfile)
+	assert.Equal(t, "mcp.delete_agent_profile", ws.ActionMCPDeleteAgentProfile)
+	assert.Equal(t, "mcp.get_mcp_config", ws.ActionMCPGetMcpConfig)
+	assert.Equal(t, "mcp.update_mcp_config", ws.ActionMCPUpdateMcpConfig)
+	assert.Equal(t, "mcp.list_shared_prompts", ws.ActionMCPListSharedPrompts)
+	assert.Equal(t, "mcp.get_shared_prompt", ws.ActionMCPGetSharedPrompt)
+	assert.Equal(t, "mcp.list_executors", ws.ActionMCPListExecutors)
+	assert.Equal(t, "mcp.list_executor_profiles", ws.ActionMCPListExecutorProfiles)
+	assert.Equal(t, "mcp.create_executor_profile", ws.ActionMCPCreateExecutorProfile)
+	assert.Equal(t, "mcp.update_executor_profile", ws.ActionMCPUpdateExecutorProfile)
+	assert.Equal(t, "mcp.delete_executor_profile", ws.ActionMCPDeleteExecutorProfile)
+	assert.Equal(t, "mcp.move_task", ws.ActionMCPMoveTask)
+	assert.Equal(t, "mcp.delete_task", ws.ActionMCPDeleteTask)
+	assert.Equal(t, "mcp.archive_task", ws.ActionMCPArchiveTask)
+	assert.Equal(t, "mcp.update_task_state", ws.ActionMCPUpdateTaskState)
+}
+
+// --- Workflow handler tests ---
+
+func TestWorkflowStepTools_SchemaExposesAutoAdvanceRequiresSignal(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	createProps := toolInputProperties(t, s, "create_workflow_step_kandev")
+	updateProps := toolInputProperties(t, s, "update_workflow_step_kandev")
+
+	assert.Contains(t, createProps, "auto_advance_requires_signal")
+	assert.Contains(t, updateProps, "auto_advance_requires_signal")
+}
+
+func TestWorkflowStepTools_SchemaExposesCancelTriggersTurnComplete(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	createProps := toolInputProperties(t, s, "create_workflow_step_kandev")
+	updateProps := toolInputProperties(t, s, "update_workflow_step_kandev")
+	assert.Contains(t, createProps, "cancel_triggers_turn_complete")
+	assert.Contains(t, updateProps, "cancel_triggers_turn_complete")
+}
+
+func TestWorkflowStepTools_SchemaExposesProfileAndSessionPolicies(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	createProps := toolInputProperties(t, s, "create_workflow_step_kandev")
+	updateProps := toolInputProperties(t, s, "update_workflow_step_kandev")
+	assert.Contains(t, createProps, "agent_profile_id")
+	assert.Contains(t, createProps, "profile_session_start_policy")
+	assert.Contains(t, createProps, "profile_session_end_policy")
+	assert.Contains(t, updateProps, "agent_profile_id")
+	assert.Contains(t, updateProps, "profile_session_start_policy")
+	assert.Contains(t, updateProps, "profile_session_end_policy")
+}
+
+func TestWorkflowStepTools_SchemaExposesSessionTarget(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	createProps := toolInputProperties(t, s, "create_workflow_step_kandev")
+	updateProps := toolInputProperties(t, s, "update_workflow_step_kandev")
+	assert.Contains(t, createProps, "session_target")
+	assert.Contains(t, updateProps, "session_target")
+	assert.Equal(t, []interface{}{"object", "null"}, createProps["session_target"].(map[string]interface{})["type"])
+	assert.Equal(t, []interface{}{"object", "null"}, updateProps["session_target"].(map[string]interface{})["type"])
+}
+
+func TestCreateWorkflowHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "wf-1", "name": "Sprint Board"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_kandev", map[string]interface{}{
+		"workspace_id": "ws-123",
+		"name":         "Sprint Board",
+		"description":  "A sprint workflow",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateWorkflow, backend.lastAction)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "ws-123", payload["workspace_id"])
+	assert.Equal(t, "Sprint Board", payload["name"])
+	assert.Equal(t, "A sprint workflow", payload["description"])
+}
+
+func TestCreateWorkflowHandler_MissingWorkspaceID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_kandev", map[string]interface{}{
+		"name": "Sprint Board",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateWorkflowHandler_MissingName(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_kandev", map[string]interface{}{
+		"workspace_id": "ws-123",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestUpdateWorkflowHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "wf-1", "name": "Updated"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_kandev", map[string]interface{}{
+		"workflow_id": "wf-1",
+		"name":        "Updated",
+		"description": "New description",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateWorkflow, backend.lastAction)
+}
+
+func TestUpdateWorkflowHandler_MissingWorkflowID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_kandev", map[string]interface{}{
+		"name": "Updated",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestDeleteWorkflowHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"success": true},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_workflow_kandev", map[string]interface{}{
+		"workflow_id": "wf-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPDeleteWorkflow, backend.lastAction)
+}
+
+func TestDeleteWorkflowHandler_MissingWorkflowID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_workflow_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+func TestImportWorkflowHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"created": []interface{}{"Sprint Board"}, "skipped": []interface{}{}},
+	}
+	s := newTestServer(t, backend)
+
+	doc := "version: 1\ntype: kandev_workflow\nworkflows:\n  - name: Sprint Board\n    steps: []\n"
+	result := callTool(t, s, "import_workflow_kandev", map[string]interface{}{
+		"workspace_id": "ws-123",
+		"document":     doc,
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPImportWorkflow, backend.lastAction)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "ws-123", payload["workspace_id"])
+	assert.Equal(t, doc, payload["document"])
+}
+
+func TestImportWorkflowHandler_MissingWorkspaceID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "import_workflow_kandev", map[string]interface{}{
+		"document": "version: 1",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestImportWorkflowHandler_MissingDocument(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "import_workflow_kandev", map[string]interface{}{
+		"workspace_id": "ws-123",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateWorkflowStepHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1", "name": "Review"}},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_step_kandev", map[string]interface{}{
+		"workflow_id": "wf-123",
+		"name":        "Review",
+		"color":       "#3b82f6",
+		"position":    float64(2),
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateWorkflowStep, backend.lastAction)
+}
+
+func TestCreateWorkflowStepHandler_AllFields(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_step_kandev", map[string]interface{}{
+		"workflow_id":                  "wf-123",
+		"name":                         "Deploy",
+		"position":                     float64(0),
+		"color":                        "#22c55e",
+		"prompt":                       "Deploy prompt",
+		"agent_profile_id":             "profile-deploy",
+		"profile_session_start_policy": "reuse",
+		"profile_session_end_policy":   "park",
+		"session_target":               map[string]interface{}{"kind": "initial"},
+		"is_start_step":                true,
+		"allow_manual_move":            true,
+		"show_in_command_panel":        true,
+		"auto_advance_requires_signal": true,
+		"events": map[string]interface{}{
+			"on_enter": []interface{}{map[string]interface{}{"type": "auto_start_agent"}},
+		},
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateWorkflowStep, backend.lastAction)
+	// Verify optional fields are forwarded in the payload
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, payload["allow_manual_move"])
+	assert.Equal(t, true, payload["show_in_command_panel"])
+	assert.Equal(t, "profile-deploy", payload["agent_profile_id"])
+	assert.Equal(t, "reuse", payload["profile_session_start_policy"])
+	assert.Equal(t, "park", payload["profile_session_end_policy"])
+	assert.Equal(t, map[string]interface{}{"kind": "initial"}, payload["session_target"])
+	assert.Equal(t, true, payload["auto_advance_requires_signal"])
+	assert.NotNil(t, payload["events"])
+}
+
+func TestCreateWorkflowStepHandler_ForwardsCancelTriggersTurnComplete(t *testing.T) {
+	backend := &testBackend{response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}}}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_step_kandev", map[string]interface{}{
+		"workflow_id":                   "wf-123",
+		"name":                          "Cancel completion",
+		"cancel_triggers_turn_complete": true,
+	})
+	assert.False(t, result.IsError)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, payload["cancel_triggers_turn_complete"])
+}
+
+func TestCreateWorkflowStepHandler_MissingWorkflowID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_step_kandev", map[string]interface{}{
+		"name": "Review",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateWorkflowStepHandler_MissingName(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_workflow_step_kandev", map[string]interface{}{
+		"workflow_id": "wf-123",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestUpdateWorkflowStepHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_step_kandev", map[string]interface{}{
+		"step_id": "step-1",
+		"name":    "Updated Name",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateWorkflowStep, backend.lastAction)
+}
+
+func TestUpdateWorkflowStepHandler_AllFields(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_step_kandev", map[string]interface{}{
+		"step_id":                      "step-1",
+		"name":                         "In Review",
+		"color":                        "#3b82f6",
+		"agent_profile_id":             "profile-review",
+		"profile_session_start_policy": "new",
+		"profile_session_end_policy":   "complete",
+		"allow_manual_move":            true,
+		"show_in_command_panel":        true,
+		"auto_advance_requires_signal": false,
+		"auto_archive_after_hours":     float64(48),
+		"events": map[string]interface{}{
+			"on_enter": []interface{}{map[string]interface{}{"type": "enable_plan_mode"}},
+		},
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateWorkflowStep, backend.lastAction)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, true, payload["allow_manual_move"])
+	assert.Equal(t, true, payload["show_in_command_panel"])
+	assert.Equal(t, "profile-review", payload["agent_profile_id"])
+	assert.Equal(t, "new", payload["profile_session_start_policy"])
+	assert.Equal(t, "complete", payload["profile_session_end_policy"])
+	assert.Equal(t, false, payload["auto_advance_requires_signal"])
+	assert.Equal(t, float64(48), payload["auto_archive_after_hours"])
+	assert.NotNil(t, payload["events"])
+}
+
+func TestUpdateWorkflowStepHandler_ForwardsCancelTriggersTurnComplete(t *testing.T) {
+	backend := &testBackend{response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}}}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_step_kandev", map[string]interface{}{
+		"step_id":                       "step-1",
+		"cancel_triggers_turn_complete": false,
+	})
+	assert.False(t, result.IsError)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, false, payload["cancel_triggers_turn_complete"])
+}
+
+func TestWorkflowStepHandlersForwardExplicitNullSessionTarget(t *testing.T) {
+	for _, toolName := range []string{"create_workflow_step_kandev", "update_workflow_step_kandev"} {
+		t.Run(toolName, func(t *testing.T) {
+			backend := &testBackend{response: map[string]interface{}{"step": map[string]interface{}{"id": "step-1"}}}
+			s := newTestServer(t, backend)
+			args := map[string]interface{}{"session_target": nil}
+			if toolName == "create_workflow_step_kandev" {
+				args["workflow_id"] = "workflow-1"
+				args["name"] = "Review"
+			} else {
+				args["step_id"] = "step-1"
+			}
+
+			result := callTool(t, s, toolName, args)
+			require.False(t, result.IsError)
+			payload, ok := backend.lastPayload.(map[string]interface{})
+			require.True(t, ok)
+			value, present := payload["session_target"]
+			require.True(t, present)
+			require.Nil(t, value)
+		})
+	}
+}
+
+func TestUpdateWorkflowStepHandler_MissingStepID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_workflow_step_kandev", map[string]interface{}{
+		"name": "Updated",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+// --- Agent handler tests ---
+
+func TestListAgentsHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"agents": []interface{}{}, "total": float64(0)},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_agents_kandev", map[string]interface{}{})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPListAgents, backend.lastAction)
+}
+
+func TestCreateAgentProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "profile-1", "name": "My Profile"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_agent_profile_kandev", map[string]interface{}{
+		"agent_id": "agent-1",
+		"name":     "My Profile",
+		"model":    "claude-sonnet-4-5-20250514",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateAgentProfile, backend.lastAction)
+}
+
+func TestCreateAgentProfileHandler_MissingAgentID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_agent_profile_kandev", map[string]interface{}{
+		"name":  "My Profile",
+		"model": "claude-sonnet-4-5-20250514",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateAgentProfileHandler_AllowsAgentDefaultModel(t *testing.T) {
+	backend := &testBackend{response: map[string]interface{}{"id": "profile-1"}}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_agent_profile_kandev", map[string]interface{}{
+		"agent_id": "agent-1",
+		"name":     "My Profile",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateAgentProfile, backend.lastAction)
+}
+
+func TestUpdateAgentHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "agent-1"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_agent_kandev", map[string]interface{}{
+		"agent_id":     "agent-1",
+		"supports_mcp": true,
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateAgent, backend.lastAction)
+}
+
+func TestUpdateAgentHandler_MissingAgentID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_agent_kandev", map[string]interface{}{
+		"supports_mcp": true,
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestDeleteAgentProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "profile-1"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_agent_profile_kandev", map[string]interface{}{
+		"profile_id": "profile-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPDeleteAgentProfile, backend.lastAction)
+}
+
+func TestDeleteAgentProfileHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_agent_profile_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+// --- MCP config handler tests ---
+
+func TestListAgentProfilesHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"profiles": []interface{}{}, "total": float64(0)},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_agent_profiles_kandev", map[string]interface{}{
+		"agent_id": "agent-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPListAgentProfiles, backend.lastAction)
+}
+
+func TestListAgentProfilesHandler_MissingAgentID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_agent_profiles_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+func TestUpdateAgentProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "profile-1"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_agent_profile_kandev", map[string]interface{}{
+		"profile_id": "profile-1",
+		"name":       "Updated Profile",
+		"model":      "claude-3.5-sonnet",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateAgentProfile, backend.lastAction)
+}
+
+func TestUpdateAgentProfileHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_agent_profile_kandev", map[string]interface{}{
+		"name": "Updated",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestGetMcpConfigHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"profile_id": "p-1", "enabled": true},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "get_mcp_config_kandev", map[string]interface{}{
+		"profile_id": "p-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPGetMcpConfig, backend.lastAction)
+}
+
+func TestGetMcpConfigHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "get_mcp_config_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+func TestUpdateMcpConfigHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"profile_id": "p-1"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_mcp_config_kandev", map[string]interface{}{
+		"profile_id": "p-1",
+		"enabled":    true,
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateMcpConfig, backend.lastAction)
+}
+
+func TestUpdateMcpConfigHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_mcp_config_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+// --- Executor handler tests ---
+
+func TestListExecutorsHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"executors": []interface{}{}, "total": float64(0)},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_executors_kandev", map[string]interface{}{})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPListExecutors, backend.lastAction)
+}
+
+func TestListExecutorProfilesHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"profiles": []interface{}{}, "total": float64(0)},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_executor_profiles_kandev", map[string]interface{}{
+		"executor_id": "exec-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPListExecutorProfiles, backend.lastAction)
+}
+
+func TestListExecutorProfilesHandler_MissingExecutorID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_executor_profiles_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateExecutorProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "prof-1", "name": "Default"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_executor_profile_kandev", map[string]interface{}{
+		"executor_id": "exec-1",
+		"name":        "Default",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPCreateExecutorProfile, backend.lastAction)
+	payload, ok := backend.lastPayload.(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "exec-1", payload["executor_id"])
+	assert.Equal(t, "Default", payload["name"])
+}
+
+func TestCreateExecutorProfileHandler_MissingExecutorID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_executor_profile_kandev", map[string]interface{}{
+		"name": "Default",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestCreateExecutorProfileHandler_MissingName(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "create_executor_profile_kandev", map[string]interface{}{
+		"executor_id": "exec-1",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestUpdateExecutorProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"id": "prof-1"},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_executor_profile_kandev", map[string]interface{}{
+		"profile_id": "prof-1",
+		"name":       "Updated Profile",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPUpdateExecutorProfile, backend.lastAction)
+}
+
+func TestUpdateExecutorProfileHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "update_executor_profile_kandev", map[string]interface{}{
+		"name": "Updated",
+	})
+
+	assert.True(t, result.IsError)
+}
+
+func TestDeleteExecutorProfileHandler_Success(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{"success": true},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_executor_profile_kandev", map[string]interface{}{
+		"profile_id": "prof-1",
+	})
+
+	assert.False(t, result.IsError)
+	assert.Equal(t, ws.ActionMCPDeleteExecutorProfile, backend.lastAction)
+}
+
+func TestDeleteExecutorProfileHandler_MissingProfileID(t *testing.T) {
+	backend := &testBackend{}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "delete_executor_profile_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+// --- ForwardToBackend tests ---
+
+func TestForwardToBackend_BackendError(t *testing.T) {
+	backend := &testBackend{
+		err: fmt.Errorf("connection refused"),
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_agents_kandev", map[string]interface{}{})
+
+	assert.True(t, result.IsError)
+}
+
+func TestForwardToBackend_ResultContainsJSON(t *testing.T) {
+	backend := &testBackend{
+		response: map[string]interface{}{
+			"agents": []interface{}{
+				map[string]interface{}{"id": "a1", "name": "claude-code"},
+			},
+			"total": float64(1),
+		},
+	}
+	s := newTestServer(t, backend)
+
+	result := callTool(t, s, "list_agents_kandev", map[string]interface{}{})
+
+	assert.False(t, result.IsError)
+	require.NotEmpty(t, result.Content)
+
+	// The result should be JSON text content
+	tc, ok := result.Content[0].(mcplib.TextContent)
+	assert.True(t, ok, "expected TextContent")
+	assert.NotEmpty(t, tc.Text)
+}

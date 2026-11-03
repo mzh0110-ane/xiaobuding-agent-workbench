@@ -1,0 +1,173 @@
+package github
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/kandev/kandev/internal/common/authcircuit"
+)
+
+// ErrInvalidPRURL signals that a caller-supplied PR URL could not be parsed.
+// Used by AssociateExistingPRByURL so HTTP callers can translate the failure
+// into a 400 instead of a generic 500.
+var ErrInvalidPRURL = errors.New("invalid PR URL")
+
+// ErrInvalidIssueReference signals that a caller-supplied GitHub issue URL or
+// number could not be resolved to a concrete issue.
+var ErrInvalidIssueReference = errors.New("invalid GitHub issue reference")
+
+// ErrIssueRepositoryMismatch signals that the issue belongs to a repository
+// that is not attached to the target task.
+var ErrIssueRepositoryMismatch = errors.New("GitHub issue repository is not attached to task")
+
+// ErrTaskPRRepositoryMismatch signals that a PR association used a
+// task_repositories row ID instead of the canonical repositories.ID attached
+// to the task.
+var ErrTaskPRRepositoryMismatch = errors.New("GitHub PR repository is not attached to task")
+
+// ErrTaskNotFound is the sentinel that cleanup paths check to distinguish
+// "the task is already gone — fine, mop up the dedup row" from a real
+// upstream failure. Adapter implementations of TaskDeleter wrap this when
+// the task domain reports a missing row so the github layer can recognize
+// the case without string-matching the underlying error message.
+var ErrTaskNotFound = errors.New("github: task not found for cleanup")
+
+// ErrSelfApprove is returned by SubmitReview when the authenticated user
+// attempts to APPROVE their own PR. GitHub rejects this with a 422; we
+// catch it server-side so the UI sees a clean, typed error rather than a
+// generic upstream failure when the frontend's visibility guard is bypassed.
+var ErrSelfApprove = errors.New("cannot approve your own pull request")
+
+// ErrInvalidToken is returned by ConfigureToken when the supplied PAT fails
+// validation against the GitHub API. Wrapped around the underlying client
+// error so HTTP callers can distinguish a validation failure (HTTP 400)
+// from a secret-store write failure (HTTP 500).
+var ErrInvalidToken = errors.New("invalid token")
+
+// ErrRepoNotResolvable signals that GitHub reported the repository as
+// missing, deleted, or inaccessible to the authenticated principal. The PR
+// watch flood storm this fixes (SyncWatchesBatched hammering the same dead
+// repo on every 5s frontend poll) classifies upstream errors via
+// isRepoNotResolvableErr and feeds the result into a 10-minute negative
+// cache so subsequent watch syncs short-circuit before acquiring the gh
+// throttle. The cache is also flushed on token swap/clear (see
+// Service.ClearRepoErrorCache wired from ConfigureToken/ClearToken) so a
+// re-auth doesn't have to wait out the TTL. Use errors.Is(err,
+// ErrRepoNotResolvable) at boundaries (WS handler, poller) where the
+// caller needs to differentiate a "stop retrying" failure from a
+// transient upstream blip.
+var ErrRepoNotResolvable = errors.New("github: repository not resolvable")
+
+// ErrTaskPRNotLinked is returned by UpdateTaskCIOptions when the patch names
+// a repository_id/pr_number that is not currently linked to the task. HTTP
+// callers translate this into a 400 rather than a generic 500.
+var ErrTaskPRNotLinked = errors.New("PR is not linked to this task")
+
+// errStoreUnavailable is returned from service methods when no Store is
+// wired (Provide can return a Service with store == nil when the SQLite
+// repos aren't configured). Returning a typed error instead of nil-
+// dereferencing keeps the watch reset handlers from panicking under that
+// degenerate config — the caller surfaces a 5xx, the process keeps running.
+var errStoreUnavailable = errors.New("github: store not configured")
+
+// repoNotResolvableSubstrings matches the wire-format substrings GitHub's
+// GraphQL/REST APIs use for a deterministic "repository does not exist /
+// not accessible" outcome:
+//   - "Could not resolve to a Repository" — GraphQL response for a missing
+//     or deleted repo (the dominant signal in the storm logs)
+//   - "Resource not accessible by integration" — GitHub Apps / fine-grained
+//     PAT scope mismatch. Treated as "dead end" here because retrying the
+//     same call with the same token will never succeed; a token swap
+//     evicts the cache via ClearRepoErrorCache.
+//
+// Raw "HTTP 404 / Not Found" is intentionally NOT matched here. A 404 on
+// /repos/{owner}/{repo}/pulls/{N} can legitimately mean "the PR was
+// deleted" while the repo itself is fine — a false-positive there would
+// negative-cache the whole repo for 10 minutes off a single stale PR
+// number. The GraphQL "Could not resolve to a Repository" string IS
+// repo-scoped by construction and remains the canonical signal.
+var repoNotResolvableSubstrings = []string{
+	"could not resolve to a repository",
+	"resource not accessible by integration",
+}
+
+// isRepoNotResolvableErr reports whether err carries a deterministic
+// "repository missing / inaccessible" signal we should not keep retrying
+// against in a tight loop. Errors flagged here are negative-cached for
+// 10 minutes via Service.repoErrorCache; the cache is evicted on watch
+// (re)creation and on token swap/clear so a freshly-linked repo or a
+// re-auth is probed immediately. The match is case-insensitive so we
+// don't depend on a stable error casing across gh CLI versions and
+// GraphQL response variants.
+//
+// Bare HTTP 404 errors are NOT classified — too ambiguous (missing PR
+// number vs missing repo) and a false positive poisons the whole repo
+// for 10 minutes. Callers that know they're hitting a repo-root
+// endpoint should wrap with ErrRepoNotResolvable explicitly.
+func isRepoNotResolvableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRepoNotResolvable) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, sub := range repoNotResolvableSubstrings {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyPollErr maps a background PR-watch poll failure to an
+// authcircuit.FailureClass, for Poller's per-workspace in-memory circuit
+// (see poller_circuit.go). This is deliberately a coarser, workspace-level
+// signal than the existing repoErrorCache (which negative-caches a single
+// repo for 10 minutes): an auth failure means every watch in the workspace
+// is broken, not just one repo, so it uses the longer permanent-backoff
+// schedule and only resets on a credential change
+// (Service.WorkspaceConnectionFingerprint), while a repo-not-resolvable
+// signal is treated as a configuration problem here too — both caches agree
+// "stop retrying this" and neither depends on the other.
+func classifyPollErr(err error) authcircuit.FailureClass {
+	if err == nil {
+		return authcircuit.FailureClassNone
+	}
+	if errors.Is(err, ErrGitHubConnectionInvalid) || errors.Is(err, ErrGitHubNotConfigured) {
+		return authcircuit.FailureClassAuth
+	}
+	if isRepoNotResolvableErr(err) {
+		return authcircuit.FailureClassConfig
+	}
+	var apiErr *GitHubAPIError
+	if errors.As(err, &apiErr) {
+		if isGitHubRateLimitAPIError(apiErr) {
+			return authcircuit.FailureClassTransient
+		}
+		switch apiErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return authcircuit.FailureClassAuth
+		case http.StatusNotFound, http.StatusUnprocessableEntity, http.StatusBadRequest:
+			return authcircuit.FailureClassConfig
+		default:
+			return authcircuit.FailureClassTransient
+		}
+	}
+	return authcircuit.FailureClassTransient
+}
+
+func isGitHubRateLimitAPIError(err *GitHubAPIError) bool {
+	if err == nil {
+		return false
+	}
+	if err.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if err.StatusCode != http.StatusForbidden {
+		return false
+	}
+	body := strings.ToLower(err.Body)
+	return strings.Contains(body, "rate limit") || strings.Contains(body, "abuse detection")
+}

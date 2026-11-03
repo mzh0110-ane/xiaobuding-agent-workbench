@@ -1,0 +1,1513 @@
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/executor"
+	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	"github.com/kandev/kandev/internal/agentctl/server/process"
+	"github.com/kandev/kandev/internal/agentruntime"
+	commonconfig "github.com/kandev/kandev/internal/common/config"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/secrets"
+	"github.com/kandev/kandev/internal/task/models"
+)
+
+const (
+	sshAgentctlHealthTimeout = 20 * time.Second
+	sshAgentctlLoopbackHost  = "127.0.0.1"
+
+	sshStatusRunning      = "running"
+	sshStatusUnknown      = "unknown"
+	sshStatusDisconnected = "disconnected"
+	sshStatusAgentctlDown = "agentctl-down"
+
+	sshTransportLostMessage = "ssh session transport lost"
+)
+
+// sshAgentctlCleanupTimeout bounds the remote controller stop a disposal
+// path issues. A package-level variable, not a constant, so a backstop test
+// need not wait out real seconds (see executor_ssh_keepalive.go).
+var sshAgentctlCleanupTimeout = 20 * time.Second
+
+// sshSessionState tracks per-session resources we need to clean up later:
+// the SSH target (so we can dial again on Stop), the per-session SSH client
+// (no shared pool — the Go SSH client's direct-tcpip mux gets unreliable
+// when many short-lived channels race the long-lived stream channels), and
+// the local port forwarder.
+type sshSessionState struct {
+	target           *SSHTarget
+	client           *ssh.Client
+	forwarder        *SSHPortForwarder
+	agentctlClient   *agentctl.Client
+	pid              int
+	remoteDir        string
+	remoteTaskDir    string
+	authToken        string
+	reusingProcess   bool
+	metadata         map[string]interface{}
+	prepareEnv       map[string]string
+	platform         SSHRemotePlatform
+	runtimeAPITunnel *sshRuntimeAPITunnel
+
+	// port is the remote agentctl instance's port (the one the local forward
+	// targets) and workdirRoot is the resolved workdir root used to launch
+	// it. Both are set once at session creation and read back by a caller
+	// that loses the create/resume race (AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.1):
+	// its own request never produced this session, so its instance metadata
+	// must come from here, not from re-deriving values the surviving session
+	// may not actually have.
+	port        int
+	workdirRoot string
+
+	// Transport liveness (docs/specs/executors/requirements/ssh-transport-liveness.md).
+	// watchdog, transportLost and lastProbeReply are guarded by the owning
+	// SSHExecutor's mutex, the same lock that guards the session map.
+	watchdog       *sshKeepaliveWatchdog
+	transportLost  bool
+	lastProbeReply time.Time
+
+	// Independent once-guards for the two handles teardown and every
+	// disposal path share: whichever reaches a handle first closes it
+	// exactly once, and the other observes the same result.
+	forwarderCloseOnce sync.Once
+	forwarderCloseErr  error
+	clientCloseOnce    sync.Once
+	clientCloseErr     error
+	// teardownOnce guards transport teardown as a whole, so a second
+	// declaration logs no further warning.
+	teardownOnce sync.Once
+}
+
+// SSHExecutor implements ExecutorBackend for SSH-reachable Linux and macOS hosts.
+//
+// Each session owns its own *ssh.Client (no shared pool). One SSH connection
+// per session keeps teardown simple — closing the executor instance closes
+// the client — at the cost of an extra TCP+handshake per session on the same
+// host. See docs/specs/executors/requirements/ssh-executor.md for the full design.
+type SSHExecutor struct {
+	agentctlResolver     *AgentctlResolver
+	secretStore          secrets.SecretStore
+	agentList            RemoteAuthAgentLister
+	logger               *logger.Logger
+	brokerPreflight      func(context.Context, *ssh.Client, *ExecutorCreateRequest, SSHRemotePlatform) error
+	stopRemote           func(context.Context, *ssh.Client, string, int) error
+	verifyRemoteIdentity func(ctx context.Context, client *ssh.Client, pid int, sessionDir, taskDir string) (bool, error)
+	closeClient          func(*ssh.Client) error
+	cleanupScript        func(context.Context, *ssh.Client, string, map[string]interface{}, map[string]string, SSHRemotePlatform, string, string) error
+
+	mu       sync.Mutex
+	sessions map[string]*sshSessionState // keyed by ExecutorInstance.InstanceID
+}
+
+// NewSSHExecutor wires up an SSH executor with shared infrastructure.
+// agentList is optional; pass nil if no agent install scripts are needed.
+func NewSSHExecutor(
+	secretStore secrets.SecretStore,
+	agentList RemoteAuthAgentLister,
+	resolver *AgentctlResolver,
+	log *logger.Logger,
+) *SSHExecutor {
+	executor := &SSHExecutor{
+		agentctlResolver: resolver,
+		secretStore:      secretStore,
+		agentList:        agentList,
+		logger:           log.WithFields(zap.String("runtime", executorTypeSSH)),
+		sessions:         make(map[string]*sshSessionState),
+	}
+	executor.brokerPreflight = executor.preflightGitHubCredentialBroker
+	executor.stopRemote = stopRemoteAgentctl
+	executor.verifyRemoteIdentity = verifyRemoteAgentctlIdentity
+	executor.closeClient = func(client *ssh.Client) error { return client.Close() }
+	executor.cleanupScript = executor.runCleanupScript
+	return executor
+}
+
+func (r *SSHExecutor) Name() executor.Name { return executor.NameSSH }
+
+func (r *SSHExecutor) HealthCheck(_ context.Context) error {
+	// SSH targets are configured per-executor — the runtime itself is always
+	// available. Per-host reachability is verified by the test-connection
+	// endpoint and surfaced in the executor status panel.
+	return nil
+}
+
+// Close terminates every still-tracked SSH session. Normal teardown happens
+// session-by-session via StopInstance; Close is the shutdown safety net for
+// sessions whose StopInstance didn't run (e.g. a hard kandev exit).
+func (r *SSHExecutor) Close() error {
+	r.mu.Lock()
+	states := make([]*sshSessionState, 0, len(r.sessions))
+	for id, s := range r.sessions {
+		states = append(states, s)
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+	for _, s := range states {
+		r.stopWatchdogAndWait(s)
+		_ = r.closeForwarderOnce(s)
+		_ = r.closeClientOnce(s)
+		_ = s.runtimeAPITunnel.Close()
+		r.awaitProbeExit(s)
+	}
+	return nil
+}
+
+func (r *SSHExecutor) closeSSHClient(client *ssh.Client) error {
+	if client == nil {
+		return nil
+	}
+	if r.closeClient != nil {
+		return r.closeClient(client)
+	}
+	return client.Close()
+}
+
+// targetFromMetadata builds an SSHTarget from the executor metadata
+// propagated via buildLaunchMetadata (req.ExecutorConfig keys merged in).
+func (r *SSHExecutor) targetFromMetadata(md map[string]interface{}) (*SSHTarget, error) {
+	host := getMetadataString(md, MetadataKeySSHHost)
+	hostAlias := getMetadataString(md, MetadataKeySSHHostAlias)
+	if host == "" && hostAlias == "" {
+		return nil, errors.New("ssh executor: host (or host_alias) is required in executor config")
+	}
+	port := 0
+	if p := getMetadataString(md, MetadataKeySSHPort); p != "" {
+		// Reject malformed / out-of-range ports loudly instead of silently
+		// falling back to 22 — that fallback would mask an obviously bad
+		// config (e.g. ssh_port="abc" or ssh_port="0") and route every
+		// launch through a port the user never meant to use.
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("ssh executor: invalid ssh_port %q (must be 1-65535)", p)
+		}
+		port = n
+	}
+	identitySource := SSHIdentitySource(getMetadataString(md, MetadataKeySSHIdentitySource))
+	identityFile := getMetadataString(md, MetadataKeySSHIdentityFile)
+	cfg := SSHConnConfig{
+		HostAlias:         hostAlias,
+		Host:              host,
+		Port:              port,
+		User:              getMetadataString(md, MetadataKeySSHUser),
+		IdentitySource:    identitySource,
+		IdentityFile:      identityFile,
+		ProxyJump:         getMetadataString(md, MetadataKeySSHProxyJump),
+		PinnedFingerprint: getMetadataString(md, MetadataKeySSHHostFingerprint),
+	}
+	if cfg.PinnedFingerprint == "" {
+		return nil, errors.New("ssh executor: host_fingerprint is required — open the SSH executor connection settings, run Test connection, and trust the host")
+	}
+	return ResolveSSHTarget(cfg)
+}
+
+// workdirRoot returns the per-profile or per-executor workdir root (defaults
+// to ~/.kandev). Per-profile wins over per-executor.
+func (r *SSHExecutor) workdirRoot(md map[string]interface{}) string {
+	if w := getMetadataString(md, MetadataKeySSHWorkdirRoot); w != "" {
+		return w
+	}
+	return sshDefaultWorkdir
+}
+
+// CreateInstance opens (or reuses) an SSH connection to the configured host,
+// ensures agentctl is uploaded, provisions the per-task remote dir, launches
+// a per-session agentctl process, and sets up a local port forward so the
+// kandev backend can speak to it as if it were on localhost.
+//
+// If ResumeRemoteInstance already attached this InstanceID (e.g. after a
+// backend restart), reuse the resumed SSH client + forwarder + remote pid
+// instead of starting a second remote agentctl on top of the live one.
+func (r *SSHExecutor) CreateInstance(ctx context.Context, req *ExecutorCreateRequest) (*ExecutorInstance, error) {
+	baseCtx := preparationContext(ctx)
+	if err := validateAgentctlStartupConfig(req.AgentctlStartupConfig); err != nil {
+		return nil, fmt.Errorf("invalid agentctl startup configuration: %w", err)
+	}
+	resumed, ok := r.resumedStateForCreate(req)
+	if ok {
+		r.mu.Lock()
+		lost := resumed.transportLost
+		r.mu.Unlock()
+		if lost {
+			return nil, fmt.Errorf("ssh: reused session unavailable: %w", ErrSSHTransportLost)
+		}
+		return r.buildResumedInstance(req, resumed), nil
+	}
+	if _, err := validateRemoteContributions(req.RemoteContributions); err != nil {
+		return nil, fmt.Errorf("ssh: validate remote contributions: %w", err)
+	}
+	if _, err := validateContributionDestinations(req.ContributionDestinations); err != nil {
+		return nil, fmt.Errorf("ssh: validate contribution destinations: %w", err)
+	}
+
+	target, err := r.targetFromMetadata(req.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	client, err := dialSSH(baseCtx, target)
+	if err != nil {
+		// Classified from this launch's own attempt, never from a stored
+		// reachability record — that record can predate this dial by a full
+		// probe interval and would misattribute a stale cause to a fresh
+		// failure (see task-05-launch-non-gating.md).
+		return nil, fmt.Errorf("ssh: connect to %s@%s: %s: %w", target.User, target.Host, ClassifyDialError(err), err)
+	}
+	var runtimeAPITunnel *sshRuntimeAPITunnel
+	released := false
+	defer func() {
+		if !released {
+			_ = client.Close()
+			_ = runtimeAPITunnel.Close()
+		}
+	}()
+	r.report(req.OnProgress, "Connecting to SSH host", PrepareStepCompleted, "")
+	if err := r.preflightGitHubCredentialBroker(baseCtx, client, req, SSHRemotePlatform{}); err != nil {
+		return nil, err
+	}
+
+	agentctlBin, platform, err := r.prepareRemoteHost(baseCtx, client, req, ctx)
+	if err != nil {
+		return nil, err
+	}
+	runtimeAPITunnel, _, err = openSSHRuntimeAPITunnelForRequest(client, req)
+	if err != nil {
+		return nil, err
+	}
+
+	workdir := r.workdirRoot(req.Metadata)
+	taskDir := ""
+	if req.WorkspaceReuseRequired {
+		// A sibling SSH execution gets its own agentctl/session directory, but
+		// must use the already materialized task directory verbatim. In
+		// particular it must not run the remote prepare script or checkout
+		// verification, either of which can mutate an active shared checkout.
+		taskDir, err = reuseRequiredRemoteTaskDir(req)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		taskDir, err = r.prepareRemoteTaskDir(baseCtx, client, workdir, req)
+		if err != nil {
+			return nil, err
+		}
+		if err := r.maybeUploadCredentials(baseCtx, client, req, platform); err != nil {
+			return nil, fmt.Errorf("ssh: prepare initial-mode configuration: %w", err)
+		}
+		if err := r.runPrepareScript(baseCtx, client, taskDir, req, platform, agentctlBin); err != nil {
+			return nil, err
+		}
+	}
+	launchCtx, launchCancel := withLaunchPhaseTimeout(baseCtx)
+	defer launchCancel()
+	if !req.WorkspaceReuseRequired {
+		if err := r.verifyPrimaryCheckout(launchCtx, client, taskDir, req, platform); err != nil {
+			return nil, err
+		}
+	} else if err := ensureReuseRequiredRemoteTaskDirExists(launchCtx, client, taskDir); err != nil {
+		return nil, err
+	}
+	sessionDir, err := r.prepareRemoteSessionDir(launchCtx, client, taskDir, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.preflightAgentBinary(launchCtx, client, req, platform); err != nil {
+		return nil, err
+	}
+
+	port, pid, fwd, authToken, err := r.startAndForwardAgentctl(launchCtx, client, agentctlBin, taskDir, sessionDir, req, platform)
+	if err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	if existing, ok := r.sessions[req.InstanceID]; ok {
+		// AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.1: another caller already
+		// recorded a session for this instance while we were dialing and
+		// preparing. Leave it and its watchdog alone, close what we just
+		// built instead of orphaning it, and proceed with the existing
+		// session on the same terms as any other reuse.
+		lost := existing.transportLost
+		r.mu.Unlock()
+		_ = fwd.Close()
+		_ = client.Close()
+		_ = runtimeAPITunnel.Close()
+		released = true
+		if lost {
+			return nil, fmt.Errorf("ssh: reused session unavailable: %w", ErrSSHTransportLost)
+		}
+		return r.buildInstanceForLostRace(req, existing), nil
+	}
+	state := &sshSessionState{
+		target:           target,
+		client:           client,
+		forwarder:        fwd,
+		pid:              pid,
+		remoteDir:        sessionDir,
+		remoteTaskDir:    taskDir,
+		authToken:        authToken,
+		metadata:         cloneSSHMetadata(req.Metadata),
+		prepareEnv:       sshRemoteContributionEnv(req, agentctlBin),
+		platform:         platform,
+		runtimeAPITunnel: runtimeAPITunnel,
+		port:             port,
+		workdirRoot:      workdir,
+	}
+	r.sessions[req.InstanceID] = state
+	r.startWatchdogLocked(req.InstanceID, state)
+	r.mu.Unlock()
+	released = true // ownership transferred to session state; released on StopInstance
+
+	return r.buildInstance(req, target, fwd, taskDir, sessionDir, port, pid, workdir, authToken), nil
+}
+
+// buildInstanceForLostRace builds an ExecutorInstance for a caller that lost
+// the create/resume race in the executor's tracked-sessions map: another
+// concurrent caller already recorded (and started a watchdog for) the
+// session this caller was about to create. It reads only from the existing
+// session state, never from this caller's request, since the request's
+// remote-agentctl metadata describes a session this caller never created.
+func (r *SSHExecutor) buildInstanceForLostRace(req *ExecutorCreateRequest, existing *sshSessionState) *ExecutorInstance {
+	client := existing.agentctlClient
+	if client == nil {
+		client = agentctl.NewClient(sshAgentctlLoopbackHost, existing.forwarder.LocalPort(), r.logger,
+			agentctl.WithExecutionID(req.InstanceID),
+			agentctl.WithSessionID(req.SessionID), agentctl.WithAuthToken(existing.authToken))
+	}
+	metadata := map[string]interface{}{
+		MetadataKeySSHHost:               existing.target.Host,
+		MetadataKeySSHPort:               strconv.Itoa(existing.target.Port),
+		MetadataKeySSHUser:               existing.target.User,
+		MetadataKeySSHHostFingerprint:    existing.target.PinnedFingerprint,
+		MetadataKeySSHRemoteTaskDir:      existing.remoteTaskDir,
+		MetadataKeySSHRemoteSessionDir:   existing.remoteDir,
+		MetadataKeySSHRemoteAgentctlPort: strconv.Itoa(existing.port),
+		MetadataKeySSHRemoteAgentctlPID:  strconv.Itoa(existing.pid),
+		MetadataKeySSHLocalForwardPort:   strconv.Itoa(existing.forwarder.LocalPort()),
+		MetadataKeySSHWorkdirRoot:        existing.workdirRoot,
+		MetadataKeyIsRemote:              true,
+		MetadataKeyReuseExistingProcess:  existing.reusingProcess,
+	}
+	// existing.metadata is the winning session's own cloned request metadata
+	// (cloneSSHMetadata(req.Metadata), captured after openSSHRuntimeAPITunnelForRequest
+	// ran for the winner), so it carries the winner's still-open tunnel's keys —
+	// never this caller's own, since this caller's tunnel was just closed above.
+	copySSHRuntimeAPIMetadata(metadata, existing.metadata)
+	return &ExecutorInstance{
+		InstanceID:    req.InstanceID,
+		TaskID:        req.TaskID,
+		SessionID:     req.SessionID,
+		RuntimeName:   r.Name(),
+		Client:        client,
+		WorkspacePath: existing.remoteTaskDir,
+		AuthToken:     existing.authToken,
+		Metadata:      metadata,
+	}
+}
+
+func reuseRequiredRemoteTaskDir(req *ExecutorCreateRequest) (string, error) {
+	if req == nil {
+		return "", fmt.Errorf("%w: missing remote task directory", models.ErrWorkspaceReuseUnsafe)
+	}
+	taskDir := strings.TrimSpace(getMetadataString(req.Metadata, MetadataKeySSHRemoteTaskDir))
+	if taskDir == "" {
+		return "", fmt.Errorf("%w: missing remote task directory", models.ErrWorkspaceReuseUnsafe)
+	}
+	return taskDir, nil
+}
+
+func (r *SSHExecutor) resumedStateForCreate(req *ExecutorCreateRequest) (*sshSessionState, bool) {
+	if req == nil || hasManagedGitHubBrokerEnv(req.Env) {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.sessions[req.InstanceID]
+	return state, ok
+}
+
+func (r *SSHExecutor) preflightGitHubCredentialBroker(
+	ctx context.Context,
+	client *ssh.Client,
+	req *ExecutorCreateRequest,
+	platform SSHRemotePlatform,
+) error {
+	shell := sshShellForRemote(req.Metadata, platform)
+	return runBrokerReachabilityPreflight(ctx, req.Env, func(
+		ctx context.Context,
+		command string,
+		env map[string]string,
+	) ([]byte, error) {
+		envScript, err := buildSSHEnvInitScript(env)
+		if err != nil {
+			return nil, err
+		}
+		input := strings.NewReader(envScript)
+		wrapped := WrapLoginShell(shell, "set -a; "+sshStdinEnvImport+"; set +a\n"+command)
+		stdout, stderr, err := runSSHCommandStdin(ctx, client, wrapped, input)
+		return []byte(stdout + stderr), err
+	})
+}
+
+// prepareRemoteHost runs the steps that are independent of any particular
+// task: detect remote OS/arch and ensure the agentctl binary is on the host.
+// Returns the resolved remote agentctl path.
+func (r *SSHExecutor) prepareRemoteHost(
+	ctx context.Context,
+	client *ssh.Client,
+	req *ExecutorCreateRequest,
+	helperContexts ...context.Context,
+) (string, SSHRemotePlatform, error) {
+	info, err := detectRemoteInfo(ctx, client)
+	if err != nil {
+		r.report(req.OnProgress, "Detecting remote OS", PrepareStepFailed, err.Error())
+		return "", SSHRemotePlatform{}, fmt.Errorf("ssh: detect remote: %w", err)
+	}
+	if err := requireSupportedRemotePlatform(info.Platform); err != nil {
+		r.report(req.OnProgress, "Detecting remote OS", PrepareStepFailed, err.Error())
+		return "", info.Platform, err
+	}
+	r.report(req.OnProgress, "Detecting remote OS", PrepareStepCompleted, info.UnameAll)
+
+	helperProgress := req.OnProgress
+	if helperProgress != nil {
+		callback := helperProgress
+		helperProgress = func(step PrepareStep, index, total int) { callback(step, index+1, total+1) }
+	}
+	helperCtx := ctx
+	if len(helperContexts) > 0 && helperContexts[0] != nil {
+		helperCtx = helperContexts[0]
+	}
+	agentctlBin, err := ensureAgentctlOnHostWithProgress(ctx, helperCtx, client, r.agentctlResolver, info.Platform, r.logger, helperProgress)
+	if err != nil {
+		r.report(req.OnProgress, "Uploading agent controller", PrepareStepFailed, err.Error())
+		return "", info.Platform, err
+	}
+	r.report(req.OnProgress, "Uploading agent controller", PrepareStepCompleted, "")
+	return agentctlBin, info.Platform, nil
+}
+
+// prepareRemoteTaskDir makes <workdir>/tasks/<taskDir> before preparation runs.
+func (r *SSHExecutor) prepareRemoteTaskDir(ctx context.Context, client *ssh.Client, workdir string, req *ExecutorCreateRequest) (string, error) {
+	taskDir, err := ensureRemoteTaskDir(ctx, client, workdir, sshTaskDirName(req))
+	if err != nil {
+		r.report(req.OnProgress, "Preparing task directory", PrepareStepFailed, err.Error())
+		return "", err
+	}
+	r.report(req.OnProgress, "Preparing task directory", PrepareStepCompleted, taskDir)
+	return taskDir, nil
+}
+
+func (r *SSHExecutor) prepareRemoteSessionDir(ctx context.Context, client *ssh.Client, taskDir string, req *ExecutorCreateRequest) (string, error) {
+	sessionDir, err := ensureRemoteSessionDir(ctx, client, taskDir, req.SessionID)
+	if err != nil {
+		r.report(req.OnProgress, "Preparing session directory", PrepareStepFailed, err.Error())
+		return "", err
+	}
+	r.report(req.OnProgress, "Preparing session directory", PrepareStepCompleted, sessionDir)
+	return sessionDir, nil
+}
+
+// startAndForwardAgentctl spawns the per-session agentctl on the remote,
+// creates a per-instance sub-server inside it, and stands up the SSH local
+// port forward to the *instance* port (not the control port). Returns the
+// instance port, the agentctl PID, and the forwarder. Cleans up everything
+// it created on any failure.
+//
+// Lifecycle mirrors what executor_sprites.go does inside its sprite:
+//  1. agentctl --workdir <taskDir> binds the control API on a random port.
+//  2. POST /api/v1/instances on that control port creates a session-scoped
+//     sub-server with its own port (allocated from agentctl's instance pool).
+//  3. The SSH executor's clients (agent stream, workspace, etc.) all talk to
+//     that sub-server, so the local port forward points there.
+func (r *SSHExecutor) startAndForwardAgentctl(
+	ctx context.Context,
+	client *ssh.Client,
+	agentctlBin, taskDir, sessionDir string,
+	req *ExecutorCreateRequest,
+	platform SSHRemotePlatform,
+) (int, int, *SSHPortForwarder, string, error) {
+	if err := uploadSSHSkillManifest(ctx, client, taskDir, req.Metadata); err != nil {
+		return 0, 0, nil, "", fmt.Errorf("ssh: upload skill manifest: %w", err)
+	}
+	shell := sshShellForRemote(req.Metadata, platform)
+	controlPort, pid, authToken, err := r.startAgentctlAndHandshake(ctx, client, shell, agentctlBin, taskDir, sessionDir, req)
+	if err != nil {
+		r.report(req.OnProgress, "Starting agent controller", PrepareStepFailed, err.Error())
+		return 0, 0, nil, "", err
+	}
+	r.report(req.OnProgress, "Starting agent controller", PrepareStepCompleted,
+		fmt.Sprintf("pid=%d control_port=%d", pid, controlPort))
+
+	// The per-instance server's workspace is the remote task dir, not the
+	// host-side req.WorkspacePath (which is meaningless on the remote).
+	// Passed explicitly so we don't briefly mutate the caller's request.
+	instancePort, ierr := createRemoteAgentInstance(
+		ctx, client, controlPort, taskDir, agentctlBin, req, authToken, r.logger,
+	)
+	if ierr != nil {
+		_ = stopRemoteAgentctl(ctx, client, sessionDir, pid)
+		r.report(req.OnProgress, "Creating agent instance", PrepareStepFailed, ierr.Error())
+		return 0, 0, nil, "", ierr
+	}
+	r.report(req.OnProgress, "Creating agent instance", PrepareStepCompleted,
+		fmt.Sprintf("instance_port=%d", instancePort))
+
+	fwd, err := StartPortForward(client, instancePort, r.logger)
+	if err != nil {
+		_ = stopRemoteAgentctl(ctx, client, sessionDir, pid)
+		return 0, 0, nil, "", fmt.Errorf("ssh: port forward: %w", err)
+	}
+	if err := waitAgentctlHealthy(ctx, fwd.LocalPort(), sshAgentctlHealthTimeout); err != nil {
+		_ = fwd.Close()
+		_ = stopRemoteAgentctl(ctx, client, sessionDir, pid)
+		return 0, 0, nil, "", fmt.Errorf("ssh: agentctl health: %w", err)
+	}
+	r.report(req.OnProgress, "Connecting to agent controller", PrepareStepCompleted,
+		fmt.Sprintf("local:%d -> remote:%d", fwd.LocalPort(), instancePort))
+	return instancePort, pid, fwd, authToken, nil
+}
+
+// startAgentctlAndHandshake starts a fresh agentctl instance and completes
+// its bootstrap handshake, retrying with a brand-new instance (fresh nonce,
+// fresh port) when the handshake is rejected by whatever is listening on the
+// picked port — see retryAgentctlHandshake. Any other failure is terminal.
+func (r *SSHExecutor) startAgentctlAndHandshake(
+	ctx context.Context,
+	client *ssh.Client,
+	shell, agentctlBin, taskDir, sessionDir string,
+	req *ExecutorCreateRequest,
+) (int, int, string, error) {
+	attempt := func() (int, int, string, error) {
+		nonce, err := generateBootstrapNonce()
+		if err != nil {
+			return 0, 0, "", fmt.Errorf("ssh: generate bootstrap nonce: %w", err)
+		}
+		nonceFingerprint := commonconfig.NonceFingerprint(nonce)
+		// Keep only the managed broker values in the long-lived remote
+		// process. sshAgentctlLaunchEnv adds the bootstrap credentials
+		// required for the authenticated control handshake without
+		// forwarding profile secrets.
+		brokerEnv := managedGitCredentialBrokerEnv(sshRemoteContributionEnv(req, agentctlBin))
+		if selectedCheckoutIsPullRequest(req.Metadata) {
+			brokerEnv = nil
+		}
+		env := sshAgentctlLaunchEnv(brokerEnv, nonce, req.AgentctlStartupConfig)
+		port, pid, err := startRemoteAgentctl(ctx, client, shell, agentctlBin, taskDir, sessionDir, env, r.logger)
+		if err != nil {
+			// Preserve port/pid so retryAgentctlHandshake's "if pid > 0"
+			// teardown fires even for a start-time failure (e.g. a
+			// ready-timeout) that left a live process behind.
+			return port, pid, "", err
+		}
+		r.logger.Debug("ssh: sending agentctl bootstrap handshake",
+			zap.Int("port", port), zap.Int("pid", pid),
+			zap.String("nonce_fingerprint", nonceFingerprint))
+		token, err := remoteControlHandshake(ctx, client, port, nonce)
+		if err != nil {
+			if errors.Is(err, errSSHAgentctlHandshakeRejected) {
+				// The fingerprint lets this rejection be correlated against
+				// agentctl's own handshake log line for the same nonce —
+				// distinguishing a mismatch/already-burned nonce from
+				// bootstrap mode never having been configured on the remote.
+				logCtx, logCancel := sshRemoteCleanupContext(ctx)
+				logTail := readRemoteAgentctlLogTail(logCtx, client, sessionDir)
+				logCancel()
+				err = fmt.Errorf("%w (port %d, pid %d, nonce %s); log:\n%s",
+					err, port, pid, nonceFingerprint, logTail)
+			}
+			return port, pid, "", err
+		}
+		return port, pid, token, nil
+	}
+	teardown := func(_, pid int) error {
+		cleanupCtx, cleanupCancel := sshRemoteCleanupContext(ctx)
+		defer cleanupCancel()
+		return stopRemoteAgentctl(cleanupCtx, client, sessionDir, pid)
+	}
+	return retryAgentctlHandshake(ctx, attempt, teardown, sleepOrContextDone)
+}
+
+func sshAgentctlLaunchEnv(base map[string]string, nonce string, startup ...commonconfig.AgentctlStartupConfig) map[string]string {
+	env := make(map[string]string, len(base))
+	for key, value := range base {
+		env[key] = value
+	}
+	// The handshake returns the bearer token to the backend; never pass it to
+	// the launched agent process. SSH reaches both listeners through explicit
+	// loopback direct-tcpip forwards, so it need not expose them remotely.
+	delete(env, "AGENTCTL_AUTH_TOKEN")
+	env["AGENTCTL_BOOTSTRAP_NONCE"] = nonce
+	env["AGENTCTL_LISTEN_HOST"] = sshAgentctlLoopbackHost
+	if len(startup) > 0 {
+		for key, value := range agentctlStartupEnvironment(startup[0]) {
+			env[key] = value
+		}
+	}
+	return env
+}
+
+func (r *SSHExecutor) buildInstance(
+	req *ExecutorCreateRequest,
+	target *SSHTarget,
+	fwd *SSHPortForwarder,
+	taskDir, sessionDir string,
+	port, pid int,
+	workdir, authToken string,
+) *ExecutorInstance {
+	metadata := map[string]interface{}{
+		MetadataKeySSHHost:               target.Host,
+		MetadataKeySSHPort:               strconv.Itoa(target.Port),
+		MetadataKeySSHUser:               target.User,
+		MetadataKeySSHHostFingerprint:    target.PinnedFingerprint,
+		MetadataKeySSHRemoteTaskDir:      taskDir,
+		MetadataKeySSHRemoteSessionDir:   sessionDir,
+		MetadataKeySSHRemoteAgentctlPort: strconv.Itoa(port),
+		MetadataKeySSHRemoteAgentctlPID:  strconv.Itoa(pid),
+		MetadataKeySSHAgentctlInstanceID: req.InstanceID,
+		MetadataKeySSHLocalForwardPort:   strconv.Itoa(fwd.LocalPort()),
+		MetadataKeySSHWorkdirRoot:        workdir,
+		MetadataKeyIsRemote:              true,
+	}
+	copySSHRuntimeAPIMetadata(metadata, req.Metadata)
+	return &ExecutorInstance{
+		InstanceID:  req.InstanceID,
+		TaskID:      req.TaskID,
+		SessionID:   req.SessionID,
+		RuntimeName: r.Name(),
+		Client: agentctl.NewClient(sshAgentctlLoopbackHost, fwd.LocalPort(), r.logger,
+			agentctl.WithExecutionID(req.InstanceID),
+			agentctl.WithSessionID(req.SessionID), agentctl.WithAuthToken(authToken)),
+		WorkspacePath: taskDir,
+		AuthToken:     authToken,
+		Metadata:      metadata,
+	}
+}
+
+// buildResumedInstance constructs an ExecutorInstance from already-attached
+// session state set up by ResumeRemoteInstance. No new dials / uploads / agent
+// launches — the remote agentctl is still running from the previous session.
+// Metadata mirrors the original launch's values so downstream consumers
+// don't see a partial view.
+func (r *SSHExecutor) buildResumedInstance(req *ExecutorCreateRequest, state *sshSessionState) *ExecutorInstance {
+	port, _ := strconv.Atoi(getMetadataString(req.Metadata, MetadataKeySSHRemoteAgentctlPort))
+	taskDir := getMetadataString(req.Metadata, MetadataKeySSHRemoteTaskDir)
+	workdir := r.workdirRoot(req.Metadata)
+	client := state.agentctlClient
+	if client == nil {
+		client = agentctl.NewClient(sshAgentctlLoopbackHost, state.forwarder.LocalPort(), r.logger,
+			agentctl.WithExecutionID(resumedSSHAgentctlInstanceID(req)),
+			agentctl.WithSessionID(req.SessionID), agentctl.WithAuthToken(state.authToken))
+	}
+	metadata := map[string]interface{}{
+		MetadataKeySSHHost:               state.target.Host,
+		MetadataKeySSHPort:               strconv.Itoa(state.target.Port),
+		MetadataKeySSHUser:               state.target.User,
+		MetadataKeySSHHostFingerprint:    state.target.PinnedFingerprint,
+		MetadataKeySSHRemoteTaskDir:      taskDir,
+		MetadataKeySSHRemoteSessionDir:   state.remoteDir,
+		MetadataKeySSHRemoteAgentctlPort: strconv.Itoa(port),
+		MetadataKeySSHRemoteAgentctlPID:  strconv.Itoa(state.pid),
+		MetadataKeySSHAgentctlInstanceID: resumedSSHAgentctlInstanceID(req),
+		MetadataKeySSHLocalForwardPort:   strconv.Itoa(state.forwarder.LocalPort()),
+		MetadataKeySSHWorkdirRoot:        workdir,
+		MetadataKeyIsRemote:              true,
+		MetadataKeyReuseExistingProcess:  state.reusingProcess,
+	}
+	copySSHRuntimeAPIMetadata(metadata, req.Metadata)
+	return &ExecutorInstance{
+		InstanceID:    req.InstanceID,
+		TaskID:        req.TaskID,
+		SessionID:     req.SessionID,
+		RuntimeName:   r.Name(),
+		Client:        client,
+		WorkspacePath: taskDir,
+		AuthToken:     state.authToken,
+		Metadata:      metadata,
+	}
+}
+
+func copySSHRuntimeAPIMetadata(dst, src map[string]interface{}) {
+	for _, key := range []string{
+		MetadataKeySSHRuntimeAPILocalURL,
+		MetadataKeySSHRuntimeAPIRemotePort,
+	} {
+		if value, ok := src[key]; ok {
+			dst[key] = value
+		}
+	}
+}
+
+// StopInstance closes the local port forward and SSH connection for every
+// stop. It preserves the remote agentctl only for graceful backend shutdown,
+// so a restart can reconnect using the persisted remote PID, port, and token.
+// User stops, rollbacks, force, failed-agent, terminal, and stale-replacement
+// stops all kill agentctl.
+// The task directory is always left intact; v2 housekeeping will sweep stale
+// dirs.
+func (r *SSHExecutor) StopInstance(ctx context.Context, instance *ExecutorInstance, force bool) error {
+	if instance == nil {
+		return nil
+	}
+	r.mu.Lock()
+	state := r.sessions[instance.InstanceID]
+	var classification sshTransportClassification
+	if state != nil {
+		// AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.8: the single disposal
+		// reading, taken in the same critical section as the removal, before
+		// any remote command on this path.
+		classification = classifySSHTransportLocked(state)
+		delete(r.sessions, instance.InstanceID)
+	}
+	r.mu.Unlock()
+	if state == nil {
+		return r.stopPersistedRemoteAgentctl(ctx, instance, force)
+	}
+
+	// Step 2: signal the watchdog loop and wait for it — only it — to exit.
+	r.stopWatchdogAndWait(state)
+	// Step 3: close the local port forward through its once-guard.
+	_ = r.closeForwarderOnce(state)
+
+	// Step 4: this path's own remote commands, skipped entirely when the
+	// reading said the transport is lost or unresponsive.
+	if classification == sshTransportAnswering && shouldRunExecutorCleanup(instance.StopReason) && state.client != nil && r.cleanupScript != nil {
+		metadata := mergeSSHMetadata(state.metadata, instance.Metadata)
+		if err := r.runWithTransportBackstop(state, sshCleanupTimeout, func() error {
+			return r.cleanupScript(ctx, state.client, state.remoteTaskDir, metadata, state.prepareEnv, state.platform, instance.InstanceID, instance.StopReason)
+		}); err != nil {
+			r.logger.Warn("failed to run SSH cleanup script", zap.String("instance_id", instance.InstanceID), zap.Error(err))
+		}
+	}
+	if !sshShouldStopRemoteAgentctl(instance, force) {
+		r.logger.Info("preserving SSH agentctl after agent stop",
+			zap.String("instance_id", instance.InstanceID),
+			zap.String("stop_reason", instance.StopReason))
+		// Step 5 and step 6: close the client and wait for the prober exit
+		// even on this early-return path, so no watchdog activity survives
+		// the call.
+		_ = r.closeClientOnce(state)
+		_ = state.runtimeAPITunnel.Close()
+		r.awaitProbeExit(state)
+		return nil
+	}
+
+	// Use the same SSH client we used for CreateInstance — if it's still
+	// alive we can kill the remote agentctl gracefully; otherwise just drop
+	// the connection on the floor.
+	if classification == sshTransportAnswering && state.client != nil {
+		stopRemote := r.stopRemote
+		if stopRemote == nil {
+			stopRemote = stopRemoteAgentctl
+		}
+		_ = r.runWithTransportBackstop(state, sshAgentctlCleanupTimeout, func() error {
+			cleanupCtx, cancel := sshRemoteCleanupContext(ctx)
+			defer cancel()
+			return stopRemote(cleanupCtx, state.client, state.remoteDir, state.pid)
+		})
+	}
+	// Step 5: close the session SSH client, through its once-guard.
+	_ = r.closeClientOnce(state)
+	_ = state.runtimeAPITunnel.Close()
+	// Step 6: wait for the prober to exit.
+	r.awaitProbeExit(state)
+	return nil
+}
+
+func sshShouldStopRemoteAgentctl(instance *ExecutorInstance, force bool) bool {
+	if instance == nil {
+		return false
+	}
+	return force || instance.AgentStopFailed || instance.StopReason != StopReasonBackendShutdown
+}
+
+func sshRemoteCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), sshAgentctlCleanupTimeout)
+}
+
+// stopPersistedRemoteAgentctl reaps a remote agentctl process whose in-memory
+// session state did not survive a backend restart, dialing fresh from the
+// pid, session directory, and connection details persisted in
+// executors_running.metadata (see persistentMetadataKeys). It is the only
+// path that can stop a session the executor never tracked in this process
+// lifetime — every other stop reuses the SSH client opened at CreateInstance
+// or ResumeRemoteInstance.
+func (r *SSHExecutor) stopPersistedRemoteAgentctl(ctx context.Context, instance *ExecutorInstance, force bool) error {
+	if !sshShouldStopRemoteAgentctl(instance, force) {
+		return nil
+	}
+	if instance == nil || len(instance.Metadata) == 0 {
+		return fmt.Errorf("ssh: persisted agentctl metadata is missing for instance %q", instanceID(instance))
+	}
+	pid, sessionDir, ok := persistedSSHAgentctlTarget(instance.Metadata)
+	if !ok {
+		return fmt.Errorf("ssh: persisted agentctl metadata is incomplete for instance %q", instance.InstanceID)
+	}
+	taskDir := strings.TrimSpace(getMetadataString(instance.Metadata, MetadataKeySSHRemoteTaskDir))
+	if taskDir == "" {
+		return fmt.Errorf("ssh: no persisted remote task dir for instance %q: agentctl identity is unprovable", instance.InstanceID)
+	}
+	target, err := r.targetFromMetadata(instance.Metadata)
+	if err != nil {
+		return fmt.Errorf("ssh: resolve persisted target for instance %q: %w", instance.InstanceID, err)
+	}
+	cleanupCtx, cancel := sshRemoteCleanupContext(ctx)
+	defer cancel()
+	client, err := dialSSH(cleanupCtx, target)
+	if err != nil {
+		return fmt.Errorf("ssh: dial persisted target for instance %q: %w", instance.InstanceID, err)
+	}
+	defer func() { _ = r.closeSSHClient(client) }()
+
+	verifyIdentity := r.verifyRemoteIdentity
+	if verifyIdentity == nil {
+		verifyIdentity = verifyRemoteAgentctlIdentity
+	}
+	isOurs, err := verifyIdentity(cleanupCtx, client, pid, sessionDir, taskDir)
+	if err != nil {
+		return fmt.Errorf("ssh: verify persisted agentctl identity for instance %q: %w", instance.InstanceID, err)
+	}
+	if !isOurs {
+		// Reached only for a *proven* abandoned row: the pid is gone, or it
+		// is held by something that is not an agentctl under this row's
+		// taskDir. Unproven identity arrives as an error above and never
+		// here, which is what makes reclaiming the directory safe — a
+		// directory is only removed once nothing is known to be using it.
+		if _, _, err := runSSHCommand(cleanupCtx, client, removeRemoteDirCommand(sessionDir)); err != nil {
+			return fmt.Errorf("ssh: remove persisted session dir for unmatched pid on instance %q: %w", instance.InstanceID, err)
+		}
+		return nil
+	}
+
+	stopRemote := r.stopRemote
+	if stopRemote == nil {
+		stopRemote = stopRemoteAgentctl
+	}
+	if err := stopRemote(cleanupCtx, client, sessionDir, pid); err != nil {
+		return fmt.Errorf("ssh: stop persisted remote agentctl for instance %q: %w", instance.InstanceID, err)
+	}
+	return nil
+}
+
+// persistedSSHAgentctlTarget extracts the remote pid and session directory a
+// persisted-metadata stop needs. Either being missing or the pid being
+// non-positive means there is nothing durable to act on — never build a
+// kill/rm-rf command from an empty or zero value.
+func persistedSSHAgentctlTarget(metadata map[string]interface{}) (pid int, sessionDir string, ok bool) {
+	pidStr := strings.TrimSpace(getMetadataString(metadata, MetadataKeySSHRemoteAgentctlPID))
+	sessionDir = strings.TrimSpace(getMetadataString(metadata, MetadataKeySSHRemoteSessionDir))
+	if pidStr == "" || sessionDir == "" {
+		return 0, "", false
+	}
+	parsedPID, err := strconv.Atoi(pidStr)
+	if err != nil || parsedPID <= 0 {
+		return 0, "", false
+	}
+	return parsedPID, sessionDir, true
+}
+
+func instanceID(instance *ExecutorInstance) string {
+	if instance == nil {
+		return "<nil>"
+	}
+	return instance.InstanceID
+}
+
+// RecoverInstances re-opens SSH connections for sessions that were live before
+// a backend restart. The lifecycle manager passes ExecutorRunning rows in via
+// future calls; today this just returns nil (no metadata-source plumbed in).
+// Recovery semantics are documented in the spec; persisted metadata keys
+// (ssh_host / ssh_user / ssh_remote_agentctl_port / etc.) are honored by
+// ResumeRemoteInstance below.
+func (r *SSHExecutor) RecoverInstances(_ context.Context, _ []*models.ExecutorRunning) ([]*ExecutorInstance, error) {
+	return nil, nil
+}
+
+// ResumeRemoteInstance is called by the lifecycle manager when re-attaching to
+// an existing SSH session (e.g. after backend restart). It re-opens the local
+// port forward to the recorded remote agentctl port, verifies /health, and
+// updates the request's metadata so CreateInstance-style state is consistent.
+//
+// If the recorded agentctl process is confirmed gone, stale runtime metadata
+// is cleared so the manager's normal create step starts a fresh instance.
+func (r *SSHExecutor) ResumeRemoteInstance(ctx context.Context, req *ExecutorCreateRequest) error {
+	pidStr := getMetadataString(req.Metadata, MetadataKeySSHRemoteAgentctlPID)
+	portStr := getMetadataString(req.Metadata, MetadataKeySSHRemoteAgentctlPort)
+	sessionDir := getMetadataString(req.Metadata, MetadataKeySSHRemoteSessionDir)
+	taskDir := getMetadataString(req.Metadata, MetadataKeySSHRemoteTaskDir)
+	if pidStr == "" || portStr == "" || sessionDir == "" || taskDir == "" {
+		return nil // not a resume — proceed with normal create
+	}
+	if hasManagedGitHubBrokerEnv(req.Env) {
+		return r.resetManagedBrokerResume(ctx, req, pidStr, sessionDir)
+	}
+	if err := requireSSHAgentctlAuthToken(req.AuthToken); err != nil {
+		return err
+	}
+
+	// Idempotency: if a previous resume attempt for this InstanceID already
+	// produced live client+forwarder state, return success without dialing
+	// again. Without this, a retry orphans the existing client+forwarder
+	// (the new ones overwrite the map entry and the old ones leak until
+	// the GC reclaims them, well after the SSH connection has timed out).
+	// CreateInstance has the same guard; mirror it here so the two entry
+	// points to r.sessions[InstanceID] agree.
+	r.mu.Lock()
+	if _, ok := r.sessions[req.InstanceID]; ok {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+
+	target, err := r.targetFromMetadata(req.Metadata)
+	if err != nil {
+		return err
+	}
+	client, err := dialSSH(ctx, target)
+	if err != nil {
+		return fmt.Errorf("ssh resume: connect: %w", err)
+	}
+	agentctlBin, err := expandRemoteHome(ctx, client, sshRemoteAgentctlPath)
+	if err != nil {
+		_ = client.Close()
+		return fmt.Errorf("ssh resume: resolve agentctl path: %w", err)
+	}
+
+	// SSH liveness is judged on the REMOTE host: MetadataKeySSHRemoteAgentctlPID
+	// (mirrored into executors_running.pid) is a pid on the remote box, so it is
+	// probed with a remote `kill -0` over this SSH client — never with a local
+	// os.FindProcess. The runtime-aware row predicate (RowProcessLiveness in
+	// liveness.go) deliberately returns Unknown for SSH rows so nothing applies a
+	// host-local check here (#1597 runtime-aware liveness).
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil || pid <= 0 {
+		_ = client.Close()
+		return fmt.Errorf("ssh resume: invalid remote agentctl pid %q", pidStr)
+	}
+	alive, err := probeRemoteAgentctlLiveness(ctx, client, pid)
+	if err != nil {
+		_ = client.Close()
+		return fmt.Errorf("ssh resume: probe agentctl pid %d: %w", pid, err)
+	}
+	if !alive {
+		_ = client.Close()
+		clearSSHResumeRuntimeMetadata(req.Metadata)
+		return nil
+	}
+	runtimeAPITunnel, _, err := openSSHRuntimeAPITunnelForRequest(client, req)
+	if err != nil {
+		_ = client.Close()
+		return err
+	}
+
+	remotePort, _ := strconv.Atoi(portStr)
+	fwd, err := StartPortForward(client, remotePort, r.logger)
+	if err != nil {
+		_ = client.Close()
+		_ = runtimeAPITunnel.Close()
+		return fmt.Errorf("ssh resume: port forward: %w", err)
+	}
+	if err := waitAgentctlHealthy(ctx, fwd.LocalPort(), sshAgentctlHealthTimeout); err != nil {
+		_ = fwd.Close()
+		_ = client.Close()
+		_ = runtimeAPITunnel.Close()
+		return fmt.Errorf("ssh resume: agentctl health: %w", err)
+	}
+	instanceClient, reusingProcess := r.newResumedAgentctlClient(
+		ctx, fwd.LocalPort(), req,
+	)
+
+	r.mu.Lock()
+	if _, ok := r.sessions[req.InstanceID]; ok {
+		// AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.1: a concurrent resume or
+		// create already recorded a session for this instance while we were
+		// dialing. Leave it and its watchdog alone and close what we just
+		// built instead of orphaning it.
+		r.mu.Unlock()
+		_ = fwd.Close()
+		_ = client.Close()
+		_ = runtimeAPITunnel.Close()
+		return nil
+	}
+	state := &sshSessionState{
+		target:           target,
+		client:           client,
+		forwarder:        fwd,
+		agentctlClient:   instanceClient,
+		pid:              pid,
+		remoteDir:        sessionDir,
+		remoteTaskDir:    taskDir,
+		authToken:        req.AuthToken,
+		reusingProcess:   reusingProcess,
+		metadata:         cloneSSHMetadata(req.Metadata),
+		prepareEnv:       sshRemoteContributionEnv(req, agentctlBin),
+		runtimeAPITunnel: runtimeAPITunnel,
+		port:             remotePort,
+		workdirRoot:      r.workdirRoot(req.Metadata),
+	}
+	r.sessions[req.InstanceID] = state
+	r.startWatchdogLocked(req.InstanceID, state)
+	r.mu.Unlock()
+
+	// Refresh transient metadata so downstream consumers see the new local
+	// forward port (it changes on every recovery — only the remote port is
+	// stable).
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]interface{})
+	}
+	req.Metadata[MetadataKeySSHLocalForwardPort] = strconv.Itoa(fwd.LocalPort())
+	return nil
+}
+
+func (r *SSHExecutor) newResumedAgentctlClient(
+	ctx context.Context,
+	localPort int,
+	req *ExecutorCreateRequest,
+) (*agentctl.Client, bool) {
+	client := agentctl.NewClient(sshAgentctlLoopbackHost, localPort, r.logger,
+		agentctl.WithExecutionID(resumedSSHAgentctlInstanceID(req)),
+		agentctl.WithSessionID(req.SessionID), agentctl.WithAuthToken(req.AuthToken))
+	status, err := client.GetStatus(ctx)
+	if err != nil {
+		r.logger.Debug("ssh resume could not get agent status; starting a new process",
+			zap.String("instance_id", req.InstanceID), zap.Error(err))
+		return client, false
+	}
+	return client, status != nil && status.IsAgentRunning()
+}
+
+func resumedSSHAgentctlInstanceID(req *ExecutorCreateRequest) string {
+	// The remote controller keeps its launch identity across local execution replacements.
+	if instanceID := getMetadataString(req.Metadata, MetadataKeySSHAgentctlInstanceID); instanceID != "" {
+		return instanceID
+	}
+	if req.PreviousExecutionID != "" {
+		return req.PreviousExecutionID
+	}
+	return req.InstanceID
+}
+
+func requireSSHAgentctlAuthToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return errors.New("ssh resume: missing agentctl auth token")
+	}
+	return nil
+}
+
+func (r *SSHExecutor) resetManagedBrokerResume(
+	ctx context.Context,
+	req *ExecutorCreateRequest,
+	pidStr, sessionDir string,
+) error {
+	brokerPreflight := r.brokerPreflight
+	if brokerPreflight == nil {
+		brokerPreflight = r.preflightGitHubCredentialBroker
+	}
+	stopRemote := r.stopRemote
+	if stopRemote == nil {
+		stopRemote = stopRemoteAgentctl
+	}
+
+	r.mu.Lock()
+	state := r.sessions[req.InstanceID]
+	r.mu.Unlock()
+	if state != nil {
+		return r.resetTrackedManagedBrokerResume(ctx, req, state, brokerPreflight, stopRemote)
+	}
+
+	target, err := r.targetFromMetadata(req.Metadata)
+	if err != nil {
+		return err
+	}
+	client, err := dialSSH(ctx, target)
+	if err != nil {
+		return fmt.Errorf("ssh resume: connect for broker refresh: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := brokerPreflight(ctx, client, req, SSHRemotePlatform{}); err != nil {
+		return err
+	}
+	pid, _ := strconv.Atoi(pidStr)
+	if err := stopRemote(ctx, client, sessionDir, pid); err != nil {
+		return fmt.Errorf("ssh resume: stop stale broker-backed agentctl: %w", err)
+	}
+	clearSSHResumeRuntimeMetadata(req.Metadata)
+	return nil
+}
+
+// resetTrackedManagedBrokerResume disposes of a tracked session as part of
+// resetting a credential-broker-backed resume (the third of the three
+// disposal paths, AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.4). Unlike the stop
+// and close paths, its own reading is taken in its own, earlier critical
+// section: the mutex is taken to read (and to re-check the session is still
+// tracked, closing the race F36 identifies before the preflight's remote
+// round trip), released for the preflight, then re-taken for the removal.
+func (r *SSHExecutor) resetTrackedManagedBrokerResume(
+	ctx context.Context,
+	req *ExecutorCreateRequest,
+	state *sshSessionState,
+	brokerPreflight func(context.Context, *ssh.Client, *ExecutorCreateRequest, SSHRemotePlatform) error,
+	stopRemote func(context.Context, *ssh.Client, string, int) error,
+) error {
+	r.mu.Lock()
+	tracked := r.sessions[req.InstanceID] == state
+	classification := classifySSHTransportLocked(state)
+	r.mu.Unlock()
+	if !tracked {
+		// A concurrent disposal already removed this session: return success
+		// immediately, closing no handle and not waiting for the other
+		// call's watchdog (AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.4).
+		return nil
+	}
+
+	if classification == sshTransportAnswering {
+		err := r.runWithTransportBackstop(state, sshBrokerPreflightTimeout, func() error {
+			preflightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sshBrokerPreflightTimeout)
+			defer cancel()
+			return brokerPreflight(preflightCtx, state.client, req, SSHRemotePlatform{})
+		})
+		if err != nil {
+			// The preflight context and the transport backstop share a
+			// deadline. If the preflight's context wins the race, its SSH
+			// call can return context.DeadlineExceeded before the backstop
+			// marks the client lost. Treat either outcome as an abandoned
+			// preflight and close the client so no wedged channel survives.
+			if r.isTransportLost(state) || errors.Is(err, context.DeadlineExceeded) {
+				r.markTransportLost(state)
+				_ = r.closeClientOnce(state)
+				return ErrSSHTransportLost
+			}
+			return err
+		}
+	}
+
+	r.mu.Lock()
+	tracked = r.sessions[req.InstanceID] == state
+	if tracked {
+		delete(r.sessions, req.InstanceID)
+	}
+	r.mu.Unlock()
+	if !tracked {
+		return nil
+	}
+
+	// Step 2: signal the watchdog loop and wait for it — only it — to exit.
+	r.stopWatchdogAndWait(state)
+	// Step 3: close the local port forward through its once-guard.
+	_ = r.closeForwarderOnce(state)
+
+	if classification != sshTransportAnswering {
+		// AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-002.15: skip the remote
+		// controller stop, leave resume metadata unchanged, and report
+		// transport loss.
+		_ = r.closeClientOnce(state)
+		_ = state.runtimeAPITunnel.Close()
+		r.awaitProbeExit(state)
+		return ErrSSHTransportLost
+	}
+
+	stopErr := r.runWithTransportBackstop(state, sshAgentctlCleanupTimeout, func() error {
+		cleanupCtx, cancel := sshRemoteCleanupContext(ctx)
+		defer cancel()
+		return stopRemote(cleanupCtx, state.client, state.remoteDir, state.pid)
+	})
+	// Step 5: close the session SSH client, through its once-guard.
+	_ = r.closeClientOnce(state)
+	_ = state.runtimeAPITunnel.Close()
+	// Step 6: wait for the prober to exit.
+	r.awaitProbeExit(state)
+	if stopErr != nil {
+		if r.isTransportLost(state) {
+			return ErrSSHTransportLost
+		}
+		return fmt.Errorf("ssh resume: stop stale broker-backed agentctl: %w", stopErr)
+	}
+	clearSSHResumeRuntimeMetadata(req.Metadata)
+	return nil
+}
+
+func clearSSHResumeRuntimeMetadata(metadata map[string]interface{}) {
+	for _, key := range []string{
+		MetadataKeySSHRemoteSessionDir,
+		MetadataKeySSHRemoteAgentctlPort,
+		MetadataKeySSHRemoteAgentctlPID,
+		MetadataKeySSHAgentctlInstanceID,
+		MetadataKeySSHLocalForwardPort,
+		MetadataKeySSHRemoteAgentctlURL,
+		MetadataKeySSHRuntimeAPIRemotePort,
+	} {
+		delete(metadata, key)
+	}
+}
+
+// GetRemoteStatus reports the SSH host's current reachability for the UI
+// status badge. Best-effort and bounded by a short timeout.
+func (r *SSHExecutor) GetRemoteStatus(ctx context.Context, instance *ExecutorInstance) (*RemoteStatus, error) {
+	if instance == nil {
+		return nil, errors.New("instance is nil")
+	}
+	// AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-001.7: read the transport-lost
+	// marker and the client handle in one critical section and decide there,
+	// so a teardown can't close the client between the read and the probe.
+	// Only the decision needs the mutex; the healthy-session probe below
+	// runs after it is released.
+	r.mu.Lock()
+	state := r.sessions[instance.InstanceID]
+	var transportLost bool
+	var client *ssh.Client
+	if state != nil {
+		transportLost = state.transportLost
+		client = state.client
+	}
+	r.mu.Unlock()
+	now := time.Now()
+	status := &RemoteStatus{
+		RuntimeName:   r.Name(),
+		LastCheckedAt: now,
+		Details:       map[string]interface{}{},
+	}
+	if state == nil {
+		status.State = sshStatusUnknown
+		status.ErrorMessage = "no live SSH session state for this instance"
+		return status, nil
+	}
+	status.RemoteName = state.target.Host
+	status.Details["pid"] = state.pid
+	status.Details["host"] = state.target.Host
+	status.Details["user"] = state.target.User
+	status.Details["fingerprint"] = state.target.PinnedFingerprint
+
+	if transportLost {
+		status.State = sshStatusDisconnected
+		status.ErrorMessage = sshTransportLostMessage
+		return status, nil
+	}
+	if client == nil {
+		status.State = sshStatusDisconnected
+		return status, nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if !isRemoteAgentctlAlive(probeCtx, client, state.pid) {
+		// A concurrent teardown may have closed client after the read above
+		// but before (or during) this probe, so a failed probe alone doesn't
+		// distinguish "agentctl not answering" from "transport lost mid-probe"
+		// (AC-EXECUTORS-SSH-TRANSPORT-LIVENESS-001.7). Recheck the marker.
+		if r.isTransportLost(state) {
+			status.State = sshStatusDisconnected
+			status.ErrorMessage = sshTransportLostMessage
+			return status, nil
+		}
+		status.State = sshStatusAgentctlDown
+		return status, nil
+	}
+	status.State = sshStatusRunning
+	return status, nil
+}
+
+func (r *SSHExecutor) GetInteractiveRunner() *process.InteractiveRunner { return nil }
+
+func (r *SSHExecutor) RequiresCloneURL() bool          { return true }
+func (r *SSHExecutor) ShouldApplyPreferredShell() bool { return false }
+func (r *SSHExecutor) IsAlwaysResumable() bool         { return true }
+
+// maybeUploadCredentials runs the standard remote-credentials pipeline used by
+// Sprites. Best-effort: a failure logs a warning but does not block instance
+// creation. SSH-specific tweaks: remote auth target dir defaults to the SSH
+// user's $HOME (resolved at runtime via a tiny `printf %s "$HOME"` probe),
+// and the file uploader writes via SFTP.
+//
+// Credential upload only fires when the executor profile selected at least
+// one remote-credentials method (or remote_auth_secrets / setup-script env
+// vars). A failure here doesn't abort the launch — credentials are
+// best-effort and missing ones surface later as the agent's own auth error.
+func (r *SSHExecutor) maybeUploadCredentials(
+	ctx context.Context,
+	client *ssh.Client,
+	req *ExecutorCreateRequest,
+	platform SSHRemotePlatform,
+) error {
+	if err := r.uploadCredentials(ctx, client, req, platform); err != nil {
+		r.logger.Warn(
+			"ssh executor: credential upload failed; launch will proceed but agent may not authenticate",
+			zap.String("task_id", req.TaskID),
+			zap.String("session_id", req.SessionID),
+			zap.Error(err),
+		)
+	}
+	return nil
+}
+
+// preflightAgentBinary probes the remote for the agent's required binary
+// before we provision the per-session agentctl. Without this, a remote that
+// lacks (say) `npx` surfaces the failure deep inside agentctl as an opaque
+// `exec: "npx": executable file not found in $PATH` once the agent process
+// actually tries to spawn — long after a successful "Starting agent
+// controller" step, which reads as "everything is fine".
+//
+// We extract the binary by calling BuildCommand with Runtime=ssh — that
+// returns the exact command the lifecycle will eventually ship to agentctl.
+// The first token is the binary; we shell out to POSIX `command -v` on the
+// remote and treat empty stdout as "missing". On miss we surface the
+// agent's name + InstallScript() so the error is actionable in the UI.
+func (r *SSHExecutor) preflightAgentBinary(
+	ctx context.Context,
+	client *ssh.Client,
+	req *ExecutorCreateRequest,
+	platform SSHRemotePlatform,
+) error {
+	if req.AgentConfig == nil {
+		return nil
+	}
+	stepName := "Verifying agent binary"
+	shell := sshShellForRemote(req.Metadata, platform)
+
+	// Prefer the agent's standalone CLI when present on the remote: running it
+	// directly skips the per-launch `npx` registry round-trip. A hit is recorded
+	// in metadata so the command builder emits the native binary; a miss (or a
+	// transport hiccup during this optional probe) falls through to verifying
+	// the default (npx) command below.
+	if r.probeNativeBinary(ctx, client, shell, req, stepName) {
+		return nil
+	}
+
+	cmd := buildRemotePreflightAgentCommand(req)
+	args := cmd.Args()
+	if len(args) == 0 {
+		return nil
+	}
+	binary := args[0]
+	out, err := ProbeRemoteBinary(ctx, client, shell, binary)
+	if err != nil {
+		r.report(req.OnProgress, stepName, PrepareStepFailed, err.Error())
+		return fmt.Errorf("ssh: probe %s on remote: %w", binary, err)
+	}
+	if out == "" {
+		msg := formatMissingAgentBinaryError(req.AgentConfig, binary)
+		r.report(req.OnProgress, stepName, PrepareStepFailed, msg)
+		return errors.New(msg)
+	}
+	r.report(req.OnProgress, stepName, PrepareStepCompleted, out)
+	return nil
+}
+
+func buildRemotePreflightAgentCommand(req *ExecutorCreateRequest) agents.Command {
+	if req == nil || req.AgentConfig == nil {
+		return agents.Command{}
+	}
+	return req.AgentConfig.BuildCommand(agents.CommandOptions{
+		Runtime:               agentruntime.RuntimeSSH,
+		ManagedRuntimeVersion: req.ManagedRuntimeVersion,
+	})
+}
+
+// probeNativeBinary probes the remote for the agent's standalone CLI (if it
+// declares one via NativeBinaryAgent). On a hit it records the binary name in
+// req.Metadata under MetadataKeyNativeBinary and returns true. It returns false
+// when the agent has no native binary, the binary is absent, or the probe hits
+// a transport error — the native binary is an optimisation, so a glitch here
+// must not abort the launch or surface a misleading "agent binary" failure.
+// The caller falls through to the required default-command probe, which reports
+// transport failures with proper context.
+func (r *SSHExecutor) probeNativeBinary(ctx context.Context, client *ssh.Client, shell string, req *ExecutorCreateRequest, stepName string) bool {
+	nb, ok := req.AgentConfig.(agents.NativeBinaryAgent)
+	if !ok {
+		return false
+	}
+	name := nb.NativeBinaryName()
+	if name == "" {
+		return false
+	}
+	// Clear any stale/caller-provided value up front so only a positive probe
+	// below sets it; a miss or transport error must not leave the command
+	// builder preferring the native binary on an npx-only host. delete on a nil
+	// map is a no-op.
+	delete(req.Metadata, MetadataKeyNativeBinary)
+	out, err := ProbeRemoteBinary(ctx, client, shell, name)
+	if err != nil {
+		r.logger.Warn("native binary probe failed on remote, falling back to default command",
+			zap.String("binary", name), zap.Error(err))
+		return false
+	}
+	if out == "" {
+		return false
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]interface{})
+	}
+	req.Metadata[MetadataKeyNativeBinary] = name
+	r.report(req.OnProgress, stepName, PrepareStepCompleted, out)
+	return true
+}
+
+// sshShellFromMetadata reads the user-selected login shell from the
+// per-profile metadata. Empty / unset returns "" so callers can fall
+// back to WrapLoginShell's defaultLoginShell — keeping the default in
+// one place.
+func sshShellFromMetadata(md map[string]interface{}) string {
+	return strings.TrimSpace(getMetadataString(md, MetadataKeySSHShell))
+}
+
+func sshShellForRemote(md map[string]interface{}, platform SSHRemotePlatform) string {
+	if shell := sshShellFromMetadata(md); shell != "" {
+		return shell
+	}
+	return SSHDefaultShellForPlatform(platform)
+}
+
+// agentIdentity is the slice of agents.Agent that formatMissingAgentBinaryError
+// reads. Narrowing the parameter keeps the helper trivially testable without a
+// dependency on the full Agent interface or a stub for every method on it.
+type agentIdentity interface {
+	ID() string
+	Name() string
+	InstallScript() string
+}
+
+// formatMissingAgentBinaryError builds the user-facing message we surface
+// when the agent's first command-line token isn't on the remote's $PATH.
+// Pulled out so unit tests can pin the contract without a real SSH client.
+func formatMissingAgentBinaryError(ag agentIdentity, binary string) string {
+	name := ag.Name()
+	if name == "" {
+		name = ag.ID()
+	}
+	msg := fmt.Sprintf("%s requires %q on the remote host, but it was not found in $PATH", name, binary)
+	if install := strings.TrimSpace(ag.InstallScript()); install != "" {
+		msg += "\n\nInstall hint (run on the remote):\n  " + install
+	}
+	return msg
+}
+
+// sshTaskDirName builds a stable per-task remote directory name. Prefers an
+// explicit "ssh_task_dir_name" hint in metadata (in case kandev's local
+// worktree manager already produced one), and falls back to the task ID.
+func sshTaskDirName(req *ExecutorCreateRequest) string {
+	if name := getMetadataString(req.Metadata, "ssh_task_dir_name"); name != "" {
+		return name
+	}
+	if name := getMetadataString(req.Metadata, "task_dir_name"); name != "" {
+		return name
+	}
+	return "task-" + req.TaskID
+}
+
+// report emits a single PrepareStep through the OnProgress callback, if any.
+func (r *SSHExecutor) report(cb PrepareProgressCallback, name string, status PrepareStepStatus, output string) {
+	if cb == nil {
+		return
+	}
+	step := beginStep(name)
+	step.Status = status
+	step.Output = output
+	cb(step, 0, 0)
+}

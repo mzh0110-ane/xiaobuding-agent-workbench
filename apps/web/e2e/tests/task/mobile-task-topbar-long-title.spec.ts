@@ -1,0 +1,102 @@
+import { type Page } from "@playwright/test";
+import { test, expect } from "../../fixtures/test-base";
+import { LONG_TASK_TITLE } from "../../helpers/topbar-fixtures";
+import { SessionPage } from "../../pages/session-page";
+
+type MobileTopbarMetrics = {
+  actionsLeft: number;
+  actionsRight: number;
+  documentClientWidth: number;
+  documentScrollWidth: number;
+  headerLeft: number;
+  headerRight: number;
+  titleClientWidth: number;
+  titleRight: number;
+  titleScrollWidth: number;
+};
+
+async function readMobileTopbarMetrics(
+  page: Page,
+  taskTitle: string,
+): Promise<MobileTopbarMetrics | null> {
+  return page.evaluate((titleText) => {
+    const header = Array.from(document.querySelectorAll("header")).find((node) =>
+      node.textContent?.includes(titleText),
+    ) as HTMLElement | undefined;
+    const title = Array.from(header?.querySelectorAll("span") ?? []).find(
+      (node) => node.childElementCount === 0 && node.textContent?.trim() === titleText,
+    ) as HTMLElement | undefined;
+    const actions = header?.querySelector('[data-testid="mobile-topbar-actions"]') as
+      | HTMLElement
+      | null
+      | undefined;
+    if (!header || !title || !actions) return null;
+
+    const headerRect = header.getBoundingClientRect();
+    const titleRect = title.getBoundingClientRect();
+    const actionsRect = actions.getBoundingClientRect();
+
+    return {
+      actionsLeft: actionsRect.left,
+      actionsRight: actionsRect.right,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth,
+      headerLeft: headerRect.left,
+      headerRight: headerRect.right,
+      titleClientWidth: title.clientWidth,
+      titleRight: titleRect.right,
+      titleScrollWidth: title.scrollWidth,
+    };
+  }, taskTitle);
+}
+
+test.describe("Mobile task topbar long title layout", () => {
+  // @covers AC-UI-MOBILE-TASK-CHROME-001.1, AC-UI-MOBILE-TASK-CHROME-001.2,
+  // AC-UI-MOBILE-TASK-CHROME-001.5
+  test("truncates long task titles without pushing mobile actions off-screen", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }, testInfo) => {
+    test.setTimeout(90_000);
+
+    const task = await apiClient.createTaskWithAgent(
+      seedData.workspaceId,
+      LONG_TASK_TITLE,
+      seedData.agentProfileId,
+      {
+        description: "/e2e:simple-message",
+        workflow_id: seedData.workflowId,
+        workflow_step_id: seedData.startStepId,
+        repository_ids: [seedData.repositoryId],
+      },
+    );
+
+    await testPage.goto(`/t/${task.id}`);
+    const session = new SessionPage(testPage);
+    await session.waitForLoad();
+
+    const header = testPage.locator("header").filter({ hasText: LONG_TASK_TITLE }).first();
+    await expect(header).toBeVisible({ timeout: 10_000 });
+    const taskDrawer = testPage.getByTestId("mobile-task-picker-trigger");
+    await expect(taskDrawer).toBeVisible();
+    await expect(testPage.getByTestId("layout-preset-trigger")).toHaveCount(0);
+    await expect(testPage.getByTestId("mobile-git-actions")).toHaveCount(0);
+
+    const taskDrawerBox = await taskDrawer.boundingBox();
+    expect(taskDrawerBox).not.toBeNull();
+    expect(Math.round(taskDrawerBox!.width)).toBeGreaterThanOrEqual(44);
+    expect(Math.round(taskDrawerBox!.height)).toBeGreaterThanOrEqual(44);
+
+    const metrics = await readMobileTopbarMetrics(testPage, LONG_TASK_TITLE);
+    expect(metrics).not.toBeNull();
+    if (!metrics) return;
+
+    expect(metrics.documentScrollWidth).toBeLessThanOrEqual(metrics.documentClientWidth + 1);
+    expect(metrics.titleScrollWidth).toBeGreaterThan(metrics.titleClientWidth + 8);
+    expect(metrics.titleRight).toBeLessThanOrEqual(metrics.actionsLeft + 1);
+    expect(metrics.headerLeft).toBeGreaterThanOrEqual(0);
+    expect(metrics.actionsRight).toBeLessThanOrEqual(metrics.headerRight + 1);
+    await testPage.screenshot({ path: testInfo.outputPath("long-task-title-phone.png") });
+  });
+});

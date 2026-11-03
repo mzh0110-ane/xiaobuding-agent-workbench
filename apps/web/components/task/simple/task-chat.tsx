@@ -1,0 +1,673 @@
+"use client";
+/* eslint-disable max-lines -- this component owns the chat timeline and composer composition. */
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { toast } from "@/lib/toast/sonner";
+import { IconCode, IconChevronDown, IconSend, IconPaperclip, IconUser } from "@tabler/icons-react";
+import { AgentAvatar } from "@/app/office/components/agent-avatar";
+import { Button } from "@kandev/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@kandev/ui/collapsible";
+import { EnhancePromptButton } from "@/components/enhance-prompt-button";
+import { useIsUtilityConfigured } from "@/hooks/use-is-utility-configured";
+import { PromptResultRecovery } from "@/components/prompt-result-recovery";
+import { usePromptResultDelivery } from "@/hooks/use-prompt-result-delivery";
+import { useUtilityAgentGenerator } from "@/hooks/use-utility-agent-generator";
+import { useChatMotion } from "@/hooks/use-chat-motion";
+import { useAppStore } from "@/components/state-provider";
+import { selectOfficeAgentProfiles } from "@/lib/state/slices/office/selectors";
+import { selectCommandCount } from "@/lib/state/slices/session/selectors";
+import { createComment } from "@/lib/api/domains/office-api";
+import { formatRelativeTime } from "@/lib/utils";
+import { MarkdownComment } from "./markdown-comment";
+import { AgentTurnPanel } from "./components/agent-turn-panel";
+import { RunErrorEntry } from "./components/run-error-entry";
+import { UserCommentRunBadge } from "./components/user-comment-run-badge";
+import { buildCommentTurnContext, type CommentTurnContext } from "./turn-context";
+import { groupSessionsForTimeline, groupSortKey, type SessionGroup } from "./session-groups";
+import { synchronizeInputValue } from "./synchronize-input-value";
+import type {
+  TaskComment,
+  TaskDecision,
+  TaskSession,
+  TimelineEvent,
+} from "@/app/office/tasks/[id]/types";
+import {
+  buildLaterAgentReplyMap,
+  buildRunErrorsFromSessions,
+  mergeChatEntries,
+  type ChatEntry,
+} from "./chat-entries";
+import type { TaskRepository } from "@/lib/types/http";
+import type { TaskStatusSummary } from "@/lib/types/task-status-summary";
+
+import { useTranslation } from "react-i18next";
+import { DecisionTimelineEntry, TimelineEntry } from "./task-chat-timeline-entries";
+
+const MAX_INLINE_SESSIONS = 50;
+const AUTOSCROLL_THRESHOLD_PX = 80;
+// A catalog key, not copy: `t()` at module scope would freeze at the boot locale.
+const PROMPT_INSERTED_MESSAGE_KEY = "task:enhancedPromptInserted";
+
+type TaskChatProps = {
+  taskId: string;
+  workspaceId?: string;
+  comments: TaskComment[];
+  timeline?: TimelineEvent[];
+  sessions?: TaskSession[];
+  decisions?: TaskDecision[];
+  reviewers?: string[];
+  approvers?: string[];
+  scrollParent?: HTMLElement | null;
+  readOnly?: boolean;
+  onCommentsChanged?: () => void;
+  taskTitle?: string;
+  taskDescription?: string;
+  statusSummary?: TaskStatusSummary | null;
+  repositories?: TaskRepository[];
+};
+
+function partitionGroups(groups: SessionGroup[]): {
+  visible: SessionGroup[];
+  older: SessionGroup[];
+} {
+  if (groups.length <= MAX_INLINE_SESSIONS) {
+    return { visible: groups, older: [] };
+  }
+  // Sort ascending by representative start, keep the most recent N.
+  const sorted = [...groups].sort((a, b) => groupSortKey(a).localeCompare(groupSortKey(b)));
+  const cutoff = sorted.length - MAX_INLINE_SESSIONS;
+  return { older: sorted.slice(0, cutoff), visible: sorted.slice(cutoff) };
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  return `${minutes}m ${remaining}s`;
+}
+
+function CommentEntry({
+  comment,
+  taskId,
+  turn,
+  hasLaterAgentReply,
+}: {
+  comment: TaskComment;
+  taskId: string;
+  turn?: CommentTurnContext;
+  hasLaterAgentReply?: boolean;
+}) {
+  const { t } = useTranslation();
+  const isAgent = comment.authorType === "agent";
+  // Resolve the agent name from the office agents store so renames
+  // flow through automatically. Backend session-bridged comments don't
+  // carry a name; the mapper leaves authorName empty for agents.
+  const resolvedAgentName = useAppStore((s) =>
+    isAgent
+      ? (selectOfficeAgentProfiles(s).find((a) => a.id === comment.authorId)?.name ??
+        comment.authorName ??
+        t("task:agent"))
+      : "",
+  );
+  const displayName = isAgent ? resolvedAgentName : t("task:you");
+  return (
+    <div
+      id={`comment-${comment.id}`}
+      className="flex gap-3 py-3 border-b border-border/50 scroll-mt-16"
+    >
+      {isAgent ? (
+        <AgentAvatar name={displayName} size="md" />
+      ) : (
+        <div className="h-8 w-8 rounded-md bg-muted flex items-center justify-center shrink-0">
+          <IconUser className="h-4 w-4 text-muted-foreground" />
+        </div>
+      )}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-medium text-sm">{displayName}</span>
+          {isAgent && comment.source === "session" && (
+            <span className="text-xs text-muted-foreground">{t("task:viaSession")}</span>
+          )}
+          {comment.status && (
+            <span className="text-xs text-muted-foreground">
+              {comment.status}
+              {comment.durationMs != null &&
+                t("task:afterDuration", { duration: formatDuration(comment.durationMs) })}
+            </span>
+          )}
+          <span className="text-xs text-muted-foreground">
+            {formatRelativeTime(comment.createdAt)}
+          </span>
+        </div>
+        <div className="mt-1">
+          <MarkdownComment content={comment.content} />
+        </div>
+        {!isAgent &&
+          comment.runStatus &&
+          comment.runStatus !== "finished" &&
+          !hasLaterAgentReply && (
+            <div className="mt-1.5">
+              <UserCommentRunBadge status={comment.runStatus} errorMessage={comment.runError} />
+            </div>
+          )}
+        {comment.toolCalls && comment.toolCalls.length > 0 && (
+          <Collapsible>
+            <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground mt-1 cursor-pointer hover:text-foreground transition-colors">
+              <IconCode className="h-3 w-3" />
+              {t("task:workedRanCommands", { count: comment.toolCalls.length })}
+              <IconChevronDown className="h-3 w-3" />
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="mt-2 space-y-1 text-xs font-mono bg-muted rounded-md p-2">
+                {comment.toolCalls.map((tc) => (
+                  <div key={tc.id} className="text-muted-foreground">
+                    <span className="text-foreground">{tc.name}</span>
+                    {tc.input && <span className="ml-1 opacity-70">{tc.input}</span>}
+                  </div>
+                ))}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
+        {turn && (
+          <AgentTurnPanel
+            taskId={taskId}
+            sessionId={turn.sessionId}
+            fromExclusive={turn.fromExclusive}
+            toInclusive={comment.createdAt}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+async function readFileAsMarkdown(file: File): Promise<string> {
+  if (file.type.startsWith("image/")) {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    return `![${file.name}](${dataUrl})`;
+  }
+  const text = await file.text();
+  return `**${file.name}**\n\`\`\`\n${text.slice(0, 4000)}\n\`\`\``;
+}
+
+function useChatInputHandlers(setInput: React.Dispatch<React.SetStateAction<string>>) {
+  const { t } = useTranslation();
+  const processFiles = useCallback(
+    async (files: File[]) => {
+      for (const file of files) {
+        try {
+          const md = await readFileAsMarkdown(file);
+          setInput((prev) => (prev ? `${prev}\n\n${md}` : md));
+        } catch {
+          toast.error(t("task:failedToRead", { name: file.name }));
+        }
+      }
+    },
+    [setInput, t],
+  );
+
+  const handleFileSelect = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      await processFiles(Array.from(files));
+      e.target.value = "";
+    },
+    [processFiles],
+  );
+
+  const handlePaste = useCallback(
+    async (e: React.ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imageFiles: File[] = [];
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        await processFiles(imageFiles);
+      }
+    },
+    [processFiles],
+  );
+
+  return { handleFileSelect, handlePaste };
+}
+
+type ChatInputProps = {
+  taskId: string;
+  taskTitle?: string;
+  taskDescription?: string;
+  onSubmitted?: () => void;
+};
+
+type CommentComposerFooterProps = {
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  handleEnhance: () => void;
+  isEnhancingPrompt: boolean;
+  isUtilityConfigured: boolean;
+  submitting: boolean;
+  input: string;
+  handleSubmit: () => Promise<void>;
+  pendingResult: ReturnType<typeof usePromptResultDelivery>["pendingResult"];
+  applyPending: () => void;
+  copyPending: () => Promise<void>;
+};
+
+function CommentComposerFooter({
+  fileInputRef,
+  handleFileSelect,
+  handleEnhance,
+  isEnhancingPrompt,
+  isUtilityConfigured,
+  submitting,
+  input,
+  handleSubmit,
+  pendingResult,
+  applyPending,
+  copyPending,
+}: CommentComposerFooterProps) {
+  const { t } = useTranslation();
+  const isSendDisabled = submitting || !input.trim();
+
+  return (
+    <>
+      <div className="flex items-center gap-1 px-2 pb-2">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={handleFileSelect}
+        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="h-7 w-7 cursor-pointer"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <IconPaperclip className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{t("task:attachFiles")}</TooltipContent>
+        </Tooltip>
+        <EnhancePromptButton
+          onClick={handleEnhance}
+          isLoading={isEnhancingPrompt}
+          isConfigured={isUtilityConfigured}
+        />
+        <span className="flex-1" />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={isSendDisabled ? 0 : -1} className="inline-flex">
+              <Button
+                type="button"
+                size="icon"
+                className="h-7 w-7 cursor-pointer"
+                disabled={isSendDisabled}
+                onClick={() => void handleSubmit()}
+              >
+                <IconSend className="h-3.5 w-3.5" />
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{t("task:sendComment")}</TooltipContent>
+        </Tooltip>
+      </div>
+      <div className="px-2 pb-2">
+        <PromptResultRecovery
+          pendingResult={pendingResult}
+          onApply={applyPending}
+          onCopy={copyPending}
+        />
+      </div>
+    </>
+  );
+}
+
+function ChatInput({ taskId, taskTitle, taskDescription, onSubmitted }: ChatInputProps) {
+  const { t } = useTranslation();
+  const [input, setInput] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputValueRef = useRef(input);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const setInputAndSync = useCallback((next: React.SetStateAction<string>) => {
+    synchronizeInputValue(inputValueRef, setInput, next);
+  }, []);
+  const isUtilityConfigured = useIsUtilityConfigured();
+  const { enhancePrompt, isEnhancingPrompt } = useUtilityAgentGenerator({
+    sessionId: null,
+    taskTitle: taskTitle ?? "",
+    taskDescription: taskDescription ?? "",
+  });
+  const promptDelivery = usePromptResultDelivery({
+    scopeKey: `task-comment:${taskId}`,
+    getCurrent: () => inputValueRef.current,
+    apply: (value) => {
+      setInputAndSync(value);
+      return true;
+    },
+  });
+  const { handleFileSelect, handlePaste } = useChatInputHandlers(setInputAndSync);
+
+  const handleSubmit = useCallback(async () => {
+    const current = inputValueRef.current;
+    if (!current.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      await createComment(taskId, { body: current.trim(), author_type: "user" });
+      setInputAndSync("");
+      onSubmitted?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("task:failedToSendComment"));
+    } finally {
+      setSubmitting(false);
+    }
+  }, [submitting, taskId, onSubmitted, setInputAndSync, t]);
+
+  const handleEnhance = useCallback(() => {
+    const current = inputValueRef.current;
+    if (!current.trim()) return;
+    const generation = promptDelivery.captureScope();
+    void enhancePrompt(current, (result) => {
+      const inserted = promptDelivery.deliver(current, result, generation);
+      if (inserted) {
+        toast.success(t(PROMPT_INSERTED_MESSAGE_KEY));
+      }
+      return inserted;
+    });
+  }, [enhancePrompt, promptDelivery, t]);
+
+  return (
+    <div className="mt-4 pt-4 border-t border-border">
+      <div className="rounded-md border bg-muted/30 focus-within:ring-1 focus-within:ring-ring">
+        <textarea
+          ref={textareaRef}
+          value={input}
+          onChange={(e) => setInputAndSync(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void handleSubmit();
+            }
+          }}
+          onPaste={handlePaste}
+          placeholder={t("task:addAComment")}
+          rows={2}
+          className="w-full bg-transparent px-3 py-2 text-sm outline-none resize-none"
+        />
+        <CommentComposerFooter
+          fileInputRef={fileInputRef}
+          handleFileSelect={handleFileSelect}
+          handleEnhance={handleEnhance}
+          isEnhancingPrompt={isEnhancingPrompt}
+          isUtilityConfigured={isUtilityConfigured}
+          submitting={submitting}
+          input={input}
+          handleSubmit={handleSubmit}
+          pendingResult={promptDelivery.pendingResult}
+          applyPending={promptDelivery.applyPending}
+          copyPending={promptDelivery.copyPending}
+        />
+      </div>
+    </div>
+  );
+}
+
+function isAtBottom(scrollParent: HTMLElement | null): boolean {
+  if (!scrollParent) return true; // window scroll case — be conservative.
+  const remaining = scrollParent.scrollHeight - scrollParent.scrollTop - scrollParent.clientHeight;
+  return remaining <= AUTOSCROLL_THRESHOLD_PX;
+}
+
+function scrollToBottom(scrollParent: HTMLElement | null): void {
+  if (!scrollParent) return;
+  scrollParent.scrollTop = scrollParent.scrollHeight;
+}
+
+/**
+ * Auto-scroll the chat container to the bottom when new content arrives,
+ * but only if the user was already near the bottom (within ~80px) at the
+ * time of the change.
+ *
+ * Triggers on:
+ *   - a new active session entry first appearing (active count grows)
+ *   - new messages arriving in any session for this task
+ *
+ * Uses a scroll listener to track the user's "at-bottom" intent. Reads
+ * the latest value before scrolling so we never yank focus from a user
+ * who has scrolled up.
+ */
+function useChatAutoScroll(
+  scrollParent: HTMLElement | null,
+  sessions: TaskSession[],
+  taskId: string,
+): void {
+  const activeSessionCount = sessions.filter(
+    (s) => s.state === "RUNNING" || s.state === "WAITING_FOR_INPUT",
+  ).length;
+
+  // Sum messages + command counts across all task sessions — single scalar
+  // that grows whenever new content streams in.
+  const totalContentSignal = useAppStore((s) => {
+    let sum = 0;
+    for (const session of sessions) {
+      sum += s.messages.bySession[session.id]?.length ?? 0;
+      sum += selectCommandCount(s, session.id);
+    }
+    return sum;
+  });
+
+  const wasAtBottomRef = useRef(true);
+
+  useEffect(() => {
+    if (!scrollParent) return;
+    const handler = () => {
+      wasAtBottomRef.current = isAtBottom(scrollParent);
+    };
+    handler();
+    scrollParent.addEventListener("scroll", handler, { passive: true });
+    return () => scrollParent.removeEventListener("scroll", handler);
+  }, [scrollParent]);
+
+  useEffect(() => {
+    if (wasAtBottomRef.current) {
+      scrollToBottom(scrollParent);
+      // After programmatic scroll, we are still "at bottom" by definition.
+      wasAtBottomRef.current = true;
+    }
+  }, [scrollParent, activeSessionCount, totalContentSignal, taskId]);
+}
+
+/**
+ * Scrolls the comment matching `location.hash` (e.g. `#comment-cm-A`)
+ * into view once it has rendered. Runs whenever the comments list
+ * changes so deeplinks land on the target even when comments load
+ * after first paint. Cleared after first match so it doesn't fight
+ * the user when they scroll away.
+ */
+function useCommentHashScroll(comments: TaskComment[]): void {
+  const motionEnabled = useChatMotion();
+  const targetIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const hash = window.location.hash;
+    if (!hash.startsWith("#comment-")) return;
+    targetIdRef.current = hash.slice(1);
+  }, []);
+
+  useEffect(() => {
+    const targetId = targetIdRef.current;
+    if (!targetId) return;
+    const el = document.getElementById(targetId);
+    if (!el) return;
+    el.scrollIntoView({ behavior: motionEnabled ? "smooth" : "auto", block: "center" });
+    targetIdRef.current = null;
+  }, [comments, motionEnabled]);
+}
+
+function ChatEntries({
+  taskId,
+  workspaceId,
+  repositories,
+  entries,
+}: {
+  taskId: string;
+  workspaceId: string;
+  repositories?: TaskRepository[];
+  entries: ChatEntry[];
+}) {
+  return (
+    <>
+      {entries.map((entry) => {
+        if (entry.kind === "comment") {
+          return (
+            <CommentEntry
+              key={`c-${entry.data.id}`}
+              comment={entry.data}
+              taskId={taskId}
+              turn={entry.turn}
+              hasLaterAgentReply={entry.hasLaterAgentReply}
+            />
+          );
+        }
+        if (entry.kind === "timeline") {
+          return <TimelineEntry key={`t-${entry.data.at}-${entry.data.type}`} event={entry.data} />;
+        }
+        if (entry.kind === "decision") {
+          return <DecisionTimelineEntry key={`d-${entry.data.id}`} decision={entry.data} />;
+        }
+        if (entry.kind === "error") {
+          return (
+            <RunErrorEntry
+              key={`re-${entry.data.id}`}
+              taskId={taskId}
+              workspaceId={workspaceId}
+              repositories={repositories}
+              error={entry.data}
+            />
+          );
+        }
+        // Session entries are intentionally not rendered in the Chat
+        // tab: every agent message below already shows the same agent
+        // name + "worked for Xs" footer, so the collapsed session
+        // header is pure duplicate noise. The per-agent tabs render the
+        // full transcript when the user wants it.
+        return null;
+      })}
+    </>
+  );
+}
+
+export function TaskChat({
+  taskId,
+  workspaceId = "",
+  comments,
+  timeline = [],
+  sessions = [],
+  decisions = [],
+  reviewers = [],
+  approvers = [],
+  scrollParent,
+  readOnly = false,
+  onCommentsChanged,
+  taskTitle,
+  taskDescription,
+  repositories,
+}: TaskChatProps) {
+  const { t } = useTranslation();
+  const [showOlder, setShowOlder] = useState(false);
+  const groups = useMemo(
+    () => groupSessionsForTimeline(sessions, reviewers, approvers),
+    [sessions, reviewers, approvers],
+  );
+  // Per office-task-session-lifecycle/spec.md §G, office (per-agent) groups
+  // render inline in the chat timeline alongside any kanban / quick-chat
+  // groups — one collapsible entry per (task, agent) pair, ordered by
+  // most-recent activity. The per-agent sibling tabs duplicate the same
+  // chat for users who want a focused per-agent view.
+  const { visible: visibleGroups, older: olderGroups } = useMemo(
+    () => partitionGroups(groups),
+    [groups],
+  );
+
+  const renderedGroups = useMemo(
+    () => (showOlder ? [...olderGroups, ...visibleGroups] : visibleGroups),
+    [showOlder, olderGroups, visibleGroups],
+  );
+  const turnCtx = useMemo(() => buildCommentTurnContext(comments, sessions), [comments, sessions]);
+  const runErrors = useMemo(() => buildRunErrorsFromSessions(sessions), [sessions]);
+  const laterAgentReplyMap = useMemo(() => buildLaterAgentReplyMap(comments), [comments]);
+  const entries = useMemo(
+    () =>
+      mergeChatEntries({
+        comments,
+        timeline,
+        groups: renderedGroups,
+        decisions,
+        turnCtx,
+        runErrors,
+        laterAgentReplyMap,
+      }),
+    [comments, timeline, renderedGroups, decisions, turnCtx, runErrors, laterAgentReplyMap],
+  );
+
+  useChatAutoScroll(scrollParent ?? null, sessions, taskId);
+  useCommentHashScroll(comments);
+
+  const showOlderToggle = olderGroups.length > 0 && !showOlder;
+  const isEmpty = entries.length === 0;
+
+  return (
+    <div className="flex flex-col" data-testid="task-chat-root">
+      {showOlderToggle && (
+        <button
+          type="button"
+          onClick={() => setShowOlder(true)}
+          className="self-start text-xs text-muted-foreground hover:text-foreground underline cursor-pointer mb-2"
+          data-testid="show-older-sessions"
+        >
+          {t("task:showOlderSessions", { count: olderGroups.length })}
+        </button>
+      )}
+      {isEmpty ? (
+        <p className="text-sm text-muted-foreground py-4">{t("task:noCommentsYet")}</p>
+      ) : (
+        <div data-testid="task-chat-entries">
+          <ChatEntries
+            taskId={taskId}
+            workspaceId={workspaceId}
+            repositories={repositories}
+            entries={entries}
+          />
+        </div>
+      )}
+      {!readOnly && (
+        <ChatInput
+          taskId={taskId}
+          taskTitle={taskTitle}
+          taskDescription={taskDescription}
+          onSubmitted={onCommentsChanged}
+        />
+      )}
+    </div>
+  );
+}

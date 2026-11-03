@@ -1,0 +1,181 @@
+// Executor types match models.ExecutorType in apps/backend/internal/task/models/models.go.
+import { t } from "@/lib/i18n";
+import type { WorkspaceMode } from "@/lib/kanban/map-task";
+
+export type CleanupSummary = {
+  effects: string[];
+  notes: string[];
+};
+
+export type CleanupSummaryOptions = {
+  sharesParentWorkspace?: boolean;
+};
+
+export function cleanupSharesParentWorkspace(
+  workspaceMode: WorkspaceMode | null | undefined,
+): boolean | undefined {
+  return workspaceMode == null ? undefined : workspaceMode === "inherit_parent";
+}
+
+// mock_remote is test-only and intentionally falls through to the generic effect.
+type KnownExecutor =
+  | "local"
+  | "worktree"
+  | "local_docker"
+  | "remote_docker"
+  | "sprites"
+  | "ssh"
+  | "k8s";
+
+type CleanupCopy = {
+  effectKey?: string;
+  noteKey?: string;
+};
+
+/**
+ * Catalog keys, not copy. The values resolve inside each public function so a
+ * locale switch updates both the effect list and the supporting notes.
+ */
+const SINGLE_COPIES: Record<KnownExecutor, CleanupCopy> = {
+  local: { noteKey: "task:cleanupSingleLocal" },
+  worktree: {
+    effectKey: "task:cleanupSingleWorktree",
+    noteKey: "task:cleanupSingleWorktreeNote",
+  },
+  local_docker: {
+    effectKey: "task:cleanupSingleLocalDocker",
+    noteKey: "task:cleanupSingleLocalDockerNote",
+  },
+  remote_docker: { effectKey: "task:cleanupSingleRemoteDocker" },
+  sprites: { effectKey: "task:cleanupSingleSprites" },
+  ssh: {
+    effectKey: "task:cleanupSingleSsh",
+    noteKey: "task:cleanupSingleSshNote",
+  },
+  k8s: { effectKey: "task:cleanupSingleKubernetes" },
+};
+
+const GENERIC_EFFECT_KEY = "task:cleanupAgentSessionsStopped";
+const INHERITED_PARENT_WORKSPACE_NOTE_KEY = "task:cleanupInheritedParentWorkspaceNote";
+const ARCHIVE_SINGLE_WORKTREE_COPY: CleanupCopy = {
+  effectKey: "task:archiveSingleWorktreeCleanup",
+  noteKey: "task:archiveWorktreeBranchNote",
+};
+
+function normalize(executorType: string | null | undefined): KnownExecutor | null {
+  if (!executorType) return null;
+  const key = executorType.toLowerCase();
+  if (Object.hasOwn(SINGLE_COPIES, key)) return key as KnownExecutor;
+  return null;
+}
+
+export function hasWorktreeExecutor(executorType: string | null | undefined): boolean {
+  return normalize(executorType) === "worktree";
+}
+
+function resolveCopy(copy: CleanupCopy, options?: { count: number }): CleanupSummary {
+  const effects = copy.effectKey ? [t(copy.effectKey, options)] : [];
+  effects.push(t(GENERIC_EFFECT_KEY));
+  const notes = copy.noteKey ? [t(copy.noteKey, options)] : [];
+  return { effects, notes };
+}
+
+/** Single-task variant. */
+export function getCleanupSummary(
+  executorType: string | null | undefined,
+  options?: CleanupSummaryOptions,
+): CleanupSummary {
+  if (options?.sharesParentWorkspace) {
+    return {
+      effects: [t(GENERIC_EFFECT_KEY)],
+      notes: [t(INHERITED_PARENT_WORKSPACE_NOTE_KEY)],
+    };
+  }
+  const known = normalize(executorType);
+  return known
+    ? resolveCopy(SINGLE_COPIES[known])
+    : { effects: [t(GENERIC_EFFECT_KEY)], notes: [] };
+}
+
+/** Archive variant. Delete confirmation keeps the stronger removal warning. */
+export function getArchiveCleanupSummary(executorType: string | null | undefined): CleanupSummary {
+  const known = normalize(executorType);
+  if (known === "worktree") return resolveCopy(ARCHIVE_SINGLE_WORKTREE_COPY);
+  if (known) return resolveCopy(SINGLE_COPIES[known]);
+  return { effects: [t(GENERIC_EFFECT_KEY)], notes: [] };
+}
+
+/** Catalog keys for the grouped variant. */
+const BULK_COPIES: Record<KnownExecutor, CleanupCopy> = {
+  local: { noteKey: "task:cleanupBulkLocal" },
+  worktree: {
+    effectKey: "task:cleanupBulkWorktree",
+    noteKey: "task:cleanupBulkWorktreeNote",
+  },
+  local_docker: {
+    effectKey: "task:cleanupBulkLocalDocker",
+    noteKey: "task:cleanupBulkLocalDockerNote",
+  },
+  remote_docker: { effectKey: "task:cleanupBulkRemoteDocker" },
+  sprites: { effectKey: "task:cleanupBulkSprites" },
+  ssh: {
+    effectKey: "task:cleanupBulkSsh",
+    noteKey: "task:cleanupBulkSshNote",
+  },
+  k8s: { effectKey: "task:cleanupBulkKubernetes" },
+};
+
+const ARCHIVE_BULK_COPIES: Record<KnownExecutor, CleanupCopy> = {
+  ...BULK_COPIES,
+  worktree: {
+    effectKey: "task:archiveBulkWorktreeCleanup",
+    noteKey: "task:archiveWorktreeBranchNote",
+  },
+};
+
+function getBulkSummary(
+  executorTypes: Array<string | null | undefined>,
+  copies: Record<KnownExecutor, CleanupCopy>,
+): CleanupSummary {
+  const counts = new Map<KnownExecutor, number>();
+  for (const executorType of executorTypes) {
+    const known = normalize(executorType);
+    if (!known) continue;
+    counts.set(known, (counts.get(known) ?? 0) + 1);
+  }
+
+  const order: KnownExecutor[] = [
+    "worktree",
+    "local_docker",
+    "remote_docker",
+    "sprites",
+    "ssh",
+    "k8s",
+    "local",
+  ];
+  const effects: string[] = [];
+  const notes: string[] = [];
+  for (const key of order) {
+    const count = counts.get(key);
+    if (!count) continue;
+    const copy = copies[key];
+    if (copy.effectKey) effects.push(t(copy.effectKey, { count }));
+    if (copy.noteKey) notes.push(t(copy.noteKey, { count }));
+  }
+  effects.push(t(GENERIC_EFFECT_KEY));
+  return { effects, notes };
+}
+
+/** Bulk delete variant. Groups known tasks by executor type and preserves display order. */
+export function getBulkCleanupSummary(
+  executorTypes: Array<string | null | undefined>,
+): CleanupSummary {
+  return getBulkSummary(executorTypes, BULK_COPIES);
+}
+
+/** Bulk archive variant with conditional worktree cleanup wording. */
+export function getBulkArchiveCleanupSummary(
+  executorTypes: Array<string | null | undefined>,
+): CleanupSummary {
+  return getBulkSummary(executorTypes, ARCHIVE_BULK_COPIES);
+}

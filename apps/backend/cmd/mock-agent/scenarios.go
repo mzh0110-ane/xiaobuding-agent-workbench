@@ -1,0 +1,1285 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	acp "github.com/coder/acp-go-sdk"
+
+	"github.com/kandev/kandev/internal/common/subproc"
+)
+
+// Predefined e2e test scenarios with fixed timing for deterministic test assertions.
+
+const (
+	savedPromptDeliveryScenario  = "saved-prompt-delivery"
+	savedPromptDeliveryResponse  = "SAVED_PROMPT_DELIVERED"
+	savedPromptDeliveryDirective = `e2e:saved_prompt_delivery("SAVED_PROMPT_DELIVERED")`
+)
+
+// scenarioRegistry maps scenario names to their handler functions.
+var scenarioRegistry = map[string]func(e *emitter){
+	"simple-message":          scenarioSimpleMessage,
+	"read-and-edit":           scenarioReadAndEdit,
+	"permission-flow":         scenarioPermissionFlow,
+	toolKeyError:              scenarioError,
+	"subagent":                scenarioSubagent,
+	"all-tools":               scenarioAllTools,
+	"multi-turn":              scenarioMultiTurn,
+	"diff-expansion-setup":    scenarioDiffExpansionSetup,
+	"diff-update-setup":       scenarioDiffUpdateSetup,
+	"diff-update-modify":      scenarioDiffUpdateModify,
+	"diff-update-streaming":   scenarioDiffUpdateStreaming,
+	"multi-file-setup":        scenarioMultiFileSetup,
+	"multi-file-modify":       scenarioMultiFileModify,
+	"untracked-file-setup":    scenarioUntrackedFileSetup,
+	"untracked-file-modify":   scenarioUntrackedFileModify,
+	"clarification":           scenarioClarification,
+	"clarification-no-other":  scenarioClarificationNoOther,
+	"clarification-markdown":  scenarioClarificationMarkdown,
+	"clarification-multi":     scenarioClarificationMulti,
+	"clarification-timeout":   scenarioClarificationTimeout,
+	"multi-permission":        scenarioMultiPermission,
+	"kandev-mcp-permission":   scenarioKandevMCPPermission,
+	"review-cumulative-setup": scenarioReviewCumulativeSetup,
+	"walkthrough-setup":       scenarioWalkthroughSetup,
+	"walkthrough-basic":       scenarioWalkthroughBasic,
+	"walkthrough-reemit":      scenarioWalkthroughReemit,
+	"symlink-file-setup":      scenarioSymlinkFileSetup,
+	"markdown-table":          scenarioMarkdownTable,
+	"empty-turn":              scenarioEmptyTurn,
+	"push-current-branch":     scenarioPushCurrentBranch,
+	"steer-fold-setup":        scenarioSteerFoldSetup,
+	"steer-defer-setup":       scenarioSteerDeferSetup,
+	"saved-prompt-delivery":   scenarioSavedPromptDelivery,
+	"response-retry":          scenarioResponseRetry,
+	"goal-active":             scenarioGoalActive,
+	"goal-complete":           scenarioGoalComplete,
+	"goal-clear":              scenarioGoalClear,
+	"goal-long":               scenarioGoalLong,
+	"git-commit-permission":   scenarioGitCommitPermission,
+}
+
+// steerSetupHoldMillis is how long steer-fold-setup and steer-defer-setup
+// keep their prompt open after any setup output, so the session reads
+// "generating" (steer-eligible) for long enough that an e2e test can reliably
+// deliver a mid-turn steer against it. Cancellation (turn end, session
+// cleanup) interrupts the hold immediately via waitForDelay's ctx.Done case.
+const steerSetupHoldMillis = 30_000
+
+// scenarioSteerFoldSetup holds the foreground turn open without ever emitting
+// text of its own, so a mid-turn steer delivered while it runs can only be
+// answered by the steer's own successor turn. This reproduces the "folded"
+// outcome from the mid-turn steering spec's outcome taxonomy
+// (docs/specs/platform/requirements/mid-turn-steering.md): the predecessor settles without
+// having produced an answer, and the operator sees a single, combined reply.
+func scenarioSteerFoldSetup(e *emitter) {
+	waitForDelay(e.ctx, steerSetupHoldMillis)
+}
+
+// scenarioSteerDeferSetup answers its own prompt immediately, then continues
+// to hold the turn open silently. A mid-turn steer delivered during the hold
+// still reaches the agent as a concurrent prompt, but runs as a genuinely
+// separate turn with its own answer -- the "deferred" outcome from the
+// outcome taxonomy. The transcript therefore shows two independent answers in
+// submission order, matching an installation whose agent CLI never folds.
+func scenarioSteerDeferSetup(e *emitter) {
+	e.text("Predecessor turn's own answer, delivered before any steer arrives.")
+	// A tool-call boundary flushes the buffered text above into its own
+	// message row (cmd/mock-agent/AGENTS.md: "flushMessageBuffer only fires
+	// on a tool-call/turn boundary"). Without it the answer stays buffered
+	// server-side for as long as this turn holds open below, so an operator
+	// (or an e2e assertion) would see nothing until the turn eventually ends.
+	flushID := nextToolID()
+	e.startTool(flushID, "Acknowledge predecessor answer", acp.ToolKindOther, map[string]any{})
+	e.completeTool(flushID, map[string]any{toolKeyResult: "ok"})
+	waitForDelay(e.ctx, steerSetupHoldMillis)
+}
+
+// scenarioEmptyTurn emits no content and no tool calls, so the turn ends
+// cleanly with no agent output. Reproduces the case where an agent treats a
+// prompt (e.g. an unsupported slash command) as a no-op and returns an empty
+// end_turn. Drives the frontend "empty turn" notice.
+func scenarioEmptyTurn(e *emitter) {
+	_ = e
+	// Stay "running" for a few seconds rather than returning instantly. The
+	// empty-turn notice is driven by the live turn.completed event, so the turn
+	// must outlast the client's initial WS subscribe (especially on mobile,
+	// where a fast auto-start turn can finish before the chat subscribes).
+	fixedDelay(3000)
+}
+
+// scenarioSavedPromptDelivery emits the fixed response used by the Quick Chat
+// saved-prompt E2E test. The handler routes here only after it finds the exact
+// directive inside a backend-generated expansion block.
+func scenarioSavedPromptDelivery(e *emitter) {
+	e.text(savedPromptDeliveryResponse)
+}
+
+// emitPredefinedScenario dispatches to a named e2e scenario.
+func emitPredefinedScenario(e *emitter, name string) {
+	if fn, ok := scenarioRegistry[name]; ok {
+		fn(e)
+	} else {
+		names := make([]string, 0, len(scenarioRegistry))
+		for k := range scenarioRegistry {
+			names = append(names, k)
+		}
+		e.text("Unknown e2e scenario: " + name + ". Available: " + strings.Join(names, ", "))
+	}
+}
+
+// scenarioSimpleMessage: text only with fixed 100ms delays.
+func scenarioSimpleMessage(e *emitter) {
+	fixedDelay(100)
+	e.thought("Processing the request...")
+
+	fixedDelay(100)
+	e.text("This is a simple mock response for e2e testing.")
+}
+
+func scenarioResponseRetry(e *emitter) {
+	e.thoughtWithID("Abandoned response attempt reasoning.")
+	e.textWithID("Abandoned response attempt answer.")
+	e.responseAttemptReset()
+	e.textWithID("Replacement response after provider retry.")
+}
+
+// scenarioReadAndEdit: read -> edit -> text with fixed delays, using real files.
+func scenarioReadAndEdit(e *emitter) {
+	f := randomFile()
+	snippet := readFileSnippet(f.absPath, 20)
+	oldStr, newStr := pickEditableFragment(f.absPath)
+	fixedDelay(50)
+
+	// Read file
+	readID := nextToolID()
+	e.startTool(readID, "Read "+f.relPath, acp.ToolKindRead,
+		map[string]any{"file_path": f.absPath},
+		acp.ToolCallLocation{Path: f.absPath})
+	fixedDelay(50)
+	e.completeTool(readID, map[string]any{"content": snippet})
+
+	fixedDelay(50)
+
+	// Edit file (with permission)
+	editID := nextToolID()
+	editInput := map[string]any{
+		"file_path":  f.absPath,
+		"old_string": oldStr,
+		"new_string": newStr,
+	}
+	e.startTool(editID, "Edit "+f.relPath, acp.ToolKindEdit, editInput,
+		acp.ToolCallLocation{Path: f.absPath})
+
+	allowed := e.requestPermission(editID, "Edit "+f.relPath, acp.ToolKindEdit, editInput)
+
+	fixedDelay(50)
+	if allowed {
+		e.completeTool(editID, map[string]any{toolKeyResult: "File edited successfully: " + f.absPath})
+	} else {
+		e.completeTool(editID, map[string]any{toolKeyResult: "Edit was denied"})
+		e.text("Edit was denied.")
+	}
+
+	fixedDelay(50)
+	e.text("Read and edit scenario complete.")
+}
+
+// scenarioMultiPermission: three sequential bash tools, each requiring permission.
+// Reproduces the "approvals reappear at turn complete" bug — user approves all
+// three, then when the turn ends the approval prompts must NOT come back.
+func scenarioMultiPermission(e *emitter) {
+	fixedDelay(50)
+	e.text("Running three commands that need approval.")
+
+	for i, label := range []string{"first", "second", "third"} {
+		fixedDelay(50)
+		id := nextToolID()
+		input := map[string]any{
+			"command":     fmt.Sprintf("echo %s", label),
+			"description": fmt.Sprintf("Step %d: %s", i+1, label),
+		}
+		e.startTool(id, fmt.Sprintf("Run %s command", label), acp.ToolKindExecute, input)
+		allowed := e.requestPermission(id, fmt.Sprintf("Run %s command", label), acp.ToolKindExecute, input)
+		fixedDelay(50)
+		if allowed {
+			e.completeTool(id, map[string]any{"output": label})
+		} else {
+			e.completeTool(id, map[string]any{"output": "denied"})
+		}
+	}
+
+	fixedDelay(50)
+	e.text("Multi-permission scenario complete.")
+}
+
+// scenarioKandevMCPPermission emits a tool_call with a Kandev MCP tool title and
+// blocks on a permission request, exercising the kandev renderer's approval UI.
+func scenarioKandevMCPPermission(e *emitter) {
+	fixedDelay(50)
+	e.text("Calling a Kandev MCP tool that needs approval.")
+
+	fixedDelay(50)
+	id := nextToolID()
+	toolName := "mcp__kandev__list_workspaces_kandev"
+	input := map[string]any{}
+	e.startTool(id, toolName, acp.ToolKindOther, input)
+	allowed := e.requestPermission(id, toolName, acp.ToolKindOther, input)
+
+	fixedDelay(50)
+	if allowed {
+		e.completeTool(id, map[string]any{
+			"workspaces": []map[string]any{{"id": "w1", "name": "Main"}},
+			"total":      1,
+		})
+	} else {
+		e.completeTool(id, map[string]any{toolKeyError: "denied"})
+	}
+
+	fixedDelay(50)
+	e.text("Kandev MCP permission scenario complete.")
+}
+
+// scenarioPermissionFlow: tool requiring permission with fixed delays.
+func scenarioPermissionFlow(e *emitter) {
+	fixedDelay(50)
+
+	bashID := nextToolID()
+	bashInput := map[string]any{
+		"command":     "echo 'testing permissions'",
+		"description": "Test permission flow",
+	}
+
+	e.startTool(bashID, "Test permissions", acp.ToolKindExecute, bashInput)
+
+	allowed := e.requestPermission(bashID, "Test permissions", acp.ToolKindExecute, bashInput)
+
+	fixedDelay(50)
+	if allowed {
+		e.completeTool(bashID, map[string]any{"output": "testing permissions"})
+		e.text("Permission was granted and command executed.")
+	} else {
+		e.completeTool(bashID, map[string]any{"output": "Permission denied"})
+		e.text("Permission was denied.")
+	}
+}
+
+// scenarioError: error result with fixed delays.
+func scenarioError(e *emitter) {
+	fixedDelay(100)
+	e.text("About to encounter an error...")
+	fixedDelay(100)
+	e.text("E2E test error: simulated failure")
+}
+
+// scenarioSubagent: a claude-style subagent (Task) tool call carrying the
+// `_meta.claudeCode` Agent marker and a toolResponse with full result metrics,
+// so the kandev adapter normalizes it to a subagent_task payload and the UI
+// renders the subagent card with metadata chips.
+func scenarioSubagent(e *emitter) {
+	taskToolID := nextToolID()
+	fixedDelay(50)
+
+	e.startSubagentTool(taskToolID,
+		"Explore the codebase",
+		"Find all files and summarize the project structure",
+		"general-purpose")
+
+	fixedDelay(50)
+	e.text("Subagent working on the task...")
+
+	// A tool call the subagent runs internally, attributed to the Task via
+	// `_meta.claudeCode.parentToolUseId` so it nests under the subagent card.
+	childToolID := nextToolID()
+	e.startChildTool(childToolID, taskToolID, "sleep 30", acp.ToolKindExecute,
+		map[string]any{"command": "sleep 30"})
+	fixedDelay(50)
+	e.completeChildTool(childToolID, taskToolID, map[string]any{"output": ""})
+
+	fixedDelay(50)
+	e.completeSubagentTool(taskToolID, "E2E subagent completed", subagentResult{
+		agentID:      "agent_e2e_0001",
+		subagentType: "general-purpose",
+		durationMs:   2200,
+		totalTokens:  9987,
+		toolUseCount: 3,
+	})
+
+	fixedDelay(50)
+	e.text("Subagent scenario complete.")
+}
+
+// scenarioAllTools: one of each tool type with fixed delays, using real files.
+func scenarioAllTools(e *emitter) {
+	used := map[string]bool{}
+	readFile := randomFile()
+	used[readFile.absPath] = true
+	grepFile := randomFileExcluding(used)
+	used[grepFile.absPath] = true
+	editFile := randomFileExcluding(used)
+
+	fixedDelay(50)
+	e.thought("Running all tools...")
+
+	scenarioAllToolsReadGrep(e, readFile, grepFile)
+	scenarioAllToolsEditBash(e, editFile)
+
+	// WebFetch
+	fixedDelay(50)
+	webID := nextToolID()
+	e.startTool(webID, "Fetch example.com", acp.ToolKindFetch,
+		map[string]any{"url": "https://example.com", clarificationPromptKey: "Summarize"})
+	fixedDelay(50)
+	e.completeTool(webID, map[string]any{"content": "Example page content"})
+
+	fixedDelay(50)
+	e.text("All tools scenario complete.")
+}
+
+func scenarioAllToolsReadGrep(e *emitter, readFile, grepFile fileInfo) {
+	// Read
+	fixedDelay(50)
+	readID := nextToolID()
+	snippet := readFileSnippet(readFile.absPath, 20)
+	e.startTool(readID, "Read "+readFile.relPath, acp.ToolKindRead,
+		map[string]any{"file_path": readFile.absPath},
+		acp.ToolCallLocation{Path: readFile.absPath})
+	fixedDelay(50)
+	e.completeTool(readID, map[string]any{"content": snippet})
+
+	// Grep
+	fixedDelay(50)
+	grepID := nextToolID()
+	e.startTool(grepID, "Search for \"func \"", acp.ToolKindSearch,
+		map[string]any{"pattern": "func ", "path": grepFile.absPath})
+	fixedDelay(50)
+	paths := randomFilePaths(3)
+	var grepResults []string
+	for i, p := range paths {
+		grepResults = append(grepResults, fmt.Sprintf("%s:%d: func found here", p, (i+1)*10))
+	}
+	e.completeTool(grepID, map[string]any{"matches": strings.Join(grepResults, "\n")})
+}
+
+func scenarioAllToolsEditBash(e *emitter, editFile fileInfo) {
+	// Edit (with permission)
+	fixedDelay(50)
+	editID := nextToolID()
+	oldStr, newStr := pickEditableFragment(editFile.absPath)
+	editInput := map[string]any{"file_path": editFile.absPath, "old_string": oldStr, "new_string": newStr}
+	e.startTool(editID, "Edit "+editFile.relPath, acp.ToolKindEdit, editInput,
+		acp.ToolCallLocation{Path: editFile.absPath})
+	allowed := e.requestPermission(editID, "Edit "+editFile.relPath, acp.ToolKindEdit, editInput)
+	fixedDelay(50)
+	if allowed {
+		e.completeTool(editID, map[string]any{toolKeyResult: "File edited successfully: " + editFile.absPath})
+	} else {
+		e.completeTool(editID, map[string]any{toolKeyResult: "Edit denied"})
+		e.text("Edit denied.")
+	}
+
+	// Bash (with permission)
+	fixedDelay(50)
+	bashID := nextToolID()
+	bashInput := map[string]any{"command": "echo done", "description": "Print done"}
+	e.startTool(bashID, "Print done", acp.ToolKindExecute, bashInput)
+	allowed = e.requestPermission(bashID, "Print done", acp.ToolKindExecute, bashInput)
+	fixedDelay(50)
+	if allowed {
+		e.completeTool(bashID, map[string]any{"output": "done"})
+	} else {
+		e.completeTool(bashID, map[string]any{"output": "Permission denied"})
+		e.text("Bash denied.")
+	}
+}
+
+// scenarioMultiTurn: minimal response for multi-turn test.
+func scenarioMultiTurn(e *emitter) {
+	fixedDelay(50)
+	e.text("Multi-turn response ready. Send another message to continue.")
+}
+
+// scenarioDiffExpansionSetup: creates a committed file and then modifies it,
+// leaving an uncommitted diff that the UI can display with expansion enabled.
+func scenarioDiffExpansionSetup(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("diff-expansion-setup: getwd failed: " + err.Error())
+		return
+	}
+
+	const totalLines = 200
+	originalLines := make([]string, totalLines)
+	for i := 0; i < totalLines; i++ {
+		originalLines[i] = fmt.Sprintf("func original_%03d() { /* line %d */ }", i+1, i+1)
+	}
+	original := strings.Join(originalLines, "\n") + "\n"
+
+	filePath := "expansion_test.go"
+	if err := os.WriteFile(filePath, []byte(original), 0o644); err != nil {
+		e.text("diff-expansion-setup: write failed: " + err.Error())
+		return
+	}
+
+	runGitCmd := makeGitRunner(wd)
+	// Add the canonical content directly. `--allow-empty` makes retries
+	// idempotent when a reused worktree already has the same file at HEAD;
+	// overwriting before `git add` also repairs a worktree left with the prior
+	// scenario's modified content. The old rm/cleanup commit sequence could
+	// fail under concurrent git setup and left the real fixture commit absent.
+	if err := runGitCmd("add", filePath); err != nil {
+		e.text("diff-expansion-setup: git add failed")
+		return
+	}
+	if err := runGitCmd("commit", "--allow-empty", "-m", "add expansion_test.go for e2e diff expansion test"); err != nil {
+		e.text("diff-expansion-setup: git commit failed")
+		return
+	}
+
+	modifiedLines := make([]string, totalLines)
+	copy(modifiedLines, originalLines)
+	modifiedLines[49] = "func modified_mid_top() { /* HUNK_TOP - modified line 50 */ }"
+	modifiedLines[149] = "func modified_mid_bottom() { /* HUNK_BOTTOM - modified line 150 */ }"
+	modified := strings.Join(modifiedLines, "\n") + "\n"
+
+	if err := os.WriteFile(filePath, []byte(modified), 0o644); err != nil {
+		e.text("diff-expansion-setup: write modified failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("diff-expansion-setup complete: expansion_test.go has two-hunk uncommitted diff (lines 50 and 150 of 200).")
+}
+
+// scenarioDiffUpdateSetup creates a simple file, commits it, then modifies it.
+func scenarioDiffUpdateSetup(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("diff-update-setup: getwd failed: " + err.Error())
+		return
+	}
+
+	filePath := "diff_update_test.txt"
+	originalContent := "line 1: original\nline 2: unchanged\nline 3: original\n"
+
+	if err := os.WriteFile(filePath, []byte(originalContent), 0o644); err != nil {
+		e.text("diff-update-setup: write failed: " + err.Error())
+		return
+	}
+
+	runGitCmd := makeGitRunner(wd)
+	_ = runGitCmd("rm", "--force", filePath)
+	_ = runGitCmd("commit", "-m", "cleanup diff_update_test.txt")
+
+	if err := os.WriteFile(filePath, []byte(originalContent), 0o644); err != nil {
+		e.text("diff-update-setup: re-write failed: " + err.Error())
+		return
+	}
+
+	if err := runGitCmd("add", filePath); err != nil {
+		e.text("diff-update-setup: git add failed")
+		return
+	}
+	if err := runGitCmd("commit", "-m", "add diff_update_test.txt"); err != nil {
+		e.text("diff-update-setup: git commit failed")
+		return
+	}
+
+	modifiedContent := "line 1: FIRST_MODIFICATION\nline 2: unchanged\nline 3: original\n"
+	if err := os.WriteFile(filePath, []byte(modifiedContent), 0o644); err != nil {
+		e.text("diff-update-setup: write modified failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("diff-update-setup complete: diff_update_test.txt has FIRST_MODIFICATION")
+}
+
+// scenarioDiffUpdateModify modifies the diff_update_test.txt file again.
+func scenarioDiffUpdateModify(e *emitter) {
+	fixedDelay(50)
+
+	filePath := "diff_update_test.txt"
+	modifiedContent := "line 1: SECOND_MODIFICATION\nline 2: unchanged\nline 3: ALSO_CHANGED\n"
+	if err := os.WriteFile(filePath, []byte(modifiedContent), 0o644); err != nil {
+		e.text("diff-update-modify: write failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("diff-update-modify complete: diff_update_test.txt now has SECOND_MODIFICATION")
+}
+
+// scenarioPushCurrentBranch pushes the worktree's current branch to origin
+// directly, with no Kandev "Create MR"/"Create PR" action involved. Used by
+// push-detection auto-link e2e tests to reproduce an agent running a raw
+// `git push` on its own — the same shape as a real user/agent pushing and
+// then opening the MR/PR through `glab mr create`, `gh pr create`, or the
+// code host's web UI, rather than through Kandev's own runtime action.
+// Expects a prior turn (e.g. diff-update-setup) to have already committed
+// something to push.
+//
+// Explicitly writes the remote-tracking ref and upstream config after
+// pushing rather than relying on `git push -u` alone: the e2e fixture's mock
+// git remote only implements the receive-pack (push) side of the smart-HTTP
+// protocol, not upload-pack/info-refs (fetch/clone) — confirmed by
+// worktree-manager's own "git fetch failed before worktree creation;
+// continuing with fallback ref" warning during task setup, and reproducible
+// directly (`git fetch` against it fails with "not valid: is this a git
+// repository?"). A real code host's push response updates
+// refs/remotes/origin/<branch> as a side effect of the exchange; here that
+// has to be reproduced by hand with `update-ref`, using the local HEAD this
+// process just successfully pushed as the known-good value — no fetch
+// required, since the pushed content is exactly what's already local.
+func scenarioPushCurrentBranch(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("push-current-branch: getwd failed: " + err.Error())
+		return
+	}
+	branchNameOut, err := runGitOutput(wd, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		e.text("push-current-branch: resolve branch name failed: " + err.Error())
+		return
+	}
+	branchName := strings.TrimSpace(string(branchNameOut))
+	headSHAOut, err := runGitOutput(wd, "rev-parse", "HEAD")
+	if err != nil {
+		e.text("push-current-branch: resolve HEAD sha failed: " + err.Error())
+		return
+	}
+	headSHA := strings.TrimSpace(string(headSHAOut))
+
+	runGitCmd := makeGitRunner(wd)
+	if err := runGitCmd("push", "origin", branchName); err != nil {
+		e.text("push-current-branch: git push failed")
+		return
+	}
+	if err := runGitCmd("update-ref", "refs/remotes/origin/"+branchName, headSHA); err != nil {
+		e.text("push-current-branch: git update-ref failed")
+		return
+	}
+	if err := runGitCmd("branch", "--set-upstream-to=origin/"+branchName, branchName); err != nil {
+		e.text("push-current-branch: git branch --set-upstream-to failed")
+		return
+	}
+
+	fixedDelay(100)
+	e.text("push-current-branch complete: pushed directly, no Create MR/PR action used")
+}
+
+// scenarioDiffUpdateStreaming modifies the file mid-turn, emitting text both
+// before and after the write so the agent's turn stays active for several
+// seconds. Used to assert that open file editor / diff panels auto-update
+// while the agent is still streaming.
+func scenarioDiffUpdateStreaming(e *emitter) {
+	fixedDelay(50)
+	e.text("diff-update-streaming: starting work")
+
+	fixedDelay(1000)
+
+	filePath := "diff_update_test.txt"
+	modifiedContent := "line 1: SECOND_MODIFICATION\nline 2: unchanged\nline 3: ALSO_CHANGED\n"
+	if err := os.WriteFile(filePath, []byte(modifiedContent), 0o644); err != nil {
+		e.text("diff-update-streaming: write failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(500)
+	e.text("diff-update-streaming: file written, continuing")
+
+	// Long tail keeps the turn active long enough for polling+sync to fire.
+	fixedDelay(6000)
+	e.text("diff-update-streaming complete")
+}
+
+// scenarioMultiFileSetup commits three tracked files, then modifies all three
+// so each shows up in git status with FIRST_MODIFICATION. Used to test the
+// case where the user has multiple file editors / diff panels open at once.
+func scenarioMultiFileSetup(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("multi-file-setup: getwd failed: " + err.Error())
+		return
+	}
+
+	runGitCmd := makeGitRunner(wd)
+	files := []string{"multi_a.txt", "multi_b.txt", "multi_c.txt"}
+
+	// Cleanup any leftovers from a prior run.
+	for _, f := range files {
+		_ = runGitCmd("rm", "--force", f)
+	}
+	_ = runGitCmd("commit", "-m", "cleanup multi-file fixtures")
+
+	// Commit pristine versions.
+	for _, f := range files {
+		original := fmt.Sprintf("%s line 1: original\n%s line 2: unchanged\n%s line 3: original\n", f, f, f)
+		if err := os.WriteFile(f, []byte(original), 0o644); err != nil {
+			e.text("multi-file-setup: write failed: " + err.Error())
+			return
+		}
+		if err := runGitCmd("add", f); err != nil {
+			e.text("multi-file-setup: git add failed for " + f)
+			return
+		}
+	}
+	if err := runGitCmd("commit", "-m", "add multi-file fixtures"); err != nil {
+		e.text("multi-file-setup: git commit failed")
+		return
+	}
+
+	// Modify all three so each appears in git status with FIRST_MODIFICATION.
+	for _, f := range files {
+		modified := fmt.Sprintf("%s line 1: FIRST_MODIFICATION\n%s line 2: unchanged\n%s line 3: original\n", f, f, f)
+		if err := os.WriteFile(f, []byte(modified), 0o644); err != nil {
+			e.text("multi-file-setup: write modified failed: " + err.Error())
+			return
+		}
+	}
+
+	fixedDelay(100)
+	e.text("multi-file-setup complete: 3 files have FIRST_MODIFICATION")
+}
+
+// scenarioMultiFileModify modifies all three multi-file fixtures within a
+// single turn, with a long trailing delay so the panels must auto-update
+// while the agent is still streaming. Reproduces the user's reported case
+// where multiple open editor / diff panels go stale on a real edit.
+func scenarioMultiFileModify(e *emitter) {
+	fixedDelay(50)
+	e.text("multi-file-modify: starting work")
+
+	fixedDelay(800)
+
+	files := []string{"multi_a.txt", "multi_b.txt", "multi_c.txt"}
+	for i, f := range files {
+		modified := fmt.Sprintf(
+			"%s line 1: SECOND_MODIFICATION\n%s line 2: unchanged\n%s line 3: ALSO_CHANGED_%d\n",
+			f, f, f, i,
+		)
+		if err := os.WriteFile(f, []byte(modified), 0o644); err != nil {
+			e.text("multi-file-modify: write failed: " + err.Error())
+			return
+		}
+		// Stagger the writes slightly to mimic a real agent doing one tool
+		// call per file rather than all writes in a single instant.
+		fixedDelay(250)
+	}
+
+	e.text("multi-file-modify: writes done, continuing")
+
+	// Long tail keeps the turn active so we can assert mid-turn updates.
+	fixedDelay(5000)
+	e.text("multi-file-modify complete")
+}
+
+// scenarioUntrackedFileSetup creates a new untracked file.
+func scenarioUntrackedFileSetup(e *emitter) {
+	fixedDelay(50)
+
+	filePath := "untracked_test.txt"
+	content := "line 1: INITIAL_CONTENT\nline 2: some text\n"
+
+	_ = os.Remove(filePath)
+
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		e.text("untracked-file-setup: write failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("untracked-file-setup complete: untracked_test.txt has INITIAL_CONTENT")
+}
+
+// scenarioUntrackedFileModify modifies the untracked file.
+func scenarioUntrackedFileModify(e *emitter) {
+	fixedDelay(50)
+
+	filePath := "untracked_test.txt"
+	content := "line 1: MODIFIED_CONTENT\nline 2: some text\nline 3: NEW_LINE\n"
+
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		e.text("untracked-file-modify: write failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("untracked-file-modify complete: untracked_test.txt now has MODIFIED_CONTENT")
+}
+
+// MCP argument keys used by the clarification scenarios. Pulled out so goconst
+// stays happy when the same string would otherwise repeat across both helpers.
+const (
+	clarificationOptionsKey = "options"
+	clarificationLabelKey   = "label"
+	clarificationDescKey    = "description"
+	clarificationPromptKey  = "prompt"
+	clarificationIDKey      = "id"
+	clarificationTitleKey   = "title"
+	clarificationCustomText = "allow_custom_text"
+)
+
+func mockOption(label, description string) map[string]any {
+	return map[string]any{clarificationLabelKey: label, clarificationDescKey: description}
+}
+
+// clarificationQuestionArgs returns the MCP arguments for a single-question
+// clarification call. Used by the simplest e2e scenario where a one-question
+// bundle exercises the same code path as multi-question.
+func clarificationQuestionArgs() map[string]any {
+	return map[string]any{
+		"questions": []map[string]any{
+			{
+				clarificationIDKey:     "db",
+				clarificationPromptKey: "Which database should we use for this project?",
+				clarificationOptionsKey: []map[string]any{
+					mockOption("PostgreSQL", "Relational database with strong consistency"),
+					mockOption("MongoDB", "Document database for flexible schemas"),
+					mockOption("SQLite", "Embedded database for simplicity"),
+				},
+			},
+		},
+	}
+}
+
+func clarificationNoOtherQuestionArgs() map[string]any {
+	return map[string]any{
+		"questions": []map[string]any{
+			{
+				clarificationIDKey:      "mode",
+				clarificationPromptKey:  "Choose a mode",
+				clarificationCustomText: false,
+				clarificationOptionsKey: []map[string]any{
+					mockOption("Fast", "Prioritize quick completion"),
+					mockOption("Safe", "Prioritize additional checks"),
+				},
+			},
+		},
+	}
+}
+
+// clarificationMarkdownQuestionArgs keeps a permanent real-protocol fixture
+// for the lightweight Markdown supported by clarification question fields.
+func clarificationMarkdownQuestionArgs() map[string]any {
+	return map[string]any{
+		"context": "Keep `context` literal.\n\nNo Markdown rendering here.",
+		"questions": []map[string]any{
+			{
+				clarificationIDKey:    "markdown",
+				clarificationTitleKey: "Use `DB`",
+				clarificationPromptKey: "Choose **one** storage mode:\n\n" +
+					"1. Prefer reliability\n2. Prefer speed\n\n" +
+					"Read [storage guidance](https://example.com/storage).",
+				clarificationOptionsKey: []map[string]any{
+					mockOption("`Postgres` [docs](https://example.com/postgres)", "Best for **production** workloads"),
+					mockOption("SQLite", "Best for *local* work"),
+				},
+			},
+		},
+	}
+}
+
+// clarificationMultiQuestionArgs returns the MCP arguments for a 3-question
+// clarification bundle that exercises the multi-question UI flow.
+func clarificationMultiQuestionArgs() map[string]any {
+	return map[string]any{
+		"questions": []map[string]any{
+			{
+				clarificationIDKey:     "db",
+				clarificationPromptKey: "Which database should we use?",
+				clarificationOptionsKey: []map[string]any{
+					mockOption("PostgreSQL", "Relational database with strong consistency"),
+					mockOption("MongoDB", "Document database for flexible schemas"),
+					mockOption("SQLite", "Embedded database for simplicity"),
+				},
+			},
+			{
+				clarificationIDKey:     "language",
+				clarificationPromptKey: "Which language should we use?",
+				clarificationOptionsKey: []map[string]any{
+					mockOption("Go", "Strong typing, fast compile"),
+					mockOption("TypeScript", "Familiar to the team"),
+					mockOption("Rust", "Best for systems work"),
+				},
+			},
+			{
+				clarificationIDKey:     "deploy",
+				clarificationPromptKey: "How should we deploy?",
+				clarificationOptionsKey: []map[string]any{
+					mockOption("Docker", "Containerized deploy"),
+					mockOption("Bare metal", "Run directly on hosts"),
+				},
+			},
+		},
+		"context_paragraphs": []string{
+			"Picking the foundational stack.",
+			"Answer all three so we can move forward.",
+		},
+	}
+}
+
+// scenarioClarification: happy path — ask a question via MCP and wait for the answer.
+func scenarioClarification(e *emitter) {
+	fixedDelay(100)
+	e.text("Let me ask you a question about the project setup.")
+
+	result, err := e.callMCPTool("kandev", "ask_user_question_kandev", clarificationQuestionArgs())
+	if err != nil {
+		e.text(fmt.Sprintf("Question failed: %s", err))
+		return
+	}
+
+	fixedDelay(50)
+	e.text(fmt.Sprintf("You answered: %s", result))
+}
+
+func scenarioClarificationNoOther(e *emitter) {
+	fixedDelay(100)
+	e.text("Please choose one of the offered modes.")
+	result, err := e.callMCPTool("kandev", "ask_user_question_kandev", clarificationNoOtherQuestionArgs())
+	if err != nil {
+		e.text(fmt.Sprintf("Question failed: %s", err))
+		return
+	}
+	fixedDelay(50)
+	e.text(fmt.Sprintf("You answered: %s", result))
+}
+
+// scenarioClarificationMarkdown exercises the restricted Markdown renderer
+// through the same blocking MCP round trip used by real clarification calls.
+func scenarioClarificationMarkdown(e *emitter) {
+	fixedDelay(100)
+	e.text("Let me ask you a formatted question about project storage.")
+
+	result, err := e.callMCPTool("kandev", "ask_user_question_kandev", clarificationMarkdownQuestionArgs())
+	if err != nil {
+		e.text(fmt.Sprintf("Question failed: %s", err))
+		return
+	}
+
+	fixedDelay(50)
+	e.text(fmt.Sprintf("You answered: %s", result))
+}
+
+// scenarioClarificationMulti: stress the multi-question path — 3 questions in
+// one bundle, all required, single MCP call.
+func scenarioClarificationMulti(e *emitter) {
+	fixedDelay(100)
+	e.text("Let me ask you a few questions about the project setup.")
+
+	result, err := e.callMCPTool("kandev", "ask_user_question_kandev", clarificationMultiQuestionArgs())
+	if err != nil {
+		e.text(fmt.Sprintf("Questions failed: %s", err))
+		return
+	}
+
+	fixedDelay(50)
+	e.text(fmt.Sprintf("You answered: %s", result))
+}
+
+// scenarioClarificationTimeout: ask a question with a short timeout, then continue.
+func scenarioClarificationTimeout(e *emitter) {
+	fixedDelay(100)
+	e.text("Let me ask you a question about the project setup.")
+
+	ctx, cancel := contextWithTimeout(5)
+	defer cancel()
+
+	result, err := e.callMCPToolCtx(ctx, "kandev", "ask_user_question_kandev", clarificationQuestionArgs())
+	if err != nil {
+		fixedDelay(50)
+		if ctx.Err() != nil {
+			e.text("Question timed out, continuing without answer.")
+		} else {
+			e.text(fmt.Sprintf("Question failed: %s", err))
+		}
+		return
+	}
+
+	fixedDelay(50)
+	e.text(fmt.Sprintf("You answered: %s", result))
+}
+
+// scenarioReviewCumulativeSetup creates a file, commits it, then modifies and
+// commits again, then makes a final uncommitted modification.  This produces a
+// file with both committed and uncommitted changes relative to the session's
+// base commit, exercising the cumulative diff (base → working tree).
+func scenarioReviewCumulativeSetup(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("review-cumulative-setup: getwd failed: " + err.Error())
+		return
+	}
+
+	filePath := "review_cumulative_test.txt"
+	baseContent := "line 1: BASE_CONTENT\nline 2: unchanged\nline 3: BASE_CONTENT\n"
+
+	// Clean up any leftover file from a previous run.
+	runGitCmd := makeGitRunner(wd)
+	_ = runGitCmd("rm", "--force", filePath)
+	_ = runGitCmd("commit", "-m", "cleanup "+filePath)
+
+	// Write original content and commit.
+	if err := os.WriteFile(filePath, []byte(baseContent), 0o644); err != nil {
+		e.text("review-cumulative-setup: write base failed: " + err.Error())
+		return
+	}
+	if err := runGitCmd("add", filePath); err != nil {
+		e.text("review-cumulative-setup: git add base failed")
+		return
+	}
+	if err := runGitCmd("commit", "-m", "add "+filePath+" with base content"); err != nil {
+		e.text("review-cumulative-setup: git commit base failed")
+		return
+	}
+
+	// Second commit: modify the file.
+	committedContent := "line 1: COMMITTED_CHANGE\nline 2: unchanged\nline 3: BASE_CONTENT\n"
+	if err := os.WriteFile(filePath, []byte(committedContent), 0o644); err != nil {
+		e.text("review-cumulative-setup: write committed failed: " + err.Error())
+		return
+	}
+	if err := runGitCmd("add", filePath); err != nil {
+		e.text("review-cumulative-setup: git add committed failed")
+		return
+	}
+	if err := runGitCmd("commit", "-m", "modify "+filePath+" with committed change"); err != nil {
+		e.text("review-cumulative-setup: git commit committed failed")
+		return
+	}
+
+	// Leave an uncommitted modification on top.
+	uncommittedContent := "line 1: COMMITTED_CHANGE\nline 2: unchanged\nline 3: UNCOMMITTED_CHANGE\n"
+	if err := os.WriteFile(filePath, []byte(uncommittedContent), 0o644); err != nil {
+		e.text("review-cumulative-setup: write uncommitted failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("review-cumulative-setup complete: " + filePath + " has COMMITTED_CHANGE and UNCOMMITTED_CHANGE")
+}
+
+// walkthroughDemoArgs is the show_walkthrough_kandev payload used by
+// scenarioWalkthroughBasic. task_id is resolved server-side from the session's
+// env (KANDEV_TASK_ID), mirroring the clarification path, so it is omitted here.
+// Walkthrough step JSON keys, hoisted to constants to satisfy goconst.
+const (
+	wtKeyTitle   = "title"
+	wtKeyFile    = "file"
+	wtKeyLine    = "line"
+	wtKeyLineEnd = "line_end"
+	wtKeyText    = "text"
+	wtKeySteps   = "steps"
+)
+
+// wtStep builds one show_walkthrough step map. Keeping the JSON keys in one
+// place avoids repeating string literals (goconst).
+func wtStep(title, file, text string, line, lineEnd int) map[string]interface{} {
+	m := map[string]interface{}{wtKeyTitle: title, wtKeyFile: file, wtKeyLine: line, wtKeyText: text}
+	if lineEnd > 0 {
+		m[wtKeyLineEnd] = lineEnd
+	}
+	return m
+}
+
+// wtArgs assembles show_walkthrough_kandev args from a title and steps.
+func wtArgs(title string, steps ...map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{wtKeyTitle: title, wtKeySteps: steps}
+}
+
+// scenarioWalkthroughReemit emits one walkthrough, waits, then emits a second
+// (different) one — exercising the live `task.walkthrough.updated` path so the
+// UI must reflect the re-emit without a page reload.
+func scenarioWalkthroughReemit(e *emitter) {
+	fixedDelay(50)
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("walkthrough-reemit: getwd failed: " + err.Error())
+		return
+	}
+	runGitCmd := makeGitRunner(wd)
+	if !writeWalkthroughFile(e, runGitCmd, "walkthrough-reemit", "reemit.txt", "line 1\nline 2\n", "line 1\nREEMIT_CHANGE\n") {
+		return
+	}
+
+	e.text("First tour incoming.")
+	if _, err := e.callMCPTool("kandev", "show_walkthrough_kandev", wtArgs("First",
+		wtStep("First step", "reemit.txt", "REEMIT_FIRST step one.", 1, 0),
+		wtStep("First step 2", "reemit.txt", "REEMIT_FIRST step two.", 2, 0),
+	)); err != nil {
+		e.text(fmt.Sprintf("show_walkthrough failed: %s", err))
+		return
+	}
+	e.text("reemit-first-done")
+
+	fixedDelay(200)
+
+	if _, err := e.callMCPTool("kandev", "show_walkthrough_kandev", wtArgs("Second",
+		wtStep("Second step", "reemit.txt", "REEMIT_SECOND step one.", 1, 0),
+		wtStep("Second step 2", "reemit.txt", "REEMIT_SECOND step two.", 2, 0),
+		wtStep("Second step 3", "reemit.txt", "REEMIT_SECOND step three.", 1, 0),
+	)); err != nil {
+		e.text(fmt.Sprintf("show_walkthrough re-emit failed: %s", err))
+		return
+	}
+	e.text("reemit-second-done")
+}
+
+// walkthroughDemoArgs builds a 5-step tour spanning three changed files plus
+// one clean committed file (exercising both the diff-anchored card and the
+// full-file / editor-mode floating window).
+func walkthroughDemoArgs() map[string]interface{} {
+	return map[string]interface{}{
+		wtKeyTitle: "Tour of the change",
+		wtKeySteps: []map[string]interface{}{
+			wtStep("Overview", "walkthrough_a.txt",
+				"Big picture: this tour explains how the sample changes connect across the touched files.\n\nELI5: first we show the map, then we explain each changed line.", 1, 0),
+			wtStep("The change in A", "walkthrough_a.txt",
+				"Step 2: this is WALKTHROUGH_CHANGE_A the tour narrates.", 2, 3),
+			wtStep("File B", "walkthrough_b.txt",
+				"Step 3: WALKTHROUGH_CHANGE_B lives in file B.", 4, 5),
+			wtStep("File C", "walkthrough_c.txt",
+				"Step 4: WALKTHROUGH_CHANGE_C lives in file C.", 2, 0),
+			wtStep("Unchanged file", "walkthrough_base.txt",
+				"Step 5: WALKTHROUGH_UNCHANGED: this base file did not change; shown from its current state.", 1, 0),
+		},
+	}
+}
+
+// writeWalkthroughFile writes content and commits it, then (when changed is
+// non-empty) leaves an uncommitted modification so the file appears in review.
+func writeWalkthroughFile(e *emitter, runGitCmd func(args ...string) error, prefix, path, base, changed string) bool {
+	if err := os.WriteFile(path, []byte(base), 0o644); err != nil {
+		e.text(prefix + ": write base failed: " + err.Error())
+		return false
+	}
+	if err := runGitCmd("add", path); err != nil {
+		e.text(prefix + ": git add failed: " + err.Error())
+		return false
+	}
+	if err := runGitCmd("commit", "-m", "add "+path); err != nil {
+		e.text(prefix + ": git commit failed: " + err.Error())
+		return false
+	}
+	if changed == "" {
+		return true
+	}
+	if err := os.WriteFile(path, []byte(changed), 0o644); err != nil {
+		e.text(prefix + ": write change failed: " + err.Error())
+		return false
+	}
+	return true
+}
+
+func setupWalkthroughFiles(e *emitter, prefix string) bool {
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text(prefix + ": getwd failed: " + err.Error())
+		return false
+	}
+	runGitCmd := makeGitRunner(wd)
+
+	fixtures := []string{"walkthrough_a.txt", "walkthrough_b.txt", "walkthrough_c.txt"}
+	_ = runGitCmd(append([]string{"rm", "--force"}, fixtures...)...)
+	_ = runGitCmd("commit", "-m", "cleanup walkthrough fixtures")
+
+	// Three changed files (diff-anchored steps) + one clean committed file (editor-mode step).
+	ok := writeWalkthroughFile(e, runGitCmd, prefix, "walkthrough_a.txt",
+		"line 1: ENTRY\nline 2: BASE\nline 3: BASE\n",
+		"line 1: ENTRY\nline 2: WALKTHROUGH_CHANGE_A\nline 3: WALKTHROUGH_CHANGE_A\n")
+	ok = ok && writeWalkthroughFile(e, runGitCmd, prefix, "walkthrough_b.txt",
+		"line 1: B\nline 2: BASE\nline 3: BASE\nline 4: BASE\nline 5: BASE\n",
+		"line 1: B\nline 2: BASE\nline 3: BASE\nline 4: WALKTHROUGH_CHANGE_B\nline 5: WALKTHROUGH_CHANGE_B\n")
+	ok = ok && writeWalkthroughFile(e, runGitCmd, prefix, "walkthrough_c.txt",
+		"line 1: C\nline 2: BASE\n", "line 1: C\nline 2: WALKTHROUGH_CHANGE_C\n")
+	const baseContent = "line 1: WALKTHROUGH_UNCHANGED\nline 2: seeded on main\n"
+	if !walkthroughBaseIsClean(runGitCmd, baseContent) {
+		_ = runGitCmd("rm", "--force", "walkthrough_base.txt")
+		_ = runGitCmd("commit", "-m", "cleanup walkthrough base fixture")
+		ok = ok && writeWalkthroughFile(e, runGitCmd, prefix, "walkthrough_base.txt", baseContent, "")
+	}
+	return ok
+}
+
+func walkthroughBaseIsClean(runGitCmd func(args ...string) error, expectedContent string) bool {
+	content, err := os.ReadFile("walkthrough_base.txt")
+	return err == nil &&
+		string(content) == expectedContent &&
+		runGitCmd("ls-files", "--error-unmatch", "walkthrough_base.txt") == nil &&
+		runGitCmd("diff", "--quiet", "--", "walkthrough_base.txt") == nil &&
+		runGitCmd("diff", "--cached", "--quiet", "--", "walkthrough_base.txt") == nil
+}
+
+func emitWalkthroughTour(e *emitter, doneText string) {
+	fixedDelay(100)
+	e.text("Let me walk you through the change.")
+	toolID := nextToolID()
+	toolName := "show_walkthrough_kandev"
+	args := walkthroughDemoArgs()
+	e.startTool(toolID, toolName, acp.ToolKindOther, args)
+	result, err := e.callMCPTool("kandev", toolName, args)
+	if err != nil {
+		e.completeTool(toolID, map[string]any{toolKeyError: "MCP error: " + err.Error()})
+		e.text(fmt.Sprintf("show_walkthrough failed: %s", err))
+		return
+	}
+	e.completeTool(toolID, map[string]any{toolKeyResult: result})
+	fixedDelay(50)
+	e.text(doneText)
+}
+
+// scenarioWalkthroughSetup creates changed files without emitting a walkthrough.
+// It lets E2E tests click the actual Changes-panel Walkthrough request button.
+func scenarioWalkthroughSetup(e *emitter) {
+	fixedDelay(50)
+	if !setupWalkthroughFiles(e, "walkthrough-setup") {
+		return
+	}
+	e.text("walkthrough-setup complete: changes ready")
+}
+
+// scenarioWalkthroughRequested is the mock-agent response to the prompt generated
+// by the Changes-panel Walkthrough button.
+func scenarioWalkthroughRequested(e *emitter) {
+	emitWalkthroughTour(e, "walkthrough-request complete: 5-step tour emitted")
+}
+
+// scenarioWalkthroughBasic creates changed files, then emits a 5-step code
+// walkthrough over them via the show_walkthrough_kandev MCP tool.
+func scenarioWalkthroughBasic(e *emitter) {
+	fixedDelay(50)
+	if !setupWalkthroughFiles(e, "walkthrough-basic") {
+		return
+	}
+	emitWalkthroughTour(e, "walkthrough-basic complete: 5-step tour emitted")
+}
+
+// scenarioSymlinkFileSetup creates a file and a symlink to it, commits both,
+// then modifies the target file leaving an uncommitted diff.
+func scenarioSymlinkFileSetup(e *emitter) {
+	fixedDelay(50)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		e.text("symlink-file-setup: getwd failed: " + err.Error())
+		return
+	}
+
+	runGitCmd := makeGitRunner(wd)
+
+	// Create target file and commit it.
+	targetFile := "real-file.txt"
+	if err := os.WriteFile(targetFile, []byte("Hello from symlink target!\n"), 0o644); err != nil {
+		e.text("symlink-file-setup: write target failed: " + err.Error())
+		return
+	}
+	_ = runGitCmd("add", targetFile)
+	_ = runGitCmd("commit", "-m", "add real-file.txt")
+
+	// Create symlink and commit it.
+	linkFile := "link-file.txt"
+	_ = os.Remove(linkFile) // clean up if leftover
+	if err := os.Symlink(targetFile, linkFile); err != nil {
+		e.text("symlink-file-setup: symlink failed: " + err.Error())
+		return
+	}
+	_ = runGitCmd("add", linkFile)
+	_ = runGitCmd("commit", "-m", "add link-file.txt symlink")
+
+	// Modify target file, leaving an uncommitted diff.
+	if err := os.WriteFile(targetFile, []byte("Modified symlink target content!\n"), 0o644); err != nil {
+		e.text("symlink-file-setup: write modified failed: " + err.Error())
+		return
+	}
+
+	fixedDelay(100)
+	e.text("symlink-file-setup complete")
+}
+
+func runGitOutput(wd string, args ...string) ([]byte, error) {
+	cmd := subproc.NewGitCommand(context.Background(), append([]string{"-C", wd}, args...)...)
+	return subproc.RunGitOutputClass(context.Background(), subproc.GitLifecycle, cmd)
+}
+
+// makeGitRunner returns a function that runs git commands in the given directory.
+func makeGitRunner(wd string) func(args ...string) error {
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Mock Agent",
+		"GIT_AUTHOR_EMAIL=mock@test.local",
+		"GIT_COMMITTER_NAME=Mock Agent",
+		"GIT_COMMITTER_EMAIL=mock@test.local",
+	)
+	return func(args ...string) error {
+		for attempt := 0; attempt < 5; attempt++ {
+			cmd := subproc.NewGitCommand(context.Background(), append([]string{
+				"-c", "commit.gpgsign=false",
+				"-c", "tag.gpgsign=false",
+			}, args...)...)
+			cmd.Dir = wd
+			cmd.Env = gitEnv
+			out, cmdErr := subproc.RunGitCombinedOutputClass(context.Background(), subproc.GitLifecycle, cmd)
+			if cmdErr == nil {
+				return nil
+			}
+			if !retryableGitSetupOutput(string(out)) || attempt == 4 {
+				_, _ = fmt.Fprintf(logOutput, "mock-agent: git %v failed: %v\nOutput: %s\n", args, cmdErr, out)
+				return cmdErr
+			}
+			time.Sleep(time.Duration(50*(1<<attempt)) * time.Millisecond)
+		}
+		return fmt.Errorf("git %v failed after retries", args)
+	}
+}
+
+func retryableGitSetupOutput(output string) bool {
+	lower := strings.ToLower(output)
+	for _, marker := range []string{
+		"index.lock",
+		"could not lock",
+		"another git process",
+		"unable to create",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// contextWithTimeout creates a context with timeout in seconds.
+func contextWithTimeout(seconds int) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
+}
+
+// scenarioMarkdownTable: emits a dense label/value markdown table modeled on a
+// real agent bug-report summary. The table has narrow header labels in column 1
+// and long inline-code identifiers in column 2 — the shape that previously
+// caused header words to wrap character-by-character ("Failin g test") because
+// the value column starved the label column.
+func scenarioMarkdownTable(e *emitter) {
+	fixedDelay(100)
+	e.text("Pushed.\n\n" +
+		"## Summary\n\n" +
+		"| | |\n" +
+		"|---|---|\n" +
+		"| **Failing test** | `TestHandleAgentBootReady_DrainsOrphanedQueuedMessage/already_WAITING_FOR_INPUT_(boot_raced_persistResumeState)` |\n" +
+		"| **Symptom** | `session.State = \"RUNNING\", want WAITING_FOR_INPUT` |\n" +
+		"| **Root cause** | Pre-existing race, not introduced by this PR. `handleAgentBootReady` synchronously flips state to `WAITING_FOR_INPUT` then spawns a goroutine that calls `PromptTask` and flips state to `RUNNING`. The test asserted on `WAITING_FOR_INPUT` immediately after the handler returned. On faster CI scheduling the goroutine wins the race. The kandev-ci container apparently schedules tighter than the github-hosted ubuntu, so it loses where the previous env got lucky. |\n" +
+		"| **Fix** | Cherry-picked `b8d06ea8 test(backend): fix race in TestHandleAgentBootReady_DrainsOrphanedQueuedMessage` from `feature/subtask-with-repo-se-vhz` (a parallel branch that already addressed this). The test now accepts either `WAITING_FOR_INPUT` or `RUNNING`. Both prove the boot-ready flip landed and rule out the original `STARTING + queue still full` regression. |\n" +
+		"| **Local verification** | `go test -race -count=5` → 5/5 PASS. |\n")
+}

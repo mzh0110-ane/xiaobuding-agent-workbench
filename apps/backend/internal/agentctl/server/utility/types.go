@@ -1,0 +1,283 @@
+// Package utility provides one-shot prompt execution via inference-capable agents.
+// This is a simplified interface compared to the full session-based adapters,
+// designed for quick tasks like generating commit messages or PR descriptions.
+package utility
+
+import "github.com/kandev/kandev/internal/common/acpprovider"
+import "github.com/kandev/kandev/pkg/agent"
+
+// PromptRequest is the request for executing an inference prompt.
+type PromptRequest struct {
+	// Prompt is the fully resolved prompt text to send to the LLM.
+	Prompt string `json:"prompt" binding:"required"`
+
+	// AgentID is the agent to use (e.g., "claude-code", "amp").
+	AgentID string `json:"agent_id" binding:"required"`
+
+	// Model is the model to use (e.g., "claude-haiku-4-5").
+	Model string `json:"model,omitempty"`
+
+	// Mode is the optional session mode to set before sending the prompt.
+	// If empty, no session/set_mode call is made and the agent default is used.
+	Mode string `json:"mode,omitempty"`
+
+	// Profile-owned launch policy. These values are resolved by the backend
+	// at call start and are never accepted from an external client.
+	AutoApprovePermissions *bool `json:"auto_approve_permissions,omitempty"`
+
+	// InferenceConfig is the agent's inference configuration.
+	// This is passed from the backend which has access to the agent registry.
+	InferenceConfig *InferenceConfigDTO `json:"inference_config,omitempty"`
+
+	// MaxTokens is the maximum tokens for the response (default: 1024).
+	MaxTokens int `json:"max_tokens,omitempty"`
+
+	// MCPServers are the MCP servers to expose to the agent for the duration
+	// of this single inference call. Forwarded to ACP `session/new` so the
+	// agent can call tools mid-prompt. Empty (the common case) keeps the
+	// existing "pure inference, no tools" behaviour for utility-agent
+	// callers that only need text-in/text-out (PR title generation, commit
+	// messages, etc.).
+	MCPServers []MCPServerDTO `json:"mcp_servers,omitempty"`
+}
+
+// MCPServerDTO describes a single MCP server endpoint to wire into the
+// agent's session. Mirrors the ACP McpServer shape but kept JSON-flat so it
+// crosses the agentctl HTTP boundary cleanly. Today we use HTTP transport
+// only (Type="http"); stdio/sse can be added when a caller needs them.
+type MCPServerDTO struct {
+	Name string `json:"name"`
+	Type string `json:"type"`          // "http" | "sse" | "stdio"
+	URL  string `json:"url,omitempty"` // for http/sse
+	// HeaderKVs is an optional set of HTTP headers (key, value pairs).
+	HeaderKVs []HTTPHeaderDTO `json:"headers,omitempty"`
+}
+
+// HTTPHeaderDTO is a single HTTP header for HTTP/SSE-transport MCP servers.
+type HTTPHeaderDTO struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// ProbeRequest is the request for probing an agent's capabilities.
+// It runs initialize + session/new against an ephemeral ACP subprocess and
+// returns the discovered agent info, auth methods, models, and modes without
+// sending any prompt.
+type ProbeRequest struct {
+	// AgentID is the agent to probe (e.g., "claude-acp", "codex-acp").
+	AgentID string `json:"agent_id" binding:"required"`
+
+	// Model optionally asks the probe to apply a model after session/new and
+	// return the provider's resulting configuration options.
+	Model string `json:"model,omitempty"`
+
+	// Mode optionally selects a session mode before the probe returns its
+	// resolved configuration options.
+	Mode string `json:"mode,omitempty"`
+
+	// ConfigOptions optionally applies additional select values before the
+	// probe returns its resolved configuration options.
+	ConfigOptions map[string]string `json:"config_options,omitempty"`
+
+	// Refresh asks agent-specific discovery fallbacks to invalidate their own
+	// model caches. ACP session discovery itself always starts a fresh process.
+	Refresh bool `json:"refresh,omitempty"`
+	// ProfileContext marks probes started from a concrete profile discovery
+	// request. It prevents launch settings and provider diagnostics from entering
+	// command logs or client-visible errors.
+	ProfileContext bool `json:"profile_context,omitempty"`
+
+	// InferenceConfig is the agent's inference configuration.
+	// Command and WorkDir are required; Model is intentionally omitted for probes.
+	InferenceConfig *InferenceConfigDTO `json:"inference_config,omitempty"`
+}
+
+// ProbeResponse is the response from probing an agent.
+type ProbeResponse struct {
+	// Success indicates if the probe completed successfully.
+	Success bool `json:"success"`
+
+	// Error is the error message if the probe failed.
+	Error string `json:"error,omitempty"`
+
+	// FailureCode is a stable classification for failures the backend can
+	// handle without receiving raw subprocess diagnostics.
+	FailureCode ProbeFailureCode `json:"failure_code,omitempty"`
+
+	// DurationMs is the probe duration in milliseconds.
+	DurationMs int `json:"duration_ms,omitempty"`
+
+	// AgentName is the agent name reported in initialize response (if any).
+	AgentName string `json:"agent_name,omitempty"`
+	// AgentVersion is the agent version reported in initialize response (if any).
+	AgentVersion string `json:"agent_version,omitempty"`
+
+	// ProtocolVersion is the negotiated ACP protocol version.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
+
+	// AuthMethods are the authentication methods advertised by the agent.
+	AuthMethods []ProbeAuthMethod `json:"auth_methods,omitempty"`
+
+	// Models are the models the agent advertises from session/new.
+	Models []ProbeModel `json:"models,omitempty"`
+	// CurrentModelID is the default/current model selected by the agent.
+	CurrentModelID string `json:"current_model_id,omitempty"`
+
+	// Modes are the session modes the agent advertises from session/new.
+	Modes []ProbeMode `json:"modes,omitempty"`
+	// CurrentModeID is the default/current mode selected by the agent.
+	CurrentModeID string `json:"current_mode_id,omitempty"`
+
+	// ConfigOptions are select-style session options advertised by session/new.
+	ConfigOptions []ProbeConfigOption `json:"config_options"`
+
+	// Commands are the slash commands the agent advertises via the
+	// `available_commands_update` session notification (drained briefly
+	// after session/new).
+	Commands []ProbeCommand `json:"commands,omitempty"`
+
+	// LoadSession indicates if the agent supports session/load.
+	LoadSession bool `json:"load_session,omitempty"`
+	// PromptCapabilities reports which content block types the agent accepts.
+	PromptCapabilities ProbePromptCapabilities `json:"prompt_capabilities,omitempty"`
+}
+
+// ProbeFailureCode identifies a bounded, machine-actionable probe failure.
+type ProbeFailureCode string
+
+const (
+	// ProbeFailureManagedRuntimeNPMResolution means the trusted top-level npm
+	// package failed exact-version resolution with ETARGET.
+	ProbeFailureManagedRuntimeNPMResolution ProbeFailureCode = "managed_runtime_npm_resolution"
+	// ProbeFailureManagedRuntimeNPMPolicy means npm rejected the trusted exact
+	// package version under a date-qualified release policy.
+	ProbeFailureManagedRuntimeNPMPolicy ProbeFailureCode = "managed_runtime_npm_policy"
+	// ProbeFailureUnsupportedContext means the selected inference protocol
+	// cannot honor the profile's command prefix or CLI flags.
+	ProbeFailureUnsupportedContext ProbeFailureCode = "unsupported_profile_context"
+	// ProbeFailureAuthenticationRequired is a sanitized authentication failure.
+	ProbeFailureAuthenticationRequired ProbeFailureCode = "authentication_required"
+)
+
+// ProbeAuthMethod is a single advertised authentication method.
+type ProbeAuthMethod struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+// ProbeModel is a single advertised model. Meta carries agent-specific
+// extras from ACP's `_meta` field — e.g. GitHub Copilot exposes
+// `copilotUsage` ("1x", "0.33x", "0x") and `copilotEnablement` here.
+type ProbeModel struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+// ProbeMode is a single advertised session mode.
+type ProbeMode struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+}
+
+type ProbeConfigOption struct {
+	Type         string                    `json:"type"`
+	ID           string                    `json:"id"`
+	Name         string                    `json:"name"`
+	Description  string                    `json:"description,omitempty"`
+	CurrentValue string                    `json:"current_value"`
+	Category     string                    `json:"category,omitempty"`
+	Options      []ProbeConfigOptionChoice `json:"options,omitempty"`
+}
+
+type ProbeConfigOptionChoice struct {
+	Value       string `json:"value"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// ProbeCommand is a single slash command advertised by the agent via the
+// ACP `available_commands_update` session notification.
+type ProbeCommand struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// ProbePromptCapabilities reports the agent's prompt input capabilities.
+type ProbePromptCapabilities struct {
+	Image           bool `json:"image,omitempty"`
+	Audio           bool `json:"audio,omitempty"`
+	EmbeddedContext bool `json:"embedded_context,omitempty"`
+}
+
+// InferenceConfigDTO is the inference configuration passed from backend to agentctl.
+type InferenceConfigDTO struct {
+	// Protocol selects the one-shot inference transport. Empty means ACP.
+	Protocol agent.Protocol `json:"protocol,omitempty"`
+	// Command is the protocol command for one-shot inference.
+	// e.g., ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+	Command []string `json:"command"`
+	// ModelFlag is the flag template for specifying the model.
+	ModelFlag []string `json:"model_flag,omitempty"`
+	// WorkDir is the working directory for the agent process.
+	WorkDir string `json:"work_dir"`
+	// Env lists agent runtime environment overrides for the inference subprocess.
+	Env map[string]string `json:"env,omitempty"`
+	// StripEnv lists environment variables to strip from the inference
+	// subprocess environment entirely (not just set to empty).
+	StripEnv      []string `json:"strip_env,omitempty"`
+	CLIFlags      []string `json:"cli_flags,omitempty"`
+	CommandPrefix []string `json:"command_prefix,omitempty"`
+	// ProviderGatewayAuth, when set, makes the probe/inference subprocess
+	// authenticate against a Kandev-configured OpenAI-compatible provider
+	// (base URL + bearer key) right after the ACP initialize handshake, the
+	// same mechanism the live session adapter uses.
+	ProviderGatewayAuth *acpprovider.GatewayAuth `json:"provider_gateway_auth,omitempty"`
+	// OperatorDefined marks a command that came from a custom agent the
+	// install operator registered in Settings rather than from an agent
+	// definition compiled into the binary. Such a command cannot appear in
+	// the probe allow-list, because it does not exist until the operator
+	// types it. See resolveSpawnCommand.
+	OperatorDefined bool `json:"operator_defined,omitempty"`
+}
+
+// PromptResponse is the response from executing a utility prompt.
+type PromptResponse struct {
+	// Success indicates if the prompt completed successfully.
+	Success bool `json:"success"`
+
+	// Response is the generated text.
+	Response string `json:"response,omitempty"`
+
+	// Model is the model that was used.
+	Model string `json:"model,omitempty"`
+
+	// PromptTokens is the number of input tokens.
+	PromptTokens int `json:"prompt_tokens,omitempty"`
+
+	// ResponseTokens is the number of output tokens.
+	ResponseTokens int `json:"response_tokens,omitempty"`
+
+	// DurationMs is the execution duration in milliseconds.
+	DurationMs int `json:"duration_ms,omitempty"`
+
+	// Error is the error message if the prompt failed.
+	Error string `json:"error,omitempty"`
+}
+
+// ModelInfo represents an available model.
+type ModelInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// ModelsResponse is the response for listing available models.
+type ModelsResponse struct {
+	Models []ModelInfo `json:"models"`
+}

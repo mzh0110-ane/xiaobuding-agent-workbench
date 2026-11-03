@@ -1,0 +1,950 @@
+package hostutility
+
+import (
+	"container/list"
+	"context"
+	cryptorand "crypto/rand"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/kandev/kandev/internal/agent/agents"
+	"github.com/kandev/kandev/internal/agent/managedruntime"
+	"github.com/kandev/kandev/internal/agent/registry"
+	agentctlclient "github.com/kandev/kandev/internal/agent/runtime/agentctl"
+	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
+	agentctlutil "github.com/kandev/kandev/internal/agentctl/server/utility"
+	"github.com/kandev/kandev/internal/common/acpprovider"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/system/storage"
+	"github.com/kandev/kandev/internal/system/storage/tempartifacts"
+	"github.com/kandev/kandev/pkg/agent"
+)
+
+// Manager owns the per-agent-type warm agentctl instances used for boot probes,
+// capability refresh, and sessionless utility execution.
+//
+// Lifecycle:
+//   - Start(ctx): creates a process-scoped tmp parent dir, iterates enabled
+//     ACP-capable inference agents, and for each creates an agentctl instance
+//     (tmp subdir, no agent subprocess) and runs ProbeAgent in parallel.
+//   - ExecutePrompt / RawPrompt: picks the instance for the agent type and runs
+//     an ephemeral ACP session (same path as task-scoped utility calls).
+//   - RefreshAgent: re-runs the probe against the existing instance.
+//   - Stop(ctx): deletes each instance from agentctl and removes the tmp parent.
+type Manager struct {
+	registry        *registry.Registry
+	controlHost     string
+	controlPort     int
+	controlClient   *agentctlclient.ControlClient
+	authToken       string // per-launch auth token for instance clients
+	log             *logger.Logger
+	profileResolver interface {
+		Resolve(context.Context, string) (*settingsmodels.AgentProfile, error)
+	}
+	providerGatewayAuthResolver ProviderGatewayAuthResolver
+
+	parentTmpDir  string
+	tempArtifacts *tempartifacts.Registry
+	tempLease     *tempartifacts.Lease
+	cache         *cache
+	modelCache    *modelConfigCache
+	profileCache  *profileCapabilityCache
+	profileKey    []byte
+
+	mu                            sync.RWMutex
+	instances                     map[string]*instance // keyed by agent type
+	createGroup                   singleflight.Group
+	modelGroup                    singleflight.Group
+	modelGenerationMu             sync.Mutex
+	modelGenerations              map[string]uint64
+	profileGenerations            map[string]uint64
+	profileContextGenerations     map[string]uint64
+	profileContextGenerationNodes map[string]*list.Element
+	profileContextGenerationOrder *list.List
+	nextProfileContextGeneration  uint64
+	profileGroup                  singleflight.Group
+	managedRuntimeSelections      managedruntime.SelectionReader
+	startCancel                   context.CancelFunc
+	stopped                       bool
+}
+
+// ProviderGatewayAuthResolver resolves provider authentication for a saved
+// profile. The lifecycle manager owns profile and secret resolution; the host
+// utility only forwards the resulting ACP data to agentctl.
+type ProviderGatewayAuthResolver func(
+	context.Context,
+	string,
+	string,
+) (*acpprovider.GatewayAuth, string, string, error)
+
+// SetProfileResolver wires the profile eligibility and launch-policy reader.
+func (m *Manager) SetProfileResolver(resolver interface {
+	Resolve(context.Context, string) (*settingsmodels.AgentProfile, error)
+}) {
+	m.profileResolver = resolver
+}
+
+// SetProviderGatewayAuthResolver wires the lifecycle-owned provider resolver.
+func (m *Manager) SetProviderGatewayAuthResolver(resolver ProviderGatewayAuthResolver) {
+	m.providerGatewayAuthResolver = resolver
+}
+
+// instance is a single warm agentctl instance bound to an agent type.
+type instance struct {
+	agentType         string
+	instanceID        string
+	workDir           string
+	client            *agentctlclient.Client
+	operationGateOnce sync.Once
+	operationGate     *semaphore.Weighted
+}
+
+// Shared probes and prompts each take one slot. Repair takes every slot so it
+// cannot remove an npm execution tree while another utility process uses it.
+const hostUtilityOperationCapacity int64 = 1 << 20
+
+func (i *instance) acquireOperation(ctx context.Context, exclusive bool) (func(), error) {
+	i.operationGateOnce.Do(func() {
+		i.operationGate = semaphore.NewWeighted(hostUtilityOperationCapacity)
+	})
+	weight := int64(1)
+	if exclusive {
+		weight = hostUtilityOperationCapacity
+	}
+	if err := i.operationGate.Acquire(ctx, weight); err != nil {
+		return nil, err
+	}
+	return func() { i.operationGate.Release(weight) }, nil
+}
+
+// NewManager constructs a HostUtilityManager.
+func NewManager(
+	reg *registry.Registry,
+	controlHost string,
+	controlPort int,
+	controlClient *agentctlclient.ControlClient,
+	log *logger.Logger,
+) *Manager {
+	profileKey := make([]byte, 32)
+	if _, err := cryptorand.Read(profileKey); err != nil {
+		panic("host utility profile cache key initialization failed")
+	}
+	return &Manager{
+		registry:                      reg,
+		controlHost:                   controlHost,
+		controlPort:                   controlPort,
+		controlClient:                 controlClient,
+		log:                           log.WithFields(zap.String("component", "host-utility")),
+		cache:                         newCache(),
+		modelCache:                    newModelConfigCache(),
+		profileCache:                  newProfileCapabilityCache(),
+		profileKey:                    profileKey,
+		instances:                     make(map[string]*instance),
+		modelGenerations:              make(map[string]uint64),
+		profileGenerations:            make(map[string]uint64),
+		profileContextGenerations:     make(map[string]uint64),
+		profileContextGenerationNodes: make(map[string]*list.Element),
+		profileContextGenerationOrder: list.New(),
+	}
+}
+
+// SetAuthToken sets the per-launch auth token for authenticating instance clients.
+func (m *Manager) SetAuthToken(token string) {
+	m.authToken = token
+}
+
+// SetManagedRuntimeSelectionStore wires the install-wide exact-version
+// resolver used by every host-local managed-runtime command path.
+func (m *Manager) SetManagedRuntimeSelectionStore(store managedruntime.SelectionReader) {
+	m.managedRuntimeSelections = store
+}
+
+func (m *Manager) SetTemporaryArtifactRegistry(registry *tempartifacts.Registry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tempArtifacts = registry
+}
+
+// Start boots one warm instance per ACP-capable inference agent and runs an
+// initial probe against each in parallel. Individual agent failures are
+// captured in the cache but do not abort the other agents.
+func (m *Manager) Start(ctx context.Context) error {
+	startCtx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		cancel()
+		return nil
+	}
+	m.startCancel = cancel
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.startCancel = nil
+		m.mu.Unlock()
+		cancel()
+	}()
+
+	// Create a process-scoped parent dir so concurrent kandev processes do not
+	// share state, and so Stop only removes dirs owned by this process.
+	parent, err := os.MkdirTemp("", fmt.Sprintf("kandev-host-utility-%d-*", os.Getpid()))
+	if err != nil {
+		return fmt.Errorf("create host utility tmp dir: %w", err)
+	}
+	m.mu.RLock()
+	artifactRegistry := m.tempArtifacts
+	m.mu.RUnlock()
+	var tempLease *tempartifacts.Lease
+	if artifactRegistry != nil {
+		tempLease, err = artifactRegistry.RegisterExisting(
+			ctx, storage.TemporaryArtifactKindHostUtility, parent, nil,
+		)
+		if err != nil {
+			_ = os.RemoveAll(parent)
+			return fmt.Errorf("register host utility tmp dir: %w", err)
+		}
+	}
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		if tempLease != nil {
+			_ = tempLease.Remove(context.Background())
+		} else if err := os.RemoveAll(parent); err != nil {
+			m.log.Warn("failed to remove unused host utility parent tmp dir",
+				zap.String("path", parent), zap.Error(err))
+		}
+		return nil
+	}
+	m.parentTmpDir = parent
+	m.tempLease = tempLease
+	m.mu.Unlock()
+	m.log.Info("host utility parent tmp dir created", zap.String("path", parent))
+
+	targets := m.eligibleAgents()
+	if len(targets) == 0 {
+		m.log.Info("no ACP-capable inference agents enabled; host utility idle")
+		return nil
+	}
+
+	g, gctx := errgroup.WithContext(startCtx)
+	g.SetLimit(maxConcurrentBootstraps)
+	for _, ag := range targets {
+		ag := ag
+		g.Go(func() error {
+			m.bootstrapAgent(gctx, ag)
+			return nil // Never fail the group; per-agent failures land in cache.
+		})
+	}
+	_ = g.Wait()
+	return nil
+}
+
+// Stop deletes all warm instances and removes the process-scoped tmp parent.
+// Only dirs owned by this process are removed; other kandev processes' dirs
+// are untouched.
+func (m *Manager) Stop(ctx context.Context) {
+	if m.modelCache != nil {
+		m.modelCache.clear()
+	}
+	if m.profileCache != nil {
+		m.profileCache.clear()
+	}
+	m.mu.Lock()
+	m.stopped = true
+	cancel := m.startCancel
+	m.startCancel = nil
+	instances := make([]*instance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		instances = append(instances, inst)
+	}
+	m.instances = make(map[string]*instance)
+	parentTmpDir := m.parentTmpDir
+	m.parentTmpDir = ""
+	tempLease := m.tempLease
+	m.tempLease = nil
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	for _, inst := range instances {
+		deleteCtx, cancel := hostUtilityDeleteContext(ctx)
+		m.deleteInstance(deleteCtx, inst)
+		cancel()
+	}
+
+	if tempLease != nil {
+		if err := tempLease.Remove(ctx); err != nil {
+			m.log.Warn("failed to remove host utility parent tmp dir", zap.String("path", parentTmpDir), zap.Error(err))
+		}
+	} else if parentTmpDir != "" {
+		if err := os.RemoveAll(parentTmpDir); err != nil {
+			m.log.Warn("failed to remove host utility parent tmp dir",
+				zap.String("path", parentTmpDir), zap.Error(err))
+		}
+	}
+}
+
+const hostUtilityDeleteTimeout = 2 * time.Second
+
+func hostUtilityDeleteContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), hostUtilityDeleteTimeout)
+}
+
+func (m *Manager) deleteInstance(ctx context.Context, inst *instance) {
+	if inst == nil {
+		return
+	}
+	if m.controlClient != nil {
+		if err := m.controlClient.DeleteInstance(ctx, inst.instanceID); err != nil {
+			m.log.Warn("failed to delete host utility instance",
+				zap.String("agent_type", inst.agentType),
+				zap.String("instance_id", inst.instanceID),
+				zap.Error(err))
+		}
+	}
+	if inst.workDir == "" {
+		return
+	}
+	if err := os.RemoveAll(inst.workDir); err != nil {
+		m.log.Warn("failed to remove host utility work dir",
+			zap.String("agent_type", inst.agentType),
+			zap.String("path", inst.workDir),
+			zap.Error(err))
+	}
+}
+
+// eligibleAgents returns enabled agents that implement supported inference
+// transports.
+func (m *Manager) eligibleAgents() []agents.InferenceAgent {
+	all := m.registry.ListInferenceAgents()
+	out := make([]agents.InferenceAgent, 0, len(all))
+	for _, ia := range all {
+		ag, ok := ia.(agents.Agent)
+		if !ok || !ag.Enabled() {
+			continue
+		}
+		rt := ag.Runtime()
+		if rt == nil || (rt.Protocol != agent.ProtocolACP && rt.Protocol != agent.ProtocolCodexAppServer) {
+			continue
+		}
+		out = append(out, ia)
+	}
+	return out
+}
+
+// bootstrapAgent creates a warm instance for one agent type and runs the
+// initial probe. Failures are recorded in the cache with the appropriate
+// status so the UI can surface them.
+func (m *Manager) bootstrapAgent(ctx context.Context, ia agents.InferenceAgent) {
+	ag := ia.(agents.Agent)
+	agentType := ag.ID()
+	log := m.log.WithFields(zap.String("agent_type", agentType))
+
+	// Publish "probing" synchronously so the UI can distinguish "not started"
+	// (cache miss) from "in flight".
+	m.cache.set(AgentCapabilities{
+		AgentType:     agentType,
+		Status:        StatusProbing,
+		LastCheckedAt: time.Now(),
+	})
+
+	cfg := inferenceConfigForHostUtility(ia)
+	if cfg == nil || !cfg.Supported {
+		m.cache.set(AgentCapabilities{
+			AgentType:     agentType,
+			Status:        StatusNotConfigured,
+			Error:         "inference config not available",
+			LastCheckedAt: time.Now(),
+		})
+		return
+	}
+
+	// Pre-check installation so we can skip expensive probes.
+	if disc, err := ag.IsInstalled(ctx); err != nil || disc == nil || !disc.Available {
+		msg := "agent not installed"
+		if err != nil {
+			msg = err.Error()
+		}
+		log.Info("skipping host utility bootstrap: agent not installed")
+		m.cache.set(AgentCapabilities{
+			AgentType:     agentType,
+			Status:        StatusNotInstalled,
+			Error:         msg,
+			LastCheckedAt: time.Now(),
+		})
+		return
+	}
+
+	inst, err := m.createInstance(ctx, agentType)
+	if err != nil {
+		log.Warn("failed to create host utility instance", zap.Error(err))
+		m.cache.set(AgentCapabilities{
+			AgentType:     agentType,
+			Status:        StatusFailed,
+			Error:         err.Error(),
+			LastCheckedAt: time.Now(),
+		})
+		return
+	}
+
+	if ctx.Err() != nil {
+		deleteCtx, cancel := hostUtilityDeleteContext(ctx)
+		m.deleteInstance(deleteCtx, inst)
+		cancel()
+		return
+	}
+
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		deleteCtx, cancel := hostUtilityDeleteContext(ctx)
+		m.deleteInstance(deleteCtx, inst)
+		cancel()
+		return
+	}
+	m.instances[agentType] = inst
+	m.mu.Unlock()
+
+	caps := m.probe(ctx, inst, ia, false)
+	m.cache.set(caps)
+	log.Info("host utility bootstrap completed",
+		zap.String("status", string(caps.Status)),
+		zap.Int("models", len(caps.Models)),
+		zap.Int("modes", len(caps.Modes)))
+}
+
+// safeAgentTypeName validates that the string is safe for use as a single
+// filesystem path segment: only letters, digits, dash, and underscore. The
+// ACP agent IDs registered in the agent registry always satisfy this (they
+// are hardcoded Go identifiers), but we enforce it explicitly so CodeQL's
+// taint analysis can see that the value cannot escape the parent tmp dir.
+var safeAgentTypeName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// createInstance asks the control client to create a new workspace-only
+// agentctl instance in a tmp subdirectory dedicated to this agent type.
+func (m *Manager) createInstance(ctx context.Context, agentType string) (*instance, error) {
+	if !safeAgentTypeName.MatchString(agentType) {
+		return nil, fmt.Errorf("invalid agent type %q: must match %s", agentType, safeAgentTypeName.String())
+	}
+	m.mu.RLock()
+	parentTmpDir := m.parentTmpDir
+	stopped := m.stopped
+	m.mu.RUnlock()
+	if stopped {
+		return nil, errManagerStopped
+	}
+	if parentTmpDir == "" {
+		return nil, errors.New("host utility manager not started")
+	}
+	workDir := filepath.Join(parentTmpDir, agentType)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", workDir, err)
+	}
+
+	req := &agentctlclient.CreateInstanceRequest{
+		WorkspacePath: workDir,
+		AgentType:     agentType,
+		// No AgentCommand / Protocol / AutoStart: the instance is workspace-only
+		// and never runs a persistent agent subprocess. Probe/Prompt calls
+		// spawn their own ephemeral ACP subprocesses via InferencePrompt/Probe.
+	}
+	resp, err := m.controlClient.CreateInstance(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("create instance: %w", err)
+	}
+
+	client := agentctlclient.NewClient(m.controlHost, resp.Port, m.log,
+		agentctlclient.WithExecutionID(resp.ID),
+		agentctlclient.WithAuthToken(m.authToken))
+
+	// Wait a moment for the instance HTTP server to come up.
+	healthCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := waitForClientHealthy(healthCtx, client); err != nil {
+		deleteCtx, deleteCancel := hostUtilityDeleteContext(ctx)
+		m.deleteInstance(deleteCtx, &instance{
+			agentType:  agentType,
+			instanceID: resp.ID,
+			workDir:    workDir,
+			client:     client,
+		})
+		deleteCancel()
+		return nil, fmt.Errorf("instance %s not healthy: %w", resp.ID, err)
+	}
+
+	return &instance{
+		agentType:  agentType,
+		instanceID: resp.ID,
+		workDir:    workDir,
+		client:     client,
+	}, nil
+}
+
+func waitForClientHealthy(ctx context.Context, c *agentctlclient.Client) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		if err := c.Health(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return lastErr
+			}
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// errAgentNotInstalled is returned from getInstance when the agent CLI is not
+// installed on the host. The Refresh path uses it to classify Status
+// accurately instead of lumping every error into StatusFailed.
+var errAgentNotInstalled = errors.New("agent not installed")
+var errManagerStopped = errors.New("host utility manager stopped")
+
+// getInstance returns the warm instance for the agent type, lazily recreating
+// it if missing (e.g. after a previous failure or crash).
+func (m *Manager) getInstance(ctx context.Context, agentType string) (*instance, agents.InferenceAgent, error) {
+	ia, ok := m.registry.GetInferenceAgent(agentType)
+	if !ok {
+		return nil, nil, fmt.Errorf("agent %q not found or not inference-capable", agentType)
+	}
+	ag, ok := ia.(agents.Agent)
+	if !ok || !ag.Enabled() {
+		return nil, nil, fmt.Errorf("agent %q is not a full agent type", agentType)
+	}
+	if rt := ag.Runtime(); rt == nil || (rt.Protocol != agent.ProtocolACP && rt.Protocol != agent.ProtocolCodexAppServer) {
+		return nil, nil, fmt.Errorf("agent %q is not ACP-capable", agentType)
+	}
+
+	m.mu.RLock()
+	if m.stopped {
+		m.mu.RUnlock()
+		return nil, nil, errManagerStopped
+	}
+	inst := m.instances[agentType]
+	parentTmpDir := m.parentTmpDir
+	m.mu.RUnlock()
+	if inst != nil {
+		if err := m.staleInstanceCause(ctx, inst); err == nil {
+			return inst, ia, nil
+		} else if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+	}
+
+	if parentTmpDir == "" {
+		return nil, nil, errors.New("host utility manager not started")
+	}
+
+	// Serialize instance creation per agent type via singleflight so two
+	// concurrent callers don't both spawn a process and then race to cache
+	// the result.
+	v, err, _ := m.createGroup.Do(agentType, func() (interface{}, error) {
+		// Double-check inside the singleflight window.
+		m.mu.RLock()
+		existing := m.instances[agentType]
+		m.mu.RUnlock()
+		if existing != nil {
+			if err := m.staleInstanceCause(ctx, existing); err == nil {
+				return existing, nil
+			} else if ctx.Err() != nil {
+				return nil, ctx.Err()
+			} else {
+				m.dropStaleInstance(ctx, agentType, existing, err)
+			}
+		}
+		// Pre-check installation so Refresh surfaces `not_installed`
+		// instead of collapsing it into `failed` via createInstance errors.
+		if disc, derr := ag.IsInstalled(ctx); derr != nil || disc == nil || !disc.Available {
+			return nil, errAgentNotInstalled
+		}
+		created, cerr := m.createInstance(ctx, agentType)
+		if cerr != nil {
+			return nil, cerr
+		}
+		m.mu.Lock()
+		if m.stopped {
+			m.mu.Unlock()
+			deleteCtx, cancel := hostUtilityDeleteContext(ctx)
+			m.deleteInstance(deleteCtx, created)
+			cancel()
+			return nil, errManagerStopped
+		}
+		m.instances[agentType] = created
+		m.mu.Unlock()
+		return created, nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return v.(*instance), ia, nil
+}
+
+const instanceHealthCheckTimeout = 500 * time.Millisecond
+
+func (m *Manager) staleInstanceCause(ctx context.Context, inst *instance) error {
+	if inst == nil || inst.client == nil {
+		return errors.New("host utility instance client missing")
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, instanceHealthCheckTimeout)
+	defer cancel()
+	err := inst.client.Health(healthCtx)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+func (m *Manager) dropStaleInstance(ctx context.Context, agentType string, inst *instance, cause error) {
+	m.log.Warn("host utility instance unhealthy; recreating",
+		zap.String("agent_type", agentType),
+		zap.String("instance_id", inst.instanceID),
+		zap.Error(cause))
+	deleteCtx, cancel := hostUtilityDeleteContext(ctx)
+	m.deleteInstance(deleteCtx, inst)
+	cancel()
+
+	m.mu.Lock()
+	if current := m.instances[agentType]; current == inst {
+		delete(m.instances, agentType)
+	}
+	m.mu.Unlock()
+}
+
+// probeTimeout caps each ACP probe so an agent that hangs (e.g. one that
+// blocks waiting for interactive auth) doesn't keep its UI badge stuck on
+// "Probing". 60s is generous enough for cold npm fetches and ACP handshake,
+// short enough that the user sees a definitive Error/AuthRequired status
+// quickly. Without this bound the only ceiling is the 5-minute HTTP client
+// timeout on the agentctl call.
+const probeTimeout = 60 * time.Second
+
+// maxConcurrentBootstraps caps how many agents are warmed and probed at once at
+// boot. Unbounded, every ACP-capable agent starts together, and each spawns its
+// runtime through `npx -y <package>`, which installs the package when missing.
+// On a cold npm cache they starve each other: measured on Windows with five
+// installed agents, every probe hit the 60s probeTimeout and none succeeded,
+// while the same five capped at two produced two usable results.
+//
+// With a warm cache the cap makes no measurable difference, so this is not a
+// speed-up — it stops a cold sweep from failing wholesale and leaving the
+// capability cache empty for every agent.
+const maxConcurrentBootstraps = 2
+
+// probe runs an ACP probe against the given instance and translates the result
+// into an AgentCapabilities record suitable for the cache.
+func (m *Manager) probe(ctx context.Context, inst *instance, ia agents.InferenceAgent, refresh bool) AgentCapabilities {
+	return m.probeWithCommand(ctx, inst, ia, refresh, agents.Command{})
+}
+
+func (m *Manager) probeWithCommand(
+	ctx context.Context,
+	inst *instance,
+	ia agents.InferenceAgent,
+	refresh bool,
+	command agents.Command,
+) AgentCapabilities {
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	resolvedCommand, err := m.resolveInferenceCommand(probeCtx, inst.agentType, ia, command)
+	if err != nil {
+		return probeFailureCapabilities(inst.agentType, StatusFailed, err.Error(), 0, time.Now())
+	}
+
+	req := buildProbeRequest(inst, ia, refresh, resolvedCommand)
+	resp, err := m.probeManagedRuntime(probeCtx, inst, ia, resolvedCommand, req)
+	if err != nil {
+		return probeFailureCapabilities(inst.agentType, StatusFailed, err.Error(), 0, time.Now())
+	}
+	return capabilitiesFromProbe(inst.agentType, resp, time.Now())
+}
+
+func (m *Manager) probeManagedRuntime(
+	ctx context.Context,
+	inst *instance,
+	ia agents.InferenceAgent,
+	command agents.Command,
+	req *agentctlutil.ProbeRequest,
+) (*agentctlutil.ProbeResponse, error) {
+	release, err := inst.acquireOperation(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := inst.client.Probe(ctx, req)
+	release()
+	if err != nil || resp.Success || resp.FailureCode != agentctlutil.ProbeFailureManagedRuntimeNPMResolution {
+		return resp, err
+	}
+
+	release, err = inst.acquireOperation(ctx, true)
+	if err != nil {
+		return resp, nil
+	}
+	defer release()
+	return m.recoverManagedRuntimeProbe(ctx, inst, ia, command, req, resp), nil
+}
+
+func (m *Manager) recoverManagedRuntimeProbe(
+	ctx context.Context,
+	inst *instance,
+	ia agents.InferenceAgent,
+	failedCommand agents.Command,
+	failedRequest *agentctlutil.ProbeRequest,
+	initial *agentctlutil.ProbeResponse,
+) *agentctlutil.ProbeResponse {
+	if ctx.Err() != nil {
+		return initial
+	}
+	managed, ok := ia.(agents.ManagedNPMRuntimeAgent)
+	if !ok {
+		return initial
+	}
+	spec := managed.ManagedNPMRuntime()
+	retryCommand, _, ok := managedRuntimeProbeRetry(failedCommand, spec)
+	if !ok {
+		return initial
+	}
+	m.log.Info("recovering managed runtime host capability probe",
+		zap.String("agent_type", inst.agentType),
+		zap.String("recovery_scope", "host_capability_probe"),
+		zap.Int("attempt", 1))
+	response, err := inst.client.Probe(ctx, cloneProbeRequestWithCommand(failedRequest, retryCommand))
+	if err != nil {
+		m.log.Warn("managed runtime host capability probe retry failed",
+			zap.String("agent_type", inst.agentType),
+			zap.String("recovery_scope", "host_capability_probe"),
+			zap.String("outcome", "failed"),
+			zap.Error(err))
+		return &agentctlutil.ProbeResponse{Success: false, Error: err.Error()}
+	}
+	m.log.Info("managed runtime host capability probe retry completed",
+		zap.String("agent_type", inst.agentType),
+		zap.String("recovery_scope", "host_capability_probe"),
+		zap.String("outcome", string(capabilityStatus(response))))
+	return response
+}
+
+func cloneProbeRequestWithCommand(
+	request *agentctlutil.ProbeRequest,
+	command agents.Command,
+) *agentctlutil.ProbeRequest {
+	retry := *request
+	config := *request.InferenceConfig
+	config.Command = command.Args()
+	retry.InferenceConfig = &config
+	return &retry
+}
+
+func capabilityStatus(response *agentctlutil.ProbeResponse) Status {
+	if response != nil && response.Success {
+		return StatusOK
+	}
+	if response != nil && response.FailureCode == agentctlutil.ProbeFailureUnsupportedContext {
+		return StatusUnsupported
+	}
+	return StatusFailed
+}
+
+func managedRuntimeProbeRetry(
+	command agents.Command,
+	spec agents.ManagedNPMRuntimeSpec,
+) (agents.Command, string, bool) {
+	args := command.Args()
+	if len(args) < 6 || args[0] != "npx" || args[1] != "--yes" || args[2] != "--prefer-offline" ||
+		args[3] != "--prefix" || args[4] != managedruntime.NPMProjectPrefix {
+		return agents.Command{}, "", false
+	}
+	packageSpec := args[5]
+	if err := managedruntime.ValidateExactPackageSpec(packageSpec); err != nil {
+		return agents.Command{}, "", false
+	}
+	prefix := spec.Package + "@"
+	if !strings.HasPrefix(packageSpec, prefix) {
+		return agents.Command{}, "", false
+	}
+	version := strings.TrimPrefix(packageSpec, prefix)
+	want := spec.ACPCommandWithNpmPreference(version, false).Args()
+	if !slices.Equal(args, want) {
+		return agents.Command{}, "", false
+	}
+	return spec.ACPCommandWithNpmPreference(version, true), packageSpec, true
+}
+
+func capabilitiesFromProbe(agentType string, resp *agentctlutil.ProbeResponse, now time.Time) AgentCapabilities {
+	if !resp.Success {
+		status := StatusFailed
+		if resp.FailureCode == agentctlutil.ProbeFailureUnsupportedContext {
+			status = StatusUnsupported
+		} else if resp.FailureCode == agentctlutil.ProbeFailureAuthenticationRequired || isAuthError(resp.Error) {
+			status = StatusAuthRequired
+		}
+		return probeFailureCapabilities(agentType, status, resp.Error, resp.DurationMs, now)
+	}
+	caps := AgentCapabilities{
+		AgentType:       agentType,
+		AgentName:       resp.AgentName,
+		AgentVersion:    resp.AgentVersion,
+		Status:          StatusOK,
+		ProtocolVersion: resp.ProtocolVersion,
+		LoadSession:     resp.LoadSession,
+		PromptCapabilities: PromptCapabilities{
+			Image:           resp.PromptCapabilities.Image,
+			Audio:           resp.PromptCapabilities.Audio,
+			EmbeddedContext: resp.PromptCapabilities.EmbeddedContext,
+		},
+		CurrentModelID: resp.CurrentModelID,
+		CurrentModeID:  resp.CurrentModeID,
+		DurationMs:     resp.DurationMs,
+		LastCheckedAt:  now,
+	}
+	for _, m := range resp.AuthMethods {
+		caps.AuthMethods = append(caps.AuthMethods, AuthMethod{
+			ID: m.ID, Name: m.Name, Description: m.Description, Meta: m.Meta,
+		})
+	}
+	for _, m := range resp.Models {
+		caps.Models = append(caps.Models, Model{
+			ID: m.ID, Name: m.Name, Description: m.Description, Meta: m.Meta,
+		})
+	}
+	for _, m := range resp.Modes {
+		caps.Modes = append(caps.Modes, Mode{
+			ID: m.ID, Name: m.Name, Description: m.Description, Meta: m.Meta,
+		})
+	}
+	caps.ConfigOptions = configOptionsFromProbe(resp.ConfigOptions)
+	for _, c := range resp.Commands {
+		caps.Commands = append(caps.Commands, Command{Name: c.Name, Description: c.Description})
+	}
+	return caps
+}
+
+// resolveInferenceCommand selects the trusted exact host version for ordinary
+// probes and prompts. A non-empty override is reserved for candidate probes.
+func (m *Manager) resolveInferenceCommand(
+	ctx context.Context,
+	agentType string,
+	ia agents.InferenceAgent,
+	override agents.Command,
+) (agents.Command, error) {
+	if !override.IsEmpty() {
+		return override, nil
+	}
+	cfg := inferenceConfigForHostUtility(ia)
+	if cfg == nil || !cfg.Supported {
+		return agents.Command{}, errors.New("inference config not available")
+	}
+	command := cfg.Command
+	ag, ok := ia.(agents.Agent)
+	if !ok || m.managedRuntimeSelections == nil {
+		return command, nil
+	}
+	managed, ok := ag.(agents.ManagedNPMRuntimeAgent)
+	if !ok {
+		return command, nil
+	}
+	spec := managed.ManagedNPMRuntime()
+	if spec.NativeBinaryOnPath() {
+		return spec.NativeCommand(), nil
+	}
+	selection, found, err := m.managedRuntimeSelections.Get(ctx, agentType, spec.Package)
+	if err != nil {
+		return agents.Command{}, fmt.Errorf("resolve active managed runtime version for %s: %w", agentType, err)
+	}
+	version := spec.DefaultVersion
+	if found && selection.Package == spec.Package {
+		version = selection.Version
+	}
+	if cfg.Protocol == agent.ProtocolCodexAppServer {
+		return spec.RuntimeCommand(version), nil
+	}
+	return spec.ACPCommand(version), nil
+}
+
+const modelConfigResolveTimeout = 60 * time.Second
+
+func buildProbeRequest(
+	inst *instance,
+	ia agents.InferenceAgent,
+	refresh bool,
+	command agents.Command,
+) *agentctlutil.ProbeRequest {
+	cfg := inferenceConfigForHostUtility(ia)
+	probeCommand := cfg.Command
+	if !command.IsEmpty() {
+		probeCommand = command
+	}
+	return &agentctlutil.ProbeRequest{
+		AgentID: inst.agentType,
+		Refresh: refresh,
+		InferenceConfig: &agentctlutil.InferenceConfigDTO{
+			Protocol:        cfg.Protocol,
+			Command:         probeCommand.Args(),
+			ModelFlag:       cfg.ModelFlag.Args(),
+			WorkDir:         inst.workDir,
+			Env:             agents.RuntimeEnvFor(ia),
+			StripEnv:        agents.StripEnvFor(ia),
+			OperatorDefined: cfg.OperatorDefined,
+		},
+	}
+}
+
+func inferenceConfigForHostUtility(ia agents.InferenceAgent) *agents.InferenceConfig {
+	if hostAgent, ok := ia.(agents.HostUtilityInferenceAgent); ok {
+		return hostAgent.HostUtilityInferenceConfig()
+	}
+	return ia.InferenceConfig()
+}
+
+func probeFailureCapabilities(
+	agentType string,
+	status Status,
+	errorMessage string,
+	durationMs int,
+	checkedAt time.Time,
+) AgentCapabilities {
+	return AgentCapabilities{
+		AgentType:     agentType,
+		Status:        status,
+		Error:         errorMessage,
+		DurationMs:    durationMs,
+		LastCheckedAt: checkedAt,
+	}
+}
+
+// isAuthError is a coarse heuristic — ACP auth failures bubble up as string
+// errors from the SDK without a distinct code. We match obvious markers so
+// the UI can route the user to the auth flow; anything unmatched stays as
+// StatusFailed.
+func isAuthError(s string) bool {
+	lower := strings.ToLower(s)
+	for _, needle := range []string{"auth", "login", "unauthorized", "credential", "api key", "token"} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}

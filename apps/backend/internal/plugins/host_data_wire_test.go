@@ -1,0 +1,486 @@
+// host_data_wire_test.go proves the Host data API (ADR 0043) end to end over
+// the REAL go-plugin gRPC transport: a plugin-side pluginsdk.Host call
+// travels through proto -> a real grpc.Server/Client pair with a real
+// GRPCBroker (hcplugin.TestPluginGRPCConn — no subprocess, but the same
+// transport code production uses) -> this package's real *pluginHost, which
+// enforces the api_read:<resource> capability gate and calls the injected
+// (fake) data sources.
+//
+// This complements two narrower test layers that already exist:
+//   - pkg/pluginsdk/host_data_test.go exercises grpcHostServer/grpcHostClient
+//     over a bufconn with a fake pluginsdk.Host — proves the SDK's wire
+//     plumbing, not kandev's real capability gate or DTO mapping.
+//   - internal/plugins/host_data_test.go calls *pluginHost's methods
+//     directly (no transport) — proves the gate and DTO mapping in-process.
+//
+// Only this file drives a real *pluginHost from the plugin side of a real
+// broker connection, so it is the one place proving a plugin cannot read
+// undeclared resources no matter how it talks to kandev.
+//
+// Placement: this lives in internal/plugins (not pkg/pluginsdk) because it
+// needs to construct a real *pluginHost, which imports pluginsdk — importing
+// internal/plugins from a pkg/pluginsdk test would invert that dependency
+// direction. internal/plugins already imports pluginsdk and hashicorp/go-plugin
+// transitively, so the harness reuse (hcplugin.TestPluginGRPCConn) is a
+// same-direction import here.
+package plugins
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	hcplugin "github.com/hashicorp/go-plugin"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	analyticsmodels "github.com/kandev/kandev/internal/analytics/models"
+	"github.com/kandev/kandev/internal/plugins/manifest"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
+	"github.com/kandev/kandev/pkg/pluginsdk"
+)
+
+// wireAuthorPlugin is a minimal author-facing pluginsdk.Plugin. It only
+// exists to receive the Host injected over the broker (via the embedded
+// UnimplementedPlugin's HostSetter/Host() accessor — see serve.go's "Host
+// injection" doc), so these tests can call host.Sessions()... exactly as a
+// real plugin author would from OnEvent/HandleWebhook.
+type wireAuthorPlugin struct {
+	pluginsdk.UnimplementedPlugin
+}
+
+// dialPluginHostOverWire serves host (a real, capability-gated *pluginHost)
+// as the kandev.plugin.v1 Host service over a real go-plugin gRPC broker —
+// hcplugin.TestPluginGRPCConn wires a real unix-socket grpc.Server/Client
+// pair with a real GRPCBroker, matching production transport behavior
+// (pkg/pluginsdk/serve_test.go uses the identical harness). It returns the
+// plugin-side pluginsdk.Host handle, so callers exercise the full
+// SDK-call -> proto -> grpc -> broker -> grpcHostServer -> *pluginHost path.
+func dialPluginHostOverWire(t *testing.T, host *pluginHost) pluginsdk.Host {
+	t.Helper()
+	author := &wireAuthorPlugin{}
+	gp := &pluginsdk.GRPCPlugin{Impl: author, Host: host, HostDialTimeout: 5 * time.Second}
+
+	client, server := hcplugin.TestPluginGRPCConn(t, false, map[string]hcplugin.Plugin{
+		pluginsdk.PluginMapKey: gp,
+	})
+	// Registered in the same order as pkg/pluginsdk/serve_test.go's
+	// deferred cleanup (server.Stop before client.Close): t.Cleanup runs
+	// LIFO, so registering Close first means Stop runs first at teardown.
+	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(server.Stop)
+
+	raw, err := client.Dispense(pluginsdk.PluginMapKey)
+	require.NoError(t, err)
+	_, ok := raw.(*pluginsdk.RemotePlugin)
+	require.True(t, ok, "Dispense(%q) should return *pluginsdk.RemotePlugin, got %T", pluginsdk.PluginMapKey, raw)
+
+	require.Eventually(t, func() bool {
+		return author.Host() != nil
+	}, 5*time.Second, 10*time.Millisecond, "plugin-side Host should be injected via the broker")
+	return author.Host()
+}
+
+// seedSessionsWireFixture wires d's fake task data source with a single
+// workspace/task and n canned sessions (newest first: session-0 started
+// most recently), plus n matching SessionCodeStats rows in the analytics
+// fake, and a distinguishing acp_session_id on the first session so the DTO
+// round-trip assertion has something to check besides IDs.
+func seedSessionsWireFixture(d *testDataHost, n int) {
+	d.tasks.workspaces = []*taskmodels.Workspace{{ID: "ws-1"}}
+	d.tasks.tasksByWorkspace = map[string][]*taskmodels.Task{"ws-1": {{ID: "task-1", WorkspaceID: "ws-1"}}}
+
+	base := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	sessions := make([]*taskmodels.TaskSession, n)
+	stats := make([]*analyticsmodels.SessionCodeStats, n)
+	for i := 0; i < n; i++ {
+		id := "session-" + string(rune('0'+i))
+		sessions[i] = &taskmodels.TaskSession{
+			ID:        id,
+			TaskID:    "task-1",
+			State:     taskmodels.TaskSessionStateRunning,
+			StartedAt: base.Add(time.Duration(n-i) * time.Hour), // session-0 newest
+		}
+		if i == 0 {
+			sessions[i].Metadata = map[string]any{"acp": map[string]any{"session_id": "acp-session-0"}}
+		}
+		linesAdded := int64(10 * (i + 1))
+		linesDeleted := int64(i + 1)
+		stats[i] = &analyticsmodels.SessionCodeStats{
+			SessionID:             id,
+			LinesAddedCommitted:   &linesAdded,
+			LinesDeletedCommitted: &linesDeleted,
+		}
+	}
+	d.tasks.sessionsByTask = map[string][]*taskmodels.TaskSession{"task-1": sessions}
+	d.codeStats.stats = stats
+}
+
+// TestPluginHostData_Wire_GetTaskNotFound proves a missing task surfaces as
+// gRPC NotFound over the real broker transport (GetTaskResponse's wrapper
+// doesn't change that), matching *pluginHost's in-process taskReader.Get
+// contract exactly — see host_data_test.go's
+// TestPluginHost_Tasks_SucceedsWithCapability for the in-process half.
+func TestPluginHostData_Wire_GetTaskNotFound(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+	host := dialPluginHostOverWire(t, d.host)
+
+	task, err := host.Tasks().Get(context.Background(), "no-such-task")
+	require.Nil(t, task)
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok, "expected a gRPC status error, got %v", err)
+	require.Equal(t, codes.NotFound, st.Code())
+}
+
+// TestPluginHostData_Wire_SessionsRoundTrip proves canned Sessions +
+// SessionCodeStats data round-trips correctly, over the real broker
+// transport, through a *pluginHost whose manifest declares api_read:sessions
+// — the concrete "plugin reads kandev data over gRPC" scenario ADR 0043
+// exists for.
+func TestPluginHostData_Wire_SessionsRoundTrip(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	seedSessionsWireFixture(d, 1)
+
+	host := dialPluginHostOverWire(t, d.host)
+
+	sessions, pageInfo, err := host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+	require.Equal(t, "session-0", sessions[0].ID)
+	require.Equal(t, "task-1", sessions[0].TaskID)
+	require.Equal(t, "acp-session-0", sessions[0].ACPSessionID, "acp_session_id should round-trip from TaskSession.Metadata")
+	require.Equal(t, "RUNNING", sessions[0].State)
+	require.NotNil(t, pageInfo)
+	require.False(t, pageInfo.HasMore)
+
+	stats, _, err := host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	require.Equal(t, "session-0", stats[0].SessionID)
+	require.True(t, stats[0].CommittedLinesAvailable)
+	require.Equal(t, int64(10), stats[0].LinesAddedCommitted)
+}
+
+// TestPluginHostData_Wire_PermissionDeniedPerResource is the security
+// assertion: a *pluginHost whose manifest does NOT declare api_read:sessions
+// returns gRPC PermissionDenied with the exact "capability
+// 'api_read:sessions' not declared" wire message when a plugin calls
+// Sessions().CodeStats over the real transport — proving the gate is
+// enforced host-side, not something a malicious or buggy plugin could route
+// around by talking to the wire protocol directly. Run twice, with two
+// different capability sets, to prove the gate is per-resource (not a single
+// on/off switch): a manifest with only api_read:tasks still denies sessions,
+// while its own declared resource (tasks) succeeds over the same connection.
+func TestPluginHostData_Wire_PermissionDeniedPerResource(t *testing.T) {
+	t.Run("NoCapabilitiesDeclared", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{})
+		seedSessionsWireFixture(d, 1)
+		host := dialPluginHostOverWire(t, d.host)
+
+		_, _, err := host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_read:sessions' not declared", st.Message())
+	})
+
+	t.Run("OnlyTasksCapabilityDeclared_TasksWorkSessionsDenied", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{APIRead: []string{"tasks"}})
+		seedSessionsWireFixture(d, 1)
+		// seedSessionsWireFixture wires a bare task-1 fixture (Sessions()
+		// needs one to hang sessions off of); give it a Title so the Tasks()
+		// assertion below has something distinguishing to check.
+		d.tasks.tasksByWorkspace["ws-1"][0].Title = "Fix the bug"
+		host := dialPluginHostOverWire(t, d.host)
+
+		// The declared resource (tasks) succeeds over the wire.
+		tasks, _, err := host.Tasks().List(context.Background(), pluginsdk.TaskFilter{}, pluginsdk.Page{})
+		require.NoError(t, err)
+		require.Len(t, tasks, 1)
+		require.Equal(t, "Fix the bug", tasks[0].Title)
+
+		// The undeclared resource (sessions) is denied, per-resource, on the
+		// exact same connection/host.
+		_, _, err = host.Sessions().CodeStats(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_read:sessions' not declared", st.Message())
+
+		_, _, err = host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{})
+		require.Error(t, err)
+		st, ok = status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_read:sessions' not declared", st.Message())
+	})
+}
+
+func TestPluginHostData_Wire_ExecutorProfiles(t *testing.T) {
+	t.Run("DeniedWithoutCapability", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{})
+		host := dialPluginHostOverWire(t, d.host)
+		reader, ok := pluginsdk.ExecutorProfiles(host)
+		require.True(t, ok)
+
+		_, _, err := reader.List(context.Background(), pluginsdk.Page{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_read:executor_profiles' not declared", st.Message())
+	})
+
+	t.Run("MapsProfilesAndExecutorType", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{APIRead: []string{"executor_profiles"}})
+		d.tasks.executorProfiles = []*taskmodels.ExecutorProfile{{ID: "profile-1", ExecutorID: "executor-1", Name: "Docker"}}
+		d.tasks.executors = map[string]*taskmodels.Executor{"executor-1": {ID: "executor-1", Type: taskmodels.ExecutorTypeLocalDocker}}
+		host := dialPluginHostOverWire(t, d.host)
+		reader, ok := pluginsdk.ExecutorProfiles(host)
+		require.True(t, ok)
+
+		profiles, pageInfo, err := reader.List(context.Background(), pluginsdk.Page{})
+		require.NoError(t, err)
+		require.Len(t, profiles, 1)
+		require.Equal(t, "profile-1", profiles[0].ID)
+		require.Equal(t, "Docker", profiles[0].DisplayName)
+		require.Equal(t, "local_docker", profiles[0].ExecutorType)
+		require.NotNil(t, pageInfo)
+	})
+}
+
+// TestPluginHostData_Wire_Messages proves the api_read:messages gate and the
+// content sanitization travel intact over the real transport: an undeclared
+// manifest is denied with the exact wire message, and a declared one reads
+// back conversation content with <kandev-system> blocks stripped.
+func TestPluginHostData_Wire_Messages(t *testing.T) {
+	t.Run("DeniedWithoutCapability", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{})
+		host := dialPluginHostOverWire(t, d.host)
+
+		_, _, err := host.Messages().List(context.Background(), pluginsdk.MessageFilter{}, pluginsdk.Page{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_read:messages' not declared", st.Message())
+	})
+
+	t.Run("SucceedsAndStripsSystemContent", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{APIRead: []string{"messages"}})
+		d.messages.messages = []*taskmodels.Message{{
+			ID:            "m1",
+			TaskSessionID: "s1",
+			TaskID:        "t1",
+			AuthorType:    taskmodels.MessageAuthorUser,
+			Content:       "<kandev-system>hidden</kandev-system>Visible text.",
+			Type:          taskmodels.MessageTypeMessage,
+			CreatedAt:     time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC),
+		}}
+		host := dialPluginHostOverWire(t, d.host)
+
+		msgs, _, err := host.Messages().List(context.Background(), pluginsdk.MessageFilter{SessionIDs: []string{"s1"}}, pluginsdk.Page{Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, msgs, 1)
+		require.Equal(t, "Visible text.", msgs[0].Content)
+		require.Equal(t, "user", msgs[0].AuthorType)
+	})
+}
+
+// TestPluginHostData_Wire_Writes proves the write RPCs (CreateTask/UpdateTask/
+// SendMessage) travel intact over the real broker transport and enforce
+// api_write:<resource> host-side, exactly like the reads. A plugin declaring
+// api_write:tasks (but not messages) can create/update tasks over the wire, and
+// its undeclared message send is denied with the exact wire message on the
+// same connection.
+func TestPluginHostData_Wire_Writes(t *testing.T) {
+	t.Run("TasksCreateUpdateSucceed_MessageDenied", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{APIWrite: []string{"tasks"}})
+		d.taskWriter.created = &taskmodels.Task{ID: "task-new", WorkspaceID: "ws-1", WorkflowID: "wf-1", Title: "Investigate"}
+		d.taskWriter.updated = &taskmodels.Task{ID: "task-1", Title: "Renamed"}
+		host := dialPluginHostOverWire(t, d.host)
+
+		created, err := host.Tasks().Create(context.Background(), pluginsdk.CreateTaskInput{
+			WorkspaceID: "ws-1", WorkflowID: "wf-1", Title: "Investigate", StartAgent: true,
+		})
+		require.NoError(t, err)
+		require.Equal(t, "task-new", created.ID)
+		require.Equal(t, "plugin:p1", d.taskWriter.lastCreate.Source)
+		require.Equal(t, 1, d.starter.calls, "start_agent should reach the wired starter")
+
+		title := "Renamed"
+		updated, err := host.Tasks().Update(context.Background(), pluginsdk.UpdateTaskInput{ID: "task-1", Title: &title})
+		require.NoError(t, err)
+		require.Equal(t, "task-1", updated.ID)
+
+		// The undeclared message write is denied, per-resource, on the same host.
+		_, err = host.Messages().Send(context.Background(), "task-1", "", "hi")
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_write:messages' not declared", st.Message())
+	})
+
+	t.Run("SendMessageSucceeds", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{APIWrite: []string{"messages"}})
+		d.messenger.result = PluginMessageResult{SessionID: "session-2", Status: "queued"}
+		host := dialPluginHostOverWire(t, d.host)
+
+		dispatch, err := host.Messages().Send(context.Background(), "task-1", "session-2", "from the plugin")
+		require.NoError(t, err)
+		require.Equal(t, "session-2", dispatch.SessionID)
+		require.Equal(t, "queued", dispatch.Status)
+		require.Equal(t, "from the plugin", d.messenger.lastText)
+		require.Equal(t, "plugin:p1", d.messenger.lastSource)
+	})
+
+	t.Run("TaskCreateDeniedWithoutCapability", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{})
+		host := dialPluginHostOverWire(t, d.host)
+
+		_, err := host.Tasks().Create(context.Background(), pluginsdk.CreateTaskInput{Title: "x", WorkspaceID: "ws-1", WorkflowID: "wf-1"})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'api_write:tasks' not declared", st.Message())
+		require.Equal(t, 0, d.taskWriter.createCalls, "gate must block before the service call")
+	})
+}
+
+// TestPluginHostData_Wire_InvokeUtilityAgent proves the agent_invoke gate and
+// the one-shot completion round-trip over the real transport: an undeclared
+// manifest is PermissionDenied, and a declared one resolves the platform
+// default or an explicit profile and returns the runner's text.
+func TestPluginHostData_Wire_InvokeUtilityAgent(t *testing.T) {
+	t.Run("DeniedWithoutCapability", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{})
+		host := dialPluginHostOverWire(t, d.host)
+
+		_, err := host.InvokeUtilityAgent(context.Background(), "hi")
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok, "expected a gRPC status error, got %v", err)
+		require.Equal(t, codes.PermissionDenied, st.Code())
+		require.Equal(t, "capability 'agent_invoke' not declared", st.Message())
+	})
+
+	t.Run("UsesDefault", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{AgentInvoke: true})
+		d.defaultProfile.profileID = "profile-default"
+		d.profiles.profilesByID = map[string]*AgentProfile{
+			"profile-default": {Enabled: true, InferenceCapable: true},
+		}
+		d.utilRun.text = "summary text"
+		host := dialPluginHostOverWire(t, d.host)
+
+		got, err := host.InvokeUtilityAgent(context.Background(), "summarize")
+		require.NoError(t, err)
+		require.Equal(t, "summary text", got)
+		require.Equal(t, "profile-default", d.utilRun.gotProfileID)
+		require.Equal(t, 1, d.defaultProfile.calls)
+	})
+
+	t.Run("UsesExplicitOverride", func(t *testing.T) {
+		d := newTestDataHost(manifest.Capabilities{AgentInvoke: true})
+		d.defaultProfile.err = status.Error(codes.Unavailable, "default unavailable")
+		d.profiles.profilesByID = map[string]*AgentProfile{
+			"profile-override": {Enabled: true, InferenceCapable: true},
+		}
+		d.utilRun.text = "override text"
+		host := dialPluginHostOverWire(t, d.host)
+
+		got, err := host.InvokeUtilityAgent(context.Background(), "summarize", pluginsdk.UtilityAgentOptions{ProfileID: "profile-override"})
+		require.NoError(t, err)
+		require.Equal(t, "override text", got)
+		require.Equal(t, "profile-override", d.utilRun.gotProfileID)
+		require.Equal(t, 0, d.defaultProfile.calls)
+	})
+}
+
+// TestPluginHostData_Wire_SessionsPagination seeds three sessions and drives
+// two Sessions().List calls over the real broker connection: Page{Limit: 2}
+// must return exactly 2 items plus a non-empty PageInfo.NextCursor, and a
+// follow-up call passing that cursor back must return the remaining item
+// with HasMore=false — proving the opaque-cursor pagination contract (ADR
+// 0042 "Conventions") survives the real proto round trip, not just the
+// in-process paginate() helper.
+func TestPluginHostData_Wire_SessionsPagination(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"sessions"}})
+	seedSessionsWireFixture(d, 3)
+	host := dialPluginHostOverWire(t, d.host)
+
+	firstPage, pageInfo, err := host.Sessions().List(context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{Limit: 2})
+	require.NoError(t, err)
+	require.Len(t, firstPage, 2)
+	require.Equal(t, "session-0", firstPage[0].ID)
+	require.Equal(t, "session-1", firstPage[1].ID)
+	require.NotNil(t, pageInfo)
+	require.True(t, pageInfo.HasMore)
+	require.NotEmpty(t, pageInfo.NextCursor)
+
+	secondPage, secondPageInfo, err := host.Sessions().List(
+		context.Background(), pluginsdk.SessionFilter{}, pluginsdk.Page{Limit: 2, Cursor: pageInfo.NextCursor},
+	)
+	require.NoError(t, err)
+	require.Len(t, secondPage, 1)
+	require.Equal(t, "session-2", secondPage[0].ID)
+	require.NotNil(t, secondPageInfo)
+	require.False(t, secondPageInfo.HasMore)
+	require.Empty(t, secondPageInfo.NextCursor)
+}
+
+// TestPluginHostData_Wire_WorkflowSteps_OnEnterActionTypes proves the full
+// model -> DTO -> proto -> gRPC wire -> pluginsdk chain for WorkflowStep's
+// on_enter_action_types field: a step with several on_enter actions reports
+// their types in authored order, a step with none reports nil (not an empty
+// slice) at every hop, and action Config never travels — pluginsdk.WorkflowStep
+// has no Config field at all, so there is no wire shape for it to leak
+// through.
+func TestPluginHostData_Wire_WorkflowSteps_OnEnterActionTypes(t *testing.T) {
+	d := newTestDataHost(manifest.Capabilities{APIRead: []string{"workflows"}})
+	d.steps.steps = map[string][]*wfmodels.WorkflowStep{
+		"wf-1": {
+			{
+				ID:         "step-work",
+				WorkflowID: "wf-1",
+				Name:       "Work",
+				Position:   0,
+				StageType:  wfmodels.StageType("work"),
+				Events: wfmodels.StepEvents{
+					OnEnter: []wfmodels.OnEnterAction{
+						{Type: wfmodels.OnEnterAutoStartAgent, Config: map[string]interface{}{"agent_profile_id": "profile-1"}},
+						{Type: wfmodels.OnEnterRunCodeReview},
+						// Unknown types must remain available to plugin callers so they can
+						// apply their own forward-compatible handling.
+						{Type: wfmodels.OnEnterActionType("future_action")},
+					},
+				},
+			},
+			{
+				ID:         "step-todo",
+				WorkflowID: "wf-1",
+				Name:       "Todo",
+				Position:   1,
+				StageType:  wfmodels.StageType("custom"),
+			},
+		},
+	}
+	host := dialPluginHostOverWire(t, d.host)
+
+	steps, err := host.Workflows().ListSteps(context.Background(), "wf-1")
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+
+	require.Equal(t, "step-work", steps[0].ID)
+	require.Equal(t, []string{"auto_start_agent", "run_code_review", "future_action"}, steps[0].OnEnterActionTypes)
+
+	require.Equal(t, "step-todo", steps[1].ID)
+	require.Nil(t, steps[1].OnEnterActionTypes)
+}

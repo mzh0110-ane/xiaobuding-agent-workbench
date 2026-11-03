@@ -1,0 +1,1123 @@
+package service
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	taskmodels "github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/workflow/models"
+	"github.com/kandev/kandev/internal/workflow/repository"
+)
+
+// setupTestService builds a Service against an in-memory SQLite DB. Callers
+// needing to observe log output (e.g. via a zaptest observer core) may pass a
+// logOverride; otherwise a quiet default logger is used.
+func setupTestService(t *testing.T, logOverride ...*logger.Logger) (*Service, *sqlx.DB) {
+	rawDB, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	// Pin the pool to one connection: every connection to an in-memory SQLite
+	// DB gets its own database, so a second one (e.g. the async history
+	// writer goroutine racing a test's read) would not see the schema,
+	// causing flaky "no such table" failures.
+	rawDB.SetMaxOpenConns(1)
+	sqlxDB := sqlx.NewDb(rawDB, "sqlite3")
+	t.Cleanup(func() { _ = sqlxDB.Close() })
+
+	// Create workflows table (normally created by task repo)
+	_, err = sqlxDB.Exec(`CREATE TABLE IF NOT EXISTS workflows (
+		id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '',
+		workflow_template_id TEXT DEFAULT '', name TEXT NOT NULL,
+		description TEXT DEFAULT '', created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL
+	)`)
+	require.NoError(t, err)
+
+	repo, err := repository.NewWithDB(sqlxDB, sqlxDB, nil)
+	require.NoError(t, err)
+
+	log := logOverride
+	var svcLogger *logger.Logger
+	if len(log) > 0 {
+		svcLogger = log[0]
+	} else {
+		svcLogger, _ = logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	}
+	svc := NewService(repo, svcLogger)
+	t.Cleanup(func() { _ = svc.Close() })
+	return svc, sqlxDB
+}
+
+func insertWorkflow(t *testing.T, db *sqlx.DB, id, name string) {
+	now := time.Now().UTC()
+	_, err := db.Exec("INSERT INTO workflows (id, workspace_id, name, created_at, updated_at) VALUES (?, '', ?, ?, ?)", id, name, now, now)
+	require.NoError(t, err)
+}
+
+// mockWorkflowProvider implements WorkflowProvider with in-memory state for tests.
+type mockWorkflowProvider struct {
+	workflows        []*taskmodels.Workflow
+	getWorkflowCalls int
+	deleted          []string
+	// forceUpdateWorkflowErr, when set, makes UpdateWorkflow fail without
+	// mutating state - used to test that a rebind Warn never fires for a
+	// change that was not actually persisted.
+	forceUpdateWorkflowErr error
+}
+
+func (m *mockWorkflowProvider) ListWorkflows(_ context.Context, workspaceID string, includeHidden bool) ([]*taskmodels.Workflow, error) {
+	var result []*taskmodels.Workflow
+	for _, wf := range m.workflows {
+		if wf.WorkspaceID != workspaceID {
+			continue
+		}
+		if !includeHidden && wf.Hidden {
+			continue
+		}
+		result = append(result, wf)
+	}
+	return result, nil
+}
+
+func (m *mockWorkflowProvider) GetWorkflow(_ context.Context, id string) (*taskmodels.Workflow, error) {
+	m.getWorkflowCalls++
+	for _, wf := range m.workflows {
+		if wf.ID == id {
+			return wf, nil
+		}
+	}
+	return nil, fmt.Errorf("workflow %s not found", id)
+}
+
+func (m *mockWorkflowProvider) CreateWorkflow(_ context.Context, workspaceID, name, description string) (*taskmodels.Workflow, error) {
+	now := time.Now().UTC()
+	wf := &taskmodels.Workflow{
+		ID:          "imported-" + name,
+		WorkspaceID: workspaceID,
+		Name:        name,
+		Description: description,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	m.workflows = append(m.workflows, wf)
+	return wf, nil
+}
+
+func (m *mockWorkflowProvider) UpdateWorkflow(_ context.Context, workflow *taskmodels.Workflow) error {
+	if m.forceUpdateWorkflowErr != nil {
+		return m.forceUpdateWorkflowErr
+	}
+	for i, wf := range m.workflows {
+		if wf.ID == workflow.ID {
+			m.workflows[i] = workflow
+			return nil
+		}
+	}
+	return fmt.Errorf("workflow %s not found", workflow.ID)
+}
+
+func (m *mockWorkflowProvider) DeleteWorkflow(_ context.Context, id string) error {
+	m.deleted = append(m.deleted, id)
+	for i, wf := range m.workflows {
+		if wf.ID == id {
+			m.workflows = append(m.workflows[:i], m.workflows[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("workflow %s not found", id)
+}
+
+func (m *mockWorkflowProvider) addWorkflow(id, workspaceID, name string) {
+	now := time.Now().UTC()
+	m.workflows = append(m.workflows, &taskmodels.Workflow{
+		ID:          id,
+		WorkspaceID: workspaceID,
+		Name:        name,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+}
+
+func createStep(t *testing.T, svc *Service, step *models.WorkflowStep) {
+	err := svc.CreateStep(context.Background(), step)
+	require.NoError(t, err)
+}
+
+func TestCreateStepRejectsConfigureSessionWithProfile(t *testing.T) {
+	svc, db := setupTestService(t)
+	insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+	step := &models.WorkflowStep{
+		WorkflowID:     "wf-1",
+		Name:           "Work",
+		AgentProfileID: "profile-1",
+		Events: models.StepEvents{OnEnter: []models.OnEnterAction{{
+			Type: models.OnEnterConfigureSession,
+			Config: map[string]interface{}{"rules": []interface{}{
+				map[string]interface{}{"agent_name": "codex", "operation": "keep"},
+			}}},
+		}},
+	}
+
+	err := svc.CreateStep(context.Background(), step)
+	require.ErrorContains(t, err, "cannot be combined with agent_profile_id")
+
+	steps, err := svc.repo.ListStepsByWorkflow(context.Background(), "wf-1")
+	require.NoError(t, err)
+	require.Empty(t, steps)
+}
+
+// TestListTemplates_FiltersHidden verifies that templates marked
+// `hidden: true` in their embedded YAML are excluded from the picker shown by
+// the create-workflow dialog and the settings UI.
+func TestListTemplates_FiltersHidden(t *testing.T) {
+	svc, _ := setupTestService(t)
+
+	templates, err := svc.ListTemplates(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, templates, "ListTemplates returned no templates; the assertion below would vacuously pass")
+
+	hiddenIDs := []string{"improve-kandev", "office-default", "routine"}
+	for _, tmpl := range templates {
+		assert.NotContains(t, hiddenIDs, tmpl.ID, "hidden template must not be returned by ListTemplates")
+	}
+}
+
+func TestGetNextStepByPosition(t *testing.T) {
+	t.Run("middle step returns next step", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "In Progress", Position: 1})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		next, err := svc.GetNextStepByPosition(ctx, "wf-1", 0)
+		require.NoError(t, err)
+		assert.NotNil(t, next)
+		assert.Equal(t, "In Progress", next.Name)
+		assert.Equal(t, 1, next.Position)
+	})
+
+	t.Run("last step returns nil", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "In Progress", Position: 1})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		next, err := svc.GetNextStepByPosition(ctx, "wf-1", 2)
+		require.NoError(t, err)
+		assert.Nil(t, next)
+	})
+
+	t.Run("gaps in positions still finds next", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "First", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Second", Position: 2})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Third", Position: 5})
+
+		next, err := svc.GetNextStepByPosition(ctx, "wf-1", 0)
+		require.NoError(t, err)
+		assert.NotNil(t, next)
+		assert.Equal(t, "Second", next.Name)
+		assert.Equal(t, 2, next.Position)
+
+		next, err = svc.GetNextStepByPosition(ctx, "wf-1", 2)
+		require.NoError(t, err)
+		assert.NotNil(t, next)
+		assert.Equal(t, "Third", next.Name)
+		assert.Equal(t, 5, next.Position)
+	})
+
+	t.Run("single step returns nil", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Only Step", Position: 0})
+
+		next, err := svc.GetNextStepByPosition(ctx, "wf-1", 0)
+		require.NoError(t, err)
+		assert.Nil(t, next)
+	})
+}
+
+func TestGetPreviousStepByPosition(t *testing.T) {
+	t.Run("middle step returns previous step", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "In Progress", Position: 1})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		prev, err := svc.GetPreviousStepByPosition(ctx, "wf-1", 2)
+		require.NoError(t, err)
+		assert.NotNil(t, prev)
+		assert.Equal(t, "In Progress", prev.Name)
+		assert.Equal(t, 1, prev.Position)
+	})
+
+	t.Run("first step returns nil", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "In Progress", Position: 1})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		prev, err := svc.GetPreviousStepByPosition(ctx, "wf-1", 0)
+		require.NoError(t, err)
+		assert.Nil(t, prev)
+	})
+
+	t.Run("gaps in positions still finds previous", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "First", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Second", Position: 2})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Third", Position: 5})
+
+		prev, err := svc.GetPreviousStepByPosition(ctx, "wf-1", 5)
+		require.NoError(t, err)
+		assert.NotNil(t, prev)
+		assert.Equal(t, "Second", prev.Name)
+		assert.Equal(t, 2, prev.Position)
+
+		prev, err = svc.GetPreviousStepByPosition(ctx, "wf-1", 2)
+		require.NoError(t, err)
+		assert.NotNil(t, prev)
+		assert.Equal(t, "First", prev.Name)
+		assert.Equal(t, 0, prev.Position)
+	})
+
+	t.Run("single step returns nil", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Only Step", Position: 0})
+
+		prev, err := svc.GetPreviousStepByPosition(ctx, "wf-1", 0)
+		require.NoError(t, err)
+		assert.Nil(t, prev)
+	})
+}
+
+func TestResolveStartStep(t *testing.T) {
+	t.Run("create step keeps only the latest explicit start step", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "First Start", Position: 0, IsStartStep: true})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Latest Start", Position: 1, IsStartStep: true})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		steps, err := svc.ListStepsByWorkflow(ctx, "wf-1")
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"Latest Start"}, startStepNames(steps))
+	})
+
+	t.Run("explicit is_start_step returns that step", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Start Here", Position: 1, IsStartStep: true})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		start, err := svc.ResolveStartStep(ctx, "wf-1")
+		require.NoError(t, err)
+		assert.NotNil(t, start)
+		assert.Equal(t, "Start Here", start.Name)
+		assert.True(t, start.IsStartStep)
+	})
+
+	t.Run("auto_start_agent does not affect fallback (uses position 0)", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{
+			WorkflowID: "wf-1",
+			Name:       "Auto Start",
+			Position:   1,
+			Events: models.StepEvents{
+				OnEnter: []models.OnEnterAction{
+					{Type: models.OnEnterAutoStartAgent},
+				},
+			},
+		})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		start, err := svc.ResolveStartStep(ctx, "wf-1")
+		require.NoError(t, err)
+		assert.NotNil(t, start)
+		assert.Equal(t, "Todo", start.Name)
+		assert.Equal(t, 0, start.Position)
+	})
+
+	t.Run("fallback to first step by position", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "First", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Second", Position: 1})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Third", Position: 2})
+
+		start, err := svc.ResolveStartStep(ctx, "wf-1")
+		require.NoError(t, err)
+		assert.NotNil(t, start)
+		assert.Equal(t, "First", start.Name)
+		assert.Equal(t, 0, start.Position)
+	})
+
+	t.Run("empty workflow returns error", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-empty", "Empty Workflow")
+
+		start, err := svc.ResolveStartStep(ctx, "wf-empty")
+		assert.Error(t, err)
+		assert.Nil(t, start)
+		assert.Contains(t, err.Error(), "has no steps")
+	})
+}
+
+func TestResolveFirstStep(t *testing.T) {
+	t.Run("returns first step by position ignoring is_start_step", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Start Here", Position: 1, IsStartStep: true})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 2})
+
+		first, err := svc.ResolveFirstStep(ctx, "wf-1")
+		require.NoError(t, err)
+		assert.NotNil(t, first)
+		assert.Equal(t, "Todo", first.Name)
+		assert.Equal(t, 0, first.Position)
+	})
+
+	t.Run("empty workflow returns error", func(t *testing.T) {
+		svc, db := setupTestService(t)
+		ctx := context.Background()
+
+		insertWorkflow(t, db, "wf-empty", "Empty Workflow")
+
+		first, err := svc.ResolveFirstStep(ctx, "wf-empty")
+		assert.Error(t, err)
+		assert.Nil(t, first)
+		assert.Contains(t, err.Error(), "has no steps")
+	})
+}
+
+func TestCreateStepsFromTemplate_RemapsStepIDs(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+
+	insertWorkflow(t, db, "wf-1", "Test Workflow")
+
+	// Use the "simple" (Kanban) template which has move_to_step references
+	err := svc.CreateStepsFromTemplate(ctx, "wf-1", "simple")
+	require.NoError(t, err)
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-1")
+	require.NoError(t, err)
+	require.Len(t, steps, 4)
+
+	// Build a map of step name → ID for verification
+	nameToID := make(map[string]string, len(steps))
+	for _, s := range steps {
+		nameToID[s.Name] = s.ID
+	}
+
+	// Backlog's OnTurnComplete should reference the real Review step UUID
+	backlog := findStepByName(steps, "Backlog")
+	require.NotNil(t, backlog)
+	require.Len(t, backlog.Events.OnTurnComplete, 1)
+	assert.Equal(t, models.OnTurnCompleteMoveToStep, backlog.Events.OnTurnComplete[0].Type)
+	assert.Equal(t, nameToID["Review"], backlog.Events.OnTurnComplete[0].Config["step_id"])
+
+	// In Progress's OnTurnComplete should reference the real Review step UUID
+	inProgress := findStepByName(steps, "In Progress")
+	require.NotNil(t, inProgress)
+	require.Len(t, inProgress.Events.OnTurnComplete, 1)
+	assert.Equal(t, nameToID["Review"], inProgress.Events.OnTurnComplete[0].Config["step_id"])
+
+	// Done's OnTurnStart should reference the real In Progress step UUID
+	done := findStepByName(steps, "Done")
+	require.NotNil(t, done)
+	require.Len(t, done.Events.OnTurnStart, 1)
+	assert.Equal(t, models.OnTurnStartMoveToStep, done.Events.OnTurnStart[0].Type)
+	assert.Equal(t, nameToID["In Progress"], done.Events.OnTurnStart[0].Config["step_id"])
+}
+
+func TestCreateStepsFromTemplate_PreservesCancelTriggersTurnComplete(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+	insertWorkflow(t, db, "wf-cancel-defaults", "Cancel defaults")
+
+	require.NoError(t, svc.CreateStepsFromTemplate(ctx, "wf-cancel-defaults", "simple"))
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-cancel-defaults")
+	require.NoError(t, err)
+	want := map[string]bool{"Backlog": true, "In Progress": true, "Review": false, "Done": false}
+	for _, step := range steps {
+		wantValue, ok := want[step.Name]
+		if !ok {
+			continue
+		}
+		field := reflect.ValueOf(step).Elem().FieldByName("CancelTriggersTurnComplete")
+		if !field.IsValid() {
+			t.Fatalf("WorkflowStep is missing CancelTriggersTurnComplete")
+		}
+		if got := field.Bool(); got != wantValue {
+			t.Errorf("created step %q cancel trigger = %t, want %t", step.Name, got, wantValue)
+		}
+	}
+}
+
+func TestCreateStepsFromTemplate_NormalizesDuplicateStartSteps(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+
+	insertWorkflow(t, db, "wf-1", "Test Workflow")
+	err := svc.repo.CreateTemplate(ctx, &models.WorkflowTemplate{
+		ID:   "duplicate-starts",
+		Name: "Duplicate Starts",
+		Steps: []models.StepDefinition{
+			{ID: "first", Name: "First Start", Position: 0, Color: "gray", IsStartStep: true},
+			{ID: "second", Name: "Latest Start", Position: 1, Color: "blue", IsStartStep: true},
+			{ID: "done", Name: "Done", Position: 2, Color: "green"},
+		},
+	})
+	require.NoError(t, err)
+
+	err = svc.CreateStepsFromTemplate(ctx, "wf-1", "duplicate-starts")
+	require.NoError(t, err)
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Latest Start"}, startStepNames(steps))
+}
+
+func TestCreateStepsFromTemplateRejectsInvalidConfigureSession(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+
+	insertWorkflow(t, db, "wf-1", "Test Workflow")
+	err := svc.repo.CreateTemplate(ctx, &models.WorkflowTemplate{
+		ID:   "invalid-session-config",
+		Name: "Invalid Session Config",
+		Steps: []models.StepDefinition{{
+			ID:             "work",
+			Name:           "Work",
+			Position:       0,
+			AgentProfileID: "profile-1",
+			Events: models.StepEvents{OnEnter: []models.OnEnterAction{{
+				Type: models.OnEnterConfigureSession,
+				Config: map[string]interface{}{"rules": []interface{}{
+					map[string]interface{}{"agent_name": "codex", "operation": "keep"},
+				}},
+			}}},
+		}},
+	})
+	require.NoError(t, err)
+
+	err = svc.CreateStepsFromTemplate(ctx, "wf-1", "invalid-session-config")
+	require.ErrorContains(t, err, "cannot be combined with agent_profile_id")
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-1")
+	require.NoError(t, err)
+	require.Empty(t, steps)
+}
+
+func findStepByName(steps []*models.WorkflowStep, name string) *models.WorkflowStep {
+	for _, s := range steps {
+		if s.Name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func startStepNames(steps []*models.WorkflowStep) []string {
+	names := make([]string, 0)
+	for _, step := range steps {
+		if step.IsStartStep {
+			names = append(names, step.Name)
+		}
+	}
+	return names
+}
+
+func setupTestServiceWithProvider(t *testing.T) (*Service, *sqlx.DB, *mockWorkflowProvider) {
+	svc, db := setupTestService(t)
+	mock := &mockWorkflowProvider{}
+	svc.SetWorkflowProvider(mock)
+	return svc, db, mock
+}
+
+func TestExportWorkflow(t *testing.T) {
+	t.Run("exports single workflow with steps", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "", "My Pipeline")
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Todo", Position: 0, Color: "gray"})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Done", Position: 1, Color: "green"})
+
+		export, err := svc.ExportWorkflow(ctx, "wf-1")
+		require.NoError(t, err)
+		assert.Equal(t, models.LegacyExportVersion, export.Version)
+		assert.Equal(t, models.ExportType, export.Type)
+		require.Len(t, export.Workflows, 1)
+		assert.Equal(t, "My Pipeline", export.Workflows[0].Name)
+		require.Len(t, export.Workflows[0].Steps, 2)
+		assert.Equal(t, "Todo", export.Workflows[0].Steps[0].Name)
+		assert.Equal(t, "Done", export.Workflows[0].Steps[1].Name)
+	})
+
+	t.Run("converts step_id refs to positions", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "", "Pipeline")
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "A", Position: 0, Color: "gray"})
+
+		// Get the created step's ID so we can reference it.
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-1")
+		require.NoError(t, err)
+		stepAID := steps[0].ID
+
+		createStep(t, svc, &models.WorkflowStep{
+			WorkflowID: "wf-1", Name: "B", Position: 1, Color: "blue",
+			Events: models.StepEvents{
+				OnTurnComplete: []models.OnTurnCompleteAction{
+					{Type: models.OnTurnCompleteMoveToStep, Config: map[string]any{"step_id": stepAID}},
+				},
+			},
+		})
+
+		export, err := svc.ExportWorkflow(ctx, "wf-1")
+		require.NoError(t, err)
+
+		stepB := export.Workflows[0].Steps[1]
+		require.Len(t, stepB.Events.OnTurnComplete, 1)
+		assert.Equal(t, 0, stepB.Events.OnTurnComplete[0].Config["step_position"])
+		assert.Nil(t, stepB.Events.OnTurnComplete[0].Config["step_id"])
+	})
+}
+
+func TestExportWorkflows(t *testing.T) {
+	t.Run("exports all workflows for workspace", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "ws-1", "Alpha")
+		mock.addWorkflow("wf-2", "ws-1", "Beta")
+		mock.addWorkflow("wf-3", "ws-2", "Other Workspace")
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-1", Name: "Step1", Position: 0})
+		createStep(t, svc, &models.WorkflowStep{WorkflowID: "wf-2", Name: "Step2", Position: 0})
+
+		export, err := svc.ExportWorkflows(ctx, "ws-1", nil)
+		require.NoError(t, err)
+		require.Len(t, export.Workflows, 2)
+
+		names := []string{export.Workflows[0].Name, export.Workflows[1].Name}
+		assert.Contains(t, names, "Alpha")
+		assert.Contains(t, names, "Beta")
+	})
+
+	t.Run("filters to the requested workflow IDs", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "ws-1", "Alpha")
+		mock.addWorkflow("wf-2", "ws-1", "Beta")
+		mock.addWorkflow("wf-3", "ws-1", "Gamma")
+
+		export, err := svc.ExportWorkflows(ctx, "ws-1", []string{"wf-1", "wf-3"})
+		require.NoError(t, err)
+		require.Len(t, export.Workflows, 2)
+
+		names := []string{export.Workflows[0].Name, export.Workflows[1].Name}
+		assert.Contains(t, names, "Alpha")
+		assert.Contains(t, names, "Gamma")
+		assert.NotContains(t, names, "Beta")
+	})
+
+	t.Run("empty (non-nil) ID list exports nothing", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "ws-1", "Alpha")
+
+		export, err := svc.ExportWorkflows(ctx, "ws-1", []string{})
+		require.NoError(t, err)
+		assert.Empty(t, export.Workflows)
+	})
+
+	t.Run("nil ID list omits hidden workflows but explicit IDs include them", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-1", "ws-1", "Alpha")
+		mock.addWorkflow("hidden-1", "ws-1", "System Flow")
+		mock.workflows[1].Hidden = true
+
+		// Back-compat path (nil) must not leak the hidden system workflow.
+		all, err := svc.ExportWorkflows(ctx, "ws-1", nil)
+		require.NoError(t, err)
+		require.Len(t, all.Workflows, 1)
+		assert.Equal(t, "Alpha", all.Workflows[0].Name)
+
+		// Explicitly requesting a hidden workflow's ID still exports it.
+		explicit, err := svc.ExportWorkflows(ctx, "ws-1", []string{"hidden-1"})
+		require.NoError(t, err)
+		require.Len(t, explicit.Workflows, 1)
+		assert.Equal(t, "System Flow", explicit.Workflows[0].Name)
+	})
+}
+
+func TestImportWorkflows(t *testing.T) {
+	t.Run("imports new workflows", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name: "Imported WF",
+					Steps: []models.StepPortable{
+						{Name: "Todo", Position: 0, Color: "gray"},
+						{Name: "Done", Position: 1, Color: "green"},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"Imported WF"}, result.Created)
+		assert.Empty(t, result.Skipped)
+
+		// Verify steps were created.
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-Imported WF")
+		require.NoError(t, err)
+		assert.Len(t, steps, 2)
+	})
+
+	t.Run("imports workflow-level prompt", func(t *testing.T) {
+		svc, _, provider := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name:   "Prompted WF",
+					Prompt: "If the PR is merged or closed, move the Task to Done.",
+					Steps: []models.StepPortable{
+						{Name: "Todo", Position: 0, Color: "gray"},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"Prompted WF"}, result.Created)
+
+		wf, err := provider.GetWorkflow(ctx, "imported-Prompted WF")
+		require.NoError(t, err)
+		assert.Equal(t, "If the PR is merged or closed, move the Task to Done.", wf.Prompt)
+	})
+
+	t.Run("normalizes duplicate start steps on import", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name: "Duplicate Starts",
+					Steps: []models.StepPortable{
+						{Name: "First Start", Position: 0, Color: "gray", IsStartStep: true},
+						{Name: "Latest Start", Position: 1, Color: "blue", IsStartStep: true},
+						{Name: "Done", Position: 2, Color: "green"},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-Duplicate Starts")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"Latest Start"}, startStepNames(steps))
+	})
+
+	t.Run("skips workflows that already exist by name", func(t *testing.T) {
+		svc, _, mock := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		mock.addWorkflow("wf-existing", "ws-1", "Existing")
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{Name: "Existing", Steps: []models.StepPortable{{Name: "S", Position: 0, Color: "blue"}}},
+				{Name: "Brand New", Steps: []models.StepPortable{{Name: "S", Position: 0, Color: "red"}}},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"Brand New"}, result.Created)
+		assert.Equal(t, []string{"Existing"}, result.Skipped)
+	})
+
+	t.Run("remaps step_position to step_id on import", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name: "WithRefs",
+					Steps: []models.StepPortable{
+						{Name: "A", Position: 0, Color: "gray"},
+						{
+							Name: "B", Position: 1, Color: "blue",
+							Events: models.StepEvents{
+								OnTurnComplete: []models.OnTurnCompleteAction{
+									{Type: models.OnTurnCompleteMoveToStep, Config: map[string]any{"step_position": 0}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		// Verify the imported step B references step A's new ID.
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-WithRefs")
+		require.NoError(t, err)
+		require.Len(t, steps, 2)
+
+		nameToID := map[string]string{}
+		for _, s := range steps {
+			nameToID[s.Name] = s.ID
+		}
+
+		stepB := findStepByName(steps, "B")
+		require.NotNil(t, stepB)
+		require.Len(t, stepB.Events.OnTurnComplete, 1)
+		assert.Equal(t, nameToID["A"], stepB.Events.OnTurnComplete[0].Config["step_id"])
+		assert.Nil(t, stepB.Events.OnTurnComplete[0].Config["step_position"])
+	})
+
+	t.Run("preserves show_in_command_panel on import", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name: "CmdPanel WF",
+					Steps: []models.StepPortable{
+						{Name: "Backlog", Position: 0, Color: "gray", ShowInCommandPanel: false},
+						{Name: "Active", Position: 1, Color: "blue", ShowInCommandPanel: true},
+						{Name: "Done", Position: 2, Color: "green", ShowInCommandPanel: false},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-CmdPanel WF")
+		require.NoError(t, err)
+		require.Len(t, steps, 3)
+
+		assert.False(t, steps[0].ShowInCommandPanel, "Backlog should not show in command panel")
+		assert.True(t, steps[1].ShowInCommandPanel, "Active should show in command panel")
+		assert.False(t, steps[2].ShowInCommandPanel, "Done should not show in command panel")
+	})
+
+	t.Run("preserves auto_advance_requires_signal on import", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name: "Signal WF",
+					Steps: []models.StepPortable{
+						{Name: "Legacy", Position: 0, Color: "gray", AutoAdvanceRequiresSignal: false},
+						{Name: "Gated", Position: 1, Color: "blue", AutoAdvanceRequiresSignal: true},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-Signal WF")
+		require.NoError(t, err)
+		require.Len(t, steps, 2)
+
+		assert.False(t, steps[0].AutoAdvanceRequiresSignal, "Legacy step should not require signal")
+		assert.True(t, steps[1].AutoAdvanceRequiresSignal, "Gated step should require signal")
+	})
+
+	t.Run("rejects invalid export data", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{Version: 99, Type: "wrong"}
+		_, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		assert.ErrorContains(t, err, "invalid export data")
+	})
+
+	t.Run("matches agent profiles on import", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		matcher := func(agentName, model, mode, _ string) string {
+			if agentName == "Claude Code" && model == "opus" {
+				return "matched-prof-1"
+			}
+			return ""
+		}
+		svc.SetAgentProfileFuncs(nil, matcher)
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name:         "ProfileWF",
+					AgentProfile: &models.AgentProfilePortable{AgentName: "Claude Code", Model: "opus", Mode: "code"},
+					Steps: []models.StepPortable{
+						{
+							Name: "Dev", Position: 0, Color: "blue",
+							AgentProfile: &models.AgentProfilePortable{AgentName: "Claude Code", Model: "opus"},
+						},
+						{
+							Name: "Review", Position: 1, Color: "green",
+							AgentProfile: &models.AgentProfilePortable{AgentName: "Unknown Agent"},
+						},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		// Verify workflow-level agent profile was persisted
+		imported, err := svc.workflowProvider.GetWorkflow(ctx, "imported-ProfileWF")
+		require.NoError(t, err)
+		assert.Equal(t, "matched-prof-1", imported.AgentProfileID, "workflow-level agent profile should be persisted")
+
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-ProfileWF")
+		require.NoError(t, err)
+		require.Len(t, steps, 2)
+
+		devStep := findStepByName(steps, "Dev")
+		require.NotNil(t, devStep)
+		assert.Equal(t, "matched-prof-1", devStep.AgentProfileID, "should match known profile")
+
+		reviewStep := findStepByName(steps, "Review")
+		require.NotNil(t, reviewStep)
+		assert.Empty(t, reviewStep.AgentProfileID, "should not match unknown profile")
+	})
+
+	t.Run("skips agent profile matching when no matcher set", func(t *testing.T) {
+		svc, _, _ := setupTestServiceWithProvider(t)
+		ctx := context.Background()
+
+		export := &models.WorkflowExport{
+			Version: models.ExportVersion,
+			Type:    models.ExportType,
+			Workflows: []models.WorkflowPortable{
+				{
+					Name:         "NoMatcher",
+					AgentProfile: &models.AgentProfilePortable{AgentName: "Claude Code"},
+					Steps: []models.StepPortable{
+						{Name: "S", Position: 0, Color: "gray", AgentProfile: &models.AgentProfilePortable{AgentName: "Claude Code"}},
+					},
+				},
+			},
+		}
+
+		result, err := svc.ImportWorkflows(ctx, "ws-1", export)
+		require.NoError(t, err)
+		require.Len(t, result.Created, 1)
+
+		steps, err := svc.repo.ListStepsByWorkflow(ctx, "imported-NoMatcher")
+		require.NoError(t, err)
+		assert.Empty(t, steps[0].AgentProfileID, "no matcher means no profile ID set")
+	})
+}
+
+// --- DeleteStep tests ---
+//
+// DeleteStep intentionally does NOT auto-reassign tasks off the deleted step: doing
+// so through the normal move path would trigger on_exit/on_enter side effects
+// (auto-start agents, session hand-offs) as a byproduct of an administrative delete,
+// and any failed move would silently leave the step deleted anyway (a partial,
+// non-atomic cascade). Affected tasks keep their dangling workflow_step_id and are
+// surfaced via the Kanban/Pipeline "Needs Reassignment" fallback for explicit manual
+// reassignment through the normal, fully-validated move path.
+
+func TestDeleteStep_RemovesStepWithoutReassigningTasks(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+	insertWorkflow(t, db, "wf-1", "Test")
+
+	createStep(t, svc, &models.WorkflowStep{ID: "start", WorkflowID: "wf-1", Name: "Start", Position: 0, IsStartStep: true})
+	createStep(t, svc, &models.WorkflowStep{ID: "mid", WorkflowID: "wf-1", Name: "Mid", Position: 1})
+	createStep(t, svc, &models.WorkflowStep{ID: "end", WorkflowID: "wf-1", Name: "End", Position: 2})
+
+	require.NoError(t, svc.DeleteStep(ctx, "mid"))
+
+	// Deleted step must not exist anymore.
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-1")
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	for _, s := range steps {
+		assert.NotEqual(t, "mid", s.ID, "deleted step must be removed")
+	}
+}
+
+func TestDeleteStep_SucceedsWhenDeletingOnlyStep(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+	insertWorkflow(t, db, "wf-3", "Test")
+
+	createStep(t, svc, &models.WorkflowStep{ID: "only", WorkflowID: "wf-3", Name: "Only", Position: 0})
+
+	require.NoError(t, svc.DeleteStep(ctx, "only"))
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-3")
+	require.NoError(t, err)
+	assert.Empty(t, steps)
+}
+
+// TestDeleteStep_WIPLimitedAutoStartTargetIsUnaffected is a regression test
+// requested during maintainer review: deleting a step must not run tasks
+// through the normal move path (which could trip a neighboring step's WIP
+// limit or trigger its auto-start-agent on_enter action as a side effect of
+// an administrative delete). Since DeleteStep no longer reassigns tasks at
+// all, this asserts the delete succeeds cleanly and is fully independent of
+// what limits/automations are configured on the surviving steps.
+func TestDeleteStep_WIPLimitedAutoStartTargetIsUnaffected(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+	insertWorkflow(t, db, "wf-5", "Test")
+
+	createStep(t, svc, &models.WorkflowStep{ID: "start", WorkflowID: "wf-5", Name: "Start", Position: 0, IsStartStep: true})
+	createStep(t, svc, &models.WorkflowStep{ID: "mid", WorkflowID: "wf-5", Name: "Mid", Position: 1})
+	createStep(t, svc, &models.WorkflowStep{
+		ID: "auto-start-limited", WorkflowID: "wf-5", Name: "Auto Start", Position: 2,
+		WIPLimit: 1,
+		Events: models.StepEvents{
+			OnEnter: []models.OnEnterAction{{Type: models.OnEnterAutoStartAgent}},
+		},
+	})
+
+	require.NoError(t, svc.DeleteStep(ctx, "mid"))
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-5")
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	for _, s := range steps {
+		assert.NotEqual(t, "mid", s.ID, "deleted step must be removed")
+		if s.ID == "auto-start-limited" {
+			// The WIP-limited/auto-start step itself must remain untouched.
+			assert.Equal(t, 1, s.WIPLimit)
+		}
+	}
+}
+
+func TestDeleteStep_ClearsStepReferences(t *testing.T) {
+	svc, db := setupTestService(t)
+	ctx := context.Background()
+	insertWorkflow(t, db, "wf-4", "Test")
+
+	createStep(t, svc, &models.WorkflowStep{ID: "s1", WorkflowID: "wf-4", Name: "S1", Position: 0})
+	createStep(t, svc, &models.WorkflowStep{ID: "s2", WorkflowID: "wf-4", Name: "S2", Position: 1})
+
+	require.NoError(t, svc.DeleteStep(ctx, "s1"))
+
+	steps, err := svc.repo.ListStepsByWorkflow(ctx, "wf-4")
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "s2", steps[0].ID)
+}

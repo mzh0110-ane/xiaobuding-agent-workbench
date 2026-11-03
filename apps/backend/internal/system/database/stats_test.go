@@ -1,0 +1,780 @@
+package database
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"expvar"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/system/jobs"
+)
+
+const fakePostgresStatsDriverName = "kandev-system-database-stats-postgres"
+
+var registerFakePostgresStatsDriverOnce sync.Once
+var fakePostgresStatsQueryHookMu sync.RWMutex
+var fakePostgresStatsQueryHook func(context.Context, string) error
+
+type fakePostgresStatsDriver struct{}
+
+func (fakePostgresStatsDriver) Open(string) (driver.Conn, error) {
+	return fakePostgresStatsConn{}, nil
+}
+
+type fakePostgresStatsConn struct{}
+
+func (fakePostgresStatsConn) Prepare(string) (driver.Stmt, error) {
+	return nil, fmt.Errorf("prepare is not implemented")
+}
+
+func (fakePostgresStatsConn) Close() error {
+	return nil
+}
+
+func (fakePostgresStatsConn) Begin() (driver.Tx, error) {
+	return nil, fmt.Errorf("transactions are not implemented")
+}
+
+func (fakePostgresStatsConn) QueryContext(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Rows, error) {
+	normalized := strings.Join(strings.Fields(query), " ")
+	fakePostgresStatsQueryHookMu.RLock()
+	hook := fakePostgresStatsQueryHook
+	fakePostgresStatsQueryHookMu.RUnlock()
+	if hook != nil {
+		if err := hook(ctx, normalized); err != nil {
+			return nil, err
+		}
+	}
+	switch normalized {
+	case "SELECT pg_database_size(current_database())":
+		return newFakeRows([]string{"pg_database_size"}, []driver.Value{int64(4096)}), nil
+	case "SELECT value FROM kandev_meta WHERE key = $1":
+		if len(args) != 1 || args[0].Value != "kandev_version" {
+			return nil, fmt.Errorf("unexpected args for schema version: %#v", args)
+		}
+		return newFakeRows([]string{"value"}, []driver.Value{"v0.99.0"}), nil
+	case "SELECT MAX(id) FROM task_session_messages",
+		"SELECT MAX(digest) FROM task_message_payloads",
+		"SELECT MAX(id) FROM task_session_git_snapshots":
+		return newFakeRows([]string{"max"}, []driver.Value{nil}), nil
+	case "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM task_session_messages",
+		"SELECT COALESCE(SUM(LENGTH(metadata)), 0) FROM task_session_messages",
+		"SELECT COALESCE(SUM(LENGTH(compressed_content)), 0) FROM task_message_payloads",
+		"SELECT COALESCE(SUM(LENGTH(files) + LENGTH(metadata)), 0) FROM task_session_git_snapshots":
+		return newFakeRows([]string{"sum"}, []driver.Value{int64(0)}), nil
+	default:
+		if strings.HasPrefix(normalized, "PRAGMA ") {
+			return nil, fmt.Errorf(`ERROR: syntax error at or near "PRAGMA" (SQLSTATE 42601)`)
+		}
+		return nil, fmt.Errorf("unexpected query: %s", normalized)
+	}
+}
+
+type fakeRows struct {
+	columns []string
+	values  []driver.Value
+	read    bool
+}
+
+func newFakeRows(columns []string, values []driver.Value) *fakeRows {
+	return &fakeRows{columns: columns, values: values}
+}
+
+func (r *fakeRows) Columns() []string {
+	return r.columns
+}
+
+func (r *fakeRows) Close() error {
+	return nil
+}
+
+func (r *fakeRows) Next(dest []driver.Value) error {
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	copy(dest, r.values)
+	return nil
+}
+
+func newTestLogger(t *testing.T) *logger.Logger {
+	t.Helper()
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "json", OutputPath: "stderr"})
+	if err != nil {
+		t.Fatalf("logger: %v", err)
+	}
+	return log
+}
+
+// stubBus is a minimal in-memory EventBus that records published events.
+type stubBus struct {
+	mu     sync.Mutex
+	events []*bus.Event
+}
+
+func (s *stubBus) Publish(_ context.Context, _ string, event *bus.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+	return nil
+}
+func (s *stubBus) Subscribe(string, bus.EventHandler) (bus.Subscription, error) { return nil, nil }
+func (s *stubBus) QueueSubscribe(string, string, bus.EventHandler) (bus.Subscription, error) {
+	return nil, nil
+}
+func (s *stubBus) Request(context.Context, string, *bus.Event, time.Duration) (*bus.Event, error) {
+	return nil, nil
+}
+func (s *stubBus) Close()            {}
+func (s *stubBus) IsConnected() bool { return true }
+
+var _ bus.EventBus = (*stubBus)(nil)
+var _ = events.SystemJobUpdate
+
+// newTestPool opens a temp SQLite at <dataDir>/kandev.db and seeds it with a
+// kandev_meta row plus a couple of user tables and rows so VACUUM has
+// something to reclaim.
+func newTestPool(t *testing.T, dataDir string) (*db.Pool, string) {
+	t.Helper()
+	dbPath := filepath.Join(dataDir, "kandev.db")
+	writerRaw, err := db.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	readerRaw, err := db.OpenSQLiteReader(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteReader: %v", err)
+	}
+	writer := sqlx.NewDb(writerRaw, "sqlite3")
+	reader := sqlx.NewDb(readerRaw, "sqlite3")
+	pool := db.NewPool(writer, reader)
+
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS kandev_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
+		`INSERT OR REPLACE INTO kandev_meta (key, value) VALUES ('kandev_version', 'v0.99.0')`,
+		`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)`,
+		`CREATE TABLE IF NOT EXISTS sessions_t (id INTEGER PRIMARY KEY, data TEXT)`,
+	}
+	for _, s := range stmts {
+		if _, err := writer.Exec(s); err != nil {
+			t.Fatalf("seed %q: %v", s, err)
+		}
+	}
+	// Insert ~100KB of churn to give VACUUM something to reclaim.
+	for i := 0; i < 200; i++ {
+		blob := make([]byte, 1024)
+		for j := range blob {
+			blob[j] = byte(j % 256)
+		}
+		if _, err := writer.Exec(`INSERT INTO users (name, payload) VALUES (?, ?)`, "row", blob); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if _, err := writer.Exec(`DELETE FROM users WHERE id % 2 = 0`); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	return pool, dbPath
+}
+
+// newTestService wires a Service with a Tracker over the stubBus.
+func newTestService(t *testing.T) (*Service, *jobs.Tracker, *stubBus, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	pool, _ := newTestPool(t, dataDir)
+	t.Cleanup(func() { _ = pool.Close() })
+
+	stub := &stubBus{}
+	log := newTestLogger(t)
+	tracker := jobs.NewTracker(stub, log)
+	dirs := ResetDirs{
+		Worktrees: filepath.Join(tmp, "worktrees"),
+		Repos:     filepath.Join(tmp, "repos"),
+		Sessions:  filepath.Join(tmp, "sessions"),
+		Tasks:     filepath.Join(tmp, "tasks"),
+		QuickChat: filepath.Join(tmp, "quick-chat"),
+	}
+	for _, d := range []string{dirs.Worktrees, dirs.Repos, dirs.Sessions, dirs.Tasks, dirs.QuickChat} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+		// Write a sentinel file so we can prove RemoveAll wiped it.
+		if err := os.WriteFile(filepath.Join(d, "sentinel"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write sentinel: %v", err)
+		}
+	}
+	svc := NewService(pool, filepath.Join(dataDir, "kandev.db"), dirs, tracker, log)
+	t.Cleanup(svc.StopBackground)
+	return svc, tracker, stub, dataDir
+}
+
+func newFakePostgresStatsPool(t *testing.T) *db.Pool {
+	t.Helper()
+	registerFakePostgresStatsDriverOnce.Do(func() {
+		sql.Register(fakePostgresStatsDriverName, fakePostgresStatsDriver{})
+	})
+	raw, err := sql.Open(fakePostgresStatsDriverName, "")
+	if err != nil {
+		t.Fatalf("open fake postgres: %v", err)
+	}
+	pg := sqlx.NewDb(raw, "pgx")
+	pool := db.NewPool(pg, pg)
+	t.Cleanup(func() { _ = pool.Close() })
+	return pool
+}
+
+// waitForState mirrors jobs.waitForState — wait until the tracker reports
+// the target state for the given id, or fail after 2s.
+func waitForState(t *testing.T, tracker *jobs.Tracker, id string, target jobs.State) *jobs.Job {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		j := tracker.Get(id)
+		if j != nil && j.State == target {
+			return j
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not reach state %s within 2s; last = %+v", id, target, tracker.Get(id))
+	return nil
+}
+
+func TestStats_ReturnsPathSizeAndSchemaVersion(t *testing.T) {
+	svc, _, _, dataDir := newTestService(t)
+
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	wantPath := filepath.Join(dataDir, "kandev.db")
+	if stats.Path != wantPath {
+		t.Errorf("Path = %q, want %q", stats.Path, wantPath)
+	}
+	if stats.SizeBytes <= 0 {
+		t.Errorf("SizeBytes = %d, want > 0", stats.SizeBytes)
+	}
+	if stats.SchemaVersion != "v0.99.0" {
+		t.Errorf("SchemaVersion = %q, want v0.99.0", stats.SchemaVersion)
+	}
+	if stats.LastBackupAt != nil {
+		t.Errorf("LastBackupAt = %v, want nil (no backups yet)", *stats.LastBackupAt)
+	}
+	payload := statsPayload(t, stats)
+	wantBackupDir := filepath.Join(dataDir, "backups")
+	if got := payload["backup_directory"]; got != wantBackupDir {
+		t.Errorf("backup_directory = %v, want %q", got, wantBackupDir)
+	}
+}
+
+func TestStatsReportsLogicalStorageAndDatabaseGauges(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	for _, statement := range []string{
+		`CREATE TABLE task_session_messages (id TEXT PRIMARY KEY, content TEXT, metadata TEXT)`,
+		`CREATE TABLE task_message_payloads (digest TEXT PRIMARY KEY, compressed_content BLOB)`,
+		`CREATE TABLE task_session_git_snapshots (id TEXT PRIMARY KEY, files TEXT, metadata TEXT)`,
+		`INSERT INTO task_session_messages VALUES ('m-1', 'hello', '{"a":1}')`,
+		`INSERT INTO task_message_payloads VALUES ('p-1', x'01020304')`,
+		`INSERT INTO task_session_git_snapshots VALUES ('g-1', '{"f":1}', '{"m":2}')`,
+	} {
+		if _, err := svc.pool.Writer().Exec(statement); err != nil {
+			t.Fatalf("seed storage metrics with %q: %v", statement, err)
+		}
+	}
+
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	waitForLogicalStatsScan(t, svc)
+	stats, err = svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats after logical scan: %v", err)
+	}
+	payload := statsPayload(t, stats)
+	for field, want := range map[string]float64{
+		"message_content_bytes":  5,
+		"message_metadata_bytes": 7,
+		"message_payload_bytes":  4,
+		"git_snapshot_bytes":     14,
+	} {
+		if got := payload[field]; got != want {
+			t.Errorf("%s = %v, want %.0f", field, got, want)
+		}
+	}
+
+	for _, name := range []string{
+		"database_size_bytes",
+		"database_wal_size_bytes",
+		"task_message_content_bytes",
+		"task_message_metadata_bytes",
+		"task_message_payload_compressed_bytes",
+		"task_git_snapshot_bytes",
+	} {
+		if expvar.Get(name) == nil {
+			t.Errorf("expvar %q is not published", name)
+		}
+	}
+}
+
+func TestStatsColdReadDoesNotWaitForLogicalScan(t *testing.T) {
+	pool := newFakePostgresStatsPool(t)
+	svc := NewService(pool, filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+	scanStarted := make(chan struct{})
+	releaseScan := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseScan) }) }
+	fakePostgresStatsQueryHookMu.Lock()
+	fakePostgresStatsQueryHook = func(_ context.Context, query string) error {
+		if strings.Contains(query, "task_session_messages") {
+			select {
+			case <-scanStarted:
+			default:
+				close(scanStarted)
+			}
+			<-releaseScan
+		}
+		return nil
+	}
+	fakePostgresStatsQueryHookMu.Unlock()
+	t.Cleanup(func() {
+		release()
+		fakePostgresStatsQueryHookMu.Lock()
+		fakePostgresStatsQueryHook = nil
+		fakePostgresStatsQueryHookMu.Unlock()
+	})
+
+	type statsResult struct {
+		stats Stats
+		err   error
+	}
+	result := make(chan statsResult, 1)
+	go func() {
+		stats, err := svc.Stats()
+		result <- statsResult{stats: stats, err: err}
+	}()
+
+	select {
+	case <-scanStarted:
+	case <-time.After(time.Second):
+		t.Fatal("logical scan did not start")
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("Stats: %v", got.err)
+		}
+		if got.stats.LogicalStatsState != logicalStatsStatePending || got.stats.MessageContentBytes != nil || got.stats.LogicalStatsMeasuredAt != nil {
+			t.Fatalf("cold logical stats = %#v, want pending with null totals and timestamp", got.stats)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Stats waited for the logical scan to finish")
+	}
+	release()
+}
+
+func TestStatsUsesLastMetadataAfterTimedOutRead(t *testing.T) {
+	svc := NewService(newFakePostgresStatsPool(t), filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+	first, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("initial Stats: %v", err)
+	}
+	waitForLogicalStatsScan(t, svc)
+
+	fakePostgresStatsQueryHookMu.Lock()
+	fakePostgresStatsQueryHook = func(ctx context.Context, query string) error {
+		if query == "SELECT pg_database_size(current_database())" {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	fakePostgresStatsQueryHookMu.Unlock()
+	t.Cleanup(func() {
+		fakePostgresStatsQueryHookMu.Lock()
+		fakePostgresStatsQueryHook = nil
+		fakePostgresStatsQueryHookMu.Unlock()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, err := svc.StatsContext(ctx)
+	if err != nil {
+		t.Fatalf("StatsContext with cached metadata: %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("StatsContext exceeded its request deadline by too much")
+	}
+	if !got.MetadataStale || got.SizeBytes != first.SizeBytes || got.MetadataMeasuredAt == nil || first.MetadataMeasuredAt == nil || !got.MetadataMeasuredAt.Equal(*first.MetadataMeasuredAt) {
+		t.Fatalf("metadata fallback = %#v, want stale last-good metadata", got)
+	}
+}
+
+func TestStatsDiscardsMetadataMeasuredAcrossDatabaseInvalidation(t *testing.T) {
+	svc := NewService(newFakePostgresStatsPool(t), filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+
+	previousSize := databaseSizeBytes.Value()
+	databaseSizeBytes.Set(991)
+	t.Cleanup(func() { databaseSizeBytes.Set(previousSize) })
+
+	queryStarted := make(chan struct{})
+	releaseQuery := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseQuery) }) }
+	var blocked atomic.Bool
+	fakePostgresStatsQueryHookMu.Lock()
+	fakePostgresStatsQueryHook = func(ctx context.Context, query string) error {
+		if query == "SELECT pg_database_size(current_database())" && blocked.CompareAndSwap(false, true) {
+			close(queryStarted)
+			select {
+			case <-releaseQuery:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	fakePostgresStatsQueryHookMu.Unlock()
+	t.Cleanup(func() {
+		release()
+		fakePostgresStatsQueryHookMu.Lock()
+		fakePostgresStatsQueryHook = nil
+		fakePostgresStatsQueryHookMu.Unlock()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := svc.StatsContext(context.Background())
+		result <- err
+	}()
+	select {
+	case <-queryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("metadata measurement did not reach the database-size query")
+	}
+
+	svc.InvalidateDatabase()
+	release()
+	if err := <-result; err == nil {
+		t.Fatal("Stats returned metadata measured before database invalidation")
+	}
+	if _, ok := svc.cachedMetadata(); ok {
+		t.Fatal("metadata measured before invalidation repopulated the cache")
+	}
+	if got := databaseSizeBytes.Value(); got != 991 {
+		t.Fatalf("database size gauge = %d, want unchanged value 991", got)
+	}
+}
+
+func TestStatsMarksLogicalSnapshotStaleWhilePersistenceIsUnhealthy(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+	svc := NewService(newFakePostgresStatsPool(t), filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	svc.SetPersistenceHealthProbe(healthy.Load)
+	t.Cleanup(svc.StopBackground)
+	if _, err := svc.Stats(); err != nil {
+		t.Fatalf("initial Stats: %v", err)
+	}
+	waitForLogicalStatsScan(t, svc)
+	healthy.Store(false)
+	got, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats while persistence is unhealthy: %v", err)
+	}
+	if got.LogicalStatsState != logicalStatsStateStale || !got.MetadataStale {
+		t.Fatalf("health fallback = %#v, want stale logical and metadata values", got)
+	}
+	svc.logicalStats.mu.Lock()
+	flight := svc.logicalStats.flight
+	svc.logicalStats.mu.Unlock()
+	if flight != nil {
+		t.Fatal("logical scan started while persistence was known unhealthy")
+	}
+}
+
+func TestInvalidateDatabaseKeepsLogicalStatsWorkerAvailable(t *testing.T) {
+	svc := NewService(nil, filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+	var scans atomic.Int32
+	svc.logicalStats.scan = func(context.Context) (logicalStorageStats, error) {
+		scans.Add(1)
+		return logicalStorageStats{messageContent: 17}, nil
+	}
+
+	svc.InvalidateDatabase()
+	if got := svc.logicalStats.Read(); got.state != logicalStatsStatePending {
+		t.Fatalf("read after invalidation = %#v, want a new background scan", got)
+	}
+	waitLogicalStatsCache(t, svc.logicalStats)
+	got := svc.logicalStats.Read()
+	if got.state != logicalStatsStateReady || got.snapshot == nil || got.snapshot.values.messageContent != 17 {
+		t.Fatalf("read after replacement scan = %#v, want a fresh snapshot", got)
+	}
+	if scans.Load() != 1 {
+		t.Fatalf("scan count = %d, want one scan after invalidation", scans.Load())
+	}
+}
+
+func TestFailedLogicalScanDoesNotReplaceMetricValues(t *testing.T) {
+	messageContentBytes.Set(8675309)
+	svc := NewService(newFakePostgresStatsPool(t), filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+	fakePostgresStatsQueryHookMu.Lock()
+	fakePostgresStatsQueryHook = func(_ context.Context, query string) error {
+		if query == "SELECT MAX(id) FROM task_session_messages" {
+			return errors.New("database busy")
+		}
+		return nil
+	}
+	fakePostgresStatsQueryHookMu.Unlock()
+	t.Cleanup(func() {
+		fakePostgresStatsQueryHookMu.Lock()
+		fakePostgresStatsQueryHook = nil
+		fakePostgresStatsQueryHookMu.Unlock()
+	})
+
+	if _, err := svc.Stats(); err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	waitForLogicalStatsScan(t, svc)
+	read, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats after failed scan: %v", err)
+	}
+	if read.LogicalStatsState != "unavailable" || read.LogicalStatsError != logicalStatsErrorScanFailed {
+		t.Fatalf("logical state = %q / %q, want unavailable / scan_failed", read.LogicalStatsState, read.LogicalStatsError)
+	}
+	if got := messageContentBytes.Value(); got != 8675309 {
+		t.Fatalf("message content gauge = %d, want prior value after failed scan", got)
+	}
+}
+
+func waitForLogicalStatsScan(t *testing.T, svc *Service) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		svc.logicalStats.mu.Lock()
+		flight := svc.logicalStats.flight
+		finished := svc.logicalStats.snapshot != nil || svc.logicalStats.errorCode != ""
+		svc.logicalStats.mu.Unlock()
+		if finished {
+			return
+		}
+		if flight == nil {
+			t.Fatal("logical stats scan did not start")
+		}
+		select {
+		case <-flight.done:
+		case <-deadline:
+			t.Fatal("logical stats scan did not finish")
+		}
+	}
+}
+
+func TestStats_ReturnsConfiguredSQLiteBackupDirectory(t *testing.T) {
+	svc, _, _, dataDir := newTestService(t)
+	svc.databasePath = filepath.Join(dataDir, "nested", "custom.db")
+
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	want := filepath.Join(dataDir, "nested", "backups")
+	if got := statsPayload(t, stats)["backup_directory"]; got != want {
+		t.Errorf("backup_directory = %v, want %q", got, want)
+	}
+}
+
+func TestStats_ResolvesRelativeSQLiteBackupDirectory(t *testing.T) {
+	relativeDatabasePath := filepath.Join("state", "kandev.db")
+	want, err := filepath.Abs(filepath.Join(filepath.Dir(relativeDatabasePath), "backups"))
+	if err != nil {
+		t.Fatalf("resolve expected backup directory: %v", err)
+	}
+
+	svc := NewService(nil, relativeDatabasePath, ResetDirs{}, nil, nil)
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	if stats.BackupDirectory != want {
+		t.Errorf("BackupDirectory = %q, want %q", stats.BackupDirectory, want)
+	}
+	if !filepath.IsAbs(stats.BackupDirectory) {
+		t.Errorf("BackupDirectory = %q, want an absolute path", stats.BackupDirectory)
+	}
+}
+
+func TestStats_PostgresDoesNotUseSQLitePragmas(t *testing.T) {
+	dataDir := t.TempDir()
+	svc := NewService(newFakePostgresStatsPool(t), filepath.Join(dataDir, "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Driver != "postgres" {
+		t.Errorf("Driver = %q, want postgres", stats.Driver)
+	}
+	if stats.Path != "" {
+		t.Errorf("Path = %q, want empty for postgres", stats.Path)
+	}
+	if stats.SizeBytes != 4096 {
+		t.Errorf("SizeBytes = %d, want 4096", stats.SizeBytes)
+	}
+	if stats.WALSizeBytes != 0 {
+		t.Errorf("WALSizeBytes = %d, want 0 for postgres", stats.WALSizeBytes)
+	}
+	if stats.SchemaVersion != "v0.99.0" {
+		t.Errorf("SchemaVersion = %q, want v0.99.0", stats.SchemaVersion)
+	}
+	if stats.LastBackupAt != nil {
+		t.Errorf("LastBackupAt = %v, want nil for postgres", *stats.LastBackupAt)
+	}
+	if got := statsPayload(t, stats)["backup_directory"]; got != "" {
+		t.Errorf("backup_directory = %v, want empty for postgres", got)
+	}
+}
+
+func TestStats_LastBackupAtPicksNewestFile(t *testing.T) {
+	svc, _, _, dataDir := newTestService(t)
+
+	backupDir := filepath.Join(dataDir, "backups")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("mkdir backups: %v", err)
+	}
+	older := filepath.Join(backupDir, "kandev-old.db")
+	newer := filepath.Join(backupDir, "kandev-new.db")
+	if err := os.WriteFile(older, []byte("a"), 0o644); err != nil {
+		t.Fatalf("write older: %v", err)
+	}
+	earlier := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(older, earlier, earlier); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if err := os.WriteFile(newer, []byte("b"), 0o644); err != nil {
+		t.Fatalf("write newer: %v", err)
+	}
+
+	stats, err := svc.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.LastBackupAt == nil {
+		t.Fatalf("LastBackupAt should be set when a backup file exists")
+	}
+	if !stats.LastBackupAt.After(earlier.Add(time.Hour)) {
+		t.Errorf("LastBackupAt %v should be more recent than %v", *stats.LastBackupAt, earlier)
+	}
+}
+
+func TestHandleStats_Returns200JSON(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/db", HandleStats(svc))
+
+	req := httpGet(t, "/db")
+	w := serveHTTP(r, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !contains(body, `"driver"`) || !contains(body, `"path"`) || !contains(body, `"schema_version"`) || !contains(body, `"backup_directory"`) {
+		t.Errorf("body missing fields: %s", body)
+	}
+}
+
+func TestHandleRefreshStatsStartsScanDespiteBackoff(t *testing.T) {
+	clock := newTestClock(time.Date(2026, time.September, 27, 12, 0, 0, 0, time.UTC))
+	retryStarted := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseRetry) })
+	var scans atomic.Int32
+	svc := NewService(nil, filepath.Join(t.TempDir(), "kandev.db"), ResetDirs{}, nil, nil)
+	t.Cleanup(svc.StopBackground)
+	svc.logicalStats.options.now = clock.Now
+	svc.logicalStats.options.retryMin = 5 * time.Minute
+	svc.logicalStats.scan = func(context.Context) (logicalStorageStats, error) {
+		switch scans.Add(1) {
+		case 1:
+			return logicalStorageStats{}, errors.New("database busy")
+		case 2:
+			close(retryStarted)
+			<-releaseRetry
+			return logicalStorageStats{messageContent: 29}, nil
+		default:
+			return logicalStorageStats{}, nil
+		}
+	}
+	svc.logicalStats.Read()
+	waitLogicalStatsCache(t, svc.logicalStats)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/db/refresh", HandleRefreshStats(svc))
+	request := httptest.NewRequest(http.MethodPost, "/db/refresh", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("refresh status = %d, want 204; body=%s", response.Code, response.Body.String())
+	}
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit refresh did not start a scan during backoff")
+	}
+	releaseOnce.Do(func() { close(releaseRetry) })
+	waitLogicalStatsCache(t, svc.logicalStats)
+	if got := svc.logicalStats.Read(); got.state != logicalStatsStateReady || got.snapshot == nil || got.snapshot.values.messageContent != 29 {
+		t.Fatalf("read after refresh = %#v, want the new snapshot", got)
+	}
+}
+
+func statsPayload(t *testing.T, stats Stats) map[string]interface{} {
+	t.Helper()
+	raw, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+	return payload
+}

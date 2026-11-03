@@ -1,0 +1,304 @@
+package integration
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	mcphandlers "github.com/kandev/kandev/internal/mcp/handlers"
+	mcpscope "github.com/kandev/kandev/internal/mcp/scope"
+	"github.com/kandev/kandev/internal/task/models"
+	taskservice "github.com/kandev/kandev/internal/task/service"
+	ws "github.com/kandev/kandev/pkg/websocket"
+)
+
+// setupMCPTestServer creates a test server with MCP handlers registered
+// and returns the server along with a parent task's IDs for subtask tests.
+func setupMCPTestServer(t *testing.T) (*TestServer, string, string, string, string) {
+	t.Helper()
+
+	ts := NewTestServer(t)
+
+	// Register MCP handlers on the gateway dispatcher
+	mcpH := mcphandlers.NewHandlers(ts.TaskSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, ts.Logger)
+	mcpH.RegisterHandlers(ts.Gateway.Dispatcher)
+
+	client := NewWSClient(t, ts.Server.URL)
+	t.Cleanup(func() { client.Close() })
+
+	workspaceID := createWorkspace(t, client)
+	defaultProfileID := "default-agent-profile"
+	_, err := ts.TaskSvc.UpdateWorkspace(context.Background(), workspaceID, &taskservice.UpdateWorkspaceRequest{
+		DefaultAgentProfileID: &defaultProfileID,
+	})
+	require.NoError(t, err)
+
+	// Create workflow
+	workflowResp, err := client.SendRequest("wf-1", ws.ActionWorkflowCreate, map[string]interface{}{
+		"workspace_id":         workspaceID,
+		"name":                 "MCP Test Workflow",
+		"workflow_template_id": "simple",
+	})
+	require.NoError(t, err)
+	var wfPayload map[string]interface{}
+	require.NoError(t, workflowResp.ParsePayload(&wfPayload))
+	workflowID := wfPayload["id"].(string)
+
+	// Get first workflow step
+	stepResp, err := client.SendRequest("steps-1", ws.ActionWorkflowStepList, map[string]interface{}{
+		"workflow_id": workflowID,
+	})
+	require.NoError(t, err)
+	var stepPayload map[string]interface{}
+	require.NoError(t, stepResp.ParsePayload(&stepPayload))
+	steps := stepPayload["steps"].([]interface{})
+	workflowStepID := steps[0].(map[string]interface{})["id"].(string)
+
+	// Create parent task
+	taskResp, err := client.SendRequest("task-1", ws.ActionTaskCreate, map[string]interface{}{
+		"workspace_id":     workspaceID,
+		"workflow_id":      workflowID,
+		"workflow_step_id": workflowStepID,
+		"title":            "Parent Task",
+	})
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, taskResp.Type)
+	var taskPayload map[string]interface{}
+	require.NoError(t, taskResp.ParsePayload(&taskPayload))
+	parentTaskID := taskPayload["id"].(string)
+	callerSessionID := "mcp-parent-session"
+	require.NoError(t, ts.TaskRepo.CreateTaskSession(context.Background(), &models.TaskSession{
+		ID: callerSessionID, TaskID: parentTaskID, IsPrimary: true,
+		State: models.TaskSessionStateWaitingForInput,
+	}))
+	ts.mcpCallerTaskID = parentTaskID
+	ts.mcpCallerSessionID = callerSessionID
+
+	return ts, parentTaskID, workspaceID, workflowID, workflowStepID
+}
+
+// dispatchTrustedMCP exercises the in-process dispatcher path used by the
+// authenticated agent stream. Raw /ws intentionally rejects the internal
+// mcp.* namespace (ADR-2026-07-19-reject-mcp-actions-on-raw-websocket).
+func dispatchTrustedMCP(
+	t *testing.T,
+	ts *TestServer,
+	requestID, action string,
+	payload map[string]interface{},
+) (*ws.Message, error) {
+	t.Helper()
+	request, err := ws.NewRequest(requestID, action, payload)
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	if ts.mcpCallerTaskID != "" && ts.mcpCallerSessionID != "" {
+		resolver := mcpscope.NewResolver(ts.TaskRepo, nil, func() bool { return false }, ts.Logger)
+		ctx, err = resolver.ScopePrincipal(ctx, ts.mcpCallerTaskID, ts.mcpCallerSessionID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return ts.Gateway.Dispatcher.Dispatch(ctx, request)
+}
+
+func TestMCPCreateTask_SubtaskInheritsFromParent(t *testing.T) {
+	ts, parentTaskID, workspaceID, workflowID, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// Create subtask with title, description, and parent_id — workspace/workflow/step should be inherited
+	resp, err := dispatchTrustedMCP(t, ts, "subtask-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"parent_id":   parentTaskID,
+		"title":       "Subtask via MCP",
+		"description": "Implement the subtask feature",
+	})
+	require.NoError(t, err)
+
+	if resp.Type == ws.MessageTypeError {
+		var errPayload ws.ErrorPayload
+		require.NoError(t, resp.ParsePayload(&errPayload))
+		t.Fatalf("expected response but got error: %s", errPayload.Message)
+	}
+
+	var payload map[string]interface{}
+	require.NoError(t, resp.ParsePayload(&payload))
+
+	assert.NotEmpty(t, payload["id"])
+	assert.Equal(t, "Subtask via MCP", payload["title"])
+	assert.Equal(t, parentTaskID, payload["parent_id"])
+	assert.Equal(t, workspaceID, payload["workspace_id"])
+	assert.Equal(t, workflowID, payload["workflow_id"])
+}
+
+func TestMCPCreateTask_SubtaskVisibleInListTasks(t *testing.T) {
+	ts, parentTaskID, _, _, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	client := NewWSClient(t, ts.Server.URL)
+	defer client.Close()
+
+	// Get parent's workflow_id for listing
+	getResp, err := client.SendRequest("get-parent", ws.ActionTaskGet, map[string]interface{}{
+		"id": parentTaskID,
+	})
+	require.NoError(t, err)
+	var parentPayload map[string]interface{}
+	require.NoError(t, getResp.ParsePayload(&parentPayload))
+	workflowID := parentPayload["workflow_id"].(string)
+
+	// Create subtask
+	resp, err := dispatchTrustedMCP(t, ts, "subtask-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"parent_id":   parentTaskID,
+		"title":       "Visible Subtask",
+		"description": "Implement the visible subtask feature",
+	})
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	// List tasks — should contain both parent and subtask
+	listResp, err := dispatchTrustedMCP(t, ts, "list-1", ws.ActionMCPListTasks, map[string]interface{}{
+		"workflow_id": workflowID,
+	})
+	require.NoError(t, err)
+	var listPayload map[string]interface{}
+	require.NoError(t, listResp.ParsePayload(&listPayload))
+
+	tasks := listPayload["tasks"].([]interface{})
+	assert.Len(t, tasks, 2, "should have parent + subtask")
+
+	// Find the subtask and verify parent_id
+	var found bool
+	for _, raw := range tasks {
+		task := raw.(map[string]interface{})
+		if task["title"] == "Visible Subtask" {
+			assert.Equal(t, parentTaskID, task["parent_id"])
+			found = true
+		}
+	}
+	assert.True(t, found, "subtask should be visible in list_tasks")
+}
+
+func TestMCPCreateTask_TopLevelWithoutParent(t *testing.T) {
+	ts, _, workspaceID, workflowID, workflowStepID := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// Create top-level task (no parent_id, all IDs provided)
+	resp, err := dispatchTrustedMCP(t, ts, "top-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"workspace_id":     workspaceID,
+		"workflow_id":      workflowID,
+		"workflow_step_id": workflowStepID,
+		"title":            "Top Level Task",
+	})
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var payload map[string]interface{}
+	require.NoError(t, resp.ParsePayload(&payload))
+
+	assert.NotEmpty(t, payload["id"])
+	assert.Equal(t, "Top Level Task", payload["title"])
+	// parent_id should be empty (omitempty means absent from JSON)
+	_, hasParent := payload["parent_id"]
+	assert.False(t, hasParent, "top-level task should not have parent_id")
+}
+
+func TestMCPCreateTask_NoParentNoIDs_ReturnsError(t *testing.T) {
+	ts, _, _, _, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// No parent_id and no workspace/workflow -> should fail
+	resp, err := dispatchTrustedMCP(t, ts, "fail-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"title": "Orphan Task",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ws.MessageTypeError, resp.Type)
+}
+
+func TestMCPCreateTask_InvalidParentID_ReturnsError(t *testing.T) {
+	ts, _, _, _, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	resp, err := dispatchTrustedMCP(t, ts, "bad-parent", ws.ActionMCPCreateTask, map[string]interface{}{
+		"parent_id": "nonexistent-task-id",
+		"title":     "Bad Parent",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ws.MessageTypeError, resp.Type)
+}
+
+func TestMCPCreateTask_StartAgentFalse_DoesNotRequireDescription(t *testing.T) {
+	ts, parentTaskID, _, _, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// With start_agent=false, description should NOT be required for subtasks
+	resp, err := dispatchTrustedMCP(t, ts, "subtask-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"parent_id":   parentTaskID,
+		"title":       "Subtask without description",
+		"start_agent": false, // Don't auto-start, so no description needed
+	})
+	require.NoError(t, err)
+
+	// Should succeed because start_agent=false means no agent needs the description
+	assert.Equal(t, ws.MessageTypeResponse, resp.Type, "start_agent=false should allow subtask without description")
+}
+
+func TestMCPCreateTask_StartAgentTrue_RequiresDescription(t *testing.T) {
+	ts, parentTaskID, _, _, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// With start_agent=true (default), description IS required for subtasks
+	resp, err := dispatchTrustedMCP(t, ts, "subtask-1", ws.ActionMCPCreateTask, map[string]interface{}{
+		"parent_id": parentTaskID,
+		"title":     "Subtask without description",
+		// start_agent defaults to true, description is required
+	})
+	require.NoError(t, err)
+
+	// Should fail because the sub-agent needs the description as initial prompt
+	assert.Equal(t, ws.MessageTypeError, resp.Type, "start_agent=true should require description for subtask")
+}
+
+func TestMCPCreateTask_SourceTaskID_TopLevel_Succeeds(t *testing.T) {
+	ts, parentTaskID, workspaceID, workflowID, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// source_task_id is set by agentctl to the current task; verify the path succeeds
+	// and the task is created (even though parentTaskID has no repositories).
+	resp, err := dispatchTrustedMCP(t, ts, "top-source", ws.ActionMCPCreateTask, map[string]interface{}{
+		"workspace_id":      workspaceID,
+		"workflow_id":       workflowID,
+		"title":             "Top Level with Source Task",
+		"source_task_id":    parentTaskID,
+		"source_session_id": "mcp-parent-session",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ws.MessageTypeResponse, resp.Type, "valid source_task_id should not cause failure")
+
+	var payload map[string]interface{}
+	require.NoError(t, resp.ParsePayload(&payload))
+	assert.NotEmpty(t, payload["id"])
+}
+
+func TestMCPCreateTask_SourceTaskID_NotFound_IsRejected(t *testing.T) {
+	ts, _, workspaceID, workflowID, _ := setupMCPTestServer(t)
+	defer ts.Close()
+
+	// A session cannot replace its server-derived source task with a missing
+	// or foreign task ID. Admission rejects it before repository resolution or
+	// task creation.
+	before, err := ts.TaskSvc.ListTasks(context.Background(), workflowID)
+	require.NoError(t, err)
+	resp, err := dispatchTrustedMCP(t, ts, "top-notfound", ws.ActionMCPCreateTask, map[string]interface{}{
+		"workspace_id":   workspaceID,
+		"workflow_id":    workflowID,
+		"title":          "Top Level with Missing Source Task",
+		"source_task_id": "nonexistent-task-id-xyz",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ws.MessageTypeError, resp.Type)
+	after, err := ts.TaskSvc.ListTasks(context.Background(), workflowID)
+	require.NoError(t, err)
+	assert.Len(t, after, len(before))
+}

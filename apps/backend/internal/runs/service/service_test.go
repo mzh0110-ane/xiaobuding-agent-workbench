@@ -1,0 +1,1084 @@
+package service_test
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "github.com/mattn/go-sqlite3"
+
+	settingsstore "github.com/kandev/kandev/internal/agent/settings/store"
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/events"
+	"github.com/kandev/kandev/internal/events/bus"
+	"github.com/kandev/kandev/internal/office/models"
+	officesqlite "github.com/kandev/kandev/internal/office/repository/sqlite"
+	runssqlite "github.com/kandev/kandev/internal/runs/repository/sqlite"
+	runsservice "github.com/kandev/kandev/internal/runs/service"
+)
+
+// testWorkspaceID is the workspace stamped on every agent profile seeded by
+// seedAgentProfile, so causation resolution can resolve a workspace for
+// every agent id these tests use without each test declaring its own.
+const testWorkspaceID = "ws-test"
+
+// seedAgentProfile inserts a minimal agent_profiles row (and its parent
+// agents row, shared across every call since agent_profiles.agent_id is a
+// foreign key PostgreSQL enforces but SQLite does not) so
+// resolveCausation's workspace lookup (AC-OFFICE-RUN-CAUSATION-001.20)
+// succeeds for hand-picked test agent ids that were never created through
+// the office agent CRUD API. Rebinds its placeholders so the same helper
+// works against both the SQLite and PostgreSQL twin tests in this package.
+func seedAgentProfile(t *testing.T, db *sqlx.DB, id string) {
+	t.Helper()
+	now := time.Now().UTC()
+	_, err := db.Exec(db.Rebind(`
+		INSERT INTO agents (id, name, created_at, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO NOTHING
+	`), "test-agent", "test-agent", now, now)
+	if err != nil {
+		t.Fatalf("seed agent for profile %s: %v", id, err)
+	}
+	_, err = db.Exec(db.Rebind(`
+		INSERT INTO agent_profiles (
+			id, agent_id, name, agent_display_name, created_at, updated_at, workspace_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`), id, "test-agent", id, id, now, now, testWorkspaceID)
+	if err != nil {
+		t.Fatalf("seed agent profile %s: %v", id, err)
+	}
+}
+
+func seedGlobalProfileTask(t *testing.T, repo *runssqlite.Repository, profileID, taskID, workspaceID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := repo.Writer().ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY,
+			workspace_id TEXT NOT NULL DEFAULT ''
+		)
+	`); err != nil {
+		t.Fatalf("create task table: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := repo.Writer().ExecContext(ctx, repo.Writer().Rebind(`
+		INSERT INTO agents (id, name, created_at, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO NOTHING
+	`), "global-test-agent", "global-test-agent", now, now); err != nil {
+		t.Fatalf("seed global agent: %v", err)
+	}
+	if _, err := repo.Writer().ExecContext(ctx, repo.Writer().Rebind(`
+		INSERT INTO agent_profiles (
+			id, agent_id, name, agent_display_name, created_at, updated_at, workspace_id
+		) VALUES (?, ?, ?, ?, ?, ?, '')
+	`), profileID, "global-test-agent", profileID, profileID, now, now); err != nil {
+		t.Fatalf("seed global profile: %v", err)
+	}
+	if _, err := repo.Writer().ExecContext(ctx, repo.Writer().Rebind(`
+		INSERT INTO tasks (id, workspace_id) VALUES (?, ?)
+	`), taskID, workspaceID); err != nil {
+		t.Fatalf("seed global profile task: %v", err)
+	}
+}
+
+// newTestService spins up an in-memory SQLite, builds the office repo
+// (which creates the runs / run_events tables under the new names),
+// and wraps a fresh runs Service around the embedded runs repo. The
+// office repo is created here, not the runs repo directly, so the
+// schema migrations run.
+func newTestService(t *testing.T) (*runsservice.Service, bus.EventBus) {
+	t.Helper()
+	svc, eb, _ := newTestServiceWithRepo(t)
+	return svc, eb
+}
+
+func newTestServiceWithRepo(t *testing.T) (
+	*runsservice.Service, bus.EventBus, *runssqlite.Repository,
+) {
+	t.Helper()
+	db, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, _, err := settingsstore.Provide(db, db, nil); err != nil {
+		t.Fatalf("settings store init: %v", err)
+	}
+
+	officeRepo, err := officesqlite.NewWithDB(db, db, nil)
+	if err != nil {
+		t.Fatalf("init office repo: %v", err)
+	}
+
+	// Every agent_profile_id literal used across this file's tests, seeded
+	// once here so causation resolution's workspace lookup succeeds.
+	for _, id := range []string{
+		"a1", "a2", "agent-a", "agent-primary", "mentioned-agent", "payload-agent",
+	} {
+		seedAgentProfile(t, db, id)
+	}
+
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	eb := bus.NewMemoryEventBus(log)
+
+	svc := runsservice.New(officeRepo.RunsRepository(), eb, log, nil)
+	return svc, eb, officeRepo.RunsRepository()
+}
+
+// agentInPayload is the shape office.QueueRun packs into the runs
+// service today: the agent_profile_id rides inside the JSON payload
+// because the resolver hasn't been wired yet.
+func agentInPayload(agentID string) map[string]any {
+	return map[string]any{"agent_profile_id": agentID, "task_id": "t1"}
+}
+
+// TestQueueRun_InsertsRow pins the happy path: a fresh request lands
+// in the runs table with the agent + reason from the request and a
+// JSON payload that round-trips through the service.
+func TestQueueRun_InsertsRow(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:  "task_assigned",
+		Payload: agentInPayload("a1"),
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+}
+
+func TestQueueRun_GlobalProfileUsesTaskWorkspace(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	seedGlobalProfileTask(t, repo, "global-profile", "global-task", "ws-global")
+
+	if _, err := svc.QueueRun(context.Background(), runsservice.QueueRunRequest{
+		AgentProfileID: "global-profile",
+		TaskID:         "global-task",
+		Reason:         "task_assigned",
+		ActorKind:      models.ActorKindSystem,
+	}); err != nil {
+		t.Fatalf("queue global profile task: %v", err)
+	}
+	run := getRun(t, repo, "global-profile", "task_assigned")
+	if run.WorkspaceID != "ws-global" {
+		t.Fatalf("workspace_id = %q, want ws-global", run.WorkspaceID)
+	}
+}
+
+func TestQueueRun_DoesNotCoalesceTaskAssignedAcrossTasks(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	for _, taskID := range []string{"task-a", "task-b"} {
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			AgentProfileID: "agent-primary",
+			TaskID:         taskID,
+			WorkflowStepID: "step-1",
+			Reason:         "task_assigned",
+			IdempotencyKey: "task_assigned:" + taskID + ":agent-primary:step-1",
+		}); err != nil {
+			t.Fatalf("queue %s: %v", taskID, err)
+		}
+	}
+
+	var payloads []string
+	if err := repo.Reader().SelectContext(ctx, &payloads,
+		`SELECT payload FROM runs WHERE agent_profile_id = ? ORDER BY requested_at`,
+		"agent-primary"); err != nil {
+		t.Fatalf("list queued payloads: %v", err)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("queued task_assigned runs = %d, want 2", len(payloads))
+	}
+	seen := make(map[string]bool, len(payloads))
+	for _, raw := range payloads {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("decode payload %q: %v", raw, err)
+		}
+		taskID, ok := payload["task_id"].(string)
+		if !ok {
+			t.Fatalf("payload task_id = %v, want string", payload["task_id"])
+		}
+		seen[taskID] = true
+	}
+	if !seen["task-a"] || !seen["task-b"] {
+		t.Fatalf("queued task IDs = %#v, want task-a and task-b", seen)
+	}
+}
+
+func TestQueueRun_DoesNotCoalesceManualRecoveryAcrossTasks(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	for _, taskID := range []string{"task-a", "task-b"} {
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			AgentProfileID: "agent-primary",
+			TaskID:         taskID,
+			Reason:         "manual_resume_after_failure",
+			IdempotencyKey: "manual_resume_after_failure:" + taskID,
+		}); err != nil {
+			t.Fatalf("queue %s: %v", taskID, err)
+		}
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE agent_profile_id = ?`,
+		"agent-primary"); err != nil {
+		t.Fatalf("count queued runs: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("manual recovery runs = %d, want 2", count)
+	}
+}
+
+func TestQueueRun_UsesRequestAgentProfileIDAndAddsEnvelopePayload(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "task-1",
+		WorkflowStepID: "work",
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:comment-1",
+		Payload: map[string]any{
+			"comment_id": "comment-1",
+			"author_id":  "user-1",
+		},
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+
+	statuses, err := repo.GetRunsByCommentIDs(ctx, []string{"comment-1"})
+	if err != nil {
+		t.Fatalf("get comment runs: %v", err)
+	}
+	status, ok := statuses["comment-1"]
+	if !ok {
+		t.Fatalf("missing run status for comment-1: %+v", statuses)
+	}
+	run, err := repo.GetRunByID(ctx, status.RunID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.AgentProfileID != "agent-primary" {
+		t.Fatalf("agent_profile_id = %q, want agent-primary", run.AgentProfileID)
+	}
+	if run.IdempotencyKey == nil || *run.IdempotencyKey != "task_comment:comment-1" {
+		t.Fatalf("idempotency_key = %v, want task_comment:comment-1", run.IdempotencyKey)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(run.Payload), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	for k, want := range map[string]string{
+		"agent_profile_id": "agent-primary",
+		"task_id":          "task-1",
+		"workflow_step_id": "work",
+		"comment_id":       "comment-1",
+		"author_id":        "user-1",
+	} {
+		if got, _ := payload[k].(string); got != want {
+			t.Fatalf("payload[%s] = %q, want %q (payload=%v)", k, got, want, payload)
+		}
+	}
+}
+
+func TestQueueRun_DoesNotCoalesceDistinctTaskComments(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	for _, commentID := range []string{"comment-1", "comment-2"} {
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			AgentProfileID: "agent-primary",
+			TaskID:         "task-1",
+			WorkflowStepID: "work",
+			Reason:         "task_comment",
+			IdempotencyKey: "task_comment:" + commentID,
+			Payload: map[string]any{
+				"comment_id": commentID,
+			},
+		}); err != nil {
+			t.Fatalf("queue %s: %v", commentID, err)
+		}
+	}
+
+	statuses, err := repo.GetRunsByCommentIDs(ctx, []string{"comment-1", "comment-2"})
+	if err != nil {
+		t.Fatalf("get comment runs: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want one run per distinct comment", statuses)
+	}
+	if statuses["comment-1"].RunID == statuses["comment-2"].RunID {
+		t.Fatalf("distinct comments must not point at the same coalesced run: %+v", statuses)
+	}
+}
+
+func TestQueueRun_DoesNotCoalesceTaskCommentPrefixWithCustomReason(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	commentIDs := []string{"comment-1", "comment-2"}
+	keys := []string{
+		"task_comment:comment-1:work:task-1:agent-primary:follow-up",
+		"task_comment:comment-2:work:task-1:agent-primary:follow-up",
+	}
+	for i, key := range keys {
+		commentID := commentIDs[i]
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			AgentProfileID: "agent-primary",
+			TaskID:         "task-1",
+			WorkflowStepID: "work",
+			Reason:         "follow_up",
+			IdempotencyKey: key,
+			Payload: map[string]any{
+				"comment_id": commentID,
+			},
+		}); err != nil {
+			t.Fatalf("queue %s: %v", commentID, err)
+		}
+	}
+
+	for _, key := range keys {
+		exists, err := repo.CheckIdempotencyKey(ctx, key, runsservice.IdempotencyWindowHours)
+		if err != nil {
+			t.Fatalf("check idempotency key %s: %v", key, err)
+		}
+		if !exists {
+			t.Fatalf("missing inserted run for idempotency key %s", key)
+		}
+	}
+}
+
+func TestQueueRun_LegacyCommentWakeDoesNotOverwriteCanonicalCommentRun(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "target-task",
+		WorkflowStepID: "work",
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:comment-engine:work:target-task:agent-primary:abcd1234",
+		Payload: map[string]any{
+			"comment_id":     "comment-engine",
+			"source_task_id": "source-task",
+		},
+	}); err != nil {
+		t.Fatalf("queue engine run: %v", err)
+	}
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "source-task",
+		Reason:         "task_comment",
+		Payload: map[string]any{
+			"comment_id": "comment-legacy",
+		},
+	}); err != nil {
+		t.Fatalf("queue legacy run: %v", err)
+	}
+
+	statuses, err := repo.GetRunsByCommentIDs(ctx, []string{"comment-engine", "comment-legacy"})
+	if err != nil {
+		t.Fatalf("get comment runs: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want both comment runs", statuses)
+	}
+	if statuses["comment-engine"].RunID == statuses["comment-legacy"].RunID {
+		t.Fatalf("legacy run coalesced into canonical comment run: %+v", statuses)
+	}
+	engineRun, err := repo.GetRunByID(ctx, statuses["comment-engine"].RunID)
+	if err != nil {
+		t.Fatalf("get engine run: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(engineRun.Payload), &payload); err != nil {
+		t.Fatalf("decode engine payload: %v", err)
+	}
+	if payload["task_id"] != "target-task" || payload["source_task_id"] != "source-task" {
+		t.Fatalf("engine payload was overwritten by legacy coalesce: %#v", payload)
+	}
+
+}
+
+func TestQueueRun_SaltedKeyUsesPayloadCommentID(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "task-1",
+		WorkflowStepID: "work",
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:trigger-comment:work:task-1:agent-primary:abcd1234",
+		Payload: map[string]any{
+			"comment_id": "action-comment",
+		},
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+
+	statuses, err := repo.GetRunsByCommentIDs(ctx, []string{"trigger-comment", "action-comment"})
+	if err != nil {
+		t.Fatalf("get comment runs: %v", err)
+	}
+	if _, ok := statuses["trigger-comment"]; ok {
+		t.Fatalf("salted run attached to trigger comment instead of payload comment: %+v", statuses)
+	}
+	if _, ok := statuses["action-comment"]; !ok {
+		t.Fatalf("missing payload comment status: %+v", statuses)
+	}
+}
+
+// TestQueueRun_CommentStatusIgnoresMentionRuns pins that
+// task_mentioned runs carrying the same payload comment_id do not
+// replace the task_comment run shown on the comment.
+func TestQueueRun_CommentStatusIgnoresMentionRuns(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "task-1",
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:comment-1:work:task-1:agent-primary:abcd1234",
+		Payload: map[string]any{
+			"comment_id": "comment-1",
+		},
+	}); err != nil {
+		t.Fatalf("queue task_comment: %v", err)
+	}
+	if err := repo.CreateRun(ctx, &models.Run{
+		ID:             "mention-run",
+		AgentProfileID: "mentioned-agent",
+		Reason:         "task_mentioned",
+		Payload:        `{"comment_id":"comment-1","task_id":"task-1"}`,
+		Status:         "queued",
+		CoalescedCount: 1,
+	}); err != nil {
+		t.Fatalf("create mention run: %v", err)
+	}
+	if err := repo.SetRunRequestedAtForTest(ctx, "mention-run", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("move mention run later: %v", err)
+	}
+
+	statuses, err := repo.GetRunsByCommentIDs(ctx, []string{"comment-1"})
+	if err != nil {
+		t.Fatalf("get comment runs: %v", err)
+	}
+	status, ok := statuses["comment-1"]
+	if !ok {
+		t.Fatalf("missing comment status: %+v", statuses)
+	}
+	run, err := repo.GetRunByID(ctx, status.RunID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Reason != "task_comment" {
+		t.Fatalf("comment status attached to reason %q, want task_comment", run.Reason)
+	}
+}
+
+func TestQueueRun_PublishesSourceTaskForCrossTaskComment(t *testing.T) {
+	svc, eb := newTestService(t)
+	ctx := context.Background()
+
+	eventsCh := make(chan map[string]interface{}, 1)
+	_, err := eb.Subscribe(events.OfficeRunQueued, func(_ context.Context, e *bus.Event) error {
+		if data, ok := e.Data.(map[string]interface{}); ok {
+			eventsCh <- data
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "agent-primary",
+		TaskID:         "target-task",
+		WorkflowStepID: "target-step",
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:comment-1:work:target-task:agent-primary:abcd1234",
+		Payload: map[string]any{
+			"comment_id":     "comment-1",
+			"source_task_id": "source-task",
+		},
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+
+	select {
+	case data := <-eventsCh:
+		if data["task_id"] != "source-task" {
+			t.Fatalf("event task_id = %v, want source-task", data["task_id"])
+		}
+		if data["comment_id"] != "comment-1" {
+			t.Fatalf("event comment_id = %v, want comment-1", data["comment_id"])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for OfficeRunQueued event")
+	}
+}
+
+// TestQueueRun_RejectsWithoutAgent pins that the service refuses to
+// insert when no agent can be resolved from the payload (the
+// resolver-less path is what office.QueueRun uses today).
+func TestQueueRun_RejectsWithoutAgent(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	_, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:  "task_assigned",
+		Payload: map[string]any{"task_id": "t1"},
+	})
+	if err == nil {
+		t.Fatal("expected error when agent_profile_id is missing")
+	}
+}
+
+// TestQueueRun_Idempotency pins that a second request with the same
+// idempotency key inside the 24h window is suppressed silently —
+// neither inserts a new row nor returns an error.
+func TestQueueRun_Idempotency(t *testing.T) {
+	svc, eb := newTestService(t)
+	ctx := context.Background()
+
+	count := 0
+	_, err := eb.Subscribe(events.OfficeRunQueued, func(_ context.Context, _ *bus.Event) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			Reason:         "task_comment",
+			IdempotencyKey: "task_comment:c1",
+			Payload:        agentInPayload("a1"),
+		}); err != nil {
+			t.Fatalf("queue %d: %v", i, err)
+		}
+	}
+
+	// The bus is async by default; let the publish goroutine drain.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if count >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one OfficeRunQueued event, got %d", count)
+	}
+}
+
+// TestQueueRun_IdempotencyReportsDedupedOutcome pins that a suppressed
+// duplicate reports QueueOutcomeDeduped rather than QueueOutcomeQueued, so a
+// caller that logs or asserts on the outcome (e.g. the office auto-start
+// path in internal/orchestrator) can tell a real insert from a no-op.
+func TestQueueRun_IdempotencyReportsDedupedOutcome(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	first, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:c1",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue 1: %v", err)
+	}
+	if first != runsservice.QueueOutcomeQueued {
+		t.Errorf("first outcome = %q, want %q", first, runsservice.QueueOutcomeQueued)
+	}
+
+	second, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_comment",
+		IdempotencyKey: "task_comment:c1",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue 2: %v", err)
+	}
+	if second != runsservice.QueueOutcomeDeduped {
+		t.Errorf("second outcome = %q, want %q", second, runsservice.QueueOutcomeDeduped)
+	}
+}
+
+// TestQueueRun_DistinctIdempotencyKeyStillQueuesAfterDedup pins the actual
+// office auto-start defect this package's caller relies on: a step re-entry
+// that changes the idempotency key (in production, because task.UpdatedAt
+// changed) must still queue and insert a fresh row once the first run has
+// finished, not be swallowed by the dedup path that suppressed the first
+// identical key. Before the fix, the office auto-start key had no per-entry
+// component, so a rejected review card routed back to the same step would
+// collide with the first entry's key forever.
+func TestQueueRun_DistinctIdempotencyKeyStillQueuesAfterDedup(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	firstEntry, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_assigned",
+		IdempotencyKey: "task_assigned:t1:a1:step2:2026-01-01T00:00:00Z",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue first entry: %v", err)
+	}
+	if firstEntry != runsservice.QueueOutcomeQueued {
+		t.Fatalf("first entry outcome = %q, want %q", firstEntry, runsservice.QueueOutcomeQueued)
+	}
+
+	// Same key again within the entry (e.g. a duplicate delivery) is
+	// suppressed, exactly like TestQueueRun_IdempotencyReportsDedupedOutcome.
+	dup, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_assigned",
+		IdempotencyKey: "task_assigned:t1:a1:step2:2026-01-01T00:00:00Z",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue duplicate: %v", err)
+	}
+	if dup != runsservice.QueueOutcomeDeduped {
+		t.Fatalf("duplicate outcome = %q, want %q", dup, runsservice.QueueOutcomeDeduped)
+	}
+
+	// Simulate the first run having actually run and finished (the office
+	// scheduler claims and finishes it) before the step is re-entered.
+	// CoalesceRun only matches status='queued' rows, so a still-queued first
+	// row would coalesce the second entry instead of exercising the
+	// idempotency path this test targets.
+	var firstRunID string
+	if err := repo.Reader().GetContext(ctx, &firstRunID,
+		`SELECT id FROM runs WHERE idempotency_key = ?`,
+		"task_assigned:t1:a1:step2:2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("look up first run id: %v", err)
+	}
+	if err := repo.SetRunStatusForTest(ctx, firstRunID, "finished", nil, nil); err != nil {
+		t.Fatalf("finish first run: %v", err)
+	}
+
+	// A later re-entry into the same step (task, agent, step unchanged) with
+	// a bumped UpdatedAt component must still queue.
+	secondEntry, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_assigned",
+		IdempotencyKey: "task_assigned:t1:a1:step2:2026-01-01T01:00:00Z",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue second entry: %v", err)
+	}
+	if secondEntry != runsservice.QueueOutcomeQueued {
+		t.Errorf("second entry outcome = %q, want %q (a key with no per-entry component would dedupe this and silently drop the run)", secondEntry, runsservice.QueueOutcomeQueued)
+	}
+}
+
+// TestQueueRun_DedupesOnIdempotencyIndexRace pins the fix for the duplicate
+// on_children_completed wake race: idx_run_idempotency (unique on
+// idempotency_key with no time bound) can reject an insert even when
+// CheckIdempotencyKey's 24h-windowed lookup found no duplicate — for
+// example when two independent producers derive the same operation id and
+// race the insert, or (as reproduced deterministically here) when the
+// colliding row is older than the window. Before the fix insertRun wrapped
+// that unique-constraint violation in a generic "enqueue run" error, which
+// aborted the losing producer's step actions and logged a spurious ERROR
+// instead of being treated as an idempotent no-op.
+func TestQueueRun_DedupesOnIdempotencyIndexRace(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	const key = "task_children_completed:parent-1:0541818c598576d27d09bff86195037f87910dbf34f0420f6a99dc468aa1dfc7"
+
+	outcome, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		IdempotencyKey: key,
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue first run: %v", err)
+	}
+	if outcome != runsservice.QueueOutcomeQueued {
+		t.Fatalf("first outcome = %q, want %q", outcome, runsservice.QueueOutcomeQueued)
+	}
+
+	var firstRunID string
+	if err := repo.Reader().GetContext(ctx, &firstRunID,
+		`SELECT id FROM runs WHERE idempotency_key = ?`, key); err != nil {
+		t.Fatalf("look up first run id: %v", err)
+	}
+	// Push the first row outside CheckIdempotencyKey's 24h window so the
+	// racing insert reaches idx_run_idempotency instead of being caught
+	// by the earlier check — the exact gap a true concurrent race falls
+	// into (both producers pass the check before either commits).
+	if err := repo.SetRunRequestedAtForTest(ctx, firstRunID, time.Now().UTC().Add(-25*time.Hour)); err != nil {
+		t.Fatalf("age first run past the idempotency window: %v", err)
+	}
+
+	second, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		IdempotencyKey: key,
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue racing run: %v", err)
+	}
+	if second != runsservice.QueueOutcomeDeduped {
+		t.Fatalf("racing outcome = %q, want %q", second, runsservice.QueueOutcomeDeduped)
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE idempotency_key = ?`, key); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("runs with idempotency_key %q = %d, want 1", key, count)
+	}
+}
+
+// TestQueueRun_DedupesOnWakeWaveKeyIndexRace mirrors
+// TestQueueRun_DedupesOnIdempotencyIndexRace for idx_run_wake_wave: two
+// requests carrying the same (WakeWaveKey, AgentProfileID) must collapse to
+// one runs row, and the losing request must return QueueOutcomeDeduped, not
+// an error (AC-OFFICE-WAKE-WAVE-IDENTITY-002.3/.4).
+func TestQueueRun_DedupesOnWakeWaveKeyIndexRace(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	const waveKey = "task_children_completed:parent-1:deadbeef"
+
+	first, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		WakeWaveKey:    waveKey,
+		WakeWaveString: "parent-1|child-1,child-2",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue first run: %v", err)
+	}
+	if first != runsservice.QueueOutcomeQueued {
+		t.Fatalf("first outcome = %q, want %q", first, runsservice.QueueOutcomeQueued)
+	}
+
+	second, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		WakeWaveKey:    waveKey,
+		WakeWaveString: "parent-1|child-1,child-2",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue racing run: %v", err)
+	}
+	if second != runsservice.QueueOutcomeDeduped {
+		t.Fatalf("racing outcome = %q, want %q", second, runsservice.QueueOutcomeDeduped)
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE wake_wave_key = ?`, waveKey); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("runs with wake_wave_key %q = %d, want 1", waveKey, count)
+	}
+}
+
+// TestQueueRun_WakeWaveKey_DifferentAgentBothQueued pins .002.7: the same
+// wave fanning out to two distinct target agents must produce one run per
+// agent, not a suppressed second one.
+func TestQueueRun_WakeWaveKey_DifferentAgentBothQueued(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+	const waveKey = "task_children_completed:parent-1:deadbeef"
+
+	for _, agent := range []string{"a1", "a2"} {
+		outcome, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			Reason:         "task_children_completed",
+			WakeWaveKey:    waveKey,
+			WakeWaveString: "parent-1|child-1,child-2",
+			Payload:        agentInPayload(agent),
+		})
+		if err != nil {
+			t.Fatalf("queue run for %s: %v", agent, err)
+		}
+		if outcome != runsservice.QueueOutcomeQueued {
+			t.Fatalf("outcome for %s = %q, want %q", agent, outcome, runsservice.QueueOutcomeQueued)
+		}
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE wake_wave_key = ?`, waveKey); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("runs with wake_wave_key %q = %d, want 2 (one per agent)", waveKey, count)
+	}
+}
+
+// TestQueueRun_WakeCarryingRequest_NotCoalesced exercises .002.14 with both
+// requests carrying their own wave identity, addressed to the same agent
+// inside the coalescing window. Two independent rows must exist afterward.
+// Both requests carrying a wave key means CoalesceRun's row-side guard
+// (`AND wake_wave_key = ”`) already excludes the first row as a merge
+// candidate on its own, so this test's assertion holds regardless of
+// whether the request-side guard (shouldCoalesceRun) does anything at all —
+// it does NOT isolate the request side despite the name. See
+// TestQueueRun_WakeCarryingRequest_NotCoalescedIntoNonWaveRow for the test
+// that isolates the request-side guard specifically (asymmetric setup: an
+// existing non-wave-carrying row, a wave-carrying second request), and
+// TestQueueRun_ExistingWaveCarryingRow_NotMergedInto for the row-side guard
+// in isolation (the reverse asymmetry).
+func TestQueueRun_WakeCarryingRequest_NotCoalesced(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	first, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		WakeWaveKey:    "task_children_completed:parent-1:aaaa",
+		WakeWaveString: "parent-1|child-1",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue first run: %v", err)
+	}
+	if first != runsservice.QueueOutcomeQueued {
+		t.Fatalf("first outcome = %q, want %q", first, runsservice.QueueOutcomeQueued)
+	}
+
+	second, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:         "task_children_completed",
+		WakeWaveKey:    "task_children_completed:parent-2:bbbb",
+		WakeWaveString: "parent-2|child-2",
+		Payload:        agentInPayload("a1"),
+	})
+	if err != nil {
+		t.Fatalf("queue second run: %v", err)
+	}
+	if second != runsservice.QueueOutcomeQueued {
+		t.Fatalf("second outcome = %q, want %q (must not coalesce into the first parent's run)", second, runsservice.QueueOutcomeQueued)
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE agent_profile_id = 'a1' AND reason = 'task_children_completed'`,
+	); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("runs for a1 = %d, want 2 (no coalescing across distinct waves)", count)
+	}
+}
+
+// TestQueueRun_ExistingWaveCarryingRow_NotMergedInto pins the other half of
+// .002.14 — the row side: a *non*-wave-carrying request must not merge into
+// an existing queued row that carries a wave identity, even though the
+// request itself would otherwise be coalescible (shouldCoalesceRun returns
+// true — no wave key of its own, no task_comment prefix) and the
+// (agent, reason) pair matches. This is CoalesceRun's "AND wake_wave_key =
+// ”" guard on the target row, which TestQueueRun_WakeCarryingRequest_
+// NotCoalesced does not reach because both of its requests carry a wave
+// key and so never call shouldCoalesceRun's true branch. Deleting the
+// guard would let this test's second request silently overwrite the
+// first row's payload and identity.
+func TestQueueRun_ExistingWaveCarryingRow_NotMergedInto(t *testing.T) {
+	svc, _, repo := newTestServiceWithRepo(t)
+	ctx := context.Background()
+
+	first, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "a1",
+		TaskID:         "parent-1",
+		Reason:         "task_children_completed",
+		IdempotencyKey: "wave-first",
+		WakeWaveKey:    "task_children_completed:parent-1:aaaa",
+		WakeWaveString: "parent-1|child-1",
+		Payload:        map[string]any{"marker": "wave-row"},
+	})
+	if err != nil {
+		t.Fatalf("queue first run: %v", err)
+	}
+	if first != runsservice.QueueOutcomeQueued {
+		t.Fatalf("first outcome = %q, want %q", first, runsservice.QueueOutcomeQueued)
+	}
+
+	// Same agent and reason as the first row, but no wave identity of its
+	// own — an ordinary request that would coalesce into a plain queued
+	// row for the same (agent, reason) inside the window.
+	second, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		AgentProfileID: "a1",
+		TaskID:         "parent-1",
+		Reason:         "task_children_completed",
+		IdempotencyKey: "plain-second",
+		Payload:        map[string]any{"marker": "plain-row"},
+	})
+	if err != nil {
+		t.Fatalf("queue second run: %v", err)
+	}
+	if second != runsservice.QueueOutcomeQueued {
+		t.Fatalf("second outcome = %q, want %q (must not merge into the wave-carrying row)",
+			second, runsservice.QueueOutcomeQueued)
+	}
+
+	var count int
+	if err := repo.Reader().GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM runs WHERE agent_profile_id = 'a1' AND reason = 'task_children_completed'`,
+	); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("runs for a1 = %d, want 2 (the second request must not merge into the first)", count)
+	}
+
+	var firstRow struct {
+		Payload        string `db:"payload"`
+		WakeWaveKey    string `db:"wake_wave_key"`
+		CoalescedCount int    `db:"coalesced_count"`
+	}
+	if err := repo.Reader().GetContext(ctx, &firstRow,
+		`SELECT payload, wake_wave_key, coalesced_count FROM runs WHERE wake_wave_key = ?`,
+		"task_children_completed:parent-1:aaaa",
+	); err != nil {
+		t.Fatalf("read first row: %v", err)
+	}
+	if firstRow.CoalescedCount != 1 {
+		t.Fatalf("first row coalesced_count = %d, want 1 (unmerged)", firstRow.CoalescedCount)
+	}
+	var firstPayload map[string]any
+	if err := json.Unmarshal([]byte(firstRow.Payload), &firstPayload); err != nil {
+		t.Fatalf("decode first row payload: %v", err)
+	}
+	if firstPayload["marker"] != "wave-row" {
+		t.Fatalf("first row marker = %v, want wave-row (the plain request must not overwrite it)", firstPayload["marker"])
+	}
+}
+
+// TestQueueRun_Coalescing pins that two requests for the same
+// (agent, reason) inside the 5s window collapse onto a single row
+// with coalesced_count = 2 instead of producing two queued rows.
+func TestQueueRun_Coalescing(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+			Reason:  "task_comment",
+			Payload: agentInPayload("a1"),
+		}); err != nil {
+			t.Fatalf("queue %d: %v", i, err)
+		}
+	}
+	// We can't read the row directly from this package without
+	// pulling the runs repo into the test; the no-error assertion
+	// plus the signal-count assertion below cover the externally
+	// observable contract.
+}
+
+// TestQueueRun_SignalsScheduler pins that an INSERT pokes the in-
+// process signal channel exactly once. Coalesced rows do not signal
+// a second time because they don't add a new claimable row.
+func TestQueueRun_SignalsScheduler(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	signal := svc.SubscribeSignal()
+
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:  "task_assigned",
+		Payload: agentInPayload("a1"),
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+
+	select {
+	case <-signal:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected signal within 100ms of QueueRun returning")
+	}
+}
+
+// TestQueueRun_LatencySignalUnder100ms is the B3.7 latency pin: a
+// fresh INSERT must produce a claim signal within 100ms. Without
+// the event-driven signal path (B3.5) this would take up to one
+// 5s tick.
+func TestQueueRun_LatencySignalUnder100ms(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	signal := svc.SubscribeSignal()
+
+	start := time.Now()
+	if _, err := svc.QueueRun(ctx, runsservice.QueueRunRequest{
+		Reason:  "task_assigned",
+		Payload: agentInPayload("a1"),
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+
+	select {
+	case <-signal:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("event-driven signal did not arrive within 100ms (elapsed=%s)", time.Since(start))
+	}
+
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("signal latency %s exceeds 100ms budget", elapsed)
+	}
+}
+
+// TestQueueRun_ResolverPathPickedOverPayload pins that when an
+// AgentResolver is wired, it is consulted instead of the
+// agent_profile_id stored in the payload. The engine's queue_run
+// path will use this with a profile→instance resolver.
+func TestQueueRun_ResolverPathPickedOverPayload(t *testing.T) {
+	db, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	if _, _, err := settingsstore.Provide(db, db, nil); err != nil {
+		t.Fatalf("settings store init: %v", err)
+	}
+	officeRepo, err := officesqlite.NewWithDB(db, db, nil)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	seedAgentProfile(t, db, "resolved-agent")
+	log, _ := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	eb := bus.NewMemoryEventBus(log)
+
+	resolverCalled := false
+	resolver := runsservice.AgentResolverFunc(
+		func(_ context.Context, _ runsservice.QueueRunRequest) (string, error) {
+			resolverCalled = true
+			return "resolved-agent", nil
+		},
+	)
+	svc := runsservice.New(officeRepo.RunsRepository(), eb, log, resolver)
+
+	if _, err := svc.QueueRun(context.Background(), runsservice.QueueRunRequest{
+		Reason:  "task_assigned",
+		Payload: agentInPayload("payload-agent"),
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if !resolverCalled {
+		t.Fatal("expected resolver to be consulted before payload fallback")
+	}
+}

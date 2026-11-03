@@ -1,0 +1,194 @@
+"use client";
+
+import { forwardRef, useEffect, useRef, useState, type ComponentPropsWithoutRef } from "react";
+import { IconCheck, IconCircle, IconCircleFilled, IconListCheck, IconX } from "@tabler/icons-react";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@kandev/ui/hover-card";
+import { Popover, PopoverTrigger, PopoverContent } from "@kandev/ui/popover";
+import { useCompactTaskChrome } from "@/hooks/use-compact-task-chrome";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "react-i18next";
+
+type TodoDisplayItem = {
+  text: string;
+  done?: boolean;
+  status?: "pending" | "in_progress" | "completed" | "failed";
+};
+
+type TodoIndicatorProps = {
+  todos: TodoDisplayItem[];
+};
+
+function resolveStatus(todo: TodoDisplayItem): "pending" | "in_progress" | "completed" | "failed" {
+  if (todo.status) return todo.status;
+  return todo.done ? "completed" : "pending";
+}
+
+function StatusIcon({ status, className }: { status: string; className?: string }) {
+  switch (status) {
+    case "completed":
+      return <IconCheck className={cn("h-3.5 w-3.5 text-green-500", className)} />;
+    case "in_progress":
+      return <IconCircleFilled className={cn("h-3.5 w-3.5 text-blue-500", className)} />;
+    case "failed":
+      return <IconX className={cn("h-3.5 w-3.5 text-red-500", className)} />;
+    default:
+      return <IconCircle className={cn("h-3.5 w-3.5 text-muted-foreground/40", className)} />;
+  }
+}
+
+function TodoList({
+  todos,
+  fillHeight = false,
+}: {
+  todos: TodoDisplayItem[];
+  fillHeight?: boolean;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+  }, []);
+
+  return (
+    <div
+      ref={listRef}
+      className={cn(
+        "space-y-1.5 overflow-y-auto",
+        // The popover/hovercard caps the list at max-h-48 so it never
+        // outgrows its small surface; a pinned panel instead lets the list
+        // flex to fill the whole height of its hosting panel and scrolls
+        // internally there.
+        fillHeight ? "min-h-0 flex-1" : "max-h-48",
+      )}
+    >
+      {todos.map((todo, idx) => {
+        const s = resolveStatus(todo);
+        return (
+          <div key={idx} className="flex items-start gap-2 text-xs">
+            <span className="text-muted-foreground/60 shrink-0 w-4 text-right tabular-nums">
+              {idx + 1}
+            </span>
+            <StatusIcon status={s} className="mt-0.5 shrink-0 h-3 w-3" />
+            <span className={cn(s === "completed" && "line-through text-muted-foreground")}>
+              {todo.text}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TodoIndicatorContent({
+  todos,
+  completed,
+  progress,
+  fillHeight = false,
+}: {
+  todos: TodoDisplayItem[];
+  completed: number;
+  progress: number;
+  fillHeight?: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div
+      data-testid="todo-indicator-popover"
+      className={cn(fillHeight && "flex h-full min-h-0 flex-col")}
+    >
+      <div className="flex items-center justify-between text-xs mb-2">
+        <span className="font-medium text-foreground">{t("task:todos")}</span>
+        <span className="text-muted-foreground">
+          {t("task:todosCompleted", { completed, total: todos.length })}
+        </span>
+      </div>
+      <div className="h-1.5 rounded-full bg-muted/70 mb-3">
+        <div
+          className="h-full rounded-full bg-primary/80 transition-[width]"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <TodoList todos={todos} fillHeight={fillHeight} />
+    </div>
+  );
+}
+
+type TodoIndicatorButtonProps = {
+  allComplete: boolean;
+  completed: number;
+  total: number;
+  open?: boolean;
+} & ComponentPropsWithoutRef<"button">;
+
+const TodoIndicatorTrigger = forwardRef<HTMLButtonElement, TodoIndicatorButtonProps>(
+  function TodoIndicatorTrigger({ allComplete, completed, total, open, ...buttonProps }, ref) {
+    return (
+      <button
+        {...buttonProps}
+        ref={ref}
+        type="button"
+        data-testid="todo-indicator"
+        aria-expanded={open}
+        className={cn(
+          "flex items-center gap-1.5 px-2 py-0.5 text-xs transition-colors rounded cursor-pointer",
+          allComplete
+            ? "text-green-500 hover:text-green-400"
+            : "text-muted-foreground hover:text-foreground",
+        )}
+      >
+        {allComplete ? <IconCheck className="h-3 w-3" /> : <IconListCheck className="h-3 w-3" />}
+        <span>
+          {completed}/{total}
+        </span>
+      </button>
+    );
+  },
+);
+
+export function TodoIndicator({ todos }: TodoIndicatorProps) {
+  const usesCompactTaskChrome = useCompactTaskChrome();
+  const [open, setOpen] = useState(false);
+
+  if (!todos.length) return null;
+
+  const completed = todos.filter((t) => resolveStatus(t) === "completed").length;
+  const allComplete = completed === todos.length;
+  const progress = Math.round((completed / todos.length) * 100);
+  const content = <TodoIndicatorContent todos={todos} completed={completed} progress={progress} />;
+
+  if (!usesCompactTaskChrome) {
+    return (
+      <HoverCard openDelay={200} closeDelay={100}>
+        <HoverCardTrigger asChild>
+          <TodoIndicatorTrigger
+            allComplete={allComplete}
+            completed={completed}
+            total={todos.length}
+          />
+        </HoverCardTrigger>
+        <HoverCardContent side="top" align="start" className="w-72 p-3">
+          {content}
+        </HoverCardContent>
+      </HoverCard>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <TodoIndicatorTrigger
+          allComplete={allComplete}
+          completed={completed}
+          total={todos.length}
+          open={open}
+        />
+      </PopoverTrigger>
+      <PopoverContent side="top" align="start" className="w-72 p-3">
+        {content}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+export { StatusIcon, resolveStatus, TodoIndicatorContent };
+export type { TodoDisplayItem };

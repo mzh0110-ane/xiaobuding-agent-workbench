@@ -1,0 +1,117 @@
+import type { SeedData } from "../fixtures/test-base";
+import type { ApiClient } from "./api-client";
+import { pollUntil } from "./poll-until";
+
+export const REVIEW_OWNER = "testorg";
+export const REVIEW_SHARED_FILE = "shared-pr.ts";
+
+/** Keep the mocked GitHub repository tied to the worker's seeded repository. */
+export function reviewRepositoryName(seedData: Pick<SeedData, "repositoryId">): string {
+  const suffix = seedData.repositoryId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
+  return `e2e-review-${suffix.toLowerCase()}`;
+}
+
+export const REVIEW_PRS = [
+  {
+    number: 121,
+    title: "First review branch",
+    branch: "feat/first-review",
+    marker: "FIRST_PR_MARKER",
+    repositoryName: "E2E-Repo",
+  },
+  {
+    number: 122,
+    title: "Second review branch",
+    branch: "feat/second-review",
+    marker: "SECOND_PR_MARKER",
+    repositoryName: "E2E-Repo-feat-second-review",
+  },
+] as const;
+
+export async function seedMultiPRReviewTask(
+  apiClient: ApiClient,
+  seedData: SeedData,
+  title: string,
+  description = "/e2e:simple-message",
+) {
+  const repositoryName = reviewRepositoryName(seedData);
+  await apiClient.mockGitHubReset();
+  await apiClient.mockGitHubSetUser("reviewer");
+
+  const task = await apiClient.createTaskWithAgent(
+    seedData.workspaceId,
+    title,
+    seedData.agentProfileId,
+    {
+      description,
+      workflow_id: seedData.workflowId,
+      workflow_step_id: seedData.startStepId,
+      repositories: REVIEW_PRS.map((pr) => ({
+        repository_id: seedData.repositoryId,
+        base_branch: "main",
+        checkout_branch: pr.branch,
+      })),
+      executor_profile_id: seedData.worktreeExecutorProfileId,
+    },
+  );
+
+  await apiClient.mockGitHubAddPRs(
+    REVIEW_PRS.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      state: "open",
+      head_branch: pr.branch,
+      base_branch: "main",
+      author_login: "reviewer",
+      repo_owner: REVIEW_OWNER,
+      repo_name: repositoryName,
+      html_url: `https://github.com/${REVIEW_OWNER}/${repositoryName}/pull/${pr.number}`,
+      additions: 1,
+      deletions: 0,
+    })),
+  );
+
+  for (const pr of REVIEW_PRS) {
+    await apiClient.mockGitHubAddPRFiles(REVIEW_OWNER, repositoryName, pr.number, [
+      {
+        filename: REVIEW_SHARED_FILE,
+        status: "added",
+        additions: 1,
+        deletions: 0,
+        patch: `@@ -0,0 +1 @@\n+${pr.marker}`,
+      },
+    ]);
+    await apiClient.mockGitHubAssociateTaskPR({
+      workspace_id: seedData.workspaceId,
+      task_id: task.id,
+      repository_id: seedData.repositoryId,
+      owner: REVIEW_OWNER,
+      repo: repositoryName,
+      pr_number: pr.number,
+      pr_url: `https://github.com/${REVIEW_OWNER}/${repositoryName}/pull/${pr.number}`,
+      pr_title: pr.title,
+      head_branch: pr.branch,
+      base_branch: "main",
+      author_login: "reviewer",
+      additions: 1,
+      deletions: 0,
+    });
+  }
+
+  // Association requests are synchronous, but this read barrier makes the
+  // seed contract explicit before the browser's first task-PR sync. Without
+  // it, a cold worker could open the changes panel after only the first row
+  // was visible to the frontend.
+  const expectedNumbers = REVIEW_PRS.map((pr) => pr.number).sort((a, b) => a - b);
+  await pollUntil(
+    async () =>
+      (await apiClient.listTaskPRs(task.id)).map((pr) => pr.pr_number).sort((a, b) => a - b),
+    (numbers) =>
+      numbers.length === expectedNumbers.length &&
+      numbers.every((number, index) => number === expectedNumbers[index]),
+    15_000,
+    "waiting for both seeded review PR associations",
+  );
+
+  return task;
+}

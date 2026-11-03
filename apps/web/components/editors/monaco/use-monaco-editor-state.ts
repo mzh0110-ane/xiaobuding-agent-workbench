@@ -1,0 +1,488 @@
+import { useCallback, useEffect, useState, useRef, type RefObject } from "react";
+import type { OnMount, OnChange } from "@monaco-editor/react";
+import type { editor as monacoEditor, IDisposable } from "monaco-editor";
+import { useCommentsStore } from "@/lib/state/slices/comments";
+import { useDiffFileComments } from "@/hooks/domains/comments/use-diff-comments";
+import { useRunComment } from "@/hooks/domains/comments/use-run-comment";
+import { buildDiffComment, useCommentedLines } from "@/lib/diff/comment-utils";
+import { useAppStore } from "@/components/state-provider";
+import { useToast } from "@/components/toast-provider";
+import { useCommandPanelOpen } from "@/lib/commands/command-registry";
+import { useGutterComments } from "@/hooks/use-gutter-comments";
+import type { DiffComment } from "@/lib/diff/types";
+import { useTranslation } from "react-i18next";
+
+export type FormZoneRange = {
+  startLine: number;
+  endLine: number;
+  codeContent: string;
+} | null;
+
+export type FloatingButtonPosition = {
+  x: number;
+  y: number;
+} | null;
+
+// ---------------------------------------------------------------------------
+// Hook options
+// ---------------------------------------------------------------------------
+
+type UseMonacoEditorStateOpts = {
+  path: string;
+  repo?: string;
+  enableComments: boolean;
+  sessionId?: string;
+  wrapperRef: RefObject<HTMLDivElement | null>;
+  onChange: (newContent: string) => void;
+  onSave: () => void;
+  contentRef: RefObject<string>;
+};
+
+// ---------------------------------------------------------------------------
+// useMonacoEditorComments — comment state, gutter, keyboard, ViewZone refs
+// ---------------------------------------------------------------------------
+
+// eslint-disable-next-line max-lines-per-function
+export function useMonacoEditorComments(opts: UseMonacoEditorStateOpts) {
+  const { t } = useTranslation();
+  const { path, repo, enableComments, sessionId, wrapperRef, onChange, onSave, contentRef } = opts;
+
+  const [wrapEnabled, setWrapEnabled] = useState(true);
+  const [formZoneRange, setFormZoneRange] = useState<FormZoneRange>(null);
+  const [floatingButtonPos, setFloatingButtonPos] = useState<FloatingButtonPosition>(null);
+  const [currentSelection, setCurrentSelection] = useState<{
+    text: string;
+    startLine: number;
+    endLine: number;
+  } | null>(null);
+  const [showDiffIndicators, setShowDiffIndicators] = useState(true);
+  const [editorInstance, setEditorInstance] = useState<monacoEditor.IStandaloneCodeEditor | null>(
+    null,
+  );
+  const editorRef = useRef<monacoEditor.IStandaloneCodeEditor | null>(null);
+  const mousePositionRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const onSaveRef = useRef(onSave);
+  useEffect(() => {
+    onSaveRef.current = onSave;
+  }, [onSave]);
+  const decorationsRef = useRef<monacoEditor.IEditorDecorationsCollection | null>(null);
+  const diffDecorationsRef = useRef<monacoEditor.IEditorDecorationsCollection | null>(null);
+  const disposablesRef = useRef<IDisposable[]>([]);
+  const { toast } = useToast();
+  const { setOpen: setCommandPanelOpen } = useCommandPanelOpen();
+
+  const addComment = useCommentsStore((state) => state.addComment);
+  const removeComment = useCommentsStore((state) => state.removeComment);
+  const updateComment = useCommentsStore((state) => state.updateComment);
+  const editingCommentId = useCommentsStore((state) => state.editingCommentId);
+  const setEditingComment = useCommentsStore((state) => state.setEditingComment);
+  const comments = useDiffFileComments(sessionId ?? "", path, undefined, repo ?? "");
+  const commentedLines = useCommentedLines(comments);
+
+  const handleGutterSelectionComplete = useCallback(
+    (params: { range: { start: number; end: number }; code: string }) => {
+      setFormZoneRange({
+        startLine: params.range.start,
+        endLine: params.range.end,
+        codeContent: params.code,
+      });
+    },
+    [],
+  );
+
+  const { clearGutterSelection } = useGutterComments(editorInstance, {
+    enabled: enableComments && !!sessionId,
+    commentedLines,
+    onSelectionComplete: handleGutterSelectionComplete,
+  });
+
+  // Stable callback refs for ViewZone renders (avoids stale closures)
+  const handleCommentSubmitRef = useRef((() => {}) as (annotation: string) => void);
+  const handleCommentDeleteRef = useRef((() => {}) as (commentId: string) => void);
+  const handleCommentUpdateRef = useRef((() => {}) as (
+    commentId: string,
+    annotation: string,
+  ) => void);
+
+  // Editor mount
+  const handleEditorDidMount: OnMount = useCallback(
+    (editor, monaco) => {
+      editorRef.current = editor;
+      setEditorInstance(editor);
+      decorationsRef.current = editor.createDecorationsCollection([]);
+      diffDecorationsRef.current = editor.createDecorationsCollection([]);
+      if (enableComments && sessionId) {
+        disposablesRef.current.push(
+          editor.onDidChangeCursorSelection(() => {
+            const selection = editor.getSelection();
+            if (!selection || selection.isEmpty()) {
+              setCurrentSelection(null);
+              return;
+            }
+            const model = editor.getModel();
+            if (!model) return;
+            const text = model.getValueInRange(selection);
+            if (!text.trim()) {
+              setCurrentSelection(null);
+              return;
+            }
+            setCurrentSelection({
+              text,
+              startLine: selection.startLineNumber,
+              endLine: selection.endLineNumber,
+            });
+          }),
+        );
+      }
+      disposablesRef.current.push(
+        editor.onMouseDown((e) => {
+          if (e.target.type !== 3 && e.target.type !== 4) return;
+          const lineNumber = e.target.position?.lineNumber;
+          if (!lineNumber) return;
+          const storeState = useCommentsStore.getState();
+          const fileComments = storeState.getCommentsForFile(sessionId ?? "", path);
+          const lineComments = fileComments.filter(
+            (c) => lineNumber >= c.startLine && lineNumber <= c.endLine,
+          );
+          if (lineComments.length > 0) {
+            const id = lineComments[0].id;
+            storeState.setEditingComment(storeState.editingCommentId === id ? null : id);
+          }
+        }),
+      );
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => {
+        setCommandPanelOpen(true);
+      });
+      editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.KeyZ, () => {
+        setWrapEnabled((prev) => !prev);
+      });
+    },
+    [path, repo, enableComments, sessionId, setCommandPanelOpen, setWrapEnabled],
+  );
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      for (const d of disposablesRef.current) d.dispose();
+      disposablesRef.current = [];
+    };
+  }, []);
+
+  // Track mouse position
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      mousePositionRef.current = { x: e.clientX, y: e.clientY };
+    };
+    document.addEventListener("mousemove", handleMouseMove);
+    return () => document.removeEventListener("mousemove", handleMouseMove);
+  }, []);
+
+  // Cmd/Ctrl+S to save
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+        e.preventDefault();
+        e.stopPropagation();
+        onSaveRef.current();
+      }
+    };
+    wrapper.addEventListener("keydown", handler);
+    return () => wrapper.removeEventListener("keydown", handler);
+  }, [wrapperRef]);
+
+  // Comment decorations
+  useEffect(() => {
+    if (!decorationsRef.current || !editorRef.current) return;
+    const decorations: monacoEditor.IModelDeltaDecoration[] = [];
+    const linesWithComments = new Set<number>();
+    const firstLines = new Set<number>();
+    for (const comment of comments) {
+      firstLines.add(comment.startLine);
+      for (let line = comment.startLine; line <= comment.endLine; line++)
+        linesWithComments.add(line);
+    }
+    for (const lineNum of linesWithComments) {
+      decorations.push({
+        range: { startLineNumber: lineNum, startColumn: 1, endLineNumber: lineNum, endColumn: 1 },
+        options: {
+          isWholeLine: true,
+          className: "monaco-comment-line",
+          lineNumberClassName: "monaco-comment-line-number",
+          firstLineDecorationClassName: firstLines.has(lineNum)
+            ? "monaco-comment-bar-icon"
+            : "monaco-comment-bar",
+        },
+      });
+    }
+    decorationsRef.current.set(decorations);
+  }, [comments, editorInstance]);
+
+  // Show floating button at end of selection
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    const editor = editorRef.current;
+    if (!wrapper || !editor || !enableComments || !sessionId) return;
+    const handleMouseUp = (e: MouseEvent) => {
+      if ((e.target as HTMLElement).closest(".floating-comment-btn")) return;
+      setTimeout(() => {
+        if (!currentSelection) return;
+        const sel = editor.getSelection();
+        if (!sel || sel.isEmpty()) return;
+        const endPos = editor.getScrolledVisiblePosition({
+          lineNumber: sel.endLineNumber,
+          column: sel.endColumn,
+        });
+        if (!endPos) return;
+        setFloatingButtonPos({ x: endPos.left, y: endPos.top + endPos.height });
+      }, 10);
+    };
+    const handleMouseDown = (e: MouseEvent) => {
+      if ((e.target as HTMLElement).closest(".floating-comment-btn")) return;
+      setFloatingButtonPos(null);
+    };
+    wrapper.addEventListener("mouseup", handleMouseUp);
+    wrapper.addEventListener("mousedown", handleMouseDown);
+    return () => {
+      wrapper.removeEventListener("mouseup", handleMouseUp);
+      wrapper.removeEventListener("mousedown", handleMouseDown);
+    };
+  }, [enableComments, sessionId, currentSelection, wrapperRef]);
+
+  // Cmd+I to open inline comment form
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper || !enableComments || !sessionId) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "i") {
+        if (!currentSelection) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setFormZoneRange({
+          startLine: currentSelection.startLine,
+          endLine: currentSelection.endLine,
+          codeContent: currentSelection.text,
+        });
+        setFloatingButtonPos(null);
+      }
+    };
+    wrapper.addEventListener("keydown", handleKeyDown, true);
+    return () => wrapper.removeEventListener("keydown", handleKeyDown, true);
+  }, [enableComments, sessionId, currentSelection, wrapperRef]);
+
+  // Escape to close inline forms
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (formZoneRange) {
+          setFormZoneRange(null);
+          clearGutterSelection();
+        }
+        if (editingCommentId) setEditingComment(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [formZoneRange, editingCommentId, setEditingComment, clearGutterSelection]);
+
+  // Click outside to close editing / new comment form
+  useEffect(() => {
+    if (!editingCommentId && !formZoneRange) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if ((e.target as HTMLElement).closest("[data-comment-zone]")) return;
+      if (editingCommentId) setEditingComment(null);
+      if (formZoneRange) {
+        setFormZoneRange(null);
+        clearGutterSelection();
+      }
+    };
+    const timer = setTimeout(() => {
+      document.addEventListener("mousedown", handleMouseDown);
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("mousedown", handleMouseDown);
+    };
+  }, [editingCommentId, formZoneRange, setEditingComment, clearGutterSelection]);
+
+  const handleChange: OnChange = useCallback(
+    (value) => {
+      if (value !== undefined) {
+        contentRef.current = value;
+        onChange(value);
+      }
+    },
+    [onChange, contentRef],
+  );
+
+  const handleFloatingButtonClick = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!currentSelection) return;
+      setFormZoneRange({
+        startLine: currentSelection.startLine,
+        endLine: currentSelection.endLine,
+        codeContent: currentSelection.text,
+      });
+      setFloatingButtonPos(null);
+    },
+    [currentSelection],
+  );
+
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const { runComment } = useRunComment({
+    sessionId: sessionId ?? null,
+    taskId: activeTaskId ?? null,
+  });
+
+  const createCommentFromForm = useCallback(
+    (annotation: string): DiffComment | null => {
+      if (!formZoneRange || !sessionId) return null;
+      const comment = buildDiffComment({
+        filePath: path,
+        repositoryName: repo ?? "",
+        sessionId,
+        startLine: formZoneRange.startLine,
+        endLine: formZoneRange.endLine,
+        side: "additions",
+        text: annotation,
+        codeContent: formZoneRange.codeContent,
+      });
+      addComment(comment);
+      setFormZoneRange(null);
+      clearGutterSelection();
+      const editor = editorRef.current;
+      if (editor) {
+        const pos = editor.getPosition();
+        if (pos)
+          editor.setSelection({
+            startLineNumber: pos.lineNumber,
+            startColumn: pos.column,
+            endLineNumber: pos.lineNumber,
+            endColumn: pos.column,
+          });
+      }
+      return comment;
+    },
+    [formZoneRange, sessionId, path, repo, addComment, clearGutterSelection],
+  );
+
+  const handleCommentSubmit = useCallback(
+    (annotation: string) => {
+      const comment = createCommentFromForm(annotation);
+      if (comment) {
+        toast({
+          title: t("editors:commentAdded"),
+          description: t("editors:commentWillBeSentWithNextMessage"),
+        });
+      }
+    },
+    [createCommentFromForm, toast],
+  );
+
+  const handleCommentSubmitAndRun = useCallback(
+    async (annotation: string) => {
+      const comment = createCommentFromForm(annotation);
+      if (comment) {
+        try {
+          const { queued } = await runComment(comment);
+          toast({
+            title: t("editors:commentSent"),
+            description: queued ? t("editors:queuedForTheAgent") : t("editors:sentToTheAgent"),
+          });
+        } catch {
+          toast({
+            title: t("editors:failedToSendComment"),
+            description: t("editors:pleaseTryAgain"),
+            variant: "error",
+          });
+        }
+      }
+    },
+    [createCommentFromForm, runComment, toast],
+  );
+
+  const handleCommentRun = useCallback(
+    async (comment: DiffComment) => {
+      try {
+        const { queued } = await runComment(comment);
+        toast({
+          title: t("editors:commentSent"),
+          description: queued ? t("editors:queuedForTheAgent") : t("editors:sentToTheAgent"),
+        });
+      } catch {
+        toast({
+          title: t("editors:failedToSendComment"),
+          description: t("editors:pleaseTryAgain"),
+          variant: "error",
+        });
+      }
+    },
+    [runComment, toast],
+  );
+
+  const handleDeleteComment = useCallback(
+    (commentId: string) => {
+      if (!sessionId) return;
+      removeComment(commentId);
+      toast({ title: t("editors:commentDeleted") });
+    },
+    [sessionId, removeComment, toast],
+  );
+
+  const handleUpdateComment = useCallback(
+    (commentId: string, annotation: string) => {
+      updateComment(commentId, { text: annotation });
+      setEditingComment(null);
+      toast({ title: t("editors:commentUpdated") });
+    },
+    [updateComment, setEditingComment, toast],
+  );
+
+  // Keep stable refs updated for ViewZone renders
+  useEffect(() => {
+    handleCommentSubmitRef.current = handleCommentSubmit;
+  }, [handleCommentSubmit]);
+  const handleCommentSubmitAndRunRef = useRef(handleCommentSubmitAndRun);
+  useEffect(() => {
+    handleCommentSubmitAndRunRef.current = handleCommentSubmitAndRun;
+  }, [handleCommentSubmitAndRun]);
+  useEffect(() => {
+    handleCommentDeleteRef.current = handleDeleteComment;
+  }, [handleDeleteComment]);
+  useEffect(() => {
+    handleCommentUpdateRef.current = handleUpdateComment;
+  }, [handleUpdateComment]);
+  const handleCommentRunRef = useRef(handleCommentRun);
+  useEffect(() => {
+    handleCommentRunRef.current = handleCommentRun;
+  }, [handleCommentRun]);
+
+  return {
+    wrapEnabled,
+    setWrapEnabled,
+    showDiffIndicators,
+    setShowDiffIndicators,
+    editorInstance,
+    editorRef,
+    decorationsRef,
+    diffDecorationsRef,
+    formZoneRange,
+    setFormZoneRange,
+    floatingButtonPos,
+    editingCommentId,
+    setEditingComment,
+    comments,
+    clearGutterSelection,
+    handleEditorDidMount,
+    handleChange,
+    handleFloatingButtonClick,
+    handleCommentSubmitRef,
+    handleCommentSubmitAndRunRef,
+    handleCommentDeleteRef,
+    handleCommentUpdateRef,
+    handleCommentRunRef,
+  };
+}

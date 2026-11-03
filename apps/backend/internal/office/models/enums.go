@@ -1,0 +1,444 @@
+// Package models — enum types.
+//
+// This file colocates the named string types used by office structs.
+// Each type wraps the existing magic-string vocabulary so callsites can
+// compare against typed constants instead of bare string literals. The
+// underlying type is `string` in every case, so `database/sql` Scan /
+// `driver.Value` bind, and JSON marshaling, all continue to work
+// without custom hooks.
+//
+// Convention: typed-string + untyped const, with a `String()` method.
+// Untyped consts let existing comparison sites keep working when the
+// struct field gets re-typed.
+package models
+
+// ApprovalStatus is the lifecycle state of an Approval row.
+type ApprovalStatus string
+
+// Approval status values. See internal/office/approvals/service.go for
+// the state machine (pending → approved | rejected).
+const (
+	ApprovalStatusPending  ApprovalStatus = "pending"
+	ApprovalStatusApproved ApprovalStatus = "approved"
+	ApprovalStatusRejected ApprovalStatus = "rejected"
+)
+
+// String implements fmt.Stringer.
+func (s ApprovalStatus) String() string { return string(s) }
+
+// RoutineRunStatus is the lifecycle state of a RoutineRun row.
+// See internal/office/routines/service.go for the state machine.
+type RoutineRunStatus string
+
+// Routine run status values.
+const (
+	RoutineRunStatusReceived    RoutineRunStatus = "received"
+	RoutineRunStatusTaskCreated RoutineRunStatus = "task_created"
+	RoutineRunStatusSkipped     RoutineRunStatus = "skipped"
+	RoutineRunStatusCoalesced   RoutineRunStatus = "coalesced"
+	RoutineRunStatusFailed      RoutineRunStatus = "failed"
+	RoutineRunStatusDone        RoutineRunStatus = "done"
+	RoutineRunStatusCancelled   RoutineRunStatus = "cancelled"
+)
+
+// String implements fmt.Stringer.
+func (s RoutineRunStatus) String() string { return string(s) }
+
+// RoutineConcurrencyPolicy controls what happens when a routine fires
+// while a previous run is still in flight.
+type RoutineConcurrencyPolicy string
+
+// Routine concurrency policy values.
+const (
+	ConcurrencyPolicySkipIfActive     RoutineConcurrencyPolicy = "skip_if_active"
+	ConcurrencyPolicyCoalesceIfActive RoutineConcurrencyPolicy = "coalesce_if_active"
+	ConcurrencyPolicyAlwaysCreate     RoutineConcurrencyPolicy = "always_create"
+)
+
+// String implements fmt.Stringer.
+func (p RoutineConcurrencyPolicy) String() string { return string(p) }
+
+// Valid reports whether p is one of the declared RoutineConcurrencyPolicy values.
+// Use at trust boundaries (HTTP handlers, config loaders) to reject malformed input.
+func (p RoutineConcurrencyPolicy) Valid() bool {
+	switch p {
+	case ConcurrencyPolicySkipIfActive, ConcurrencyPolicyCoalesceIfActive, ConcurrencyPolicyAlwaysCreate:
+		return true
+	}
+	return false
+}
+
+// RoutineCatchUpPolicy controls what happens when a scheduled routine
+// missed fires (e.g. backend was down). Whatever the policy, a claim
+// dispatches at most one routine run — the policy only decides whether
+// the gap crossed is reported to the woken agent. See
+// docs/specs/office/requirements/routine-catch-up.md.
+type RoutineCatchUpPolicy string
+
+// Routine catch-up policy values. The DB default is
+// `summarize_missed`; the alternative skips gap reporting entirely.
+const (
+	// CatchUpPolicySummarizeMissed is the canonical summarizing policy:
+	// the gap crossed by a claim is recorded and delivered to the woken
+	// agent. Named for what happens (one wake, gap summarized), not for
+	// the discarded enqueue-N-runs design the old name implied.
+	CatchUpPolicySummarizeMissed RoutineCatchUpPolicy = "summarize_missed"
+	// CatchUpPolicyEnqueueMissedWithCap is the deprecated alias for
+	// CatchUpPolicySummarizeMissed. Retained forever — never delete —
+	// so NormaliseCatchUpPolicy has a name to compare persisted rows
+	// and API requests against; installs that already stored it must
+	// keep reading and writing successfully.
+	CatchUpPolicyEnqueueMissedWithCap RoutineCatchUpPolicy = "enqueue_missed_with_cap"
+	CatchUpPolicySkipMissed           RoutineCatchUpPolicy = "skip_missed"
+)
+
+// String implements fmt.Stringer.
+func (p RoutineCatchUpPolicy) String() string { return string(p) }
+
+// Valid reports whether p is one of the declared RoutineCatchUpPolicy
+// values, including the deprecated alias — a client sending the old
+// value on create/update gets 200, not 400; NormaliseCatchUpPolicy
+// normalizes the persisted value to the canonical one.
+func (p RoutineCatchUpPolicy) Valid() bool {
+	switch p {
+	case CatchUpPolicySummarizeMissed, CatchUpPolicyEnqueueMissedWithCap, CatchUpPolicySkipMissed:
+		return true
+	}
+	return false
+}
+
+// RoutineStatus is the operator-set lifecycle state of a Routine. It gates
+// every fire path: a routine only dispatches while it holds a firing status.
+// See docs/specs/office/requirements/routine-status-gating.md.
+type RoutineStatus string
+
+// Routine status values. The `Routine.Status` struct field stays a bare
+// string (no migration, no write-side validation); these constants are for
+// comparison, not storage.
+const (
+	RoutineStatusActive   RoutineStatus = "active"
+	RoutineStatusPaused   RoutineStatus = "paused"
+	RoutineStatusArchived RoutineStatus = "archived"
+)
+
+// String implements fmt.Stringer.
+func (s RoutineStatus) String() string { return string(s) }
+
+// CanFire reports whether a routine holding this status may dispatch a run.
+// Allowlist, not denylist: only "active" and the empty string (the
+// NOT NULL DEFAULT 'active' column's "no writer set one" case) fire.
+// Comparison is byte-exact — no case folding, no trimming — so "Active" and
+// " active" do not fire, and any value outside the three declared constants
+// suppresses along with them. There is deliberately no Valid() counterpart:
+// nothing here validates a status on write, so a write-side predicate would
+// have no caller.
+func (s RoutineStatus) CanFire() bool {
+	return s == RoutineStatusActive || s == ""
+}
+
+// BudgetScopeType selects what a BudgetPolicy applies to.
+type BudgetScopeType string
+
+// Budget scope-type values.
+const (
+	BudgetScopeAgent     BudgetScopeType = "agent"
+	BudgetScopeProject   BudgetScopeType = "project"
+	BudgetScopeWorkspace BudgetScopeType = "workspace"
+)
+
+// String implements fmt.Stringer.
+func (s BudgetScopeType) String() string { return string(s) }
+
+// Valid reports whether s is one of the declared BudgetScopeType values.
+// Use at trust boundaries (HTTP handlers, config loaders) to reject
+// malformed input before it reaches the cost service.
+func (s BudgetScopeType) Valid() bool {
+	switch s {
+	case BudgetScopeAgent, BudgetScopeProject, BudgetScopeWorkspace:
+		return true
+	}
+	return false
+}
+
+// CostSource records which layer priced a CostEvent's dollars, distinct
+// from Estimated (a usage-authority flag). NULL on legacy rows written
+// before this field existed — never inferred.
+type CostSource string
+
+// Cost-source values. See docs/specs/office/requirements/costs.md.
+const (
+	// CostSourceProviderReported means the CLI forwarded an authoritative
+	// USD amount (claude-acp's usage_update.cost.amount); no rates apply.
+	CostSourceProviderReported CostSource = "provider_reported"
+	// CostSourceModelsDevList means the row was priced from a models.dev
+	// list-price lookup; the four rate_*_per_million columns and
+	// pricing_catalog_version record what was applied.
+	CostSourceModelsDevList CostSource = "models_dev_list"
+	// CostSourceUnpriced means no cost could be resolved (no pricing
+	// lookup wired, empty model id, or a lookup miss); cost_subcents is 0.
+	CostSourceUnpriced CostSource = "unpriced"
+)
+
+// String implements fmt.Stringer.
+func (s CostSource) String() string { return string(s) }
+
+// Valid reports whether s is one of the declared CostSource values.
+func (s CostSource) Valid() bool {
+	switch s {
+	case CostSourceProviderReported, CostSourceModelsDevList, CostSourceUnpriced:
+		return true
+	}
+	return false
+}
+
+// BudgetPeriod is the time window a BudgetPolicy limit applies to.
+type BudgetPeriod string
+
+// Budget period values. BudgetPeriodTotal (AC-OFFICE-BUDGET-002.8) selects
+// an unbounded-below window by name, rather than by falling through from an
+// unrecognized period value.
+const (
+	BudgetPeriodDaily   BudgetPeriod = "daily"
+	BudgetPeriodMonthly BudgetPeriod = "monthly"
+	BudgetPeriodYearly  BudgetPeriod = "yearly"
+	BudgetPeriodTotal   BudgetPeriod = "total"
+)
+
+// String implements fmt.Stringer.
+func (p BudgetPeriod) String() string { return string(p) }
+
+// Valid reports whether p is one of the declared BudgetPeriod values.
+func (p BudgetPeriod) Valid() bool {
+	switch p {
+	case BudgetPeriodDaily, BudgetPeriodMonthly, BudgetPeriodYearly, BudgetPeriodTotal:
+		return true
+	}
+	return false
+}
+
+// BudgetActionOnExceed is the side-effect a BudgetPolicy triggers on
+// limit breach.
+type BudgetActionOnExceed string
+
+// Budget action values. The set matches what the cost service writes;
+// see internal/office/costs/budgets.go.
+const (
+	BudgetActionPauseAgent    BudgetActionOnExceed = "pause_agent"
+	BudgetActionBlockNewTasks BudgetActionOnExceed = "block_new_tasks"
+	BudgetActionNotifyOnly    BudgetActionOnExceed = "notify_only"
+)
+
+// String implements fmt.Stringer.
+func (a BudgetActionOnExceed) String() string { return string(a) }
+
+// Valid reports whether a is one of the declared BudgetActionOnExceed values.
+func (a BudgetActionOnExceed) Valid() bool {
+	switch a {
+	case BudgetActionPauseAgent, BudgetActionBlockNewTasks, BudgetActionNotifyOnly:
+		return true
+	}
+	return false
+}
+
+// ProviderHealthScope identifies what slice of a provider a
+// ProviderHealth row covers.
+type ProviderHealthScope string
+
+// Provider-health scope values. The triple
+// (workspace_id, provider_id, scope, scope_value) is the PK so a
+// tier-specific failure does not take the whole provider down.
+const (
+	ProviderHealthScopeProvider ProviderHealthScope = "provider"
+	ProviderHealthScopeTier     ProviderHealthScope = "tier"
+	ProviderHealthScopeModel    ProviderHealthScope = "model"
+)
+
+// String implements fmt.Stringer.
+func (s ProviderHealthScope) String() string { return string(s) }
+
+// ProviderHealthState is the current eligibility state of a
+// (workspace, provider, scope) tuple.
+type ProviderHealthState string
+
+// Provider-health state values. user_action_required is the
+// "blocked, won't auto-recover" terminal state; degraded is auto-retryable.
+const (
+	ProviderHealthHealthy            ProviderHealthState = "healthy"
+	ProviderHealthShortRetry         ProviderHealthState = "short_retry"
+	ProviderHealthDegraded           ProviderHealthState = "degraded"
+	ProviderHealthUserActionRequired ProviderHealthState = "user_action_required"
+)
+
+// String implements fmt.Stringer.
+func (s ProviderHealthState) String() string { return string(s) }
+
+// RouteAttemptOutcome is the result of one route attempt persisted to
+// office_route_attempts. See internal/office/scheduler/dispatch_routing.go
+// for the lifecycle.
+type RouteAttemptOutcome string
+
+// Route attempt outcome values.
+const (
+	RouteAttemptOutcomeLaunched              RouteAttemptOutcome = "launched"
+	RouteAttemptOutcomeRetryScheduled        RouteAttemptOutcome = "retry_scheduled"
+	RouteAttemptOutcomeFailedProviderUnavail RouteAttemptOutcome = "failed_provider_unavailable"
+	RouteAttemptOutcomeFailedOther           RouteAttemptOutcome = "failed_other"
+	RouteAttemptOutcomeSkippedDegraded       RouteAttemptOutcome = "skipped_degraded"
+	RouteAttemptOutcomeSkippedUserAction     RouteAttemptOutcome = "skipped_user_action"
+	RouteAttemptOutcomeSkippedMissingMapping RouteAttemptOutcome = "skipped_missing_mapping"
+	RouteAttemptOutcomeMaxAttempts           RouteAttemptOutcome = "skipped_max_attempts"
+)
+
+// String implements fmt.Stringer.
+func (o RouteAttemptOutcome) String() string { return string(o) }
+
+// AdapterPhase narrows the lifecycle stage at which a routing error
+// surfaced. Mirrors routingerr.Phase; redeclared so office-tier types
+// have no dependency on the runtime tier.
+type AdapterPhase string
+
+// Adapter phase values. Source of truth:
+// internal/agent/runtime/routingerr/routingerr.go.
+const (
+	AdapterPhaseAuthCheck     AdapterPhase = "auth_check"
+	AdapterPhaseProcessStart  AdapterPhase = "process_start"
+	AdapterPhaseSessionInit   AdapterPhase = "session_init"
+	AdapterPhasePromptSend    AdapterPhase = "prompt_send"
+	AdapterPhaseStreaming     AdapterPhase = "streaming"
+	AdapterPhaseToolExecution AdapterPhase = "tool_execution"
+	AdapterPhaseShutdown      AdapterPhase = "shutdown"
+)
+
+// String implements fmt.Stringer.
+func (p AdapterPhase) String() string { return string(p) }
+
+// ErrorConfidence is the classifier's confidence in its verdict.
+// Mirrors routingerr.Confidence.
+type ErrorConfidence string
+
+// Error confidence values.
+const (
+	ErrorConfidenceHigh   ErrorConfidence = "high"
+	ErrorConfidenceMedium ErrorConfidence = "medium"
+	ErrorConfidenceLow    ErrorConfidence = "low"
+)
+
+// String implements fmt.Stringer.
+func (c ErrorConfidence) String() string { return string(c) }
+
+// SkillSourceType identifies where a Skill row's content came from.
+// Mirrors the TS union in apps/web/lib/state/slices/office/types.ts.
+type SkillSourceType string
+
+// Skill source-type values.
+const (
+	SkillSourceTypeInline    SkillSourceType = "inline"
+	SkillSourceTypeLocalPath SkillSourceType = "local_path"
+	SkillSourceTypeGit       SkillSourceType = "git"
+	SkillSourceTypeSkillsSh  SkillSourceType = "skills_sh"
+	SkillSourceTypeUserHome  SkillSourceType = "user_home"
+	SkillSourceTypeSystem    SkillSourceType = "system"
+)
+
+// String implements fmt.Stringer.
+func (s SkillSourceType) String() string { return string(s) }
+
+// SkillApprovalState gates whether a Skill row is usable.
+type SkillApprovalState string
+
+// Skill approval-state values.
+const (
+	SkillApprovalStatePending  SkillApprovalState = "pending"
+	SkillApprovalStateApproved SkillApprovalState = "approved"
+	SkillApprovalStateRejected SkillApprovalState = "rejected"
+)
+
+// String implements fmt.Stringer.
+func (s SkillApprovalState) String() string { return string(s) }
+
+// ChannelPlatform is the external service a Channel row relays to.
+// Open set — new adapters add new platforms.
+type ChannelPlatform string
+
+// Known channel platforms.
+const (
+	ChannelPlatformSlack   ChannelPlatform = "slack"
+	ChannelPlatformWebhook ChannelPlatform = "webhook"
+)
+
+// String implements fmt.Stringer.
+func (p ChannelPlatform) String() string { return string(p) }
+
+// ChannelStatus is the operational state of a Channel row. Free-form;
+// typed for documentation.
+type ChannelStatus string
+
+// Known channel statuses.
+const (
+	ChannelStatusActive       ChannelStatus = "active"
+	ChannelStatusDisconnected ChannelStatus = "disconnected"
+	ChannelStatusError        ChannelStatus = "error"
+)
+
+// String implements fmt.Stringer.
+func (s ChannelStatus) String() string { return string(s) }
+
+// ActivityActorType identifies who emitted an ActivityEntry. Open set
+// (typed for documentation): user | agent | system.
+type ActivityActorType string
+
+// Known activity actor types.
+const (
+	ActivityActorUser   ActivityActorType = "user"
+	ActivityActorAgent  ActivityActorType = "agent"
+	ActivityActorSystem ActivityActorType = "system"
+)
+
+// String implements fmt.Stringer.
+func (a ActivityActorType) String() string { return string(a) }
+
+// ActivityTargetType identifies what an ActivityEntry happened to.
+// Free-form; typed for documentation.
+type ActivityTargetType string
+
+// Known activity target types (subset; new domains add new values).
+const (
+	ActivityTargetAgent     ActivityTargetType = "agent"
+	ActivityTargetTask      ActivityTargetType = "task"
+	ActivityTargetProject   ActivityTargetType = "project"
+	ActivityTargetBudget    ActivityTargetType = "budget"
+	ActivityTargetSkill     ActivityTargetType = "skill"
+	ActivityTargetChannel   ActivityTargetType = "channel"
+	ActivityTargetRoutine   ActivityTargetType = "routine"
+	ActivityTargetWorkspace ActivityTargetType = "workspace"
+)
+
+// String implements fmt.Stringer.
+func (t ActivityTargetType) String() string { return string(t) }
+
+// ActivityAction is the verb describing an ActivityEntry (free-form,
+// dotted convention e.g. "budget.alert", "agent.hired").
+type ActivityAction string
+
+// String implements fmt.Stringer.
+func (a ActivityAction) String() string { return string(a) }
+
+// Workspace pause/resume activity actions (workspace-kill-switch). Noop
+// covers every request that committed neither a pause nor a release: a
+// repeat pause of an already-paused workspace, a resume of a workspace
+// that isn't paused, and a resume that loses a concurrent CAS race.
+const (
+	ActivityActionWorkspacePaused    ActivityAction = "workspace_paused"
+	ActivityActionWorkspaceResumed   ActivityAction = "workspace_resumed"
+	ActivityActionWorkspacePauseNoop ActivityAction = "workspace_pause_noop"
+)
+
+// Deferred-assignment activity actions (paused-assignment-replay): a task
+// assignment blocked by an active workspace pause, then either replayed
+// once the workspace resumes or dropped because the task/assignee no
+// longer qualifies by the time replay runs.
+const (
+	ActivityActionTaskAssignmentDeferred ActivityAction = "task_assignment_deferred"
+	ActivityActionTaskAssignmentReplayed ActivityAction = "task_assignment_replayed"
+	ActivityActionTaskAssignmentDropped  ActivityAction = "task_assignment_dropped"
+)

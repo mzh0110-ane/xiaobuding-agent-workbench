@@ -1,0 +1,61 @@
+"use client";
+
+import { Button } from "@kandev/ui/button";
+import { IconArrowLeft, IconArrowRight, IconRocket } from "@tabler/icons-react";
+import { SETUP_WIZARD_STEP_COUNT, SETUP_WIZARD_STEPS } from "./setup-wizard-steps";
+import { useTranslation } from "react-i18next";
+
+type WizardFooterProps = {
+  step: number;
+  canAdvance: boolean;
+  submitting: boolean;
+  onBack: () => void;
+  onNext: () => void;
+  onSkip: () => void;
+  onSubmit: () => void;
+};
+
+export function WizardFooter({
+  step,
+  canAdvance,
+  submitting,
+  onBack,
+  onNext,
+  onSkip,
+  onSubmit,
+}: WizardFooterProps) {
+  const { t } = useTranslation();
+  const isLast = step === SETUP_WIZARD_STEP_COUNT - 1;
+  const isTaskStep = step === SETUP_WIZARD_STEPS.TASK;
+
+  return (
+    <div className="flex items-center justify-between mt-8">
+      <div className="flex items-center gap-2">
+        {step > 0 && (
+          <Button variant="ghost" onClick={onBack} className="cursor-pointer">
+            <IconArrowLeft className="h-4 w-4 mr-1" />
+            {t("common:back")}
+          </Button>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        {isTaskStep && (
+          <Button variant="ghost" onClick={onSkip} className="cursor-pointer">
+            {t("common:skip")}
+          </Button>
+        )}
+        {isLast ? (
+          <Button onClick={onSubmit} disabled={submitting} className="cursor-pointer">
+            <IconRocket className="h-4 w-4 mr-1" />
+            {submitting ? t("office:creating") : t("office:createLaunch")}
+          </Button>
+        ) : (
+          <Button onClick={onNext} disabled={!canAdvance} className="cursor-pointer">
+            {t("common:next")}
+            <IconArrowRight className="h-4 w-4 ml-1" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

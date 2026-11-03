@@ -1,0 +1,246 @@
+package repository
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/kandev/kandev/internal/db"
+	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/sqlite"
+)
+
+// Phase 0 tests for the multi-repo TaskEnvironment / TaskEnvironmentRepo schema.
+
+func newEnv(t *testing.T, repo *sqlite.Repository, taskID, envID string) *models.TaskEnvironment {
+	t.Helper()
+	env := &models.TaskEnvironment{
+		ID:           envID,
+		TaskID:       taskID,
+		ExecutorType: "local_pc",
+		Status:       models.TaskEnvironmentStatusReady,
+		TaskDirName:  "fix-bug_ab12",
+	}
+	if err := repo.CreateTaskEnvironment(context.Background(), env); err != nil {
+		t.Fatalf("create env: %v", err)
+	}
+	return env
+}
+
+func newTaskWithRepo(t *testing.T, repo *sqlite.Repository, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	wf := &models.Workflow{ID: "wf-env", Name: "Env Workflow"}
+	_ = repo.CreateWorkflow(ctx, wf)
+	task := &models.Task{ID: taskID, WorkflowID: wf.ID, Title: "Env Task"}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+}
+
+func TestTaskEnvironment_TaskDirNameRoundTrip(t *testing.T) {
+	repo, cleanup := createTestSQLiteRepo(t)
+	defer cleanup()
+
+	newTaskWithRepo(t, repo, "task-env-1")
+	env := newEnv(t, repo, "task-env-1", "env-1")
+
+	got, err := repo.GetTaskEnvironment(context.Background(), env.ID)
+	if err != nil {
+		t.Fatalf("get env: %v", err)
+	}
+	if got.TaskDirName != "fix-bug_ab12" {
+		t.Errorf("expected task_dir_name persisted; got %q", got.TaskDirName)
+	}
+	if len(got.Repos) != 0 {
+		t.Errorf("expected 0 repos, got %d", len(got.Repos))
+	}
+}
+
+func TestTaskEnvironmentRepo_CRUD(t *testing.T) {
+	repo, cleanup := createTestSQLiteRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	newTaskWithRepo(t, repo, "task-env-2")
+	env := newEnv(t, repo, "task-env-2", "env-2")
+	compactedAt := time.Now().UTC().Truncate(time.Second)
+
+	er := &models.TaskEnvironmentRepo{
+		TaskEnvironmentID:         env.ID,
+		RepositoryID:              "repo-frontend",
+		WorktreeID:                "wt-1",
+		WorktreePath:              "/tmp/tasks/x/frontend",
+		WorktreeBranch:            "feature/x",
+		WorktreeBranchOwner:       "kandev",
+		WorktreeIntegrationRef:    "main",
+		WorktreeRecoveryHeadSHA:   strings.Repeat("a", 40),
+		WorktreeBranchCompactedAt: &compactedAt,
+		Position:                  0,
+	}
+	if err := repo.CreateTaskEnvironmentRepo(ctx, er); err != nil {
+		t.Fatalf("create env repo: %v", err)
+	}
+	if er.ID == "" {
+		t.Fatal("expected ID to be assigned")
+	}
+
+	list, err := repo.ListTaskEnvironmentRepos(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].RepositoryID != "repo-frontend" ||
+		list[0].WorktreeBranchOwner != "kandev" || list[0].WorktreeIntegrationRef != "main" ||
+		list[0].WorktreeRecoveryHeadSHA != strings.Repeat("a", 40) ||
+		list[0].WorktreeBranchCompactedAt == nil ||
+		!list[0].WorktreeBranchCompactedAt.Equal(compactedAt) {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+
+	er.WorktreeBranch = "feature/x-renamed"
+	er.WorktreeIntegrationRef = "develop"
+	er.ErrorMessage = "fetch failed"
+	if err := repo.UpdateTaskEnvironmentRepo(ctx, er); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	list, _ = repo.ListTaskEnvironmentRepos(ctx, env.ID)
+	if list[0].WorktreeBranch != "feature/x-renamed" || list[0].WorktreeIntegrationRef != "develop" || list[0].ErrorMessage != "fetch failed" {
+		t.Errorf("update did not persist: %+v", list[0])
+	}
+
+	if err := repo.DeleteTaskEnvironmentRepo(ctx, er.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	list, _ = repo.ListTaskEnvironmentRepos(ctx, env.ID)
+	if len(list) != 0 {
+		t.Errorf("expected empty list after delete, got %d", len(list))
+	}
+}
+
+func TestTaskEnvironmentRepo_PreloadOnGet(t *testing.T) {
+	repo, cleanup := createTestSQLiteRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	newTaskWithRepo(t, repo, "task-env-3")
+	env := newEnv(t, repo, "task-env-3", "env-3")
+
+	rows := []*models.TaskEnvironmentRepo{
+		{TaskEnvironmentID: env.ID, RepositoryID: "repo-backend", Position: 1, WorktreePath: "/b"},
+		{TaskEnvironmentID: env.ID, RepositoryID: "repo-frontend", Position: 0, WorktreePath: "/f"},
+	}
+	for _, r := range rows {
+		if err := repo.CreateTaskEnvironmentRepo(ctx, r); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+
+	got, err := repo.GetTaskEnvironment(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.Repos) != 2 {
+		t.Fatalf("expected 2 repos, got %d", len(got.Repos))
+	}
+	if got.Repos[0].RepositoryID != "repo-frontend" {
+		t.Errorf("expected position-ordered list, frontend (pos=0) first; got %s", got.Repos[0].RepositoryID)
+	}
+	if got.RepoFor("repo-backend") == nil {
+		t.Error("expected RepoFor lookup to find repo-backend")
+	}
+	if got.RepoFor("missing") != nil {
+		t.Error("expected RepoFor to return nil for unknown repo")
+	}
+}
+
+func TestTaskEnvironmentRepo_CreateWithEmbeddedRepos(t *testing.T) {
+	repo, cleanup := createTestSQLiteRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	newTaskWithRepo(t, repo, "task-env-4")
+	env := &models.TaskEnvironment{
+		ID:           "env-4",
+		TaskID:       "task-env-4",
+		ExecutorType: "local_pc",
+		Status:       models.TaskEnvironmentStatusReady,
+		Repos: []*models.TaskEnvironmentRepo{
+			{RepositoryID: "repo-a", Position: 0, WorktreePath: "/a"},
+			{RepositoryID: "repo-b", Position: 1, WorktreePath: "/b"},
+		},
+	}
+	if err := repo.CreateTaskEnvironment(ctx, env); err != nil {
+		t.Fatalf("create env with repos: %v", err)
+	}
+	got, err := repo.GetTaskEnvironment(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.Repos) != 2 {
+		t.Fatalf("expected 2 repos persisted, got %d", len(got.Repos))
+	}
+	for _, r := range got.Repos {
+		if r.TaskEnvironmentID != env.ID {
+			t.Errorf("expected env id wired; got %q", r.TaskEnvironmentID)
+		}
+	}
+}
+
+func TestTaskEnvironmentRepo_CascadeDeleteOnEnvDelete(t *testing.T) {
+	repo, cleanup := createTestSQLiteRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	newTaskWithRepo(t, repo, "task-env-5")
+	env := newEnv(t, repo, "task-env-5", "env-5")
+	er := &models.TaskEnvironmentRepo{TaskEnvironmentID: env.ID, RepositoryID: "repo-x"}
+	if err := repo.CreateTaskEnvironmentRepo(ctx, er); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.DeleteTaskEnvironment(ctx, env.ID); err != nil {
+		t.Fatalf("delete env: %v", err)
+	}
+	list, err := repo.ListTaskEnvironmentRepos(ctx, env.ID)
+	if err != nil {
+		t.Fatalf("list after delete: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("expected cascade delete to remove per-repo rows, got %d", len(list))
+	}
+}
+
+func TestTaskEnvironmentRepo_LegacyFlatColumnsAreGone(t *testing.T) {
+	// The flat task_environments worktree columns were removed by the
+	// one-time cutover; only the versioned migration knows the legacy shape.
+	// The migration-path coverage lives in the sqlite package's
+	// TestCutover_NormalizesLegacyFlatEnvironment.
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "final.db")
+
+	dbConn, err := db.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	sqlxDB := sqlx.NewDb(dbConn, "sqlite3")
+	if _, err := sqlite.NewWithDB(sqlxDB, sqlxDB, nil); err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlxDB.Close() })
+
+	_, err = sqlxDB.Exec(`
+		INSERT INTO task_environments (
+			id, task_id, repository_id, executor_type, worktree_id,
+			worktree_path, worktree_branch, workspace_path,
+			created_at, updated_at
+		) VALUES ('legacy-env', 'task-env-6', 'repo-legacy', 'local_pc',
+			'wt-legacy', '/wt/legacy', 'main', '',
+			datetime('now'), datetime('now'))
+	`)
+	if err == nil {
+		t.Fatal("expected legacy flat columns to be absent from the final schema")
+	}
+}

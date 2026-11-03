@@ -1,0 +1,124 @@
+"use client";
+
+import { useState, memo } from "react";
+import { IconMinus, IconPlus, IconMaximize } from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@kandev/ui/dialog";
+import { MemoizedMarkdown } from "@/components/shared/memoized-markdown";
+import type { Message } from "@/lib/types/http";
+import { useTranslation } from "react-i18next";
+import { t } from "@/lib/i18n";
+
+function parsePlanContent(text: string): { title: string; body: string } {
+  const lines = text.split("\n");
+  const firstContentIdx = lines.findIndex((l) => l.trim().length > 0);
+  if (firstContentIdx === -1) return { title: t("task:agentPlan"), body: "" };
+  const firstLine = lines[firstContentIdx];
+  const isHeading = /^#{1,6}\s+/.test(firstLine);
+  const title = isHeading ? firstLine.replace(/^#{1,6}\s+/, "").trim() : firstLine.trim();
+  const body = isHeading ? lines.slice(firstContentIdx + 1).join("\n") : text;
+  return { title: title || t("task:agentPlan"), body };
+}
+
+function PlanMarkdownBody({
+  text,
+  className,
+  taskId,
+  worktreePath,
+  onOpenFile,
+}: {
+  text: string;
+  className?: string;
+  taskId: string;
+  worktreePath?: string;
+  onOpenFile?: (path: string) => void;
+}) {
+  return (
+    <div
+      className={`markdown-body max-w-none text-sm [&>*]:my-2 [&>p]:my-2 [&>ul]:my-2 [&>ol]:my-2 ${className ?? ""}`}
+    >
+      <MemoizedMarkdown
+        content={text}
+        taskId={taskId}
+        worktreePath={worktreePath}
+        onOpenFile={onOpenFile}
+      />
+    </div>
+  );
+}
+
+export const AgentPlanMessage = memo(function AgentPlanMessage({
+  comment,
+  worktreePath,
+  onOpenFile,
+}: {
+  comment: Message;
+  worktreePath?: string;
+  onOpenFile?: (path: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [collapsed, setCollapsed] = useState(false);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const text = comment.content;
+
+  if (!text) return null;
+
+  const { title, body } = parsePlanContent(text);
+
+  return (
+    <>
+      <div className="rounded-lg border border-border/60 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/40">
+          <span className="text-sm font-medium">{title}</span>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={collapsed ? t("task:expandPlan") : t("task:collapsePlan")}
+              className="h-7 w-7 cursor-pointer"
+              onClick={() => setCollapsed(!collapsed)}
+            >
+              {collapsed ? <IconPlus className="h-4 w-4" /> : <IconMinus className="h-4 w-4" />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={t("task:openPlanDetails")}
+              className="h-7 w-7 cursor-pointer"
+              onClick={() => setDialogOpen(true)}
+            >
+              <IconMaximize className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+        {!collapsed && (
+          <div className="max-h-[300px] overflow-y-auto">
+            <div className="px-5 py-4 border-l-2 border-border/30 ml-3">
+              <PlanMarkdownBody
+                text={body}
+                className="text-foreground/80 [&_strong]:text-foreground"
+                taskId={comment.task_id}
+                worktreePath={worktreePath}
+                onOpenFile={onOpenFile}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="max-w-[95vw] sm:max-w-[70vw] w-[95vw] max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+          </DialogHeader>
+          <PlanMarkdownBody
+            text={body}
+            taskId={comment.task_id}
+            worktreePath={worktreePath}
+            onOpenFile={onOpenFile}
+          />
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+});

@@ -1,0 +1,207 @@
+"use client";
+
+import { memo } from "react";
+
+import { SHORTCUTS } from "@/lib/keyboard/constants";
+import { DesktopChatInputToolbar } from "./chat-input-toolbar-desktop";
+import { MobileChatInputToolbar } from "./chat-input-toolbar-mobile";
+import { SubmitButton } from "./chat-input-toolbar-primitives";
+import { shouldUseCompactTaskChrome } from "@/hooks/use-compact-task-chrome";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import type { ContextFile } from "@/lib/state/context-files-store";
+import type { MCPAttachmentHistory } from "@/lib/state/slices/session-runtime/types";
+import type { PluginComposerCapability, PluginPresentation } from "@/lib/plugins/types";
+
+export type ChatInputToolbarProps = {
+  planModeEnabled: boolean;
+  planModeAvailable?: boolean;
+  mcpServers?: string[];
+  mcpAttachmentHistory?: MCPAttachmentHistory;
+  onPlanModeChange: (enabled: boolean) => void;
+  sessionId: string | null;
+  taskId: string | null;
+  taskTitle?: string;
+  taskDescription: string;
+  isAgentBusy: boolean;
+  canCancelAgent?: boolean;
+  /** Whether the input has content to send (text, comments, or context) */
+  hasContent?: boolean;
+  planActionDisabledReason?: string;
+  isDisabled: boolean;
+  submitDisabledReason?: string;
+  isSending: boolean;
+  onCancel: () => void | Promise<void>;
+  onSubmit: () => void;
+  submitKey?: "enter" | "cmd_enter";
+  contextCount?: number;
+  contextPopoverOpen?: boolean;
+  onContextPopoverOpenChange?: (open: boolean) => void;
+  /** Whether plan is selected as context in the popover (independent of plan panel) */
+  planContextEnabled?: boolean;
+  contextFiles?: ContextFile[];
+  onToggleFile?: (file: ContextFile) => void;
+  onImplementPlan?: (fresh: boolean) => void;
+  /** Callback to enhance the current prompt with AI */
+  onEnhancePrompt?: () => void;
+  /** Whether prompt enhancement is in progress */
+  isEnhancingPrompt?: boolean;
+  /** Whether utility agent is configured for AI enhancement */
+  isUtilityConfigured?: boolean;
+  /** Callback to open file picker for attaching files */
+  onAttachFiles?: () => void;
+  /** Hide the sessions dropdown (for quick chat) */
+  hideSessionsDropdown?: boolean;
+  /** When true, only render the submit/cancel button — no other controls */
+  minimalToolbar?: boolean;
+  /** Hide ACP/session-specific controls while keeping Plan, attachment, and context controls */
+  hideAgentControls?: boolean;
+  /** Hide the plan mode toggle button (for ephemeral/quick chat sessions) */
+  hidePlanMode?: boolean;
+  composerCapability?: PluginComposerCapability;
+  composerSurface?: "task-chat" | "quick-chat";
+};
+
+function MinimalToolbar({
+  isAgentBusy,
+  canCancelAgent,
+  sessionId,
+  hasContent,
+  isDisabled,
+  submitDisabledReason,
+  isSending,
+  onCancel,
+  onSubmit,
+  submitKey = "cmd_enter",
+  taskId,
+  taskTitle,
+  presentation,
+}: Pick<
+  ChatInputToolbarProps,
+  | "isAgentBusy"
+  | "canCancelAgent"
+  | "sessionId"
+  | "hasContent"
+  | "isDisabled"
+  | "submitDisabledReason"
+  | "isSending"
+  | "onCancel"
+  | "onSubmit"
+  | "submitKey"
+  | "taskId"
+  | "taskTitle"
+> & { presentation: PluginPresentation }) {
+  const submitShortcut = submitKey === "enter" ? SHORTCUTS.SUBMIT_ENTER : SHORTCUTS.SUBMIT;
+  return (
+    <div className="flex items-center justify-end gap-1 px-1 pt-0 pb-0.5 border-t border-border">
+      <SubmitButton
+        isAgentBusy={isAgentBusy}
+        canCancelAgent={canCancelAgent}
+        sessionId={sessionId}
+        taskId={taskId}
+        taskTitle={taskTitle}
+        presentation={presentation}
+        hasContent={hasContent ?? false}
+        isDisabled={isDisabled}
+        submitDisabledReason={submitDisabledReason}
+        isSending={isSending}
+        planModeEnabled={false}
+        onCancel={onCancel}
+        onSubmit={onSubmit}
+        submitShortcut={submitShortcut}
+      />
+    </div>
+  );
+}
+
+const toolbarDefaults = {
+  planModeAvailable: true,
+  mcpServers: [] as string[],
+  submitKey: "cmd_enter" as const,
+  contextCount: 0,
+  contextPopoverOpen: false,
+  planContextEnabled: false,
+  contextFiles: [] as ContextFile[],
+  isEnhancingPrompt: false,
+  isUtilityConfigured: false,
+  hideAgentControls: false,
+  hidePlanMode: false,
+};
+
+export const ChatInputToolbar = memo(function ChatInputToolbar(rawProps: ChatInputToolbarProps) {
+  const props = { ...toolbarDefaults, ...rawProps };
+  const submitShortcut = props.submitKey === "enter" ? SHORTCUTS.SUBMIT_ENTER : SHORTCUTS.SUBMIT;
+  const responsiveBreakpoint = useResponsiveBreakpoint();
+  const usesCompactTaskChrome = shouldUseCompactTaskChrome(responsiveBreakpoint);
+
+  if (props.minimalToolbar) {
+    return (
+      <MinimalToolbar
+        isAgentBusy={props.isAgentBusy}
+        canCancelAgent={props.canCancelAgent}
+        sessionId={props.sessionId}
+        hasContent={props.hasContent}
+        isDisabled={props.isDisabled}
+        submitDisabledReason={props.submitDisabledReason}
+        isSending={props.isSending}
+        onCancel={props.onCancel}
+        onSubmit={props.onSubmit}
+        submitKey={props.submitKey}
+        taskId={props.taskId}
+        taskTitle={props.taskTitle}
+        // Same discriminator the non-minimal path uses to pick the mobile
+        // toolbar, so a coarse-pointer tablet does not get the compact
+        // toolbar in one composer and a "desktop" decoration in the other.
+        presentation={usesCompactTaskChrome ? "mobile" : "desktop"}
+      />
+    );
+  }
+
+  if (usesCompactTaskChrome) {
+    return (
+      <MobileChatInputToolbar
+        planModeEnabled={props.planModeEnabled}
+        planModeAvailable={props.planModeAvailable}
+        onPlanModeChange={props.onPlanModeChange}
+        hidePlanMode={props.hidePlanMode}
+        hideAgentControls={props.hideAgentControls}
+        hideSessionsDropdown={
+          (props.hideSessionsDropdown ?? false) || responsiveBreakpoint.isMobile
+        }
+        mcpServers={props.mcpServers}
+        mcpAttachmentHistory={props.mcpAttachmentHistory}
+        sessionId={props.sessionId}
+        taskId={props.taskId}
+        taskTitle={props.taskTitle}
+        onAttachFiles={props.onAttachFiles}
+        contextPopoverOpen={props.contextPopoverOpen}
+        onContextPopoverOpenChange={props.onContextPopoverOpenChange ?? (() => {})}
+        contextCount={props.contextCount}
+        planContextEnabled={props.planContextEnabled}
+        contextFiles={props.contextFiles}
+        onToggleFile={props.onToggleFile ?? (() => {})}
+        isAgentBusy={props.isAgentBusy}
+        canCancelAgent={props.canCancelAgent}
+        hasContent={props.hasContent ?? false}
+        onImplementPlan={props.onImplementPlan}
+        planActionDisabledReason={props.planActionDisabledReason}
+        onEnhancePrompt={props.onEnhancePrompt}
+        isEnhancingPrompt={props.isEnhancingPrompt}
+        isUtilityConfigured={props.isUtilityConfigured}
+        isDisabled={props.isDisabled}
+        submitDisabledReason={props.submitDisabledReason}
+        isSending={props.isSending}
+        onCancel={props.onCancel}
+        onSubmit={props.onSubmit}
+        submitShortcut={submitShortcut}
+        composerCapability={props.composerCapability}
+        composerSurface={props.composerSurface}
+        presentation={
+          responsiveBreakpoint.isMobile || responsiveBreakpoint.isTablet ? "mobile" : "desktop"
+        }
+      />
+    );
+  }
+
+  const { submitKey: _submitKey, ...desktopProps } = props;
+  return <DesktopChatInputToolbar {...desktopProps} submitShortcut={submitShortcut} />;
+});

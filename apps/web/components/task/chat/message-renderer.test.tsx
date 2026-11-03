@@ -1,0 +1,188 @@
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MessageRenderer } from "./message-renderer";
+import { sessionId as toSessionId, taskId as toTaskId, type Message } from "@/lib/types/http";
+
+const REMOVED_PAYLOAD = "removed secret";
+
+const fallbackOpenFile = vi.hoisted(() => vi.fn());
+const useOpenFileAtLine = vi.hoisted(() =>
+  vi.fn((onOpenFile: ((path: string) => void) | undefined) => (path: string) => onOpenFile?.(path)),
+);
+
+vi.mock("@/hooks/use-panel-actions", () => ({
+  usePanelActions: () => ({ openFile: fallbackOpenFile }),
+}));
+
+vi.mock("@/hooks/use-file-editors", () => ({
+  useOpenFileAtLine,
+}));
+
+vi.mock("@/components/task/chat/messages/action-message", () => ({
+  ActionMessage: ({ comment }: { comment: { content: string } }) => (
+    <div data-testid="action-message-renderer">{comment.content}</div>
+  ),
+}));
+
+vi.mock("@/components/task/chat/messages/status-message", () => ({
+  StatusMessage: ({ comment }: { comment: { content: string } }) => (
+    <div data-testid="status-message-renderer">{comment.content}</div>
+  ),
+}));
+
+vi.mock("@/components/state-provider", () => ({
+  useAppStore: () => null,
+}));
+
+function message(overrides: Partial<Message>): Message {
+  return {
+    id: "msg-1",
+    session_id: toSessionId("sess-1"),
+    task_id: toTaskId("task-1"),
+    author_type: "agent",
+    type: "message",
+    content: "hello",
+    created_at: "2026-06-16T12:00:00Z",
+    ...overrides,
+  };
+}
+
+describe("MessageRenderer markdown file links", () => {
+  afterEach(() => {
+    fallbackOpenFile.mockClear();
+    useOpenFileAtLine.mockClear();
+  });
+
+  it("forwards the renderer session through edit file links", () => {
+    const onOpenFile = vi.fn();
+
+    render(
+      <MessageRenderer
+        comment={message({
+          type: "tool_edit",
+          content: "Edited /workspace/src/app.ts",
+          metadata: {
+            status: "complete",
+            normalized: {
+              modify_file: {
+                file_path: "/workspace/src/app.ts",
+                mutations: [{ type: "replace", start_line: 7 }],
+              },
+            },
+          },
+        })}
+        isTaskDescription={false}
+        worktreePath="/workspace"
+        sessionId="requested-session"
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    expect(useOpenFileAtLine).toHaveBeenCalledWith(
+      onOpenFile,
+      7,
+      "/workspace",
+      "requested-session",
+    );
+  });
+
+  it("opens agent plan file links with the renderer file opener", () => {
+    const onOpenFile = vi.fn();
+
+    render(
+      <MessageRenderer
+        comment={message({
+          type: "agent_plan",
+          content: "# Plan\n\nRead [AGENTS](/apps/web/AGENTS.md).",
+        })}
+        isTaskDescription={false}
+        worktreePath="/workspace/kandev"
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "AGENTS" }));
+
+    expect(onOpenFile).toHaveBeenCalledWith("apps/web/AGENTS.md");
+    expect(fallbackOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("opens thinking file links with the renderer worktree context", () => {
+    const onOpenFile = vi.fn();
+
+    const { container } = render(
+      <MessageRenderer
+        comment={message({
+          type: "thinking",
+          content:
+            "I need to inspect the project guidance before proceeding with this task. Read [AGENTS](/workspace/kandev/apps/web/AGENTS.md).",
+        })}
+        isTaskDescription={false}
+        worktreePath="/workspace/kandev"
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    const thinking = within(container);
+    fireEvent.click(thinking.getByText("Thinking", { exact: true }));
+    fireEvent.click(thinking.getByRole("link", { name: "AGENTS" }));
+
+    expect(onOpenFile).toHaveBeenCalledWith("apps/web/AGENTS.md");
+    expect(fallbackOpenFile).not.toHaveBeenCalled();
+  });
+});
+
+it.each(["tool_read", "tool_edit", "tool_search", "tool_call"])(
+  "renders removed %s details without old payloads",
+  (type) => {
+    const view = render(
+      <MessageRenderer
+        comment={message({
+          type: type as Message["type"],
+          content: "Retained title",
+          metadata: {
+            status: "complete",
+            title: "Retained title",
+            payload_retention: { version: 1, removed_at: "2026-09-14T00:00:00Z" },
+            normalized: {
+              generic: { output: REMOVED_PAYLOAD },
+              read_file: { output: { content: REMOVED_PAYLOAD } },
+              modify_file: { mutations: [{ content: REMOVED_PAYLOAD }] },
+              code_search: { output: { files: [REMOVED_PAYLOAD] } },
+              http_request: { response: REMOVED_PAYLOAD },
+            },
+          },
+        })}
+        isTaskDescription={false}
+      />,
+    );
+    expect(view.getByText("Retained title")).toBeTruthy();
+    expect(view.getByText("Completed")).toBeTruthy();
+    expect(view.getByTestId("tool-payload-removed").textContent).toMatch(/Tool details removed on/);
+    expect(view.queryByText(REMOVED_PAYLOAD)).toBeNull();
+    view.unmount();
+  },
+);
+
+it("routes retained provider turn failures through the settled action renderer", () => {
+  render(
+    <MessageRenderer
+      comment={message({
+        type: "status",
+        content: "Selected model is at capacity.",
+        metadata: {
+          variant: "error",
+          failure_scope: "turn",
+          runtime_retained: true,
+          recovery_actions: false,
+        },
+      })}
+      isTaskDescription={false}
+    />,
+  );
+
+  expect(screen.getByTestId("action-message-renderer").textContent).toBe(
+    "Selected model is at capacity.",
+  );
+  expect(screen.queryByTestId("status-message-renderer")).toBeNull();
+});

@@ -1,0 +1,101 @@
+import type {
+  ReviewComment,
+  PlanComment,
+  PRFeedbackComment,
+  WalkthroughComment,
+  AgentMessageComment,
+} from "@/lib/state/slices/comments";
+import type { FileAttachment } from "@/components/task/chat/file-attachment";
+import type { TaskPreviewFeedback } from "@/lib/types/http";
+
+type ContextItemBase = {
+  id: string;
+  label: string;
+  pinned?: boolean;
+  onRemove?: () => void;
+  onRetry?: () => void;
+  onUnpin?: () => void;
+};
+
+export type PlanContextItem = ContextItemBase & {
+  kind: "plan";
+  taskId?: string;
+  onOpen: () => void;
+};
+
+export type FileContextItem = ContextItemBase & {
+  kind: "file";
+  path: string;
+  isDirectory: boolean;
+  onOpen?: (path: string) => void;
+};
+
+export type PromptContextItem = ContextItemBase & {
+  kind: "prompt";
+  promptContent?: string;
+  onClick?: () => void;
+};
+
+export type CommentContextItem = ContextItemBase & {
+  kind: "comment";
+  filePath: string;
+  repositoryName?: string;
+  comments: ReviewComment[];
+  onRemoveComment: (id: string) => void;
+  onOpen?: () => void;
+};
+
+export type PlanCommentContextItem = ContextItemBase & {
+  kind: "plan-comment";
+  comments: PlanComment[];
+  onOpen: () => void;
+};
+
+export type PreviewFeedbackContextItem = ContextItemBase & {
+  kind: "preview-feedback";
+  items: TaskPreviewFeedback[];
+  onOpen?: () => void;
+};
+
+export type ImageContextItem = ContextItemBase & {
+  kind: "image";
+  attachment: FileAttachment;
+  onDeliveryModeChange?: (mode: "prompt" | "path") => void;
+};
+
+export type FileAttachmentContextItem = ContextItemBase & {
+  kind: "file-attachment";
+  attachment: FileAttachment;
+};
+
+export type PRFeedbackContextItem = ContextItemBase & {
+  kind: "pr-feedback";
+  comments: PRFeedbackComment[];
+  onRemoveComment: (id: string) => void;
+};
+
+export type WalkthroughCommentContextItem = ContextItemBase & {
+  kind: "walkthrough-comment";
+  comments: WalkthroughComment[];
+  onRemoveComment: (id: string) => void;
+};
+
+export type AgentMessageCommentContextItem = ContextItemBase & {
+  kind: "agent-message-comment";
+  comments: AgentMessageComment[];
+};
+
+export type ContextItem =
+  | PlanContextItem
+  | FileContextItem
+  | PromptContextItem
+  | CommentContextItem
+  | PlanCommentContextItem
+  | PreviewFeedbackContextItem
+  | ImageContextItem
+  | FileAttachmentContextItem
+  | PRFeedbackContextItem
+  | WalkthroughCommentContextItem
+  | AgentMessageCommentContextItem;
+
+export type ContextItemKind = ContextItem["kind"];

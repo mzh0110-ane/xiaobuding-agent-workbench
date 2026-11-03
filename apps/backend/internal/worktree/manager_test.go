@@ -1,0 +1,1212 @@
+package worktree
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/subproc"
+)
+
+func newTestLogger() *logger.Logger {
+	log, _ := logger.NewLogger(logger.LoggingConfig{
+		Level:  "error",
+		Format: "json",
+	})
+	return log
+}
+
+func newTestConfig(t *testing.T) Config {
+	tmpDir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
+	return Config{
+		Enabled:       true,
+		TasksBasePath: tmpDir,
+		BranchPrefix:  "kandev/",
+	}
+}
+
+// mockStore implements Store for testing
+type mockStore struct {
+	worktrees map[string]*Worktree
+}
+
+func newMockStore() *mockStore {
+	return &mockStore{
+		worktrees: make(map[string]*Worktree),
+	}
+}
+
+func (s *mockStore) CreateWorktree(ctx context.Context, wt *Worktree) error {
+	s.worktrees[wt.ID] = wt
+	return nil
+}
+
+func (s *mockStore) GetWorktreeBySessionID(ctx context.Context, sessionID string) (*Worktree, error) {
+	for _, wt := range s.worktrees {
+		if wt.SessionID == sessionID {
+			return wt, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *mockStore) GetWorktreeByID(ctx context.Context, id string) (*Worktree, error) {
+	wt, ok := s.worktrees[id]
+	if !ok {
+		return nil, nil
+	}
+	return wt, nil
+}
+
+func (s *mockStore) GetWorktreesByTaskID(ctx context.Context, taskID string) ([]*Worktree, error) {
+	var result []*Worktree
+	for _, wt := range s.worktrees {
+		if wt.TaskID == taskID {
+			result = append(result, wt)
+		}
+	}
+	return result, nil
+}
+
+func (s *mockStore) GetWorktreesByRepositoryID(ctx context.Context, repoID string) ([]*Worktree, error) {
+	var result []*Worktree
+	for _, wt := range s.worktrees {
+		if wt.RepositoryID == repoID {
+			result = append(result, wt)
+		}
+	}
+	return result, nil
+}
+
+func (s *mockStore) UpdateWorktree(ctx context.Context, wt *Worktree) error {
+	s.worktrees[wt.ID] = wt
+	return nil
+}
+
+func (s *mockStore) DeleteWorktree(ctx context.Context, id string) error {
+	delete(s.worktrees, id)
+	return nil
+}
+
+func (s *mockStore) ListActiveWorktrees(ctx context.Context) ([]*Worktree, error) {
+	var result []*Worktree
+	for _, wt := range s.worktrees {
+		if wt.Status == StatusActive {
+			result = append(result, wt)
+		}
+	}
+	return result, nil
+}
+
+func (s *mockStore) ListActiveWorktreePaths(_ context.Context) ([]string, error) {
+	var paths []string
+	for _, wt := range s.worktrees {
+		if wt.Status == StatusActive && wt.Path != "" {
+			paths = append(paths, wt.Path)
+		}
+	}
+	return paths, nil
+}
+
+func (s *mockStore) CountActiveWorktreeReferences(_ context.Context, _ string, _ []string) (int, error) {
+	return 0, nil
+}
+
+func (s *mockStore) CountWorktreeBranchOwners(_ context.Context, repositoryPath, branch string) (int, error) {
+	count := 0
+	for _, wt := range s.worktrees {
+		if wt.RepositoryPath == repositoryPath && wt.Branch == branch {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *mockStore) PersistBranchRecoveryHead(_ context.Context, worktreeID, expected, recoveryHead string) (bool, error) {
+	wt := s.worktrees[worktreeID]
+	if wt == nil || (wt.RecoveryHeadSHA != expected && wt.RecoveryHeadSHA != recoveryHead) {
+		return false, nil
+	}
+	wt.RecoveryHeadSHA = recoveryHead
+	return true, nil
+}
+
+func (s *mockStore) PersistBranchCompactionComplete(
+	_ context.Context, worktreeID, expectedRecoveryHead string,
+) (bool, error) {
+	wt := s.worktrees[worktreeID]
+	if wt == nil || wt.RecoveryHeadSHA != expectedRecoveryHead || wt.BranchCompactedAt != nil {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	wt.BranchCompactedAt = &now
+	return true, nil
+}
+
+func (s *mockStore) PersistBranchRecoveryRestored(_ context.Context, worktreeID, expectedRecoveryHead string) (bool, error) {
+	wt := s.worktrees[worktreeID]
+	if wt == nil || wt.RecoveryHeadSHA != expectedRecoveryHead {
+		return false, nil
+	}
+	wt.RecoveryHeadSHA = ""
+	wt.BranchCompactedAt = nil
+	return true, nil
+}
+
+// GetWorktreesBySessionID — MultiRepoStore.
+func (s *mockStore) GetWorktreesBySessionID(_ context.Context, sessionID string) ([]*Worktree, error) {
+	var out []*Worktree
+	for _, wt := range s.worktrees {
+		if wt.SessionID == sessionID && wt.Status == StatusActive {
+			out = append(out, wt)
+		}
+	}
+	return out, nil
+}
+
+// GetWorktreeBySessionAndRepository — MultiRepoStore.
+func (s *mockStore) GetWorktreeBySessionAndRepository(_ context.Context, sessionID, repoID, branchSlug string) (*Worktree, error) {
+	for _, wt := range s.worktrees {
+		if wt.SessionID == sessionID && wt.RepositoryID == repoID && wt.BranchSlug == branchSlug && wt.Status == StatusActive {
+			return wt, nil
+		}
+	}
+	return nil, nil
+}
+
+func TestNewManager(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	if mgr == nil {
+		t.Fatal("expected non-nil manager")
+	}
+	if !mgr.IsEnabled() {
+		t.Error("expected manager to be enabled")
+	}
+	if mgr.fetchTimeout != defaultGitFetchTimeout {
+		t.Fatalf("fetchTimeout = %v, want %v", mgr.fetchTimeout, defaultGitFetchTimeout)
+	}
+	if mgr.pullTimeout != defaultGitPullTimeout {
+		t.Fatalf("pullTimeout = %v, want %v", mgr.pullTimeout, defaultGitPullTimeout)
+	}
+}
+
+func TestNewManager_CustomSyncTimeouts(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.FetchTimeoutSeconds = 15
+	cfg.PullTimeoutSeconds = 25
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	if mgr.fetchTimeout != 15*time.Second {
+		t.Fatalf("fetchTimeout = %v, want %v", mgr.fetchTimeout, 15*time.Second)
+	}
+	if mgr.pullTimeout != 25*time.Second {
+		t.Fatalf("pullTimeout = %v, want %v", mgr.pullTimeout, 25*time.Second)
+	}
+}
+
+func TestNewManager_DisabledConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		Enabled:       false,
+		TasksBasePath: tmpDir,
+	}
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	if mgr.IsEnabled() {
+		t.Error("expected manager to be disabled")
+	}
+}
+
+func TestSanitizeForBranch(t *testing.T) {
+	tests := []struct {
+		name     string
+		title    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "simple title",
+			title:    "Fix login bug",
+			maxLen:   20,
+			expected: "fix-login-bug",
+		},
+		{
+			name:     "title with special chars",
+			title:    "Fix: bug #123 (urgent!)",
+			maxLen:   20,
+			expected: "fix-bug-123-urgent",
+		},
+		{
+			name:     "title exceeding max length",
+			title:    "This is a very long task title that needs truncation",
+			maxLen:   20,
+			expected: "this-is-a-very-long",
+		},
+		{
+			name:     "title with consecutive spaces",
+			title:    "Fix   multiple   spaces",
+			maxLen:   20,
+			expected: "fix-multiple-spaces",
+		},
+		{
+			name:     "empty title",
+			title:    "",
+			maxLen:   20,
+			expected: "",
+		},
+		{
+			name:     "title starting and ending with special chars",
+			title:    "---Fix bug---",
+			maxLen:   20,
+			expected: "fix-bug",
+		},
+		{
+			name:     "title with numbers",
+			title:    "Task 123 done",
+			maxLen:   20,
+			expected: "task-123-done",
+		},
+		{
+			name:     "truncation at boundary",
+			title:    "Fix the login page bug",
+			maxLen:   15,
+			expected: "fix-the-login-p",
+		},
+		{
+			name:     "truncation at hyphen position removes trailing hyphen",
+			title:    "Fix the login-page bug",
+			maxLen:   13,
+			expected: "fix-the-login",
+		},
+		{
+			name:     "CJK-only title strips to empty",
+			title:    "修复登录问题",
+			maxLen:   20,
+			expected: "",
+		},
+		{
+			name:     "Cyrillic-only title strips to empty",
+			title:    "Исправить баг",
+			maxLen:   20,
+			expected: "",
+		},
+		{
+			name:     "Arabic-only title strips to empty",
+			title:    "إصلاح الخطأ",
+			maxLen:   20,
+			expected: "",
+		},
+		{
+			name:     "emoji-only title strips to empty",
+			title:    "🐛🔥",
+			maxLen:   20,
+			expected: "",
+		},
+		{
+			name:     "mixed ASCII and CJK keeps ASCII parts",
+			title:    "Fix 修复 bug",
+			maxLen:   20,
+			expected: "fix-bug",
+		},
+		{
+			name:     "CJK with ASCII number keeps the number",
+			title:    "Bug 42 修复",
+			maxLen:   20,
+			expected: "bug-42",
+		},
+		{
+			name:     "Issue-number prefix survives non-ASCII title body",
+			title:    "Issue #42: 修复登录问题",
+			maxLen:   20,
+			expected: "issue-42",
+		},
+		{
+			name:     "accented Latin characters are stripped",
+			title:    "café résumé",
+			maxLen:   20,
+			expected: "caf-r-sum",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SanitizeForBranch(tt.title, tt.maxLen)
+			if result != tt.expected {
+				t.Errorf("SanitizeForBranch(%q, %d) = %q, want %q", tt.title, tt.maxLen, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSemanticWorktreeName(t *testing.T) {
+	tests := []struct {
+		name      string
+		taskTitle string
+		suffix    string
+		expected  string
+	}{
+		{
+			name:      "normal title with suffix",
+			taskTitle: "Fix login bug",
+			suffix:    "ab12cd34",
+			expected:  "fix-login-bug_ab12cd34",
+		},
+		{
+			name:      "long title truncated",
+			taskTitle: "This is a very long task title that needs truncation",
+			suffix:    "ab12cd34",
+			expected:  "this-is-a-very-long_ab12cd34",
+		},
+		{
+			name:      "empty title falls back to suffix only",
+			taskTitle: "",
+			suffix:    "ab12cd34",
+			expected:  "ab12cd34",
+		},
+		{
+			name:      "title with only special chars",
+			taskTitle: "!@#$%^&*()",
+			suffix:    "ab12cd34",
+			expected:  "ab12cd34",
+		},
+		{
+			name:      "non-ASCII-only title falls back to suffix",
+			taskTitle: "修复登录问题",
+			suffix:    "ab12cd34",
+			expected:  "ab12cd34",
+		},
+		{
+			name:      "mixed ASCII and CJK keeps ASCII parts",
+			taskTitle: "Fix 修复 bug",
+			suffix:    "ab12cd34",
+			expected:  "fix-bug_ab12cd34",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SemanticWorktreeName(tt.taskTitle, tt.suffix)
+			if result != tt.expected {
+				t.Errorf("SemanticWorktreeName(%q, %q) = %q, want %q", tt.taskTitle, tt.suffix, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSmallSuffix(t *testing.T) {
+	suffix := SmallSuffix(3)
+	if len(suffix) == 0 || len(suffix) > 3 {
+		t.Fatalf("expected suffix length 1-3, got %d (%q)", len(suffix), suffix)
+	}
+	if !regexp.MustCompile(`^[a-z0-9]{1,3}$`).MatchString(suffix) {
+		t.Fatalf("suffix contains invalid characters: %q", suffix)
+	}
+}
+
+func TestSmallSuffix_MaxLenCap(t *testing.T) {
+	suffix := SmallSuffix(10)
+	if len(suffix) != 3 {
+		t.Fatalf("expected suffix length 3, got %d (%q)", len(suffix), suffix)
+	}
+}
+
+func TestNormalizeBranchPrefix(t *testing.T) {
+	if got := NormalizeBranchPrefix(""); got != DefaultBranchPrefix {
+		t.Fatalf("expected default prefix %q, got %q", DefaultBranchPrefix, got)
+	}
+	if got := NormalizeBranchPrefix("  feature/ "); got != "feature/" {
+		t.Fatalf("expected trimmed prefix %q, got %q", "feature/", got)
+	}
+}
+
+func TestValidateBranchPrefix(t *testing.T) {
+	valid := []string{"feature/", "bugfix-", "release_1.0/", "team/alpha"}
+	for _, prefix := range valid {
+		if err := ValidateBranchPrefix(prefix); err != nil {
+			t.Fatalf("expected prefix %q to be valid: %v", prefix, err)
+		}
+	}
+
+	invalid := []string{"bad prefix", "feature@{", "foo..bar"}
+	for _, prefix := range invalid {
+		if err := ValidateBranchPrefix(prefix); err == nil {
+			t.Fatalf("expected prefix %q to be invalid", prefix)
+		}
+	}
+}
+
+func TestSemanticBranchName(t *testing.T) {
+	cfg := Config{BranchPrefix: "feature/"}
+	got := cfg.SemanticBranchName("fix-login", "abc")
+	want := "feature/fix-login-abc"
+	if got != want {
+		t.Fatalf("SemanticBranchName() = %q, want %q", got, want)
+	}
+}
+
+// TestWorktreeCache_SessionIDKeying tests that cache uses sessionID consistently
+func TestWorktreeCache_SessionIDKeying(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	// Create a test worktree entry
+	sessionID := "test-session-123"
+	taskID := "test-task-456"
+	wt := &Worktree{
+		ID:        "wt-001",
+		SessionID: sessionID,
+		TaskID:    taskID,
+		Path:      "/test/path",
+	}
+
+	// Add to cache using sessionID
+	mgr.mu.Lock()
+	mgr.worktrees[sessionID] = wt
+	mgr.mu.Unlock()
+
+	// Verify cache contains entry with sessionID key
+	mgr.mu.RLock()
+	cached, exists := mgr.worktrees[sessionID]
+	mgr.mu.RUnlock()
+
+	if !exists {
+		t.Fatal("expected worktree to be in cache with sessionID key")
+	}
+	if cached.ID != wt.ID {
+		t.Errorf("cached worktree ID = %q, want %q", cached.ID, wt.ID)
+	}
+
+	// Verify cache does NOT contain entry with taskID key
+	mgr.mu.RLock()
+	_, existsByTaskID := mgr.worktrees[taskID]
+	mgr.mu.RUnlock()
+
+	if existsByTaskID {
+		t.Error("cache should not contain entry with taskID key")
+	}
+
+	// Simulate cache deletion (as done in removeWorktree)
+	mgr.mu.Lock()
+	if wt.SessionID != "" {
+		delete(mgr.worktrees, wt.SessionID)
+	}
+	mgr.mu.Unlock()
+
+	// Verify cache no longer contains entry
+	mgr.mu.RLock()
+	_, stillExists := mgr.worktrees[sessionID]
+	mgr.mu.RUnlock()
+
+	if stillExists {
+		t.Error("expected worktree to be removed from cache")
+	}
+}
+
+// TestWorktreeCache_EmptySessionID tests cache deletion with empty sessionID
+func TestWorktreeCache_EmptySessionID(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	// Create a worktree with empty sessionID
+	wt := &Worktree{
+		ID:        "wt-002",
+		SessionID: "",
+		TaskID:    "test-task-789",
+		Path:      "/test/path2",
+	}
+
+	// Add to cache with a key
+	mgr.mu.Lock()
+	mgr.worktrees["some-key"] = wt
+	mgr.mu.Unlock()
+
+	// Attempt deletion with empty sessionID (should not panic)
+	mgr.mu.Lock()
+	if wt.SessionID != "" {
+		delete(mgr.worktrees, wt.SessionID)
+	}
+	mgr.mu.Unlock()
+
+	// Verify original entry still exists (wasn't deleted)
+	mgr.mu.RLock()
+	_, exists := mgr.worktrees["some-key"]
+	mgr.mu.RUnlock()
+
+	if !exists {
+		t.Error("entry should still exist when sessionID is empty")
+	}
+}
+
+// TestRepoLocks_ReferenceCountingCleanup tests lock cleanup with reference counting
+func TestRepoLocks_ReferenceCountingCleanup(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := "/test/repo"
+
+	// Acquire lock for the first time
+	lock1 := mgr.getRepoLock(repoPath)
+	if lock1 == nil {
+		t.Fatal("expected non-nil lock")
+	}
+
+	// Verify lock exists in map with refCount = 1
+	mgr.repoLockMu.Lock()
+	entry, exists := mgr.repoLocks[repoPath]
+	mgr.repoLockMu.Unlock()
+
+	if !exists {
+		t.Fatal("expected lock entry to exist in map")
+	}
+	if entry.refCount != 1 {
+		t.Errorf("expected refCount = 1, got %d", entry.refCount)
+	}
+
+	// Acquire same lock again
+	lock2 := mgr.getRepoLock(repoPath)
+	if lock2 != lock1 {
+		t.Error("expected same lock instance")
+	}
+
+	// Verify refCount increased to 2
+	mgr.repoLockMu.Lock()
+	entry, exists = mgr.repoLocks[repoPath]
+	mgr.repoLockMu.Unlock()
+
+	if !exists {
+		t.Fatal("expected lock entry to exist in map")
+	}
+	if entry.refCount != 2 {
+		t.Errorf("expected refCount = 2, got %d", entry.refCount)
+	}
+
+	// Release lock once
+	mgr.releaseRepoLock(repoPath)
+
+	// Verify refCount decreased to 1
+	mgr.repoLockMu.Lock()
+	entry, exists = mgr.repoLocks[repoPath]
+	mgr.repoLockMu.Unlock()
+
+	if !exists {
+		t.Fatal("expected lock entry to still exist in map")
+	}
+	if entry.refCount != 1 {
+		t.Errorf("expected refCount = 1, got %d", entry.refCount)
+	}
+
+	// Release lock again
+	mgr.releaseRepoLock(repoPath)
+
+	// Verify lock removed from map when refCount reaches 0
+	mgr.repoLockMu.Lock()
+	_, exists = mgr.repoLocks[repoPath]
+	mgr.repoLockMu.Unlock()
+
+	if exists {
+		t.Error("expected lock entry to be removed from map when refCount reaches 0")
+	}
+}
+
+// TestRepoLocks_MultipleRepositories tests lock isolation between repositories
+func TestRepoLocks_MultipleRepositories(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repo1 := "/test/repo1"
+	repo2 := "/test/repo2"
+
+	// Acquire locks for different repositories
+	lock1 := mgr.getRepoLock(repo1)
+	lock2 := mgr.getRepoLock(repo2)
+
+	if lock1 == lock2 {
+		t.Error("expected different lock instances for different repositories")
+	}
+
+	// Verify both locks exist
+	mgr.repoLockMu.Lock()
+	entry1, exists1 := mgr.repoLocks[repo1]
+	entry2, exists2 := mgr.repoLocks[repo2]
+	mgr.repoLockMu.Unlock()
+
+	if !exists1 || !exists2 {
+		t.Fatal("expected both lock entries to exist")
+	}
+	if entry1.refCount != 1 || entry2.refCount != 1 {
+		t.Error("expected both locks to have refCount = 1")
+	}
+
+	// Release lock for repo1
+	mgr.releaseRepoLock(repo1)
+
+	// Verify repo1 lock removed, repo2 lock still exists
+	mgr.repoLockMu.Lock()
+	_, exists1 = mgr.repoLocks[repo1]
+	_, exists2 = mgr.repoLocks[repo2]
+	mgr.repoLockMu.Unlock()
+
+	if exists1 {
+		t.Error("expected repo1 lock to be removed")
+	}
+	if !exists2 {
+		t.Error("expected repo2 lock to still exist")
+	}
+}
+
+// TestRepoLocks_ReleaseNonexistent tests releasing a lock that doesn't exist
+func TestRepoLocks_ReleaseNonexistent(t *testing.T) {
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	// Release a lock that was never acquired (should not panic)
+	mgr.releaseRepoLock("/nonexistent/repo")
+
+	// Verify no locks in map
+	mgr.repoLockMu.Lock()
+	count := len(mgr.repoLocks)
+	mgr.repoLockMu.Unlock()
+
+	if count != 0 {
+		t.Errorf("expected 0 locks in map, got %d", count)
+	}
+}
+
+func writeFakeGitScript(t *testing.T, scriptBody string) string {
+	t.Helper()
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "git")
+	content := "#!/bin/sh\nset -eu\n\n" +
+		"while [ \"${1:-}\" = \"-c\" ] && [ \"${2:-}\" = \"core.longpaths=true\" ]; do shift 2; done\n\n" +
+		scriptBody + "\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		t.Fatalf("failed to write fake git script: %v", err)
+	}
+	return scriptDir
+}
+
+func TestPullBaseBranch_UsesNonInteractiveGitEnv(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "git-env.log")
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    printf "%s|%s|%s|%s|%s" \
+      "${GIT_TERMINAL_PROMPT:-}" \
+      "${GCM_INTERACTIVE:-}" \
+      "${GIT_ASKPASS:-}" \
+      "${SSH_ASKPASS:-}" \
+      "${GIT_SSH_COMMAND:-}" > "${KD_GIT_ENV_LOG:?}"
+    exit 0
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "--abbrev-ref" ]; then
+      echo "master"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+
+	t.Setenv("KD_GIT_ENV_LOG", logPath)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	ref, err := mgr.pullBaseBranch(context.Background(), repoPath, "origin/master", nil)
+	if err != nil {
+		t.Fatalf("pullBaseBranch() error = %v", err)
+	}
+	if ref != "origin/master" {
+		t.Fatalf("pullBaseBranch() ref = %q, want %q", ref, "origin/master")
+	}
+
+	envBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed reading fake git env log: %v", err)
+	}
+
+	got := string(envBytes)
+	wantSSH := "ssh -oBatchMode=yes"
+	if ambientSSH := os.Getenv("GIT_SSH_COMMAND"); ambientSSH != "" {
+		wantSSH = subproc.ForceGitSSHBatchMode(ambientSSH)
+	}
+	want := "0|Never|exit 1|exit 1|" + wantSSH
+	if got != want {
+		t.Fatalf("fake git env = %q, want %q", got, want)
+	}
+}
+
+func TestPullBaseBranch_FetchTimeoutFailsQuickly(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    sleep 2
+    exit 0
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "--verify" ]; then
+      exit 1
+    fi
+    if [ "${2:-}" = "--abbrev-ref" ]; then
+      echo "master"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.fetchTimeout = 100 * time.Millisecond
+
+	repoPath := t.TempDir()
+	start := time.Now()
+	ref, err := mgr.pullBaseBranch(context.Background(), repoPath, "master", nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("pullBaseBranch() error = nil, want required refresh failure")
+	}
+	if ref != "" {
+		t.Fatalf("pullBaseBranch() ref = %q, want empty on failure", ref)
+	}
+	// Allow CI scheduling variance while still asserting we timed out
+	// well before the fake 2s fetch command completes.
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("pullBaseBranch() took too long: %v", elapsed)
+	}
+}
+
+func TestPullBaseBranch_PullFailureFallsBackToRemoteRef(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    exit 0
+    ;;
+  pull)
+    echo "Authentication failed" 1>&2
+    exit 1
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "--abbrev-ref" ]; then
+      echo "master"
+      exit 0
+    fi
+    if [ "${2:-}" = "--verify" ]; then
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.pullTimeout = 300 * time.Millisecond
+
+	repoPath := t.TempDir()
+	ref, err := mgr.pullBaseBranch(context.Background(), repoPath, "master", nil)
+	if err != nil {
+		t.Fatalf("pullBaseBranch() error = %v", err)
+	}
+	if ref != "origin/master" {
+		t.Fatalf("pullBaseBranch() ref = %q, want %q", ref, "origin/master")
+	}
+}
+
+func TestFetchBranchToLocal_FetchSucceeds(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    # Simulate successful fetch
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	result, err := mgr.fetchBranchToLocal(context.Background(), repoPath, "feature/pr-branch", 0)
+	if err != nil {
+		t.Fatalf("fetchBranchToLocal() unexpected error: %v", err)
+	}
+	if result.Warning != "" {
+		t.Fatalf("expected no warning on successful fetch, got %q", result.Warning)
+	}
+}
+
+func TestFetchBranchToLocal_FetchFailsLocalBranchExists(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    echo "fatal: no remote configured" >&2
+    exit 1
+    ;;
+  rev-parse)
+    # Simulate branch exists locally
+    if [ "${2:-}" = "--verify" ]; then
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	result, err := mgr.fetchBranchToLocal(context.Background(), repoPath, "feature/pr-branch", 0)
+	if err != nil {
+		t.Fatalf("fetchBranchToLocal() should fall back to local branch, got error: %v", err)
+	}
+	if result.Warning == "" {
+		t.Fatal("expected a warning when falling back to local branch")
+	}
+	if !strings.Contains(result.Warning, "Could not fetch latest from origin") {
+		t.Fatalf("unexpected warning: %q", result.Warning)
+	}
+	if result.WarningDetail == "" {
+		t.Fatal("expected warning detail with raw git output")
+	}
+}
+
+func TestFetchBranchToLocal_RequiredRefreshRejectsLocalFallback(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    echo "fatal: Authentication failed" >&2
+    exit 1
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "--verify" ]; then
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr, err := NewManager(newTestConfig(t), newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	result, err := mgr.fetchBranchToLocalWithPolicy(
+		context.Background(), t.TempDir(), "feature/pr-branch", 0, true,
+	)
+	if err == nil {
+		t.Fatal("required checkout refresh succeeded after fetch authentication failure")
+	}
+	if result != nil {
+		t.Fatalf("required checkout refresh returned a fallback result: %+v", result)
+	}
+	if strings.Contains(err.Error(), "Using local") {
+		t.Fatalf("required checkout refresh exposed a stale local fallback: %v", err)
+	}
+}
+
+func TestFetchBranchToLocal_RequiredRefreshReportsMissingBranch(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    echo "fatal: couldn't find remote ref feature/pr-branch" >&2
+    exit 128
+    ;;
+  rev-parse)
+    if [ "${2:-}" = "--verify" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr, err := NewManager(newTestConfig(t), newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	result, err := mgr.fetchBranchToLocalWithPolicy(
+		context.Background(), t.TempDir(), "feature/pr-branch", 0, true,
+	)
+	if err == nil {
+		t.Fatal("required checkout refresh succeeded for a missing remote branch")
+	}
+	if result != nil {
+		t.Fatalf("required checkout refresh returned a result: %+v", result)
+	}
+	if !errors.Is(err, ErrInvalidBaseBranch) {
+		t.Fatalf("error = %v, want ErrInvalidBaseBranch", err)
+	}
+	if !errors.Is(err, ErrRemoteRefMissing) {
+		t.Fatalf("error = %v, want confirmed remote-ref-missing sentinel", err)
+	}
+}
+
+func TestFetchBranchToLocal_FetchFailsNoBranch(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    echo "fatal: no remote configured" >&2
+    exit 1
+    ;;
+  rev-parse)
+    # Simulate branch does NOT exist
+    if [ "${2:-}" = "--verify" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	_, err = mgr.fetchBranchToLocal(context.Background(), repoPath, "feature/pr-branch", 0)
+	if err == nil {
+		t.Fatal("fetchBranchToLocal() should fail when branch not found anywhere")
+	}
+	if !strings.Contains(err.Error(), "not found locally or on remote") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if !errors.Is(err, ErrInvalidBaseBranch) {
+		t.Fatalf("error = %v, want ErrInvalidBaseBranch", err)
+	}
+}
+
+func TestFetchBranchToLocal_MissingRemoteRefReturnsError(t *testing.T) {
+	scriptDir := writeFakeGitScript(t, `
+case "${1:-}" in
+  fetch)
+    echo "fatal: couldn't find remote ref feature/pr-branch" >&2
+    exit 128
+    ;;
+  rev-parse)
+    # Simulate branch does NOT exist locally
+    if [ "${2:-}" = "--verify" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := newTestConfig(t)
+	log := newTestLogger()
+	store := newMockStore()
+	mgr, err := NewManager(cfg, store, log)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	_, err = mgr.fetchBranchToLocal(context.Background(), repoPath, "feature/pr-branch", 0)
+	if err == nil {
+		t.Fatal("fetchBranchToLocal() should fail when remote ref is missing and no local branch")
+	}
+	if !strings.Contains(err.Error(), "not found locally or on remote") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if !strings.Contains(err.Error(), "couldn't find remote ref") {
+		t.Fatalf("expected error to contain git output, got: %v", err)
+	}
+	if !errors.Is(err, ErrInvalidBaseBranch) {
+		t.Fatalf("error = %v, want ErrInvalidBaseBranch", err)
+	}
+}
+
+// TestCreate_MissingTaskDirFields_ReturnsErrTaskDirRequired locks in the guard
+// added when the legacy flat layout was removed. Worktrees must be placed
+// inside the per-task directory; a request without TaskDirName or RepoName
+// is a programming error and must surface loudly rather than fall back.
+func TestCreate_MissingTaskDirFields_ReturnsErrTaskDirRequired(t *testing.T) {
+	cfg := newTestConfig(t)
+	mgr, err := NewManager(cfg, newMockStore(), newTestLogger())
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	repoPath := initGitRepoForWorktreeTest(t)
+
+	cases := []struct {
+		name string
+		req  CreateRequest
+	}{
+		{
+			name: "missing RepoName",
+			req: CreateRequest{
+				TaskID: "t1", SessionID: "s1",
+				RepositoryPath: repoPath, BaseBranch: "main",
+				TaskDirName: "task-1", RepoName: "",
+			},
+		},
+		{
+			name: "missing TaskDirName",
+			req: CreateRequest{
+				TaskID: "t2", SessionID: "s2",
+				RepositoryPath: repoPath, BaseBranch: "main",
+				TaskDirName: "", RepoName: "repo-1",
+			},
+		},
+		{
+			name: "both missing",
+			req: CreateRequest{
+				TaskID: "t3", SessionID: "s3",
+				RepositoryPath: repoPath, BaseBranch: "main",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := mgr.Create(context.Background(), tc.req)
+			if !errors.Is(err, ErrTaskDirRequired) {
+				t.Fatalf("Create() err = %v, want ErrTaskDirRequired", err)
+			}
+		})
+	}
+}
+
+func TestClassifyGitFallbackReason_AuthPrompt(t *testing.T) {
+	reason := classifyGitFallbackReason(nil, "fatal: could not read Username for 'https://github.com'", nil)
+	if reason != "non_interactive_auth_failed" {
+		t.Fatalf("classifyGitFallbackReason() = %q, want %q", reason, "non_interactive_auth_failed")
+	}
+}
+
+func TestClassifyGitFallbackReason_Timeout(t *testing.T) {
+	reason := classifyGitFallbackReason(context.DeadlineExceeded, "", context.DeadlineExceeded)
+	if !strings.EqualFold(reason, "timeout") {
+		t.Fatalf("classifyGitFallbackReason() = %q, want %q", reason, "timeout")
+	}
+}

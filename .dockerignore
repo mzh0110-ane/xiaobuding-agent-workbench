@@ -1,0 +1,68 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts (any depth)
+**/.next
+**/out
+**/.turbo
+**/tsconfig.tsbuildinfo
+apps/backend/bin
+apps/web/dist
+apps/landing/dist
+# Don't ignore apps/cli/{bin,dist} or apps/packages/*/dist — copied at build time
+
+# Loose Go build outputs in apps/backend/ (go build with no -o)
+apps/backend/kandev
+apps/backend/agentctl
+apps/backend/mock-agent
+apps/backend/acpdbg
+apps/backend/acp-debug
+
+# Local SQLite databases
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# Dependencies (rebuilt in Docker)
+**/node_modules
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+
+# CI/CD
+.github/
+
+# Documentation and config not needed at build time
+docs/
+k8s/
+*.md
+!apps/web/src/**/*.md
+# Needed by apps/web build scripts (generate-changelog.mjs,
+# generate-release-notes.mjs) at the repo root inside the builder stage.
+!CHANGELOG.md
+LICENSE
+
+# Test artifacts
+coverage/
+**/playwright-report
+**/test-results
+*.test.ts
+**/*_test.go
+
+# Agent/Claude config
+.claude/
+.agents/
+CLAUDE.md
+AGENTS.md

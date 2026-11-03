@@ -1,0 +1,335 @@
+// Package i18n localizes the strings the backend renders directly to a browser.
+//
+// Scope is deliberately narrow. Almost every string the backend produces is
+// diagnostic — API error payloads ("invalid payload", "wrong instance id"), log
+// lines, and agent output. Those stay English: the SPA maps API failures onto its
+// own translated copy, and translating a diagnostic would make logs and support
+// harder without helping a user. See docs/i18n.md ("Backend").
+//
+// What this package covers is the surface a user reads straight from Go: the
+// plain-text error pages served when the SPA bundle cannot be delivered, the
+// shared-task artifacts (share.html, the gist README and description), and any
+// future server-rendered copy.
+//
+// A shared task is a static file on GitHub — nobody makes a request to us when
+// they open it — so its locale is fixed when the share is created, from the
+// creator's request, and threaded down to the builders as an argument. See
+// docs/decisions/2026-08-01-share-artifact-locale.md.
+//
+// Catalogs mirror the frontend's shape (`locales/<locale>.json`, flat
+// `key: message`) and are embedded, so no runtime file access is needed.
+package i18n
+
+import (
+	"embed"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+//go:embed locales/*.json
+var catalogFS embed.FS
+
+// DefaultLocale is the source locale; every other catalog falls back to it.
+const DefaultLocale = "en"
+
+// LocaleCookie is written by the SPA language switcher and is the source of
+// truth for the active locale. Kept in sync with the frontend constant in
+// apps/web/lib/i18n/cookie.ts.
+const LocaleCookie = "kandev_locale"
+
+// supportedLocales enumerates the locales with a committed catalog. Keep in sync
+// with SUPPORTED_LOCALES in apps/web/lib/i18n/index.ts.
+var supportedLocales = map[string]bool{
+	"en":     true,
+	"pt-pt":  true,
+	"zh-cn":  true,
+	"zh-tw":  true,
+	"zh-hk":  true,
+	"ja":     true,
+	"ko":     true,
+	"pseudo": true,
+}
+
+var (
+	loadOnce sync.Once
+	catalogs map[string]map[string]string
+)
+
+func load() {
+	loadOnce.Do(func() {
+		catalogs = make(map[string]map[string]string)
+		entries, err := catalogFS.ReadDir("locales")
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			data, readErr := catalogFS.ReadFile("locales/" + entry.Name())
+			if readErr != nil {
+				continue
+			}
+			messages := map[string]string{}
+			if json.Unmarshal(data, &messages) != nil {
+				continue
+			}
+			catalogs[strings.TrimSuffix(entry.Name(), ".json")] = messages
+		}
+	})
+}
+
+// Normalize returns locale when it is supported, otherwise DefaultLocale. Used
+// for both `<html lang>` and message lookup so they can never disagree.
+func Normalize(locale string) string {
+	if Supported(locale) {
+		return canonicalLocale(locale)
+	}
+	// A region-suffixed variant of a supported base collapses onto it when the
+	// base is unambiguous ("ja-JP" → "ja"). Multi-variant bases stay exact.
+	if collapsed := normalizeRegion(locale); supportedLocales[collapsed] {
+		return collapsed
+	}
+	return DefaultLocale
+}
+
+// Supported reports whether locale has a committed catalog.
+func Supported(locale string) bool {
+	return supportedLocales[canonicalLocale(locale)]
+}
+
+func canonicalLocale(locale string) string {
+	return strings.ToLower(strings.TrimSpace(locale))
+}
+
+// normalizeRegion collapses a region-suffixed locale onto its base when the base
+// is unambiguous: "ja-JP" → "ja", "pt-BR" → "pt" (unsupported here, falls
+// through to en via Normalize). Multi-variant bases like "zh" stay exact —
+// "zh-CN"/"zh-TW"/"zh-HK" must not collapse to a shared "zh".
+func normalizeRegion(locale string) string {
+	canonical := canonicalLocale(locale)
+	base, _, hasRegion := strings.Cut(canonical, "-")
+	if !hasRegion {
+		return canonical
+	}
+	if supportedLocales[base] && base != "zh" && base != "pt" {
+		return base
+	}
+	return canonical
+}
+
+// FromRequest resolves the active locale: the kandev_locale cookie first (the
+// SPA's explicit user choice), then the browser's Accept-Language, then the
+// default. Unknown values coerce to DefaultLocale rather than erroring.
+func FromRequest(r *http.Request) string {
+	if r == nil {
+		return DefaultLocale
+	}
+	if cookie, err := r.Cookie(LocaleCookie); err == nil {
+		if Supported(cookie.Value) {
+			return Normalize(cookie.Value)
+		}
+		// Unambiguous region suffixes such as ja-JP collapse onto a shipped
+		// base. Supported() is exact, so Normalize() is not used here: it
+		// would turn an unknown cookie into en and skip Accept-Language.
+		if collapsed := normalizeRegion(cookie.Value); supportedLocales[collapsed] {
+			return collapsed
+		}
+	}
+	for _, tag := range parseAcceptLanguage(r.Header.Get("Accept-Language")) {
+		if Supported(tag) {
+			return tag
+		}
+		// Match "en-GB" against the "en" catalog.
+		if base := strings.SplitN(tag, "-", 2)[0]; Supported(base) {
+			return base
+		}
+	}
+	return DefaultLocale
+}
+
+// parseAcceptLanguage returns the header's tags in descending q-value order.
+// Malformed entries, and any entry whose q-value is unparseable or not
+// positive, are excluded rather than falling through to the request's
+// default acceptability of 1.0.
+func parseAcceptLanguage(header string) []string {
+	if header == "" {
+		return nil
+	}
+	type weighted struct {
+		tag string
+		q   float64
+	}
+	var items []weighted
+	for _, part := range strings.Split(header, ",") {
+		fields := strings.Split(strings.TrimSpace(part), ";")
+		tag := strings.ToLower(strings.TrimSpace(fields[0]))
+		if tag == "" {
+			continue
+		}
+		q, ok := acceptLanguageQuality(fields[1:])
+		if !ok || q <= 0 {
+			continue
+		}
+		items = append(items, weighted{tag: tag, q: q})
+	}
+	// Stable insertion sort: preserves header order among equal q-values.
+	for i := 1; i < len(items); i++ {
+		for j := i; j > 0 && items[j].q > items[j-1].q; j-- {
+			items[j], items[j-1] = items[j-1], items[j]
+		}
+	}
+	tags := make([]string, 0, len(items))
+	for _, item := range items {
+		tags = append(tags, item.tag)
+	}
+	return tags
+}
+
+// acceptLanguageQuality reads the q parameter from one Accept-Language
+// field's ";"-separated parameters, defaulting to 1.0 when none is present.
+// It reports ok=false for a q parameter that is present but unparseable, not
+// a finite number, or outside HTTP quality's [0,1] range, so the caller
+// excludes the tag instead of promoting a malformed value to the highest
+// priority or letting it outrank well-formed entries.
+func acceptLanguageQuality(params []string) (float64, bool) {
+	q := 1.0
+	for _, field := range params {
+		field = strings.TrimSpace(field)
+		if !strings.HasPrefix(field, "q=") {
+			continue
+		}
+		parsed, err := strconv.ParseFloat(strings.TrimPrefix(field, "q="), 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 1 {
+			return 0, false
+		}
+		q = parsed
+	}
+	return q, true
+}
+
+// T returns the message for key in locale, falling back to DefaultLocale and
+// finally to the key itself. A missing key therefore degrades to
+// visible-but-wrong rather than blank — the same contract as the frontend.
+func T(locale, key string) string {
+	load()
+	normalized := Normalize(locale)
+	if messages, ok := catalogs[normalized]; ok {
+		if message, found := messages[key]; found && message != "" {
+			return message
+		}
+	}
+	if normalized != DefaultLocale {
+		if messages, ok := catalogs[DefaultLocale]; ok {
+			if message, found := messages[key]; found && message != "" {
+				return message
+			}
+		}
+	}
+	return key
+}
+
+// Tf returns the message for key in locale with every `{{name}}` placeholder
+// replaced by the matching entry in vars. It is the only supported way to build
+// a message that carries a value: `fmt.Sprintf` on the result of T would freeze
+// the argument order in English, and a translator cannot move a placeholder that
+// is not in the catalog.
+//
+// When vars carries a "count", the i18next plural suffixes are resolved first —
+// `key_one` for exactly 1, `key_other` for anything else — falling back to the
+// unsuffixed key when the catalog defines no plural forms. That keeps the
+// contract identical to the frontend's `t("key", { count })` and is why no call
+// site ever appends an English "s" itself.
+//
+// Values are substituted verbatim; escaping (HTML, Markdown) belongs to the call
+// site, which is the only place that knows the target syntax.
+func Tf(locale, key string, vars map[string]any) string {
+	return interpolate(T(locale, pluralKey(locale, key, vars)), vars)
+}
+
+// pluralKey picks the plural variant of key that the catalog actually defines,
+// so a message with only a base form still resolves.
+func pluralKey(locale, key string, vars map[string]any) string {
+	count, ok := countVar(vars)
+	if !ok {
+		return key
+	}
+	// Only an exact 1 is singular. Comparing the original value rather than a
+	// truncated integer is what stops 1.5 from rendering as "1.5 message".
+	suffixed := key + "_other"
+	if count == 1 {
+		suffixed = key + "_one"
+	}
+	// T echoes the key back when it is missing — that is how we detect a catalog
+	// that never defined the plural forms.
+	if T(locale, suffixed) != suffixed {
+		return suffixed
+	}
+	return key
+}
+
+// countVar reads the plural selector out of vars as a float64, which is wide
+// enough for every Go numeric type a caller might hold (a proto int32, a store
+// aggregate uint64, a JSON-decoded float64) and preserves the fractional part
+// that decides singular-vs-plural. Non-numeric values are ignored rather than
+// erroring: a bad "count" degrades to the unsuffixed key.
+func countVar(vars map[string]any) (float64, bool) {
+	switch n := vars["count"].(type) {
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
+}
+
+// interpolate replaces `{{name}}` with vars[name]. Placeholders with no matching
+// var are left in place, which makes the omission visible instead of silently
+// producing a sentence with a hole in it.
+func interpolate(message string, vars map[string]any) string {
+	if len(vars) == 0 || !strings.Contains(message, "{{") {
+		return message
+	}
+	pairs := make([]string, 0, len(vars)*2)
+	for name, value := range vars {
+		pairs = append(pairs, "{{"+name+"}}", fmt.Sprint(value))
+	}
+	return strings.NewReplacer(pairs...).Replace(message)
+}
+
+// Keys lists every key in the source catalog; used by the drift test that keeps
+// translations in step with `en`.
+func Keys() []string {
+	load()
+	messages := catalogs[DefaultLocale]
+	keys := make([]string, 0, len(messages))
+	for key := range messages {
+		keys = append(keys, key)
+	}
+	return keys
+}

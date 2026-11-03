@@ -1,0 +1,159 @@
+package worktree
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func TestInvalidBaseBranchRemainsSentinelDetectable(t *testing.T) {
+	err := fmt.Errorf("prepare failed: %w", ErrInvalidBaseBranch)
+	if !errors.Is(err, ErrInvalidBaseBranch) {
+		t.Fatalf("errors.Is(%v, ErrInvalidBaseBranch) = false", err)
+	}
+}
+
+func TestIsRemoteRefMissingErrorRequiresConfirmedRemoteEvidence(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "missing ref", err: errors.New("fatal: couldn't find remote ref feature/lost"), want: true},
+		{name: "no remote", err: errors.New("fatal: no remote configured"), want: true},
+		{name: "authentication failure", err: errors.New("fatal: Authentication failed"), want: false},
+		{name: "network failure", err: errors.New("fatal: unable to access remote: connection timed out"), want: false},
+		{name: "generic invalid branch", err: fmt.Errorf("%w: feature/lost", ErrInvalidBaseBranch), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRemoteRefMissingError(tt.err); got != tt.want {
+				t.Fatalf("isRemoteRefMissingError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassifyGitError_BranchCheckedOut(t *testing.T) {
+	output := "fatal: 'feature/pr-branch' is already checked out at '/tmp/worktree-123'"
+	err := ClassifyGitError(output, fmt.Errorf("exit status 128"))
+	if !errors.Is(err, ErrBranchCheckedOut) {
+		t.Fatalf("expected ErrBranchCheckedOut, got: %v", err)
+	}
+}
+
+func TestClassifyGitError_AuthFailed(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{"could not read username", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"},
+		{"authentication failed", "fatal: Authentication failed for 'https://github.com/repo.git'"},
+		{"askpass", "fatal: could not read Password via askpass"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ClassifyGitError(tt.output, fmt.Errorf("exit status 128"))
+			if !errors.Is(err, ErrAuthFailed) {
+				t.Fatalf("expected ErrAuthFailed, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestClassifyGitError_NonFastForward(t *testing.T) {
+	output := "! [rejected]        main -> main (non-fast-forward)"
+	err := ClassifyGitError(output, fmt.Errorf("exit status 1"))
+	if !errors.Is(err, ErrNonFastForward) {
+		t.Fatalf("expected ErrNonFastForward, got: %v", err)
+	}
+}
+
+func TestClassifyGitError_GenericFailure(t *testing.T) {
+	output := "fatal: some unknown git error"
+	err := ClassifyGitError(output, fmt.Errorf("exit status 1"))
+	if !errors.Is(err, ErrGitCommandFailed) {
+		t.Fatalf("expected ErrGitCommandFailed, got: %v", err)
+	}
+}
+
+func TestClassifyGitError_PathTooLongIncludesWindowsGuidanceAndGitOutput(t *testing.T) {
+	output := "error: unable to create file generated/very/long/project.csproj: Filename too long\n" +
+		"fatal: Could not reset index file to revision 'HEAD'."
+	err := ClassifyGitError(output, fmt.Errorf("exit status 128"))
+
+	if !errors.Is(err, ErrGitCommandFailed) {
+		t.Fatalf("expected ErrGitCommandFailed, got: %v", err)
+	}
+	for _, want := range []string{"Windows", "long paths", "Filename too long", "Could not reset index file"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("classified error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestClassifyGitError_ResetIndexAloneDoesNotClaimPathLimit(t *testing.T) {
+	output := "fatal: Could not reset index file to revision 'HEAD'."
+	err := ClassifyGitError(output, fmt.Errorf("exit status 128"))
+
+	for _, misleading := range []string{"Windows", "path-length limit", "Win32 long paths"} {
+		if strings.Contains(err.Error(), misleading) {
+			t.Fatalf("generic reset-index error %q contains misleading guidance %q", err, misleading)
+		}
+	}
+}
+
+func TestContainsAuthFailure(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"authentication failed", true},
+		{"terminal prompts disabled", true},
+		{"could not read username", true},
+		{"username for 'https://github.com'", true},
+		{"askpass error", true},
+		{"branch not found", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := containsAuthFailure(tt.input); got != tt.expected {
+				t.Fatalf("containsAuthFailure(%q) = %v, want %v", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseCheckedOutPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			"standard git output",
+			"fatal: 'feature/pr-branch' is already checked out at '/tmp/worktrees/my-worktree'",
+			"/tmp/worktrees/my-worktree",
+		},
+		{
+			"no match",
+			"fatal: some other error",
+			"",
+		},
+		{
+			"no closing quote",
+			"fatal: 'branch' is already checked out at '/path",
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCheckedOutPath(tt.input)
+			if got != tt.expected {
+				t.Fatalf("parseCheckedOutPath(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}

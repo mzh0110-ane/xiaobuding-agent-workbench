@@ -1,0 +1,101 @@
+"use client";
+
+import { useState } from "react";
+import { IconPlus, IconSubtask, IconChevronDown } from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import { ButtonGroup } from "@kandev/ui/button-group";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@kandev/ui/dropdown-menu";
+import { TaskCreateDialog } from "@/components/task-create-dialog";
+import { NewSubtaskDialog } from "./new-subtask-dialog";
+import type { Task } from "@/lib/types/http";
+import { useTranslation } from "react-i18next";
+
+type NewTaskDropdownProps = {
+  workspaceId: string | null;
+  workflowId: string | null;
+  steps: Array<{ id: string; title: string; color?: string; events?: Record<string, unknown> }>;
+  activeTaskId: string | null;
+  activeTaskTitle: string;
+  onTaskCreated: (
+    task: Task,
+    mode: "create" | "edit",
+    meta?: { taskSessionId?: string | null; autoFocus?: boolean },
+  ) => void;
+};
+
+export function NewTaskDropdown({
+  workspaceId,
+  workflowId,
+  steps,
+  activeTaskId,
+  activeTaskTitle,
+  onTaskCreated,
+}: NewTaskDropdownProps) {
+  const { t } = useTranslation();
+  const [showTaskDialog, setShowTaskDialog] = useState(false);
+  const [showSubtaskDialog, setShowSubtaskDialog] = useState(false);
+
+  return (
+    <>
+      <ButtonGroup>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 gap-1 cursor-pointer"
+          onClick={() => setShowTaskDialog(true)}
+          data-testid="new-task-primary"
+        >
+          <IconPlus className="h-3.5 w-3.5" />
+          {t("task:task")}
+        </Button>
+        {activeTaskId && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 px-1 cursor-pointer"
+                data-testid="new-task-chevron"
+              >
+                <IconChevronDown className="h-3 w-3" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                className="cursor-pointer text-xs gap-1.5"
+                onClick={() => setShowSubtaskDialog(true)}
+                data-testid="new-subtask-button"
+              >
+                <IconSubtask className="h-3.5 w-3.5" />
+                {t("task:subtask")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </ButtonGroup>
+      <TaskCreateDialog
+        open={showTaskDialog}
+        onOpenChange={setShowTaskDialog}
+        mode="create"
+        workspaceId={workspaceId}
+        workflowId={workflowId}
+        defaultStepId={steps[0]?.id ?? null}
+        steps={steps}
+        onSuccess={onTaskCreated}
+      />
+      {activeTaskId && (
+        <NewSubtaskDialog
+          open={showSubtaskDialog}
+          onOpenChange={setShowSubtaskDialog}
+          parentTaskId={activeTaskId}
+          parentTaskTitle={activeTaskTitle}
+        />
+      )}
+    </>
+  );
+}

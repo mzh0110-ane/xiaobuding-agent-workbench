@@ -1,0 +1,327 @@
+"use client";
+
+import { useState } from "react";
+import {
+  IconChevronDown,
+  IconChevronRight,
+  IconCloudUpload,
+  IconGitPullRequest,
+} from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { CommitRow, type CommitItem } from "./commit-row";
+import type {
+  CommitDetailTarget,
+  CommitFileNavigationRequest,
+} from "@/lib/state/diff-target-types";
+import { groupByRepositoryName } from "@/lib/group-by-repo";
+import type { ChangedFile } from "./changes-panel-helpers";
+import { useTranslation } from "react-i18next";
+
+export type RepoGroup = ReturnType<typeof groupByRepositoryName<ChangedFile>>[number];
+
+/**
+ * Per-repo group inside a file-list section (Unstaged / Staged). Renders the
+ * collapsible repo header with optional inline action buttons (Stage all /
+ * Commit / Unstage all). Action labels and handlers are owned by the parent
+ * section so the same shape works for both variants.
+ */
+export function RepoGroupItem({
+  group,
+  collapsed,
+  onToggle,
+  renderRow,
+  primaryLabel,
+  secondaryLabel,
+  onRepoAction,
+  onRepoSecondaryAction,
+  displayName,
+  disabled = false,
+}: {
+  group: RepoGroup;
+  collapsed: boolean;
+  onToggle: () => void;
+  renderRow: (file: ChangedFile) => React.ReactNode;
+  primaryLabel: string;
+  secondaryLabel?: string;
+  onRepoAction?: (repo: string) => void;
+  onRepoSecondaryAction?: (repo: string) => void;
+  /** Optional display label override; defaults to group.repositoryName. */
+  displayName?: string;
+  disabled?: boolean;
+}) {
+  const { t } = useTranslation();
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
+  const label = displayName || group.repositoryName || t("common:repository");
+  return (
+    <li data-testid="changes-repo-group" data-repository-name={group.repositoryName || ""}>
+      <div className="flex items-center justify-between gap-2 px-1 py-0.5">
+        <button
+          type="button"
+          className="flex min-h-6 items-center gap-1.5 text-[11px] font-medium text-muted-foreground/80 uppercase tracking-wide cursor-pointer hover:text-foreground/80 min-w-0 [@media(pointer:coarse)]:min-h-11"
+          data-testid="changes-repo-header"
+          aria-expanded={!collapsed}
+          onClick={onToggle}
+        >
+          {collapsed ? (
+            <IconChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+          ) : (
+            <IconChevronDown className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+          )}
+          <span className="truncate">{label}</span>
+          <span className="text-muted-foreground/50 normal-case tracking-normal">
+            {group.items.length}
+          </span>
+        </button>
+        {(onRepoAction || onRepoSecondaryAction) && (
+          <div className="flex items-center gap-1" onClick={stop}>
+            {onRepoAction && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer"
+                data-testid="repo-group-action"
+                disabled={disabled}
+                onClick={() => onRepoAction(group.repositoryName)}
+              >
+                {primaryLabel}
+              </Button>
+            )}
+            {onRepoSecondaryAction && secondaryLabel && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer text-muted-foreground"
+                data-testid="repo-group-secondary-action"
+                disabled={disabled}
+                onClick={() => onRepoSecondaryAction(group.repositoryName)}
+              >
+                {secondaryLabel}
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+      {!collapsed && <ul className="space-y-0.5">{group.items.map(renderRow)}</ul>}
+    </li>
+  );
+}
+
+// Inline action buttons rendered in the file-list section header for single-repo
+// workspaces. Mirrors the per-repo buttons that RepoGroupItem renders for
+// multi-repo. Handlers receive an empty repo string which routes to the
+// workspace root in single-repo mode.
+export function FileSectionActions({
+  primaryLabel,
+  secondaryLabel,
+  onAction,
+  onSecondaryAction,
+  disabled = false,
+}: {
+  primaryLabel: string;
+  secondaryLabel?: string;
+  onAction?: (repo: string) => void;
+  onSecondaryAction?: (repo: string) => void;
+  disabled?: boolean;
+}) {
+  if (!onAction && !onSecondaryAction) return null;
+  return (
+    <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+      {onAction && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer"
+          data-testid="repo-group-action"
+          disabled={disabled}
+          onClick={() => onAction("")}
+        >
+          {primaryLabel}
+        </Button>
+      )}
+      {onSecondaryAction && secondaryLabel && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer text-muted-foreground"
+          data-testid="repo-group-secondary-action"
+          disabled={disabled}
+          onClick={() => onSecondaryAction("")}
+        >
+          {secondaryLabel}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+export function CommitsGroupActions({
+  repositoryName,
+  aheadCount,
+  prExists,
+  canCreatePR,
+  onRepoPush,
+  onRepoCreatePR,
+  stop,
+}: {
+  repositoryName: string;
+  aheadCount: number;
+  prExists: boolean;
+  canCreatePR: boolean;
+  onRepoPush?: (repo: string) => void;
+  onRepoCreatePR?: (repo: string) => void;
+  stop: (e: React.MouseEvent) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-1" onClick={stop}>
+      {onRepoPush && aheadCount > 0 && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer gap-1"
+          data-testid="commits-repo-push"
+          onClick={() => onRepoPush(repositoryName)}
+        >
+          <IconCloudUpload className="h-3 w-3" />
+          {t("task:push")}
+          <span className="text-muted-foreground">{aheadCount}</span>
+        </Button>
+      )}
+      {onRepoCreatePR && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 min-h-6 [@media(pointer:coarse)]:min-h-11 text-[10px] px-1.5 cursor-pointer gap-1"
+              data-testid="commits-repo-create-pr"
+              onClick={() => onRepoCreatePR(repositoryName)}
+              disabled={!canCreatePR}
+            >
+              <IconGitPullRequest className="h-3 w-3" />
+              PR
+            </Button>
+          </TooltipTrigger>
+          {prExists && <TooltipContent>{t("task:aPullRequestAlreadyExistsFor")}</TooltipContent>}
+        </Tooltip>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-repo group inside the Commits section. Like {@link RepoGroupItem} but
+ * for commit rows; surfaces a Push button when the repo is ahead of its remote.
+ */
+export function CommitsRepoGroup({
+  repositoryName,
+  displayName,
+  groupCommits,
+  aheadCount = 0,
+  existingPrUrl,
+  showHeader = true,
+  onOpenCommitDetail,
+  onAmendCommit,
+  onRevertCommit,
+  onResetToCommit,
+  onRepoPush,
+  onRepoCreatePR,
+}: {
+  repositoryName: string;
+  displayName?: string;
+  groupCommits: CommitItem[];
+  aheadCount?: number;
+  existingPrUrl?: string;
+  /** When false, render commits flat without the per-repo header. Single-repo
+   *  workspaces use this — the action buttons (Push / PR) move up to the
+   *  section header so we don't render a redundant repo sub-header. */
+  showHeader?: boolean;
+  onOpenCommitDetail?: (
+    target: CommitDetailTarget,
+    fileNavigation?: CommitFileNavigationRequest,
+  ) => void;
+  onAmendCommit?: (currentMessage: string, repo?: string) => void;
+  onRevertCommit?: (sha: string, repo?: string) => void;
+  onResetToCommit?: (sha: string, repo?: string) => void;
+  onRepoPush?: (repo: string) => void;
+  onRepoCreatePR?: (repo: string) => void;
+  /** Base branch passed through; reserved for richer per-repo PR UX. */
+  baseBranch?: string;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  // Each repo has its own "latest unpushed commit" — revert/amend in this
+  // group must target THIS repo's newest, not the merged-list newest.
+  const firstUnpushedInGroup = groupCommits.findIndex((c) => c.pushed !== true);
+  const { t } = useTranslation();
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
+  const label = displayName || repositoryName || t("common:repository");
+  // Bug 10 acknowledged trade-off: `existingPrUrl` is sourced from a
+  // workspace-scoped `prByRepo` map keyed only by "" today — the kandev task
+  // model has one PR per task, not one PR per repo. As a result every per-
+  // repo group inherits the same PR URL. When the backend grows per-repo PR
+  // tracking, callers should key `prByRepo` by `repositoryName` and the
+  // `?? prByRepo[""]` fallback in CommitsSection should be removed so each
+  // group surfaces only its own PR. Until then, the visual is "PR exists for
+  // this task" rather than "PR exists for this repo" — accept the imprecision.
+  const prExists = !!existingPrUrl;
+  // The PR scope today is workspace-wide (one PR per task). Disable per-repo
+  // Create PR once a PR exists; the user can update it via push instead.
+  const canCreatePR = !!onRepoCreatePR && !prExists;
+  const rows = groupCommits.map((commit, index) => (
+    <CommitRow
+      key={commitRowIdentity(commit)}
+      commit={commit}
+      isLatest={index === firstUnpushedInGroup}
+      onOpenCommitDetail={onOpenCommitDetail}
+      onAmendCommit={commit.pushed ? undefined : onAmendCommit}
+      onRevertCommit={commit.pushed ? undefined : onRevertCommit}
+      onResetToCommit={commit.pushed ? undefined : onResetToCommit}
+    />
+  ));
+  if (!showHeader) {
+    return <>{rows}</>;
+  }
+  return (
+    <li data-testid="commits-repo-group" data-repository-name={repositoryName || ""}>
+      <div className="flex items-center justify-between gap-2 px-1 py-0.5">
+        <button
+          type="button"
+          className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground/80 uppercase tracking-wide cursor-pointer hover:text-foreground/80 min-w-0"
+          data-testid="commits-repo-header"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((c) => !c)}
+        >
+          {collapsed ? (
+            <IconChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+          ) : (
+            <IconChevronDown className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+          )}
+          <span className="truncate">{label}</span>
+          <span className="text-muted-foreground/50 normal-case tracking-normal">
+            {groupCommits.length}
+          </span>
+        </button>
+        <CommitsGroupActions
+          repositoryName={repositoryName}
+          aheadCount={aheadCount}
+          prExists={prExists}
+          canCreatePR={canCreatePR}
+          onRepoPush={onRepoPush}
+          onRepoCreatePR={onRepoCreatePR}
+          stop={stop}
+        />
+      </div>
+      {!collapsed && <ul className="space-y-0.5">{rows}</ul>}
+    </li>
+  );
+}
+
+function commitRowIdentity(commit: CommitItem): string {
+  const target = commit.detailTarget;
+  const targetScope =
+    target.source === "local"
+      ? (target.repo ?? "")
+      : `${target.workspaceId}:${target.owner}/${target.repo}`;
+  return `${target.source}:${targetScope}:${target.sha}`;
+}

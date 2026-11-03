@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="xbd-token" content="__TOKEN__">
+<meta name="theme-color" content="#f6f5f1">
+<link rel="icon" type="image/png" href="/reliable/icon.png">
+<link rel="apple-touch-icon" href="/reliable/icon.png">
+<title>小布丁 · 协作工作台</title>
+<script>try{const t=localStorage.getItem('xiaobuding.theme');if(['light','dark','system'].includes(t))document.documentElement.dataset.theme=t}catch{}</script>
+<style>__STYLE__</style>
+</head>
+<body class="spatial-studio">
+<div class="app-layout">
+<aside id="sidebar" class="sidebar" aria-label="项目任务">
+<div class="sidebar-top">
+<a class="brand" href="/reliable"><img class="brand-avatar" src="/reliable/icon.png" alt=""><span>小布丁<small>你的 Agent 协作工作台</small></span></a>
+<button id="new-task" class="new-task-button" type="button"><span data-icon="plus"></span>新建任务</button>
+<button id="agent-settings-sidebar" class="agent-sidebar-toggle" type="button" aria-controls="agent-settings-drawer" aria-expanded="false"><span data-icon="sliders"></span><span class="agent-sidebar-label">Agent 设置</span><span data-icon="chevron"></span></button>
+<div class="search-field"><span data-icon="search"></span><input id="task-search" type="search" aria-label="搜索任务" placeholder="搜索任务或项目" autocomplete="off"></div>
+</div>
+<div class="sidebar-tabs" role="tablist" aria-label="任务分类"><button id="filter-active" type="button" role="tab" aria-selected="true">任务<span id="active-count">0</span></button><button id="filter-archived" type="button" role="tab" aria-selected="false">已归档<span id="archived-count">0</span></button></div>
+<div class="sidebar-heading"><h2 id="history-title">项目会话</h2><button id="refresh" class="icon-button" type="button" aria-label="刷新" title="刷新任务列表"><span data-icon="refresh"></span></button></div>
+<div id="task-list" class="task-list" role="tabpanel" aria-labelledby="filter-active"><p class="empty-history">正在读取任务…</p></div>
+<p id="archive-hint" class="sidebar-note" hidden>归档仅收纳。未结束任务仍占用项目，可恢复后继续或停止。</p>
+<div class="sidebar-bottom"><div id="connections" class="connections" aria-label="工具连接状态"></div><div class="appearance"><span data-icon="sun"></span><label for="theme">外观</label><select id="theme"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></div><details id="background-settings" class="background-settings"><summary><span data-icon="image"></span>背景设置<span data-icon="chevron"></span></summary><div class="background-controls"><label for="background-image">背景图片</label><select id="background-image"><option value="portrait">默认图片</option><option value="custom" disabled>自选图片</option><option value="none">无背景</option></select><button id="background-pick" type="button" aria-controls="background-file">选择本地图片</button><input id="background-file" type="file" accept="image/png,image/jpeg,image/webp" hidden><p class="background-private">图片只保存在本机浏览器 · 最大 20 MB</p><p id="background-status" role="status" aria-live="polite"></p><div class="background-range-label"><label for="background-transparency">背景透明度</label><output id="background-transparency-value" for="background-transparency">80%</output></div><input id="background-transparency" type="range" min="0" max="100" step="1" value="80" aria-describedby="background-help"><p id="background-help">0% 最清晰 · 100% 隐藏</p></div></details><div class="local-note"><span class="status-dot good"></span>本机工作区<span>本批最多三轮 · 可继续下一批</span></div></div>
+</aside>
+<div class="main-pane">
+<header class="app-header"><button id="sidebar-toggle" class="icon-button" type="button" aria-label="打开任务列表" aria-expanded="false" aria-controls="sidebar"><span data-icon="sidebar"></span></button><div class="breadcrumb"><span id="view-title">新建任务</span><span id="view-project"></span></div><div class="header-actions"><button id="task-context-toggle" class="context-toggle" type="button" aria-controls="task-summary" aria-expanded="false" hidden><span data-icon="sidebar"></span><span id="task-context-label">本批概览</span></button><button id="notification-toggle" class="quiet-button" type="button">开启提醒</button><button id="agent-settings-toggle" class="agent-header-toggle" type="button" aria-controls="agent-settings-drawer" aria-expanded="false"><span data-icon="sliders"></span><span class="agent-header-label">Agent 设置</span></button><a class="quiet-link" href="/" target="_blank" rel="noopener">Kandev 工作台<span data-icon="external"></span></a><button id="task-more" class="icon-button" type="button" aria-label="当前任务更多操作" aria-haspopup="menu" hidden><span data-icon="more"></span></button></div></header>
+<main id="main-content">
+<div id="global-error" class="notice error" role="alert" hidden></div>
+<div id="global-success" class="notice success" role="status" hidden></div>
+<section id="setup" aria-labelledby="setup-title">
+<div class="setup-canvas">
+<header class="setup-intro"><div class="setup-heading"><h1 id="setup-title">今天想做什么</h1><p class="muted">继续已有项目，或从一个新想法开始。</p></div></header>
+<div id="assistant-cards" class="assistant-cards" role="group" aria-label="选择协作方式"></div>
+<form id="form">
+<fieldset id="new-fields">
+<div class="composer">
+<div class="setup-basics">
+<div class="project-inputs"><div class="field project-field"><label for="project"><span data-icon="folder"></span>项目文件夹</label><div class="input-action"><input id="project" required autocomplete="off" spellcheck="false" placeholder="选择文件夹，或粘贴项目路径"><button id="browse" type="button">选择文件夹</button></div><p class="hint">普通文件夹也可以，自动建立本地存档，无需上传 GitHub。</p></div></div>
+<label class="inspection-choice"><input id="read-only" type="checkbox"><span><strong>只读了解项目</strong><small>直接读取所选文件夹或现有 Git 工作副本，不再复制、不修改文件。使用“调查与规划”所选模型。</small></span></label>
+</div>
+<label for="goal" class="composer-label">这次要完成的目标</label><textarea id="goal" required maxlength="12000" placeholder="例如：帮我的记账页面增加月份筛选，列表和合计一起更新。保留原来的新增、删除功能。"></textarea><div id="new-attachments"></div><div id="new-assistant-selection" class="new-assistant-selection"></div><div class="composer-footer"><div id="work-mode"></div><button id="submit" class="primary" type="submit">开始协作<span data-icon="arrow-up"></span></button></div></div>
+<p class="composer-note"><span data-icon="shield"></span>先在独立副本完成，你验收后才应用到原项目。</p>
+<div class="setup-secondary">
+<details id="assignment-settings" class="settings-disclosure"><summary><span class="disclosure-label"><span data-icon="sliders"></span>Agent 分工与模型</span><span id="assignment-summary" class="assignment-summary"></span><span data-icon="chevron" class="disclosure-chevron"></span></summary><section class="assignments" aria-labelledby="assign-title"><div class="assignment-heading"><div><h2 id="assign-title">本次怎么分工</h2><p class="hint">前端与后端依次接手同一份副本。审查由 Codex 新会话执行。</p></div><button id="refresh-models" type="button"><span data-icon="refresh"></span>刷新模型列表</button></div><div id="new-plan" class="plan-fields"></div><p class="assignment-note">两个工具默认完全访问。工具、模型和思考强度都能选择；运行中可调整后续阶段。</p></section></details>
+<details class="advanced settings-disclosure"><summary><span class="disclosure-label"><span data-icon="code"></span>检查命令与修改范围<span class="optional">可选</span></span><span data-icon="chevron" class="disclosure-chevron"></span></summary><div class="advanced-fields"><div class="field"><label for="commands">验证命令，每行一条</label><textarea id="commands" spellcheck="false" placeholder="留空自动识别；新项目先建立真实检查"></textarea></div><div class="field"><label for="scope">允许修改的文件或文件夹</label><input id="scope" spellcheck="false" placeholder="留空由调查确定，例如 src, tests"><p class="hint">多个相对路径用英文逗号分隔。</p></div></div></details>
+</div>
+</fieldset>
+<div id="form-error" class="notice error" role="alert" hidden></div>
+</form>
+<div class="first-run"><span>还没有项目？先熟悉一下协作流程。</span><button id="demo" type="button"><span data-icon="play"></span>一键体验示例</button></div>
+</div>
+</section>
+<div id="current-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+<p id="workspace-loading" class="notice" role="status" hidden>正在读取项目记录…</p>
+<section id="workspace" aria-label="项目工作区" hidden>
+<aside id="task-summary" aria-label="本批状态与操作"></aside>
+<div class="workspace-toolbar"><div id="workspace-tabs" class="workspace-tabs" role="tablist" aria-label="项目工作区"><button id="tab-conversation" type="button" role="tab" data-workspace-tab="conversation" aria-selected="true" aria-controls="panel-conversation" tabindex="0">对话</button><button id="tab-activity" type="button" role="tab" data-workspace-tab="activity" aria-selected="false" aria-controls="panel-activity" tabindex="-1">执行过程</button><button id="tab-results" type="button" role="tab" data-workspace-tab="results" aria-selected="false" aria-controls="panel-results" tabindex="-1">成果与检查</button><button id="tab-project" type="button" role="tab" data-workspace-tab="project" aria-selected="false" aria-controls="panel-project" tabindex="-1">项目计划</button></div><button id="workspace-width" class="workspace-width" type="button" aria-pressed="false" title="切换工作区宽度"><span data-icon="sidebar"></span><span>宽屏工作</span></button></div>
+<div id="workspace-content" class="workspace-content"><div id="panel-conversation" class="workspace-panel" role="tabpanel" aria-labelledby="tab-conversation" tabindex="0"><section id="task-conversation" class="conversation-panel" aria-label="项目持续对话"></section></div><div id="panel-activity" class="workspace-panel" role="tabpanel" aria-labelledby="tab-activity" tabindex="0" hidden><section id="task-activity" class="activity-panel" aria-label="实时执行过程"></section></div><div id="panel-results" class="workspace-panel" role="tabpanel" aria-labelledby="tab-results" tabindex="0" hidden><div id="task-proof"></div></div><div id="panel-project" class="workspace-panel" role="tabpanel" aria-labelledby="tab-project" tabindex="0" hidden><section id="task-project" aria-label="项目长期计划与记忆"></section></div></div>
+<div id="workspace-composer" class="workspace-composer" aria-label="发送项目问题或要求"></div>
+<details id="task-plan-settings" class="settings-disclosure task-settings"><summary><span class="disclosure-label"><span data-icon="sliders"></span>后续 Agent 安排<span id="plan-unsaved" class="draft-marker" hidden>未保存</span></span><span id="task-assignment-summary" class="assignment-summary"></span><span data-icon="chevron" class="disclosure-chevron"></span></summary><section id="task-plan-editor"></section></details>
+</section>
+<p class="footer-note">以实际检查和独立审查为依据。模型仍可能出错，最终由你验收。</p>
+</main>
+</div>
+</div>
+<button id="sidebar-backdrop" class="sidebar-backdrop" aria-label="关闭任务列表" tabindex="-1" hidden></button>
+<script>__SCRIPT__</script>
+</body>
+</html>
